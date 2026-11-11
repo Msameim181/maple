@@ -139,6 +139,16 @@ describe("OIDC sign-in", () => {
 		)
 	})
 
+	test("an unreachable server is said out loud instead of silently hiding SSO", () => {
+		scene(
+			{ update, view },
+			...entered({}),
+			Command.resolve(LoadOidcConfig, Message.FailedLoadOidcConfig()),
+			expect(role("alert")).toContainText("Couldn't reach the server"),
+			expect(passwordField).toExist(),
+		)
+	})
+
 	test("clicking SSO starts the PKCE redirect to the configured provider", () => {
 		scene(
 			{ update, view },

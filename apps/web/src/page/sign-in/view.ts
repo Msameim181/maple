@@ -135,6 +135,15 @@ export const view = Submodel.defineView<Model, Message>((model, h) => {
 						),
 					],
 				),
+				...(model.isServerUnreachable
+					? [
+							alert(h, { variant: "crit" }, [
+								alertDescription(h, [
+									"Couldn't reach the server, so some sign-in options may be missing. Check your connection and reload the page.",
+								]),
+							]),
+						]
+					: []),
 				...Option.match(maybeFailureOf(model.sso), {
 					onNone: () => [],
 					onSome: (failure) => [

@@ -43,6 +43,8 @@ export const Model = Schema.Struct({
 	oidc: Schema.NullOr(OidcProvider),
 	/** With OIDC on, the root-password form waits behind "Use root password". */
 	isRootPasswordShown: Schema.Boolean,
+	/** The config request failed, so the page cannot tell whether SSO exists. */
+	isServerUnreachable: Schema.Boolean,
 	sso: Submission,
 	password: Schema.String,
 	/** Base UI field state: focused now, and blurred at least once. */
@@ -55,6 +57,7 @@ export type Model = typeof Model.Type
 export const init = (): Model => ({
 	oidc: null,
 	isRootPasswordShown: false,
+	isServerUnreachable: false,
 	sso: Submission.NotSubmitted(),
 	password: "",
 	isPasswordFocused: false,
@@ -70,6 +73,7 @@ export const Message = defineMessageUnion({
 	SucceededSignInWithRootPassword: { token: Schema.String },
 	FailedSignInWithRootPassword: { failure: SignInFailure },
 	LoadedOidcConfig: { oidc: Schema.NullOr(OidcProvider) },
+	FailedLoadOidcConfig: {},
 	ClickedSignInWithSso: {},
 	ClickedUseRootPassword: {},
 	RedirectedToSso: {},
@@ -120,15 +124,15 @@ export const SignInWithRootPassword = Command.define("SignInWithRootPassword", {
 
 const failedSso = (failure: SignInFailure) => Message.FailedSignInWithSso({ failure })
 
-/** `GET /api/auth/oidc/config`; any failure reads as no provider, leaving the root password. */
+/** `GET /api/auth/oidc/config`; a failure says so instead of silently hiding SSO. */
 export const LoadOidcConfig = Command.define("LoadOidcConfig", {
-	messages: [Message.LoadedOidcConfig],
+	messages: [Message.LoadedOidcConfig, Message.FailedLoadOidcConfig],
 	execute: Effect.gen(function* () {
 		const config = yield* (yield* MapleAuthApi).oidcConfig
 		return Message.LoadedOidcConfig({
 			oidc: config.enabled ? { authorizeUrl: config.authorizeUrl, clientId: config.clientId } : null,
 		})
-	}).pipe(Effect.orElseSucceed(() => Message.LoadedOidcConfig({ oidc: null }))),
+	}).pipe(Effect.orElseSucceed(() => Message.FailedLoadOidcConfig())),
 })
 
 /** PKCE: keep the verifier, state and return path for the callback, then leave for the provider. */
@@ -236,7 +240,10 @@ export const update = (model: Model, message: Message) =>
 		FailedSignInWithRootPassword: ({ failure }) => ({
 			model: modifyFields(model, { submission: () => Submission.Failed({ failure }) }),
 		}),
-		LoadedOidcConfig: ({ oidc }) => ({ model: modifyFields(model, { oidc: () => oidc }) }),
+		LoadedOidcConfig: ({ oidc }) => ({
+			model: modifyFields(model, { oidc: () => oidc, isServerUnreachable: () => false }),
+		}),
+		FailedLoadOidcConfig: () => ({ model: modifyFields(model, { isServerUnreachable: () => true }) }),
 		ClickedSignInWithSso: () =>
 			model.oidc === null || model.sso._tag === "Submitting"
 				? { model }
