@@ -14,6 +14,23 @@
   <a href="https://maple.dev/brand">Brand</a>
 </p>
 
+> [!NOTE]
+> **This is a fork: self-hosted, multi-tenant Maple.**
+> This fork of [MapleTechLabs/maple](https://github.com/MapleTechLabs/maple) adds two things:
+>
+> - **A Docker Compose deployment** of the full stack. No Cloudflare, AWS or Tinybird.
+> - **Multi-organization accounts through an open-source OIDC provider (Keycloak)** instead of Clerk.
+>   It includes an IT admin page and per-org admin through Settings → Members.
+>
+> All changes are additive. They sit behind `MAPLE_AUTH_MODE=oidc` and `deploy/docker/`, so upstream
+> merges stay cheap. Work happens on the `selfhost` branch.
+>
+> | | |
+> |---|---|
+> | Design | [`docs/superpowers/specs/2026-11-11-selfhost-multitenant-design.md`](docs/superpowers/specs/2026-11-11-selfhost-multitenant-design.md) |
+> | Status | Design under review. Nothing is deployable yet. |
+> | Upstream sync | `git fetch upstream && git merge upstream/main` |
+
 ## Why Maple
 
 - **OpenTelemetry native.** Point any OTLP exporter at Maple. No proprietary agent, no vendor SDK lock-in.
