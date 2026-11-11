@@ -2,6 +2,7 @@ import { OrgClickHouseSettingsEncryptionError } from "@maple/domain/http"
 // BOUNDARY-FILE: Test doubles preserve opaque values so the consuming boundary can be exercised.
 import { afterEach, describe, expect, it, layer } from "@effect/vitest"
 import {
+	OrgClickHouseSettingsForbiddenError,
 	OrgClickHouseSettingsPersistenceError,
 	OrgClickHouseSettingsUpsertRequest,
 	OrgClickHouseSettingsUpstreamRejectedError,
@@ -479,6 +480,44 @@ describe("resolveRuntimeConfig caching", () => {
 			Layer.provide(Layer.mergeAll(envLive, testDb.layer, edgeCacheLive)),
 		)
 	}
+
+	it.effect("self-hosted: only IT (root) may repoint or remove an org's warehouse", () => {
+		const testDb = createTestDb(cacheTrackedDbs)
+		const orgId = asOrgId("org_ch_selfhost_guard")
+		const selfhostConfig = ConfigProvider.layer(
+			ConfigProvider.fromUnknown({
+				PORT: "3472",
+				TINYBIRD_HOST: "https://maple-managed.tinybird.co",
+				TINYBIRD_TOKEN: "managed-token",
+				MAPLE_AUTH_MODE: "self_hosted",
+				MAPLE_ROOT_PASSWORD: "test-root-password",
+				MAPLE_DEFAULT_ORG_ID: "default",
+				MAPLE_INGEST_KEY_ENCRYPTION_KEY: Buffer.alloc(32, 5).toString("base64"),
+				MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY: "lookup-key",
+				MAPLE_INGEST_PUBLIC_URL: "http://127.0.0.1:3474",
+				MAPLE_APP_BASE_URL: "http://127.0.0.1:3471",
+				MAPLE_SELFHOST_CLICKHOUSE_URL: "http://clickhouse:8123",
+			}),
+		)
+		const layer = OrgClickHouseSettingsService.layer.pipe(
+			Layer.provide(
+				Layer.mergeAll(
+					Env.layer.pipe(Layer.provide(selfhostConfig)),
+					testDb.layer,
+					Layer.succeed(EdgeCacheService)(makeEdgeCacheService(missOnlyBackend)),
+				),
+			),
+		)
+		return Effect.gen(function* () {
+			const service = yield* OrgClickHouseSettingsService
+			yield* Effect.promise(() => seedRow(testDb, orgId, "https://byo.example"))
+			const byAdmin = getError(yield* service.delete(orgId, [asRole("org:admin")]).pipe(Effect.exit))
+			expect(byAdmin).toBeInstanceOf(OrgClickHouseSettingsForbiddenError)
+			expect(expectSome(yield* service.resolveRuntimeConfig(orgId)).url).toBe("https://byo.example")
+			yield* service.delete(orgId, [asRole("root")])
+			expect(Option.isNone(yield* service.resolveRuntimeConfig(orgId))).toBe(true)
+		}).pipe(Effect.provide(layer))
+	})
 
 	it.effect("MAPLE_IGNORE_ORG_CLICKHOUSE routes a BYO org to the managed warehouse in development", () => {
 		const testDb = createTestDb(cacheTrackedDbs)

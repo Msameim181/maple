@@ -954,6 +954,20 @@ export class OrgClickHouseSettingsService extends Context.Service<
 			)
 		})
 
+		// Self-hosted (deploy/docker) provisions each org's database itself and lets that one host
+		// through over plain http on the private network. Repointing an org there is IT's job: an org
+		// admin (often another company) could otherwise aim the gateway at an internal service.
+		const requireWarehouseOwner = Effect.fn("OrgClickHouseSettingsService.requireWarehouseOwner")(
+			function* (roles: ReadonlyArray<RoleName>) {
+				yield* requireAdmin(roles)
+				if (Option.isSome(env.MAPLE_SELFHOST_CLICKHOUSE_URL) && !roles.some((role) => role === "root")) {
+					return yield* new OrgClickHouseSettingsForbiddenError({
+						message: "On this deployment, IT manages each organization's warehouse connection.",
+					})
+				}
+			},
+		)
+
 		const selectActiveRow = Effect.fn("OrgClickHouseSettingsService.selectActiveRow")(function* (
 			orgId: OrgId,
 		) {
@@ -1080,7 +1094,7 @@ export class OrgClickHouseSettingsService extends Context.Service<
 		) {
 			yield* Effect.annotateCurrentSpan("orgId", orgId)
 			yield* Effect.annotateCurrentSpan("tenant.userId", userId)
-			yield* requireAdmin(roles)
+			yield* requireWarehouseOwner(roles)
 
 			const url = yield* normalizeHttpUrl(payload.url)
 			const user = Str.trim(payload.user)
@@ -1184,7 +1198,7 @@ export class OrgClickHouseSettingsService extends Context.Service<
 			roles: ReadonlyArray<RoleName>,
 		) {
 			yield* Effect.annotateCurrentSpan("orgId", orgId)
-			yield* requireAdmin(roles)
+			yield* requireWarehouseOwner(roles)
 			yield* dbExecute((db) =>
 				db.run(PG.deleteFrom(OrgClickHouseSettings).where(($) => [$.orgId.eq(orgId)])),
 			)

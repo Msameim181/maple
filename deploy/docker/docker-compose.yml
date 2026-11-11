@@ -117,6 +117,7 @@ services:
       MAPLE_OIDC_ACCOUNT_URL: https://${AUTH_HOST}/realms/maple/account
       EMAIL_FROM: ${EMAIL_FROM}
       SMTP_URL: ${SMTP_URL}
+      SMTP_INSECURE: ${SMTP_INSECURE:-0} # 1 = allow a plain (no TLS) SMTP server, e.g. an internal relay
       SMTP_FROM: ${EMAIL_FROM}
     volumes:
       - maple-state:/app/.alchemy

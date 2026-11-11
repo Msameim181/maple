@@ -105,6 +105,23 @@ Requests without a valid key are rejected, so the ingest host can be public.
   Postgres rows and its `org_<id>` ClickHouse database. The org id, users (Keycloak `sub`) and
   keys stay the same.
 
+## Security notes
+
+- `MAPLE_ROOT_PASSWORD` is **break-glass access for IT**. Signing in with it on the sign-in page
+  ("Use root password") gives admin over every organization. Keep `.env` readable by root only
+  (`gen-secrets.sh` sets `chmod 600`). Rotating the value signs everyone out.
+- Org admins manage members, keys and AI for their own org. Only IT (`maple-root`) can change
+  where an org's telemetry is stored.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `502` from the API host | The runtime was stopped, usually by the OOM killer (`dmesg \| grep -i "killed process"`). Run `docker compose restart maple` and give the host more RAM. |
+| A new org shows no data and *Settings → Data platform* reports a failed apply | The schema apply was interrupted by a restart. Press **Apply** there, as an org admin or IT. |
+| Spans sent right after creating an org get `503` | The org's ingest route turns ready about a minute after its schema is applied. OTLP exporters retry by themselves. |
+| No emails | Check `SMTP_URL`, then `docker compose logs maple \| grep mail-relay`. |
+
 ## Known log noise
 
 - `alerting: errorActiveOrgsDiscovery failed … Tinybird HTTP transport failed`. Error-issue

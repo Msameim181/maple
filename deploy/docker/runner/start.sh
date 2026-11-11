@@ -9,6 +9,11 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
 	sleep 5
 done
 
+# Local Workflows do not resume after a restart, so a schema apply that was in flight would stay
+# "running" forever and block the next one. Mark it failed; Settings -> Data platform re-applies.
+DATABASE_URL="$MAPLE_PG_URL" bun -e 'await Bun.sql`UPDATE org_clickhouse_schema_apply_runs SET status = ${"failed"}, error_message = ${"Interrupted by a restart; apply the schema again."}, updated_at = now() WHERE status IN (${"queued"}, ${"running"})`' \
+	|| echo "[start] could not reset interrupted schema applies" >&2
+
 deploy/docker/runner/mail-relay.sh &
 
 exec node_modules/.bin/alchemy dev --stage dev_selfhost
