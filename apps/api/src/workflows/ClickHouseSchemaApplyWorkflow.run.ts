@@ -324,7 +324,7 @@ const loadConfig = (
 	orgId: OrgId,
 	keyring: SecretKeyring,
 	/** The self-hosted deployment's own ClickHouse origin, which may be plain http (deploy/docker). */
-	trustedHttpOrigin: string | undefined = undefined,
+	trustedHttpOrigin?: string,
 ): Effect.Effect<ChConfig, SchemaApplyConfigError | DatabaseError> =>
 	Effect.gen(function* () {
 		const rows = yield* database.execute((db) =>
@@ -372,7 +372,11 @@ const loadConfig = (
 				message: "Stored ClickHouse URL must use HTTP or HTTPS",
 			})
 		}
-		if (password.length > 0 && parsedUrl.protocol !== "https:" && parsedUrl.origin !== trustedHttpOrigin) {
+		if (
+			password.length > 0 &&
+			parsedUrl.protocol !== "https:" &&
+			parsedUrl.origin !== trustedHttpOrigin
+		) {
 			return yield* new SchemaApplyConfigError({
 				message: "Stored ClickHouse URL must use HTTPS when a password is configured",
 			})
@@ -640,12 +644,12 @@ export const runClickHouseSchemaApply = (
 const applySchema = (fence: RunFence) =>
 	Effect.gen(function* () {
 		const { database, orgId } = fence
+		const selfhostClickHouseUrl = yield* Config.option(
+			Config.String("MAPLE_SELFHOST_CLICKHOUSE_URL"),
+		).pipe(Effect.orElseSucceed(() => Option.none<string>()))
 		const trustedHttpOrigin = Option.getOrUndefined(
-			Option.flatMap(
-				yield* Config.option(Config.String("MAPLE_SELFHOST_CLICKHOUSE_URL")).pipe(
-					Effect.orElseSucceed(() => Option.none<string>()),
-				),
-				(raw) => (URL.canParse(raw) ? Option.some(new URL(raw).origin) : Option.none()),
+			Option.flatMap(selfhostClickHouseUrl, (raw) =>
+				URL.canParse(raw) ? Option.some(new URL(raw).origin) : Option.none(),
 			),
 		)
 		const encryptionKeyText = yield* Config.Redacted(PRIMARY_KEY_ENV).pipe(

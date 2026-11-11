@@ -17,6 +17,7 @@ import { Env } from "@maple/backend/platform/Env"
 import { cleanupTestDbs, createTestDb, type TestDb } from "@maple/backend/testing/test-pglite"
 import { AuthService } from "@maple/backend/services/auth/AuthService"
 import { DirectoryService, OIDC_SESSION_TTL_SECONDS } from "./DirectoryService"
+import { EmailService } from "@maple/backend/platform/EmailService"
 import { OidcClient, type OidcIdentity } from "./OidcClient"
 import { OrgProvisioner } from "./OrgProvisioner"
 
@@ -62,6 +63,12 @@ const fakeOidc = Layer.succeed(OidcClient)({
 		),
 })
 
+const sentEmails: Array<{ readonly to: string; readonly subject: string; readonly html: string }> = []
+const fakeEmail = Layer.succeed(EmailService)({
+	isConfigured: true,
+	send: (to, subject, html) => Effect.sync(() => void sentEmails.push({ to, subject, html })),
+})
+
 // ClickHouse provisioning has its own test; here an org only needs its directory rows.
 const fakeProvisioner = Layer.succeed(OrgProvisioner)({
 	provision: () => Effect.void,
@@ -88,7 +95,7 @@ const makeLayer = (testDb: TestDb) => {
 		),
 	)
 	const directory = Layer.effect(DirectoryService, DirectoryService.make).pipe(
-		Layer.provide(Layer.mergeAll(fakeOidc, fakeProvisioner)),
+		Layer.provide(Layer.mergeAll(fakeOidc, fakeProvisioner, fakeEmail)),
 	)
 	return Layer.mergeAll(directory, AuthService.layer).pipe(Layer.provide(Layer.mergeAll(env, testDb.layer)))
 }
@@ -265,6 +272,25 @@ describe("DirectoryService", () => {
 
 				const exit = yield* Effect.exit(directory.switchOrg(tenant, login.token, GLOBEX))
 				assert.instanceOf(failureOf(exit), DirectoryForbiddenError)
+			}),
+		)
+	})
+
+	it.effect("an invitation emails the invitee a sign-in link", () => {
+		const testDb = createTestDb(trackedDbs)
+		return run(
+			testDb,
+			Effect.gen(function* () {
+				const directory = yield* DirectoryService
+				yield* createOrg(ACME, "alice@acme.test")
+				const alice = yield* signIn("alice")
+				sentEmails.length = 0
+				yield* directory.createInvitation(alice.tenant, "Bob@Acme.test", "org:member")
+				assert.deepStrictEqual(
+					Arr.map(sentEmails, (mail) => mail.to),
+					["bob@acme.test"],
+				)
+				assert.include(sentEmails[0]?.html ?? "", "/sign-in")
 			}),
 		)
 	})

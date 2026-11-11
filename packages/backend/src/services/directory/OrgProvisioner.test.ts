@@ -25,6 +25,7 @@ import { OrgClickHouseSettingsService } from "@maple/backend/services/org/OrgCli
 import { OrganizationRegionService } from "@maple/backend/services/org/OrganizationRegionService"
 import { OrganizationService } from "@maple/backend/services/org/OrganizationService"
 import { DirectoryService } from "./DirectoryService"
+import { EmailService } from "@maple/backend/platform/EmailService"
 import { OidcClient } from "./OidcClient"
 import { ClickHouseAdmin, OrgProvisioner } from "./OrgProvisioner"
 
@@ -98,8 +99,9 @@ const makeHarness = (testDb: TestDb) => {
 	const noOidc = Layer.succeed(OidcClient)({
 		exchange: () => Effect.fail(new UnauthorizedError({ message: "not used" })),
 	})
+	const noEmail = Layer.succeed(EmailService)({ isConfigured: false, send: () => Effect.void })
 	const directory = Layer.effect(DirectoryService, DirectoryService.make).pipe(
-		Layer.provide(Layer.mergeAll(provisioner, noOidc)),
+		Layer.provide(Layer.mergeAll(provisioner, noOidc, noEmail)),
 	)
 	const layer = Layer.mergeAll(directory, OrgClickHouseSettingsService.layer).pipe(
 		Layer.provide(

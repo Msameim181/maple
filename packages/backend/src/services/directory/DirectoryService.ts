@@ -42,9 +42,21 @@ import {
 	SELF_HOSTED_SESSION_TTL_SECONDS,
 	verifySelfHostedSessionToken,
 } from "@maple/auth"
-import { Clock, Context, Effect, Layer, Option, Redacted, Schema, Array as Arr, String as Str } from "effect"
+import {
+	Clock,
+	Context,
+	Effect,
+	Layer,
+	Option,
+	pipe,
+	Redacted,
+	Schema,
+	Array as Arr,
+	String as Str,
+} from "effect"
 import { Database, type DatabaseApi } from "@maple/backend/platform/DatabaseLive"
 import { makeDbExecute } from "@maple/backend/platform/db-execute"
+import { EmailService } from "@maple/backend/platform/EmailService"
 import { Env, type EnvConfig } from "@maple/backend/platform/Env"
 import { OidcClient } from "./OidcClient"
 import { OrgProvisioner } from "./OrgProvisioner"
@@ -67,6 +79,16 @@ export const oidcEnabled = (env: Pick<EnvConfig, "MAPLE_OIDC_TOKEN_URL" | "MAPLE
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+$/
 const normalizeEmail = (email: string) => Str.toLowerCase(Str.trim(email))
+
+const escapeHtml = (value: string) =>
+	pipe(
+		value,
+		Str.replaceAll("&", "&amp;"),
+		Str.replaceAll("<", "&lt;"),
+		Str.replaceAll(">", "&gt;"),
+		Str.replaceAll('"', "&quot;"),
+		Str.replaceAll("'", "&#39;"),
+	)
 
 const activeOrg = (db: MapleDb, orgId: OrgId) =>
 	db
@@ -151,7 +173,28 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 			const dbExecute = makeDbExecute(database, "DirectoryService", persistence)
 			const oidc = yield* OidcClient
 			const provisioner = yield* OrgProvisioner
+			const email = yield* EmailService
 			const enabled = oidcEnabled(env)
+
+			// Best effort: the invitation stands without it; the person can still sign up at the link.
+			const sendInvitationEmail = (orgName: string, to: string) =>
+				email.isConfigured
+					? email
+							.send(
+								to,
+								`You're invited to ${orgName} on Maple`,
+								`<p>You've been invited to <b>${escapeHtml(orgName)}</b> on Maple.</p>` +
+									`<p><a href="${escapeHtml(env.MAPLE_APP_BASE_URL)}/sign-in">Sign in or create your account</a> ` +
+									`with this email address (${escapeHtml(to)}) to join.</p>`,
+							)
+							.pipe(
+								Effect.catch((error) =>
+									Effect.logWarning("Invitation email not sent").pipe(
+										Effect.annotateLogs({ error: error.message }),
+									),
+								),
+							)
+					: Effect.void
 
 			const requireEnabled = Effect.suspend(() =>
 				enabled
@@ -620,6 +663,15 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 						message: `${email} already has a pending invitation`,
 					})
 				}
+				const org = yield* dbExecute((db) =>
+					db.run(
+						PG.from(DirectoryOrgs)
+							.select()
+							.where(($) => [$.id.eq(tenant.orgId)])
+							.limit(1),
+					),
+				)
+				yield* sendInvitationEmail(org[0]?.name ?? tenant.orgId, email)
 				return new DirectoryInvitation({ id, email, role, createdAt })
 			})
 
@@ -755,6 +807,7 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 				yield* provisioner
 					.provision(request.id, tenant.userId)
 					.pipe(Effect.tapError(() => forgetOrg(request.id)))
+				if (memberCount === 0) yield* sendInvitationEmail(name, adminEmail)
 				return new DirectoryOrg({ id: request.id, name, status: "active", memberCount, createdAt })
 			})
 
@@ -846,6 +899,6 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 	},
 ) {
 	static readonly layer = Layer.effect(this, this.make).pipe(
-		Layer.provide(Layer.mergeAll(OidcClient.layer, OrgProvisioner.layer)),
+		Layer.provide(Layer.mergeAll(OidcClient.layer, OrgProvisioner.layer, EmailService.layer)),
 	)
 }

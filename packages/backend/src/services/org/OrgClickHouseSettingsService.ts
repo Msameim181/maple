@@ -960,7 +960,10 @@ export class OrgClickHouseSettingsService extends Context.Service<
 		const requireWarehouseOwner = Effect.fn("OrgClickHouseSettingsService.requireWarehouseOwner")(
 			function* (roles: ReadonlyArray<RoleName>) {
 				yield* requireAdmin(roles)
-				if (Option.isSome(env.MAPLE_SELFHOST_CLICKHOUSE_URL) && !roles.some((role) => role === "root")) {
+				if (
+					Option.isSome(env.MAPLE_SELFHOST_CLICKHOUSE_URL) &&
+					!Arr.some(roles, (role) => role === "root")
+				) {
 					return yield* new OrgClickHouseSettingsForbiddenError({
 						message: "On this deployment, IT manages each organization's warehouse connection.",
 					})

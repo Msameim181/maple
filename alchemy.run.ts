@@ -132,14 +132,14 @@ const devEnv = isSelfhost
 			MAPLE_STATUS_PAGE_BASE_URL: selfhostEnv("MAPLE_STATUS_PAGE_BASE_URL"),
 		}
 	: devApps
-	? {
-			MAPLE_API_BASE_URL: Portless.routeUrl("api"),
-			MAPLE_APP_BASE_URL: Portless.routeUrl("web"),
-			MAPLE_ELECTRIC_SYNC_URL: Portless.routeUrl("electric-sync"),
-			MAPLE_INGEST_URL: Portless.routeUrl("ingest"),
-			MAPLE_STATUS_PAGE_BASE_URL: Portless.routeUrl("status"),
-		}
-	: undefined
+		? {
+				MAPLE_API_BASE_URL: Portless.routeUrl("api"),
+				MAPLE_APP_BASE_URL: Portless.routeUrl("web"),
+				MAPLE_ELECTRIC_SYNC_URL: Portless.routeUrl("electric-sync"),
+				MAPLE_INGEST_URL: Portless.routeUrl("ingest"),
+				MAPLE_STATUS_PAGE_BASE_URL: Portless.routeUrl("status"),
+			}
+		: undefined
 
 /** A Hyperdrive config for every consumer of one shared config. */
 const sharedHyperdrive = (connection: Cloudflare.Hyperdrive.Connection) => ({
@@ -316,14 +316,14 @@ const providers = isSelfhost
 	? Cloudflare.providers()
 	: // `Acm.providers` needs the AWS credentials, so it is the layer provided TO.
 		Acm.providers.pipe(
-		Layer.provideMerge(Cloudflare.providers()),
-		Layer.provideMerge(AWS.providers()),
-		// Its credential lookup runs when the layer is built, and `bun dev` never yields the branch.
-		Layer.provideMerge(isDevServer ? Layer.empty : Planetscale.providers()),
-		// Previews only; prd and dev deploys carry no NEON_API_KEY.
-		Layer.provideMerge(!isDevServer && process.env.NEON_API_KEY ? Neon.providers() : Layer.empty),
-		Layer.provideMerge(Portless.providers()),
-	)
+			Layer.provideMerge(Cloudflare.providers()),
+			Layer.provideMerge(AWS.providers()),
+			// Its credential lookup runs when the layer is built, and `bun dev` never yields the branch.
+			Layer.provideMerge(isDevServer ? Layer.empty : Planetscale.providers()),
+			// Previews only; prd and dev deploys carry no NEON_API_KEY.
+			Layer.provideMerge(!isDevServer && process.env.NEON_API_KEY ? Neon.providers() : Layer.empty),
+			Layer.provideMerge(Portless.providers()),
+		)
 
 export default Alchemy.Stack(
 	"maple",

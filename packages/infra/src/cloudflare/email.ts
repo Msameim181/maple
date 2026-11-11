@@ -13,8 +13,11 @@ import { dischargeRuntimeContext } from "./worker-runtime.ts"
  * Self-hosted (deploy/docker) sends mail too: alchemy's local runtime writes each message to disk
  * and the container's relay hands it to SMTP. Read at plan time; the bundle never sees the env.
  */
+// @effect-diagnostics-next-line processEnv:off -- sync config read at alchemy plan time
 const isSelfhost = process.env.MAPLE_SELFHOST === "1"
-const selfhostSender = /<([^>]+)>/.exec(process.env.EMAIL_FROM ?? "")?.[1] ?? process.env.EMAIL_FROM
+// @effect-diagnostics-next-line processEnv:off -- sync config read at alchemy plan time
+const emailFrom = process.env.EMAIL_FROM ?? ""
+const selfhostSender = /<([^>]+)>/.exec(emailFrom)?.[1] ?? emailFrom
 
 export const NotificationsEmail = Cloudflare.Email.SendEmail("email", {
 	allowedSenderAddresses: [isSelfhost && selfhostSender ? selfhostSender : NOTIFICATIONS_SENDER_ADDRESS],
