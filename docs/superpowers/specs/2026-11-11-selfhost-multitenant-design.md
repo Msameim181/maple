@@ -1,6 +1,18 @@
 # Self-hosted, multi-tenant Maple (Docker + Keycloak) — design
 
-Status: draft for approval · 2026-11-11 · branch `selfhost` on `Msameim181/maple`
+Status: implemented on `selfhost` (2026-11-11). Verified end to end in Docker by `deploy/docker/scripts/smoke-test.sh`
+plus browser checks of SSO, partner self-registration, Members, `/admin` and AI settings.
+
+Changes made while building, superseding the text below where they differ:
+
+- Auth: Workers stay in `self_hosted` mode. `POST /api/auth/oidc/callback` redeems the Keycloak code
+  server-to-server and mints the existing session token with the user's org and role.
+- Each org gets its own ClickHouse database and user (`org_<id>`) via the BYO feature, so isolation is
+  enforced by the database. Delete drops it, and only IT may repoint an org's warehouse.
+- Email: alchemy's local `send_email` only logs, so `EmailService` posts to an in-container
+  HTTP-to-SMTP bridge (`deploy/docker/runner/mail-bridge.ts`). Invitations send mail.
+- The runtime is alchemy's own local runtime, not hand-written Miniflare. It needs about 5 GB of RAM
+  in the `maple` container.
 
 ## 1. Intent
 
