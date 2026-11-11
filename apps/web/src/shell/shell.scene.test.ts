@@ -638,6 +638,7 @@ describe("infrastructure section", () => {
 describe("self-hosted directory", () => {
 	const viewer = (isRoot: boolean) => ({
 		userId: "user_ana",
+		userName: "Ana Lima",
 		isRoot,
 		activeOrgId: "acme",
 		orgs: [
@@ -646,10 +647,11 @@ describe("self-hosted directory", () => {
 		],
 	})
 
+	// The user chip names the signed-in person, not self-hosted's shared "Root".
 	const userMenuOf = (model: Model) => [
 		given(model),
 		Mount.resolve(MeasureSidebarOverflow, Message.MeasuredSidebarOverflow()),
-		click(role("button", { name: /Root$/ })),
+		click(role("button", { name: /Ana Lima$/ })),
 		Mount.resolve(PositionMenu, position(Menu.User())),
 	]
 

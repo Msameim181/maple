@@ -11,6 +11,8 @@ export type DirectoryOrgOption = typeof DirectoryOrgOption.Type
 /** `GET /api/directory/me`, as the shell, settings and `/admin` read it. */
 export const DirectoryViewer = Schema.Struct({
 	userId: Schema.String,
+	/** The signed-in person as the user menu shows them: name, else email. */
+	userName: Schema.String,
 	isRoot: Schema.Boolean,
 	activeOrgId: Schema.String,
 	orgs: Schema.Array(DirectoryOrgOption),
@@ -68,6 +70,7 @@ export class DirectoryMe extends Context.Service<
 						: me.orgs
 				return Option.some<DirectoryViewer>({
 					userId: me.user.id,
+					userName: me.user.name ?? me.user.email,
 					isRoot: me.isRoot,
 					activeOrgId: me.activeOrgId,
 					orgs: Arr.map(orgs, (org) => ({ id: org.id, name: org.name })),

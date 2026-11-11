@@ -28,7 +28,8 @@
 > | | |
 > |---|---|
 > | Design | [`docs/superpowers/specs/2026-11-11-selfhost-multitenant-design.md`](docs/superpowers/specs/2026-11-11-selfhost-multitenant-design.md) |
-> | Status | Design under review. Nothing is deployable yet. |
+> | Status | Working: Docker deploy, Keycloak SSO, orgs, members, IT admin, per-org ClickHouse. Verified by [`deploy/docker/scripts/smoke-test.sh`](deploy/docker/scripts/smoke-test.sh). |
+> | Deploy guide | [`deploy/docker/README.md`](deploy/docker/README.md) |
 > | Upstream sync | `git fetch upstream && git merge upstream/main` |
 
 ## Why Maple

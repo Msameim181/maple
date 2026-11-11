@@ -344,6 +344,13 @@ export const userNameOf = (clerk: ShellClerk | null): string =>
 const initialsOf = (clerk: ShellClerk | null): string =>
 	clerk === null ? "RT" : initialsFrom(userNameOf(clerk))
 
+/** The user menu's name, with the OIDC directory's signed-in person over self-hosted's "Root". */
+const viewerName = (model: Model, clerk: ShellClerk | null): string =>
+	clerk === null && model.directory !== null ? model.directory.userName : userNameOf(clerk)
+
+const viewerInitials = (model: Model, clerk: ShellClerk | null): string =>
+	clerk === null && model.directory !== null ? initialsFrom(model.directory.userName) : initialsOf(clerk)
+
 /** `user.imageUrl`, empty without a Clerk user. */
 export const userImageOf = (clerk: ShellClerk | null): string =>
 	clerk === null ? "" : Option.match(clerk.maybeUser, { onNone: () => "", onSome: (user) => user.imageUrl })
@@ -425,11 +432,11 @@ export const shellSidebarFooter = (
 				footerCluster(
 					h,
 					model,
-					userAvatar(h, initialsOf(clerk), undefined, {
+					userAvatar(h, viewerInitials(model, clerk), undefined, {
 						url: userImageOf(clerk),
-						label: userNameOf(clerk),
+						label: viewerName(model, clerk),
 					}),
-					userNameOf(clerk),
+					viewerName(model, clerk),
 				),
 			],
 		),
