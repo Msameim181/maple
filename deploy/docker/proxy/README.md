@@ -18,7 +18,7 @@ proxy (which owns ports 80/443 and the certificates) forwards to it:
 | `API_HOST` | `127.0.0.1:8701` | API; some responses stream |
 | `SYNC_HOST` | `127.0.0.1:8705` | live sync, long polls: no buffering, 300 s timeout |
 | `AUTH_HOST` | `127.0.0.1:8080` | Keycloak; needs `X-Forwarded-*` headers |
-| `INGEST_HOST` | `127.0.0.1:3474` | OTLP from your apps; bodies up to 20 MB |
+| `INGEST_HOST` | `127.0.0.1:3474` (HTTP), `127.0.0.1:4317` (gRPC) | OTLP from your apps; bodies up to 20 MB |
 
 Change a port by setting `WEB_PORT`, `API_PORT`, `SYNC_PORT`, `AUTH_PORT` or `INGEST_PORT` in `.env`.
 

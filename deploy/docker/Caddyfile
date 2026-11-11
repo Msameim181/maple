@@ -26,7 +26,10 @@
 	reverse_proxy keycloak:8080
 }
 
-# OTLP/HTTP from your apps, authenticated per org by ingest key.
+# OTLP from your apps, authenticated per org by ingest key. gRPC (HTTP/2, application/grpc)
+# and HTTP share the hostname and port 443.
 {$INGEST_HOST} {
+	@grpc header Content-Type application/grpc*
+	reverse_proxy @grpc h2c://ingest:4317
 	reverse_proxy ingest:3474
 }

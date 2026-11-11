@@ -27,5 +27,8 @@ ingest.maple.example.com {
 	request_body {
 		max_size 20MB
 	}
+	# OTLP/gRPC shares the hostname: HTTP/2 requests with an application/grpc body.
+	@grpc header Content-Type application/grpc*
+	reverse_proxy @grpc h2c://127.0.0.1:4317
 	reverse_proxy 127.0.0.1:3474
 }

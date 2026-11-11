@@ -86,6 +86,12 @@ services:
       # The org databases live on the private compose network, over plain http.
       MAPLE_SELFHOST_CLICKHOUSE_URL: http://clickhouse:8123
       INGEST_CLICKHOUSE_ALLOW_PRIVATE_ENDPOINTS: "true"
+      INGEST_OTLP_GRPC_PORT: "4317" # OTLP/gRPC next to OTLP/HTTP on 3474
+    ports:
+      # Plain OTLP for apps on this same machine, on loopback only (the standard OTel ports).
+      # Everything else reaches ingest through the proxy at https://$INGEST_HOST.
+      - "127.0.0.1:${OTLP_HTTP_LOCAL_PORT:-4318}:3474"
+      - "127.0.0.1:${OTLP_GRPC_LOCAL_PORT:-4317}:4317"
     volumes:
       - ingest-wal:/data/wal
     depends_on:

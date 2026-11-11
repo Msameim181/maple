@@ -85,17 +85,48 @@ email-verification and password pages to match Maple: same layout, colors, fonts
 
 ## Sending telemetry
 
-Each org's ingest key is in **Settings → Ingest keys**. Point any OpenTelemetry SDK at the ingest
-host:
+Each org's private ingest key is in **Settings → Ingestion**. Send it as `Authorization: Bearer <key>`
+or as an `x-maple-ingest-key: <key>` header. Both OTLP protocols work. Pick the endpoint by where the
+app runs:
+
+| App runs… | OTLP/HTTP | OTLP/gRPC |
+|---|---|---|
+| anywhere else (internet, other servers) | `https://$INGEST_HOST` | `https://$INGEST_HOST:443` |
+| on this same server | `http://127.0.0.1:4318` | `http://127.0.0.1:4317` |
+| in Docker on this server, joined to the `maple-selfhost_default` network | `http://ingest:3474` | `http://ingest:4317` |
+| in Docker on this server, not on that network | `http://host.docker.internal:4318`* | `http://host.docker.internal:4317`* |
+
+\* On Linux add `extra_hosts: ["host.docker.internal:host-gateway"]` to that app's service.
 
 ```bash
+# OTLP/HTTP (works with every SDK)
 export OTEL_EXPORTER_OTLP_ENDPOINT=https://ingest.maple.example.com
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-export OTEL_EXPORTER_OTLP_HEADERS="x-maple-ingest-key=maple_sk_..."
+export OTEL_EXPORTER_OTLP_HEADERS="authorization=Bearer maple_sk_..."
 export OTEL_SERVICE_NAME=my-service
+
+# OTLP/gRPC (the default in several SDKs, e.g. Python and .NET)
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://ingest.maple.example.com:443
+export OTEL_EXPORTER_OTLP_PROTOCOL=grpc
 ```
 
-Requests without a valid key are rejected, so the ingest host can be public.
+Notes:
+
+- **A brand-new org** accepts data about a minute after it is created. Until then the gateway answers
+  `503`, and exporters retry.
+- **Unknown keys** get `401`, so the public ingest host is safe.
+- **The loopback ports** `4317`/`4318` are bound to `127.0.0.1` only; they are not reachable from
+  outside. Change them with `OTLP_HTTP_LOCAL_PORT` / `OTLP_GRPC_LOCAL_PORT`.
+- **Testing on `*.localhost`** (a laptop, Caddy's local CA): apps don't trust that certificate. Point
+  them at the loopback ports above instead of `https://ingest.localhost`.
+
+Check a path end to end with OpenTelemetry's own generator:
+
+```bash
+docker run --rm ghcr.io/open-telemetry/opentelemetry-collector-contrib/telemetrygen:v0.120.0 \
+  traces --otlp-http --otlp-endpoint ingest.maple.example.com:443 \
+  --otlp-header 'authorization="Bearer maple_sk_..."' --service smoke --traces 3
+```
 
 ## Operations
 
@@ -120,6 +151,21 @@ Requests without a valid key are rejected, so the ingest host can be public.
 - **Moving an org to its own server later:** deploy this same stack there and copy the org's
   Postgres rows and its `org_<id>` ClickHouse database. The org id, users (Keycloak `sub`) and
   keys stay the same.
+
+## Keycloak's admin account
+
+Keycloak creates its first admin (`KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD` in `.env`) as a
+**temporary** account. Its admin console shows a yellow banner until you replace it, and Keycloak
+documents it as meant for bootstrapping only. Its password also sits in `.env` on the server, readable
+by anyone with root there. To replace it:
+
+1. Sign in at `https://$AUTH_HOST/admin` with the `.env` admin.
+2. In realm **master** → Users → **Add user**: your own admin, with a password and 2FA. Then
+   Role mapping → **admin**.
+3. Sign out, sign in as the new admin, and delete the temporary `admin` user.
+4. Put the new username and password into `.env` (`KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD`).
+   `bootstrap.sh` signs in with them when you run it again. Keycloak ignores these values once an
+   admin exists.
 
 ## Security notes
 
