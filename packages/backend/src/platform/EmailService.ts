@@ -1,5 +1,6 @@
 import { Context, Duration, Effect, Layer, Option, Schema } from "effect"
-import { EmailSender } from "./bindings"
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http"
+import { EmailSendError, EmailSender, type EmailSenderClient } from "./bindings"
 import { Env } from "./Env"
 
 class EmailDeliveryError extends Schema.TaggedError<EmailDeliveryError>()(
@@ -25,6 +26,23 @@ export interface EmailServiceApi {
 
 const EMAIL_TIMEOUT = Duration.seconds(15)
 
+/** The `EmailSender` port over deploy/docker's bridge (`deploy/docker/runner/mail-bridge.ts`). */
+const smtpBridgeSender = (http: HttpClient.HttpClient, url: string): EmailSenderClient => ({
+	send: Effect.fn("EmailService.smtpBridge")(function* (message) {
+		const failed = (cause: unknown) =>
+			new EmailSendError({ message: `SMTP bridge send failed: ${String(cause)}`, cause })
+		const request = yield* HttpClientRequest.bodyJson(HttpClientRequest.post(url), message).pipe(
+			Effect.mapError(failed),
+		)
+		const response = yield* http.execute(request).pipe(Effect.mapError(failed))
+		if (response.status !== 200) {
+			const body = yield* response.text.pipe(Effect.orElseSucceed(() => ""))
+			return yield* failed(`HTTP ${response.status} ${body}`)
+		}
+		return { messageId: response.headers["x-message-id"] ?? "" }
+	}),
+})
+
 export class EmailService extends Context.Service<EmailService, EmailServiceApi>()(
 	"@maple/backend/lib/EmailService",
 	{
@@ -33,7 +51,13 @@ export class EmailService extends Context.Service<EmailService, EmailServiceApi>
 			const fromEmail = env.EMAIL_FROM
 
 			// The prd-only `send_email` binding, as the Worker's init bound it.
-			const sender = yield* EmailSender
+			const binding = yield* EmailSender
+			const http = yield* HttpClient.HttpClient
+			// deploy/docker has no Cloudflare email: its container bridges an HTTP POST to SMTP.
+			const sender = Option.match(env.MAPLE_SMTP_BRIDGE_URL, {
+				onNone: () => binding,
+				onSome: (url) => Option.some(smtpBridgeSender(http, url)),
+			})
 
 			// Real sends are production-only: non-prod stages share real user data
 			// (branched DBs, Clerk members), so a live binding there would deliver
@@ -97,5 +121,5 @@ export class EmailService extends Context.Service<EmailService, EmailServiceApi>
 		}),
 	},
 ) {
-	static readonly layer = Layer.effect(this, this.make)
+	static readonly layer = Layer.effect(this, this.make).pipe(Layer.provide(FetchHttpClient.layer))
 }

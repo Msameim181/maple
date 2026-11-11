@@ -56,9 +56,13 @@ kc add-roles -r maple --uusername "$IT_EMAIL" --rolename maple-root
 
 if [ $# -ge 4 ]; then
 	api="https://$API_HOST"
-	token=$(curl -fsS "$api/api/auth/login" -H 'content-type: application/json' \
-		-d "{\"password\":\"$MAPLE_ROOT_PASSWORD\"}" | sed -E 's/.*"token":"([^"]+)".*/\1/')
-	curl -fsS "$api/api/directory/orgs" -H "authorization: Bearer $token" -H 'content-type: application/json' \
-		-d "{\"id\":\"$2\",\"name\":\"$3\",\"adminEmail\":\"$4\"}" >/dev/null && echo "org $2 created (admin: $4)"
+	# CURL_OPTS=-k when testing on *.localhost with Caddy's local CA.
+	login=$(curl -fsS ${CURL_OPTS:-} "$api/api/auth/login" -H 'content-type: application/json' \
+		-d "{\"password\":\"$MAPLE_ROOT_PASSWORD\"}") || { echo "root login failed" >&2; exit 1; }
+	token=$(printf %s "$login" | sed -E 's/.*"token":"([^"]+)".*/\1/')
+	curl -fsS ${CURL_OPTS:-} "$api/api/directory/orgs" -H "authorization: Bearer $token" -H 'content-type: application/json' \
+		-d "{\"id\":\"$2\",\"name\":\"$3\",\"adminEmail\":\"$4\"}" >/dev/null \
+		|| { echo "creating org $2 failed" >&2; exit 1; }
+	echo "org $2 created; invitation sent to $4"
 fi
 echo "done. Sign in at https://$APP_HOST"

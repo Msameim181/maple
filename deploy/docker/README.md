@@ -120,7 +120,7 @@ Requests without a valid key are rejected, so the ingest host can be public.
 | `502` from the API host | The runtime was stopped, usually by the OOM killer (`dmesg \| grep -i "killed process"`). Run `docker compose restart maple` and give the host more RAM. |
 | A new org shows no data and *Settings → Data platform* reports a failed apply | The schema apply was interrupted by a restart. Press **Apply** there, as an org admin or IT. |
 | Spans sent right after creating an org get `503` | The org's ingest route turns ready about a minute after its schema is applied. OTLP exporters retry by themselves. |
-| No emails | Check `SMTP_URL`, then `docker compose logs maple \| grep mail-relay`. |
+| No emails | Check `SMTP_URL`, then `docker compose logs maple \| grep mail-bridge`. |
 
 ## Known log noise
 

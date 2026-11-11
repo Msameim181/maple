@@ -1,5 +1,5 @@
 #!/bin/sh
-# Container entrypoint: migrate Postgres, start the email relay, then run the stack.
+# Container entrypoint: migrate Postgres, start the email bridge, then run the stack.
 set -eu
 cd /app
 
@@ -14,6 +14,6 @@ done
 DATABASE_URL="$MAPLE_PG_URL" bun -e 'await Bun.sql`UPDATE org_clickhouse_schema_apply_runs SET status = ${"failed"}, error_message = ${"Interrupted by a restart; apply the schema again."}, updated_at = now() WHERE status IN (${"queued"}, ${"running"})`' \
 	|| echo "[start] could not reset interrupted schema applies" >&2
 
-deploy/docker/runner/mail-relay.sh &
+bun deploy/docker/runner/mail-bridge.ts &
 
 exec node_modules/.bin/alchemy dev --stage dev_selfhost

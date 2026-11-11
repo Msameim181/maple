@@ -184,7 +184,13 @@ export const selfObservabilityEnv = (
 					Config.map((value) => ({ MAPLE_INGEST_KEY: value })),
 				),
 		optionalPlain("MAPLE_ENDPOINT"),
-		derived("MAPLE_ENVIRONMENT", resolveDeploymentEnvironment(stage)),
+		// deploy/docker runs a dev-kind stage, but it is a real deployment: `selfhost` mails and
+		// never takes the development-only shortcuts.
+		derived(
+			"MAPLE_ENVIRONMENT",
+			// @effect-diagnostics-next-line processEnv:off -- sync config read at alchemy plan time
+			process.env.MAPLE_SELFHOST === "1" ? "selfhost" : resolveDeploymentEnvironment(stage),
+		),
 		// Read for Durable Object jurisdiction (`layerChatSessions`).
 		derived("MAPLE_REGION", region),
 		// Tells the instances apart in the shared internal org.
@@ -247,6 +253,7 @@ export const mapleServerEnv = (
 		optionalPlain("MAPLE_IGNORE_ORG_CLICKHOUSE"),
 		// Self-hosted only: every Worker reading an org's BYO ClickHouse trusts plain HTTP to this origin.
 		optionalPlain("MAPLE_SELFHOST_CLICKHOUSE_URL"),
+		optionalPlain("MAPLE_SMTP_BRIDGE_URL"),
 		// Without it billing and the BYOK entitlement fail open.
 		optionalSecret("AUTUMN_SECRET_KEY"),
 		optionalSecret("INTERNAL_SERVICE_TOKEN"),

@@ -116,6 +116,7 @@ services:
       MAPLE_OIDC_CLIENT_ID: maple-web
       MAPLE_OIDC_ACCOUNT_URL: https://${AUTH_HOST}/realms/maple/account
       EMAIL_FROM: ${EMAIL_FROM}
+      MAPLE_SMTP_BRIDGE_URL: http://127.0.0.1:8725 # runner/mail-bridge.ts, inside this container
       SMTP_URL: ${SMTP_URL}
       SMTP_INSECURE: ${SMTP_INSECURE:-0} # 1 = allow a plain (no TLS) SMTP server, e.g. an internal relay
       SMTP_FROM: ${EMAIL_FROM}

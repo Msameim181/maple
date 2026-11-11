@@ -233,6 +233,8 @@ export interface EnvConfig {
 	readonly MAPLE_OIDC_ROOT_ROLE: string
 	/** The self-hosted ClickHouse each directory org gets its own database and user on. */
 	readonly MAPLE_SELFHOST_CLICKHOUSE_URL: Option.Option<string>
+	/** deploy/docker's in-container HTTP-to-SMTP bridge; when set, email goes there, not to the binding. */
+	readonly MAPLE_SMTP_BRIDGE_URL: Option.Option<string>
 	readonly MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: Option.Option<string>
 	readonly MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: Option.Option<Redacted.Redacted>
 }
@@ -411,6 +413,7 @@ const envConfig = Config.all({
 	MAPLE_OIDC_ACCOUNT_URL: optionalString("MAPLE_OIDC_ACCOUNT_URL"),
 	MAPLE_OIDC_ROOT_ROLE: stringWithDefault("MAPLE_OIDC_ROOT_ROLE", "maple-root"),
 	MAPLE_SELFHOST_CLICKHOUSE_URL: optionalString("MAPLE_SELFHOST_CLICKHOUSE_URL"),
+	MAPLE_SMTP_BRIDGE_URL: optionalString("MAPLE_SMTP_BRIDGE_URL"),
 	MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: optionalString("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER"),
 	MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: optionalRedacted("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD"),
 })
