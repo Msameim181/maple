@@ -80,6 +80,9 @@ services:
       # Every org has its own ClickHouse (org_clickhouse_settings), which the gateway writes to
       # directly in any mode; `forward` just avoids requiring Tinybird for orgs without one.
       INGEST_WRITE_MODE: forward
+      # The org databases live on the private compose network, over plain http.
+      MAPLE_SELFHOST_CLICKHOUSE_URL: http://clickhouse:8123
+      INGEST_CLICKHOUSE_ALLOW_PRIVATE_ENDPOINTS: "true"
     volumes:
       - ingest-wal:/data/wal
     depends_on:

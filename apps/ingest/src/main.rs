@@ -9010,7 +9010,11 @@ impl ClickHouseTargetProvider for ClickHouseTargetResolver {
         }
         let endpoint_url = url::Url::parse(&target.endpoint)
             .map_err(|error| format!("ClickHouse target endpoint URL is invalid: {error}"))?;
-        if !target.password.is_empty() && endpoint_url.scheme() != "https" {
+        let trusted = std::env::var("MAPLE_SELFHOST_CLICKHOUSE_URL").ok();
+        if !target.password.is_empty()
+            && endpoint_url.scheme() != "https"
+            && !is_trusted_plaintext_clickhouse(&endpoint_url, trusted.as_deref())
+        {
             return Err(
                 "ClickHouse target endpoint must use https when a password is configured"
                     .to_owned(),
@@ -9019,6 +9023,15 @@ impl ClickHouseTargetProvider for ClickHouseTargetResolver {
         self.cache.insert(org_id.to_owned(), target.clone()).await;
         Ok(Some(target))
     }
+}
+
+/// Self-hosted deployments (deploy/docker) reach their own ClickHouse over the private compose
+/// network as plain http. Only that exact origin, named by `MAPLE_SELFHOST_CLICKHOUSE_URL`, is
+/// exempt from the https-with-password rule.
+fn is_trusted_plaintext_clickhouse(endpoint: &url::Url, trusted: Option<&str>) -> bool {
+    trusted
+        .and_then(|value| url::Url::parse(value.trim()).ok())
+        .is_some_and(|trusted| trusted.origin() == endpoint.origin())
 }
 
 /// PlanetScale Postgres-backed KeyStore. A pooled direct connection (PSBouncer
@@ -10504,6 +10517,16 @@ fn parse_fleet_size(raw: Option<String>) -> Result<u32, String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn plaintext_clickhouse_only_for_the_selfhost_origin() {
+        let url = |raw: &str| url::Url::parse(raw).unwrap();
+        let trusted = Some("http://clickhouse:8123");
+        assert!(super::is_trusted_plaintext_clickhouse(&url("http://clickhouse:8123/"), trusted));
+        assert!(!super::is_trusted_plaintext_clickhouse(&url("http://clickhouse:9000"), trusted));
+        assert!(!super::is_trusted_plaintext_clickhouse(&url("http://evil.example:8123"), trusted));
+        assert!(!super::is_trusted_plaintext_clickhouse(&url("http://clickhouse:8123"), None));
+    }
+
     #[test]
     fn clickhouse_private_endpoints_are_opt_in_or_self_hosted() {
         let allow = |raw: Option<&str>, mode: Option<&str>| {
