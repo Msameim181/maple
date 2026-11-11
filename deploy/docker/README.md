@@ -186,6 +186,11 @@ by anyone with root there. To replace it:
 
 ## Known log noise
 
+- `ingest: Missing ingest key`, every few seconds while someone has the dashboard open. This is
+  the dashboard's own browser telemetry (`maple-web`) with no key. Set `MAPLE_WEB_INGEST_KEY` to an
+  org's *public* key (`maple_pk_…`) and run `docker compose build caddy && docker compose up -d caddy`.
+  The dashboard's performance then shows up in that org, and the warning stops.
+
 - `alerting: errorActiveOrgsDiscovery failed … Tinybird HTTP transport failed`. Error-issue
   discovery first scans a shared warehouse this deployment doesn't have. It then falls back to
   the orgs with their own ClickHouse, which is every org here, so nothing is missed.

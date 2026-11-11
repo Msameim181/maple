@@ -146,6 +146,7 @@ services:
         PUBLIC_API_URL: https://${API_HOST}
         PUBLIC_SYNC_URL: https://${SYNC_HOST}
         PUBLIC_INGEST_URL: https://${INGEST_HOST}
+        WEB_INGEST_KEY: ${MAPLE_WEB_INGEST_KEY:-}
     environment:
       ACME_EMAIL: ${ACME_EMAIL}
       APP_HOST: ${APP_HOST}

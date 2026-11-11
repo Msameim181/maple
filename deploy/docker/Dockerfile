@@ -19,6 +19,10 @@ FROM deps AS web-build
 ARG PUBLIC_API_URL
 ARG PUBLIC_SYNC_URL
 ARG PUBLIC_INGEST_URL
+# Optional: one org's PUBLIC ingest key (maple_pk_...). The dashboard then reports its own
+# performance into that org; without it, its self-telemetry gets 401s (harmless).
+ARG WEB_INGEST_KEY=""
+ENV VITE_MAPLE_INGEST_KEY=$WEB_INGEST_KEY
 ENV VITE_API_BASE_URL=$PUBLIC_API_URL \
     VITE_API_PUBLIC_URL=$PUBLIC_API_URL \
     VITE_ELECTRIC_SYNC_URL=$PUBLIC_SYNC_URL \
