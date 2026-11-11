@@ -52,38 +52,36 @@ These are deliberately not built, but nothing in the design blocks them later:
 
 ### 4.1 Runtime: upstream Workers in Docker
 
-Upstream Workers are alchemy-v2 Effect classes. Alchemy generates their entry modules, and there is
-no `wrangler.jsonc` left (removed 2026-09-02). The fork's trick of running `wrangler deploy
---dry-run`, then Miniflare, does not carry over unchanged. See §8 for the inventory.
+**Spike result (2026-11-11): R1 confirmed.** Alchemy ships its own local runtime: `alchemy dev`
+backed by workerd. With `ALCHEMY_LOCAL_STATE=1` and no Cloudflare credentials, current upstream
+(`1e96be8a1`) planned and started all 31 resources locally:
 
-**Step 0: a 2–3 day spike that decides the route:**
+- api, ai, alerting, electric-sync, chat-bot, status
+- 5 queues + consumers, both Workflows, the `ChatSession` Durable Object, KV, R2
+- Hyperdrive pointed at a plain Postgres
 
-- **R1, preferred:** add a `selfhost` stage profile to `alchemy.run.ts` that builds the Worker
-  bundles (`.alchemy/bundles/*`) **without Cloudflare/AWS credentials**. A small `deploy/docker/runtime.ts`
-  then runs them under Miniflare, using the fork's `deploy/workerd/runtime.ts` (266 lines) as the
-  model:
-  - Postgres through `hyperdrives: { MAPLE_DB: pgUrl }`
-  - local Durable Objects (`ChatSession`), Queues (5 + DLQ), Workflows, KV, R2, rate limiters
-  - crons fired by the runner
-  - migrations on boot
+`/health` answered OK and self-hosted login returned a session token. The Hyperdrive dev provider is
+purely virtual and makes no cloud API calls.
 
-  Workers in the container: `api`, `ai`, `alerting` and `electric-sync` are required, because api
-  and alerting bind `ChatSession` from `ai`. `status` and `chat-bot` are optional.
-- **R2:** if alchemy cannot bundle offline, extract the generated entry per Worker once and commit
-  it under `deploy/docker/entries/`. This costs more per upstream merge.
-- **R3, fallback:** build on the Docker fork `tlvenn/maple @ f0a7114`. It runs today, but it is three
-  months behind and its web is the older React app. The auth work still applies, with different web
-  files.
+So the `maple` container runs **alchemy's local runtime itself**, under a `selfhost` stage profile.
+There is no hand-written Miniflare wiring, and bindings, crons and Workflows come from upstream's own
+stack definition. A merge from upstream therefore picks up new Workers and bindings automatically.
 
-Whatever the route:
+The `selfhost` profile (`MAPLE_SELFHOST=1`) patches `alchemy.run.ts` in a few places:
 
-- **Web** is served as a static SPA. A Caddy `reverse_proxy` replaces the Worker's `/_api` proxy. The
-  `/share/*` OG previews and the chart images in notifications are not available in v1.
-- **Alerting** needs `MAPLE_ALERTING_ALLOW_NONPROD=1`.
-- **Email:** upstream sends only through Cloudflare's `send_email` binding, which is a no-op locally.
-  The runner provides a tiny `EMAIL` stand-in that relays to an SMTP server (`SMTP_URL`). Without
-  it, alert email is off; Slack, Teams-webhook, Telegram and PagerDuty still work.
-- **Miniflare** is bumped to a release that supports the compatibility date `2026-10-01`.
+- **No AWS providers.** That means no local AWS emulator, which otherwise needs a Docker socket.
+- **No Portless.** Workers get fixed ports.
+- **Web is not run as a vite dev server.** It is built once and served statically by Caddy.
+- **The fork's runner on boot:**
+  - runs Postgres migrations
+  - builds the workspace dependencies at image build time
+  - stores local state under `/data/alchemy` (a volume)
+
+Notes:
+
+- `send_email` writes `.eml` files locally, so §4.10 adds an SMTP relay.
+- Alerting needs `MAPLE_ALERTING_ALLOW_NONPROD=1`.
+- The image is about 1.5 GB (bun monorepo + workerd), which is acceptable for one VPS.
 
 ### 4.2 Identity: Keycloak
 
@@ -282,34 +280,46 @@ Off in Docker mode:
 
 Not yet verified (the Step-0 spike answers these): offline alchemy bundling, and WorkerLoader in Miniflare.
 
-## 9. Open questions (owner decides)
+## 9. Decisions (owner, 2026-11-11)
 
-1. **Keycloak Organizations or Maple-owned membership.** The owner asked for Keycloak Organizations
-   if available. They are available, but §4.2 recommends Maple-owned membership.
-2. **Partner onboarding.** Does Keycloak get SMTP from day one, and is self-registration (with email
-   verification) on? Or does IT create every account?
-3. **AI features.** Are investigations, chat and the MCP agent in scope? They send telemetry to an
-   external LLM (OpenRouter).
-4. **Deleted orgs.** Should a deleted org's ClickHouse telemetry be purged, and its slug blocked from
-   reuse? Without either, a new org that reuses the slug would see the old org's data.
+1. **Membership:** delegated to the lead. Maple-owned membership (§4.2) is kept.
+2. **Onboarding:** an SMTP server exists.
+   - Keycloak sends verification and reset mail.
+   - Self-registration is on, with email verification.
+   - A Maple invitation adds the user on first sign-in with a verified email.
+   - Maple's invitation email and alert email go through the same SMTP server (§4.10).
+3. **AI:** in scope. An org admin or IT sets the org's OpenRouter key and turns AI on or off. The
+   existing `OrgOpenRouterKeyService` and *Settings → AI* page already do this. With billing
+   unconfigured, the add-on check answers `entitled`. No new code beyond verifying it in Docker.
+4. **Deleting an org:**
+   - Purge everything: Postgres rows through the existing purge, plus ClickHouse rows by `OrgId` in
+     every table that has an `OrgId` column.
+   - The org row stays as `deleting` until the purge finishes, then is removed. Only after that can
+     the slug be reused, and the new org starts empty.
+
+### 4.10 Email (SMTP)
+
+The runner serves the `EMAIL` (`send_email`) binding as a tiny service that relays the message to
+`SMTP_URL` using nodemailer, already a dependency or a small one. This covers alert email, digests
+and invitations. Without `SMTP_URL`, email is off.
 
 ## 10. Phases and estimate
 
-Units are focused working days for one experienced TypeScript/DevOps engineer working with an AI
-assistant. Ranges cover the unknowns above.
+The owner asked for the AI agent to do all of the work, in under 8 hours of agent time. Phases, in
+order:
 
-| # | Phase | Output | Days |
-|---|---|---|---|
-| 0 | Spike: offline alchemy bundles, Miniflare bump, `ChatSession` + queue under Miniflare | R1/R2/R3 decision | 2–3 |
-| 1 | Docker runtime: runner, compose, Caddy TLS, static web, ingest gateway, ClickHouse schema, Keycloak + realm import | Single-org stack up on the VPS (still `self_hosted` auth) | 6–9 |
-| 2 | OIDC backend: tables + migration, JWT/JWKS verify, tenant resolution, invitations, oidc service impls, `/api/me`, members and admin endpoints, tests | API multi-tenant | 5–7 |
-| 3 | Web: OIDC login, org switcher, Members rewire, Account card, `/admin` page, Clerk-only surfaces hidden | UI multi-tenant | 6–8 |
-| 4 | Per-org ClickHouse row on org create, bootstrap script, two-org isolation smoke test | Isolation proven | 2–3 |
-| 5 | SMTP `EMAIL` stand-in (alert email, optional) | Email alerts | 1–2 |
-| 6 | README / `deploy/docker/README.md`, upgrade procedure, weekly upstream-merge CI check | Docs | 2 |
-| 7 | VPS rollout, partner onboarding dry-run, fixes | Production | 3–5 |
-| | **Total** | | **27–39 days ≈ 6–8 weeks** |
+| # | Phase | Agent time |
+|---|---|---|
+| 0 | Spike: upstream runs offline under alchemy's local runtime | done |
+| 1 | `selfhost` profile + `deploy/docker` (Dockerfile, compose, Caddy, Keycloak realm, ClickHouse, ingest gateway), boots on Docker | ~2 h |
+| 2 | OIDC backend: tables, migration, token exchange, membership/invites/admin endpoints, org purge, tests | ~2 h |
+| 3 | Web: OIDC login, org switcher, Members data layer, `/admin`, Account link | ~2 h |
+| 4 | Two-org isolation smoke test, SMTP relay, README / deploy docs, push | ~1.5 h |
 
-Ongoing: merging upstream costs about 0.5–1 day per month while upstream keeps its current pace.
-Route R3 (the fork) saves about 3–4 days in phase 1 but loses three months of upstream features and
-makes future merges harder.
+Risks to the 8-hour target:
+
+- Docker image build times on the local machine (4 CPU / 8 GB Docker VM).
+- Foldkit UI work without visual review.
+
+If a phase overruns, the order above makes sure the Docker stack and the multi-tenant backend land
+first.
