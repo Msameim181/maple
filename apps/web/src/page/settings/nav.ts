@@ -96,6 +96,8 @@ const navSections: ReadonlyArray<NavShellSection<SettingsTab>> = [
 
 export type Visibility = Readonly<{
 	isClerk: boolean
+	/** Self-hosted with the OIDC directory: members are managed here too. */
+	isDirectory?: boolean
 	/** The session's permissions: every one off Clerk, none until the session answers. */
 	grants: ReadonlyArray<Policy.Permission>
 	canAccessDataPlatform: boolean
@@ -106,7 +108,8 @@ export type Visibility = Readonly<{
 }>
 
 const isVisible = (id: string, visibility: Visibility): boolean => {
-	if (id === "general" || id === "members" || id === "billing") return visibility.isClerk
+	if (id === "members") return visibility.isClerk || visibility.isDirectory === true
+	if (id === "general" || id === "billing") return visibility.isClerk
 	if (!visibility.isClerk) return true
 	if (id === "data-platform")
 		return visibility.canAccessDataPlatform || visibility.isDataPlatformLocked === true

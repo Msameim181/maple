@@ -28,6 +28,8 @@ export const SessionInfo = Schema.Struct({
 	hasAiAutoTriage: Schema.Boolean,
 	/** The org's `dataSources` rollout flag; on self-hosted. */
 	hasDataSources: Schema.Boolean,
+	/** Self-hosted with the OIDC directory: real roles, and a Members tab. */
+	isDirectory: Schema.optionalKey(Schema.Boolean),
 })
 export const SessionData = AsyncData.Schema(SessionInfo, LoadFailure)
 /** The nav's data-platform gate and the Billing tab read the one customer. */

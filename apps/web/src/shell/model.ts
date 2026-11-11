@@ -15,6 +15,7 @@ import { PinnedDashboardRow } from "./dashboards-shape"
 import * as Palette from "./palette/model"
 import { Platform } from "./palette/shortcuts"
 import { Menu, Theme } from "./message"
+import { DirectoryViewer } from "../data/directory-me"
 import { NavSurface } from "./nav"
 import { OnCallSnapshot } from "./oncall"
 import {
@@ -101,6 +102,10 @@ export const Model = Schema.Struct({
 	railTooltip: Tooltip.Model,
 	/** Clerk: the org switcher (`ClerkOrgSwitcherMenu namespaceScope`). */
 	clerkOrgMenu: ClerkOrgSwitcher.Model,
+	/** Self-hosted directory (OIDC): the viewer and their orgs; `null` until read, and without one. */
+	directory: Schema.NullOr(DirectoryViewer),
+	/** An org switch is minting its session; the page reloads when it lands. */
+	isSwitchingOrg: Schema.Boolean,
 	/** Clerk: the onboarding reward pill in the top bar. */
 	checklist: Checklist.Model,
 	/** The top bar's Connect popover. */
@@ -190,6 +195,8 @@ export const init = (flags: ShellFlags): Model => ({
 	isAppOutdated: false,
 	railTooltip: initRailTooltip(),
 	clerkOrgMenu: ClerkOrgSwitcher.init("shell-clerk-org-switcher"),
+	directory: null,
+	isSwitchingOrg: false,
 	checklist: Checklist.init(),
 	connect: ConnectPanel.init(),
 	supportChannel: SupportChannel.init(),

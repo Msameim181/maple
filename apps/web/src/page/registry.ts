@@ -92,6 +92,7 @@ import * as ServicesList from "./services/list"
 import * as Settings from "./settings"
 import * as Account from "./settings/account"
 import * as McpPage from "./settings/mcp-page"
+import * as Admin from "./admin"
 import * as Share from "./share"
 import * as SourcesList from "./sources/list"
 import * as SourcesNew from "./sources/new"
@@ -183,6 +184,7 @@ export const pages = [
 	Settings.page,
 	IngestRuleEditor.page,
 	McpPage.page,
+	Admin.page,
 	SourcesList.page,
 	SourcesNew.page,
 	SourceDetail.page,

@@ -1,5 +1,10 @@
 import { BrowserKeyValueStore } from "@effect/platform-browser"
-import { MapleApi, SelfHostedLoginRequest, UnauthorizedError } from "@maple/domain/http"
+import {
+	MapleApi,
+	type OidcCallbackRequest,
+	SelfHostedLoginRequest,
+	UnauthorizedError,
+} from "@maple/domain/http"
 import { apiBaseUrl } from "./api-base-url"
 import { Context, Effect, Layer, Option, Predicate, Schema } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http"
@@ -69,6 +74,9 @@ export class MapleAuthApi extends Context.Service<MapleAuthApi>()("@maple/web/Ma
 		return {
 			login: (password: string) =>
 				anonymous.authPublic.login({ payload: new SelfHostedLoginRequest({ password }) }),
+			oidcConfig: anonymous.directoryPublic.oidcConfig(),
+			oidcCallback: (payload: OidcCallbackRequest) =>
+				anonymous.directoryPublic.oidcCallback({ payload }),
 			session: (token: string) =>
 				makeClient(withBearer(token)).pipe(
 					Effect.flatMap((client) => client.auth.session()),

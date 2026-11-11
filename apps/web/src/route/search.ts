@@ -321,6 +321,9 @@ export const SettingsSearch = Schema.Struct({
 
 export const SignInSearch = Schema.Struct({
 	redirect_url: StringParam,
+	/** The identity provider's OIDC redirect back: the authorization code and the state it echoes. */
+	code: StringParam,
+	state: StringParam,
 })
 
 export const SignUpSearch = Schema.Struct({

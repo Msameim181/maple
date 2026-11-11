@@ -2,7 +2,12 @@ import { writeLocalStorage } from "@maple/ui/lib/local-storage"
 import { Array as Arr, Effect, Option, Schema } from "effect"
 import { Command } from "foldkit"
 import { load } from "foldkit/navigation"
-import { clearSessionToken } from "../platform/auth-api"
+import { clearSessionToken, saveSessionToken } from "../platform/auth-api"
+import { DirectoryMe } from "../data/directory-me"
+import { MapleApiClient } from "../platform/api-clients"
+import { writeLastOrg } from "../platform/oidc"
+import { OrgId } from "@maple/domain"
+import { SwitchOrgRequest } from "@maple/domain/http"
 import { Message, Theme } from "./message"
 
 /** `maple.global-namespace.<orgId>`. */
@@ -155,6 +160,33 @@ export const SaveSidebarState = Command.define("SaveSidebarState", {
 export const LogOut = Command.define("LogOut", {
 	messages: [Message.CompletedLogOut],
 	execute: clearSessionToken.pipe(Effect.andThen(load("/sign-in")), Effect.as(Message.CompletedLogOut())),
+})
+
+/** `GET /api/directory/me`, once per session token (`DirectoryMe`). */
+export const LoadDirectory = Command.define("LoadDirectory", {
+	messages: [Message.LoadedDirectory],
+	execute: Effect.gen(function* () {
+		const viewer = yield* (yield* DirectoryMe).get
+		return Message.LoadedDirectory({ viewer: Option.getOrNull(viewer) })
+	}),
+})
+
+/** `POST /api/directory/switch-org`: the new org's session replaces this one, remembered for the next sign-in. */
+export const SwitchOrg = Command.define("SwitchOrg", {
+	args: { orgId: Schema.String },
+	messages: [Message.FailedSwitchOrg],
+	execute: ({ orgId }) =>
+		Effect.gen(function* () {
+			const target = yield* Schema.decodeEffect(OrgId)(orgId)
+			const session = yield* (yield* MapleApiClient).directory.switchOrg({
+				payload: new SwitchOrgRequest({ orgId: target }),
+			})
+			yield* saveSessionToken(session.token)
+			yield* writeLastOrg(session.orgId)
+			// The whole app reads the org from the session: a reload starts it over under the new one.
+			yield* Effect.sync(() => window.location.reload())
+			return yield* Effect.never
+		}).pipe(Effect.orElseSucceed(() => Message.FailedSwitchOrg())),
 })
 
 /**

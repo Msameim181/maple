@@ -21,7 +21,15 @@ import {
 	withViewInputs,
 } from "foldkit/scene"
 import { describe, expect as expectVitest, test } from "vitest"
-import { FocusElement, SaveInfraSurfaces, SaveNamespace, SaveSidebarState, SaveTheme } from "./command"
+import {
+	FocusElement,
+	LoadDirectory,
+	SaveInfraSurfaces,
+	SwitchOrg,
+	SaveNamespace,
+	SaveSidebarState,
+	SaveTheme,
+} from "./command"
 import { LoadInfraSurfaces, LoadNamespaces, LoadOnCall } from "./data"
 import { type Integration, Menu, Message, OutMessage } from "./message"
 import { DashboardsData, init, type Model, NamespacesData } from "./model"
@@ -196,7 +204,8 @@ describe("sidebar collapse", () => {
 			given(signedIn({ isMobile: true })),
 			expect(sidebar).toBeAbsent(),
 			...open(),
-			Command.expectExact(LoadInfraSurfaces, LoadOnCall),
+			Command.expectExact(LoadInfraSurfaces, LoadOnCall, LoadDirectory),
+			Command.resolve(LoadDirectory, Message.LoadedDirectory({ viewer: null })),
 			Command.resolve(LoadOnCall, Message.FailedLoadOnCall({ orgId: "org_parity", failedAtMs: 0 })),
 			Command.resolve(LoadInfraSurfaces, surfacesAnswer("org_parity", [])),
 			Command.expectExact(SaveInfraSurfaces({ orgId: "org_parity", surfaces: [] })),
@@ -623,5 +632,57 @@ describe("infrastructure section", () => {
 			false,
 		)
 		expectVitest(dropped.model.rememberedSurfaces).toEqual({ org_parity: ["hosts"] })
+	})
+})
+
+describe("self-hosted directory", () => {
+	const viewer = (isRoot: boolean) => ({
+		userId: "user_ana",
+		isRoot,
+		activeOrgId: "acme",
+		orgs: [
+			{ id: "acme", name: "Acme" },
+			{ id: "globex", name: "Globex" },
+		],
+	})
+
+	const userMenuOf = (model: Model) => [
+		given(model),
+		Mount.resolve(MeasureSidebarOverflow, Message.MeasuredSidebarOverflow()),
+		click(role("button", { name: /Root$/ })),
+		Mount.resolve(PositionMenu, position(Menu.User())),
+	]
+
+	test("a member's user menu links the account page but not /admin", () => {
+		scene(
+			{ update, view },
+			...userMenuOf(signedIn({ directory: viewer(false) })),
+			expect(role("menuitem", { name: "Account" })).toExist(),
+			expect(role("menuitem", { name: "Admin" })).toBeAbsent(),
+		)
+	})
+
+	test("root's user menu links /admin", () => {
+		scene(
+			{ update, view },
+			...userMenuOf(signedIn({ directory: viewer(true) })),
+			expect(role("menuitem", { name: "Admin" })).toHaveAttr("href", "/admin"),
+		)
+	})
+
+	test("the header names the active org, and picking another one switches the session to it", () => {
+		scene(
+			{ update, view },
+			given(signedIn({ directory: viewer(false) })),
+			Mount.resolve(MeasureSidebarOverflow, Message.MeasuredSidebarOverflow()),
+			expect(role("button", { name: /Acme/ })).toExist(),
+			click(role("button", { name: /Acme/ })),
+			Mount.resolve(PositionMenu, position(Menu.Org())),
+			Command.resolve(LoadNamespaces, Message.FailedLoadNamespaces({ orgId: "org_parity" })),
+			click(role("menuitem", { name: "Globex" })),
+			Command.expectHas(SwitchOrg({ orgId: "globex" })),
+			Command.resolve(SwitchOrg, Message.FailedSwitchOrg()),
+			Mount.expectEnded(PositionMenu),
+		)
 	})
 })

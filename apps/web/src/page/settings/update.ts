@@ -51,6 +51,7 @@ export const visibilityOf = (model: Model): Visibility => {
 	const hasByoc = AsyncData.getOrElse(AsyncData.map(model.customer, hasBringYourOwnCloudAddOn), () => false)
 	return {
 		isClerk: isClerkAuthEnabled,
+		isDirectory: isDirectoryOf(model),
 		grants,
 		canAccessDataPlatform: canManageWarehouse && hasByoc,
 		hasDataSources: AsyncData.getOrElse(
@@ -61,9 +62,19 @@ export const visibilityOf = (model: Model): Visibility => {
 	}
 }
 
-/** The session's permissions: every one off Clerk, none until (or unless) the session answers. */
+/** Self-hosted with the OIDC directory, once the session read says so. */
+const isDirectoryOf = (model: Model): boolean =>
+	AsyncData.getOrElse(
+		AsyncData.map(model.session, (session) => session.isDirectory === true),
+		() => false,
+	)
+
+/**
+ * The session's permissions: every one for the root-password deployment, none until (or unless)
+ * the session answers under Clerk or the OIDC directory, whose tokens carry real roles.
+ */
 export const grantsOf = (model: Model): ReadonlyArray<Policy.Permission> =>
-	isClerkAuthEnabled
+	isClerkAuthEnabled || isDirectoryOf(model)
 		? AsyncData.getOrElse(
 				AsyncData.map(model.session, (session) => session.grants),
 				(): ReadonlyArray<Policy.Permission> => [],
@@ -83,8 +94,10 @@ const isPending = <A, E>(data: AsyncData.AsyncData<A, E>) =>
 
 /** The skeleton: the session (Clerk), or the customer while a deep link waits on the gated tab. */
 export const isSettingsLoading = (model: Model): boolean =>
-	isClerkAuthEnabled &&
-	(isPending(model.session) || (model.search.tab === "data-platform" && isPending(model.customer)))
+	isClerkAuthEnabled
+		? isPending(model.session) || (model.search.tab === "data-platform" && isPending(model.customer))
+		: // Self-hosted: only the directory's Members tab waits on the session to know it exists.
+			model.search.tab === "members" && isPending(model.session)
 
 export const activeTabOf = (model: Model): SettingsTab =>
 	resolveActiveSettingsTab(model.search.tab, visibleTabs(visibleSections(visibilityOf(model))))

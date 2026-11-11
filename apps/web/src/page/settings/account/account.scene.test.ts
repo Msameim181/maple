@@ -1,6 +1,8 @@
 import { DigestSubscriptionResponse } from "@maple/domain/http"
 import { Result, Schema, Array as Arr } from "effect"
 import { describe, expect, test } from "vitest"
+import { expect as expectView, given, role, scene, withViewInputs } from "foldkit/scene"
+import { view } from "./view"
 import * as EmailPreferences from "./email-preferences/update"
 import { Message as EmailPreferencesMessage } from "./email-preferences/model"
 import * as Password from "./password/update"
@@ -74,6 +76,7 @@ describe("password tab", () => {
 			search: {},
 			nowMs: 0,
 			tab: { _tag: "Password", model: { ...typed, isSaving: true } },
+			accountUrl: null,
 		}
 		const failure = (message: string) =>
 			AccountMessage.GotPasswordMessage({
@@ -216,5 +219,41 @@ describe("profile", () => {
 		const discarded = Profile.update(edited, ProfileMessage.ClickedDiscardName()).model
 		expect(Profile.namesOf(discarded, user).firstName).toBe("Ada")
 		expect(Profile.isNameDirty(discarded, user)).toBe(false)
+	})
+})
+
+describe("account under the self-hosted directory", () => {
+	const entered: AccountModel = { search: {}, nowMs: 0, tab: null, accountUrl: null }
+	const accountView = withViewInputs(view, { context })()
+
+	test("the identity provider's account page is the one thing linked", () => {
+		const loaded = updateAccount(
+			entered,
+			AccountMessage.LoadedAccountUrl({ url: "https://id.example.com/realms/maple/account" }),
+			context,
+		)
+		expect(loaded.outMessage).toBeUndefined()
+		scene(
+			{
+				update: (model: AccountModel, message: AccountMessage) =>
+					updateAccount(model, message, context),
+				view: accountView,
+			},
+			given(loaded.model),
+			expectView(role("link", { name: "Manage your account" })).toHaveAttr(
+				"href",
+				"https://id.example.com/realms/maple/account",
+			),
+			expectView(role("navigation")).toBeAbsent(),
+		)
+	})
+
+	test("without an identity provider the page sends the viewer on to settings", () => {
+		const step = updateAccount(entered, AccountMessage.LoadedAccountUrl({ url: null }), context)
+		expect(step.outMessage).toMatchObject({
+			_tag: "RequestedNavigation",
+			url: "/settings",
+			isReplace: true,
+		})
 	})
 })

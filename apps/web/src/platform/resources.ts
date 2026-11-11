@@ -6,6 +6,7 @@ import { ReadCache } from "../data/read-cache"
 import { IntegrationStatuses } from "../data/integration-statuses"
 import { LogSourceLive } from "../data/log-source"
 import { SessionTenant } from "../data/session-tenant"
+import { DirectoryMe } from "../data/directory-me"
 import { TraceSourceLive } from "../data/trace-source"
 import { WarehouseLive } from "../data/warehouse"
 import { ApiClientsLive, MapleApiV2Client, MapleInternalApiClient } from "./api-clients"
@@ -21,6 +22,7 @@ export const ResourcesLive = Layer.mergeAll(
 	Layer.mergeAll(TraceSourceLive, LogSourceLive).pipe(Layer.provideMerge(WarehouseLive)),
 	OrgCollections.layer,
 	SessionTenant.layer,
+	DirectoryMe.layer,
 	ReadCache.layer,
 	BillingCustomerCache.layer,
 	IntegrationStatuses.layer.pipe(Layer.provide([MapleInternalApiClient.layer, MapleApiV2Client.layer])),

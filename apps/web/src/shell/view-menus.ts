@@ -12,6 +12,7 @@ import { MountNamespaceSearch } from "./mounts"
 import { hasNamespaceSearch, namespaceRows, namespaceSearchRow, noNamespacesMatch } from "./namespace-search"
 import { Menu, Message } from "./message"
 import type { Model, ShellClerk } from "./model"
+import { hasOrgChoice } from "../data/directory-me"
 import { partitionSubItems } from "./nav"
 import { shellNavGroups, surfacesOf } from "./view-nav"
 import { pinnedNamespaceOf, userAvatar, userImageOf, userNameOf } from "./view-sidebar"
@@ -86,29 +87,35 @@ const themeToggle = (h: HtmlBuilder<Message>, model: Model): Html =>
 		]),
 	])
 
-const guestMenu = (h: HtmlBuilder<Message>, model: Model, menu: Menu): ReadonlyArray<Html> => [
-	menuGroup(h, undefined, [themeToggle(h, model)]),
-	menuSeparator(h),
-	menuGroup(
-		h,
-		undefined,
-		items(h, menu, [
-			{ content: [icon(h, "GearIcon"), "Settings"], href: "/settings" },
-			keyboardShortcuts(h),
-		]),
-	),
-	menuSeparator(h),
-	menuGroup(
-		h,
-		undefined,
-		items(
+const guestMenu = (h: HtmlBuilder<Message>, model: Model, menu: Menu): ReadonlyArray<Html> => {
+	// The directory (OIDC) adds the identity provider's account page and, for root, `/admin`.
+	const entries: ReadonlyArray<Item> = [
+		...(model.directory === null
+			? []
+			: [{ content: [icon(h, "UserIcon"), "Account"], href: "/account" }]),
+		...(model.directory?.isRoot === true
+			? [{ content: [icon(h, "ServerIcon"), "Admin"], href: "/admin" }]
+			: []),
+		{ content: [icon(h, "GearIcon"), "Settings"], href: "/settings" },
+		keyboardShortcuts(h),
+	]
+	return [
+		menuGroup(h, undefined, [themeToggle(h, model)]),
+		menuSeparator(h),
+		menuGroup(h, undefined, items(h, menu, entries)),
+		menuSeparator(h),
+		menuGroup(
 			h,
-			menu,
-			[{ content: [icon(h, "LogoutIcon"), "Log out"], onSelect: Message.ClickedLogOut() }],
-			2,
+			undefined,
+			items(
+				h,
+				menu,
+				[{ content: [icon(h, "LogoutIcon"), "Log out"], onSelect: Message.ClickedLogOut() }],
+				entries.length,
+			),
 		),
-	),
-]
+	]
+}
 
 const supportMenu = (h: HtmlBuilder<Message>, menu: Menu, isClerk: boolean): ReadonlyArray<Html> => [
 	menuGroup(
@@ -213,7 +220,33 @@ const namespaceList = (h: HtmlBuilder<Message>, model: Model, menu: Menu): Reado
 
 const orgMenu = (h: HtmlBuilder<Message>, model: Model, menu: Menu): ReadonlyArray<Html> => {
 	const labelId = `${popupIdOf(menu)}-label`
-	return [menuGroup(h, labelId, [menuLabel(h, labelId, ["Namespace"]), ...namespaceList(h, model, menu)])]
+	const namespaces = menuGroup(h, labelId, [
+		menuLabel(h, labelId, ["Namespace"]),
+		...namespaceList(h, model, menu),
+	])
+	const directory = model.directory
+	if (directory === null || !hasOrgChoice(directory)) return [namespaces]
+	const orgsLabelId = `${popupIdOf(menu)}-orgs-label`
+	return [
+		menuGroup(h, orgsLabelId, [
+			menuLabel(h, orgsLabelId, ["Organization"]),
+			...items(
+				h,
+				menu,
+				Arr.map(directory.orgs, (org) => ({
+					content: [
+						typography(h, { truncate: true }, [org.name]),
+						...(org.id === directory.activeOrgId ? [checkIcon(h)] : []),
+					],
+					onSelect: Message.ClickedSwitchOrg({ orgId: org.id }),
+				})),
+				// Ids clear of the namespace rows'; arrow keys follow DOM order, not ids.
+				10_000,
+			),
+		]),
+		menuSeparator(h),
+		namespaces,
+	]
 }
 
 /** The collapsed rail's section menu: every child, the ones the org lacks after a separator. */

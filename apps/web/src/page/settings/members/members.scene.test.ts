@@ -1,11 +1,14 @@
 import * as Policy from "@maple/domain/policy"
 import { AsyncData } from "foldkit"
 import { Result, Array as Arr, Option } from "effect"
-import { expect as expectView, given, scene, selector, withViewInputs } from "foldkit/scene"
+import { expect as expectView, given, role, scene, selector, text, withViewInputs } from "foldkit/scene"
+import { DirectoryMember, DirectoryUser } from "@maple/domain/http"
+import { UserId } from "@maple/domain"
+import { Schema } from "effect"
 import { describe, expect, test } from "vitest"
 import { toLoadFailure } from "@maple/views/data/load-failure"
 import { Message, type Model } from "./model"
-import { init, revisit, update } from "./update"
+import { directoryMemberRow, init, revisit, update } from "./update"
 import { view } from "./view"
 
 const ADMIN = Policy.grantsOf(["org:admin"])
@@ -225,6 +228,50 @@ describe("members avatars", () => {
 			},
 			given(loaded),
 			expectView(image).toHaveAttr("src", "https://img.clerk.test/ada.png"),
+		)
+	})
+})
+
+describe("members from the self-hosted directory", () => {
+	const directoryMember = (
+		id: string,
+		email: string,
+		name: string | null,
+		role: "org:admin" | "org:member",
+	) =>
+		new DirectoryMember({
+			user: new DirectoryUser({ id: Schema.decodeSync(UserId)(id), email, name, lastSeenAt: 0 }),
+			role,
+		})
+
+	test("the directory's members are listed by name and email, the viewer marked as such", () => {
+		const members = [
+			directoryMember("kc_ana", "ana@acme.test", "Ana Admin", "org:admin"),
+			directoryMember("kc_bo", "bo@acme.test", null, "org:member"),
+		]
+		const withOrg = update(init(ADMIN).model, Message.CompletedFetchOrganization({ name: "acme" })).model
+		const loaded = update(
+			withOrg,
+			Message.CompletedFetchMembers({
+				page: 1,
+				generation: 0,
+				result: Result.succeed({
+					rows: Arr.map(members, (member) => directoryMemberRow(member, "kc_ana")),
+					total: members.length,
+				}),
+			}),
+		).model
+		scene(
+			{
+				update: (model: Model, message: Message) => update(model, message),
+				view: withViewInputs(view, { nowMs: 0, timeZone: "UTC", isKnownMember: false })(),
+			},
+			given(loaded),
+			expectView(text("Ana Admin")).toExist(),
+			expectView(text("ana@acme.test")).toExist(),
+			// A member the provider gave no name is listed by email.
+			expectView(role("row", { name: /bo@acme\.test/ })).toExist(),
+			expectView(text("(you)")).toExist(),
 		)
 	})
 })

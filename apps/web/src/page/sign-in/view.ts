@@ -2,6 +2,7 @@ import { Option } from "effect"
 import { Submodel } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { accountLayout } from "../../layout/account-layout"
+import { alert, alertDescription } from "@maple/views/ui/alert"
 import { button } from "@maple/views/ui/button"
 import { heading } from "@maple/views/ui/heading"
 import { field, fieldError, fieldLabel, input, type FieldIds, type FieldState } from "@maple/views/ui/field"
@@ -15,6 +16,8 @@ const PASSWORD_FIELD: FieldIds = { control: "base-ui-_r_0_", label: "base-ui-_r_
 const failureMessage = (failure: SignInFailure): string =>
 	SignInFailure.match(failure, {
 		Rejected: ({ message }) => message,
+		NoOrganization: () =>
+			"Your account is not a member of any organization yet. Ask your administrator for an invitation.",
 		Unreachable: () => "Couldn't reach the server",
 		Unexpected: () => "Invalid root password",
 	})
@@ -69,8 +72,52 @@ const passwordField = (model: Model, h: HtmlBuilder<Message>): Html => {
 	])
 }
 
-export const view = Submodel.defineView<Model, Message>((model, h) =>
-	accountLayout(h, [
+const passwordForm = (model: Model, h: HtmlBuilder<Message>): Html =>
+	h.form(
+		[h.Class("space-y-6"), h.OnSubmit(Message.SubmittedSignIn())],
+		[
+			passwordField(model, h),
+			button(
+				h,
+				{
+					type: "submit",
+					className: "w-full",
+					isLoading: model.submission._tag === "Submitting",
+				},
+				["Sign in"],
+			),
+		],
+	)
+
+/** OIDC on: the provider's sign-in first, the root password one click away. */
+const ssoChoice = (h: HtmlBuilder<Message>, isRedirecting: boolean): Html =>
+	h.div(
+		[h.Class("space-y-3")],
+		[
+			button(
+				h,
+				{
+					className: "w-full",
+					isLoading: isRedirecting,
+					attributes: [h.OnClick(Message.ClickedSignInWithSso())],
+				},
+				["Sign in with SSO"],
+			),
+			button(
+				h,
+				{
+					variant: "ghost",
+					className: "w-full",
+					attributes: [h.OnClick(Message.ClickedUseRootPassword())],
+				},
+				["Use root password"],
+			),
+		],
+	)
+
+export const view = Submodel.defineView<Model, Message>((model, h) => {
+	const isSsoFirst = model.oidc !== null && !model.isRootPasswordShown
+	return accountLayout(h, [
 		h.div(
 			[h.Class("space-y-8")],
 			[
@@ -80,26 +127,22 @@ export const view = Submodel.defineView<Model, Message>((model, h) =>
 						heading(h, { level: 1, variant: "display" }, ["Sign in to Maple"]),
 						h.p(
 							[h.Class("font-display text-muted-foreground text-sm leading-relaxed")],
-							["This deployment is self-hosted. Enter the root password to continue."],
+							[
+								isSsoFirst
+									? "Sign in with your organization account."
+									: "This deployment is self-hosted. Enter the root password to continue.",
+							],
 						),
 					],
 				),
-				h.form(
-					[h.Class("space-y-6"), h.OnSubmit(Message.SubmittedSignIn())],
-					[
-						passwordField(model, h),
-						button(
-							h,
-							{
-								type: "submit",
-								className: "w-full",
-								isLoading: model.submission._tag === "Submitting",
-							},
-							["Sign in"],
-						),
+				...Option.match(maybeFailureOf(model.sso), {
+					onNone: () => [],
+					onSome: (failure) => [
+						alert(h, { variant: "crit" }, [alertDescription(h, [failureMessage(failure)])]),
 					],
-				),
+				}),
+				isSsoFirst ? ssoChoice(h, model.sso._tag === "Submitting") : passwordForm(model, h),
 			],
 		),
-	]),
-)
+	])
+})

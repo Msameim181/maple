@@ -85,12 +85,15 @@ type Step = Update.Step<Model, Message, Resources>
 
 const foldSignInOutMessage = SignIn.OutMessage.match<Step>({
 	SucceededSignIn:
-		({ token }) =>
+		({ token, returnTo }) =>
 		(model) => ({
 			model: modifyFields(model, { session: () => Session.Resolving() }),
 			commands: [
 				SaveSessionToken({ token }),
-				NavigateInternal({ url: targetAfterSignIn(model.route) }),
+				// OIDC came back to a bare `/sign-in`: its return path rode along, and the callback URL is replaced.
+				returnTo === undefined
+					? NavigateInternal({ url: targetAfterSignIn(model.route) })
+					: ReplaceUrl({ url: validateInternalRedirect(returnTo) ?? "/" }),
 			],
 		}),
 })
@@ -102,6 +105,21 @@ const foldSignIn = Update.foldChild({
 	toParentMessage: (message: SignIn.Message) => Message.GotSignInMessage({ message }),
 	foldOutMessage: foldSignInOutMessage,
 })
+
+/** Self-hosted `/sign-in`: ask for an OIDC provider, and redeem a code it sent back. */
+export const enterSignIn: Step = (model) =>
+	isClerkAuthEnabled || model.route._tag !== "SignIn"
+		? { model }
+		: foldSignInStep(SignIn.enter(model.signIn, model.route.search))(model)
+
+const foldSignInStep =
+	(step: ReturnType<typeof SignIn.enter>): Step =>
+	(model) => ({
+		model: modifyFields(model, { signIn: () => step.model }),
+		commands: Command.mapMessages(step.commands ?? [], (message) =>
+			Message.GotSignInMessage({ message }),
+		),
+	})
 
 const shellFoldConfig = {
 	read: (model: Model) => Option.some(model.shell),
@@ -1005,6 +1023,7 @@ const changedUrlStep = (model: Model, changedUrl: Url): UpdateReturn => {
 	return Update.combine([
 		foldShellStep(Shell.routeChanged(model.route._tag === nextRoute._tag, hasTopBar)),
 		settle,
+		...(isEnteringSignIn ? [enterSignIn] : []),
 	])(routed)
 }
 

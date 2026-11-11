@@ -1,4 +1,5 @@
 import { cn } from "@maple/ui/lib/utils"
+import { activeOrgName } from "../data/directory-me"
 import { MAPLE_REGION_LABELS } from "@maple/domain/organization-regions"
 import { initialsFrom } from "@maple/ui/lib/initials"
 import { hasMultipleRegions } from "../platform/region"
@@ -57,6 +58,10 @@ export const pinnedNamespaceOf = (model: Model): Option.Option<string> =>
 	Option.flatMap(model.maybeOrgId, (orgId) => Record.get(model.pinnedNamespaces, orgId))
 
 /** The self-hosted org switcher's trigger: the server tile, "Self-hosted" and the pinned namespace. */
+/** The directory's active org by name; "Self-hosted" on the root-password deployment. */
+const activeOrgNameOf = (model: Model): string =>
+	model.directory === null ? "Self-hosted" : activeOrgName(model.directory)
+
 const orgSwitcher = (h: HtmlBuilder<Message>, model: Model): Html =>
 	sidebarMenu(h, undefined, [
 		sidebarMenuItem(h, undefined, [
@@ -79,7 +84,7 @@ const orgSwitcher = (h: HtmlBuilder<Message>, model: Model): Html =>
 						[icon(h, "ServerIcon", { size: 16 })],
 					),
 					identityLabel(h, [
-						typography(h, { weight: "medium", truncate: true }, ["Self-hosted"]),
+						typography(h, { weight: "medium", truncate: true }, [activeOrgNameOf(model)]),
 						...Option.match(pinnedNamespaceOf(model), {
 							onNone: () => [],
 							onSome: (namespace) => [

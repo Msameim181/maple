@@ -1,6 +1,9 @@
 import { readClock } from "@maple/views/data/timing"
 import { isClerkAuthEnabled } from "../../../platform/auth-mode"
 import { Command } from "foldkit"
+import { Effect, Option } from "effect"
+import { DirectoryMe } from "../../../data/directory-me"
+import { MapleAuthApi } from "../../../platform/auth-api"
 import { REVERIFICATION_CANCELLED } from "../../../platform/clerk"
 import { AppRoute, hrefOf } from "../../../route"
 import { type PageContext, PageOutMessage, type PageReturn } from "../../contract"
@@ -19,6 +22,24 @@ type Return = PageReturn<Model, Message>
 type AccountRoute = Extract<AppRoute, { readonly _tag: "Account" }>
 
 const ReadAccountClock = readClock("ReadAccountClock", Message.ReadClock)
+
+/** Signed in through the directory: the provider's account page (`OidcConfig.accountUrl`). */
+export const LoadAccountUrl = Command.define("LoadAccountUrl", {
+	messages: [Message.LoadedAccountUrl],
+	execute: Effect.gen(function* () {
+		const viewer = yield* (yield* DirectoryMe).get
+		if (Option.isNone(viewer)) return Message.LoadedAccountUrl({ url: null })
+		const config = yield* (yield* MapleAuthApi).oidcConfig
+		return Message.LoadedAccountUrl({
+			url: config.enabled && config.accountUrl !== "" ? config.accountUrl : null,
+		})
+	}).pipe(Effect.orElseSucceed(() => Message.LoadedAccountUrl({ url: null }))),
+})
+
+const toSettings = PageOutMessage.RequestedNavigation({
+	url: hrefOf(AppRoute.Settings({ search: {} })),
+	isReplace: true,
+})
 
 export const activeTabOf = (model: Model): AccountTab => resolveActiveAccountTab(model.search.tab)
 
@@ -114,22 +135,18 @@ const initTab = (model: Model, tab: AccountTab, _context: PageContext): Return =
 	}
 }
 
-/** Self-hosted has nothing to manage here, so it is sent on to `/settings`. */
+/** Self-hosted links the identity provider's account page, or has nothing here and goes to `/settings`. */
 const enter = (model: Model, context: PageContext): Return => {
 	if (!isClerkAuthEnabled)
-		return {
-			model: { ...model, tab: null },
-			outMessage: PageOutMessage.RequestedNavigation({
-				url: hrefOf(AppRoute.Settings({ search: {} })),
-				isReplace: true,
-			}),
-		}
+		return model.accountUrl === null
+			? { model: { ...model, tab: null }, commands: [LoadAccountUrl()] }
+			: { model }
 	const tab = activeTabOf(model)
 	return isTabCurrent(model.tab, tab) ? { model } : initTab(model, tab, context)
 }
 
 export const init = (route: AccountRoute, context: PageContext): Return => {
-	const entered = enter({ search: route.search, nowMs: 0, tab: null }, context)
+	const entered = enter({ search: route.search, nowMs: 0, tab: null, accountUrl: null }, context)
 	return { ...entered, commands: [ReadAccountClock(), ...(entered.commands ?? [])] }
 }
 
@@ -150,6 +167,8 @@ export const update = (model: Model, message: Message, _context: PageContext): R
 const updateTab = (model: Model, message: Message): Return =>
 	Message.match<Return>(message, {
 		ReadClock: ({ nowMs }) => ({ model: { ...model, nowMs } }),
+		LoadedAccountUrl: ({ url }) =>
+			url === null ? { model, outMessage: toSettings } : { model: { ...model, accountUrl: url } },
 		ClickedTab: ({ tab }) => ({
 			model,
 			outMessage: PageOutMessage.RequestedNavigation({

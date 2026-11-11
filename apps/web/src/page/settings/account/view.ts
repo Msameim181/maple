@@ -15,13 +15,36 @@ import * as PasskeysView from "./passkeys/view"
 import * as EmailsView from "./emails/view"
 import * as PasswordView from "./password/view"
 import { activeTabOf } from "./update"
+import { card, cardDescription, cardFooter, cardHeader, cardTitle } from "@maple/views/ui/card"
+import { linkButton } from "@maple/views/ui/button"
 
 type H = HtmlBuilder<Message>
 
-export const breadcrumbs = (model: Model): ReadonlyArray<BreadcrumbEntry> => [
-	{ label: "Account", href: "/account" },
-	{ label: accountTabLabels[activeTabOf(model)] },
-]
+export const breadcrumbs = (model: Model): ReadonlyArray<BreadcrumbEntry> =>
+	model.accountUrl === null
+		? [{ label: "Account", href: "/account" }, { label: accountTabLabels[activeTabOf(model)] }]
+		: [{ label: "Account" }]
+
+/** The OIDC directory: the identity provider owns the account, so this page only links there. */
+const providerAccountCard = (h: H, accountUrl: string): Html =>
+	card(h, [
+		cardHeader(h, [
+			cardTitle(h, ["Your account"]),
+			cardDescription(h, [
+				"Your password, two-factor authentication and sessions are managed by your organization's identity provider.",
+			]),
+		]),
+		cardFooter(h, [
+			linkButton(
+				h,
+				{
+					href: accountUrl,
+					attributes: [h.Attribute("rel", "noopener noreferrer"), h.Attribute("target", "_blank")],
+				},
+				["Manage your account"],
+			),
+		]),
+	])
 
 const tabContent = (h: H, model: Model, inputs: PageViewInputs): ReadonlyArray<Html> => {
 	const tab = model.tab
@@ -112,7 +135,11 @@ const tabContent = (h: H, model: Model, inputs: PageViewInputs): ReadonlyArray<H
 
 export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, inputs, h) =>
 	model.tab === null
-		? dashboardPage(h, {}, [])
+		? dashboardPage(
+				h,
+				{ width: "settings" },
+				model.accountUrl === null ? [] : [providerAccountCard(h, model.accountUrl)],
+			)
 		: dashboardPage(
 				h,
 				{

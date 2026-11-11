@@ -31,6 +31,7 @@ const routers = {
 		Route.mapTo(AppRoute.Integrations),
 	),
 	Mcp: pipe(path("mcp"), Route.mapTo(AppRoute.Mcp)),
+	Admin: pipe(path("admin"), Route.mapTo(AppRoute.Admin)),
 	McpAuthorize: pipe(
 		path("mcp-authorize"),
 		search(Search.McpAuthorizeSearch),

@@ -6,10 +6,11 @@ import {
 import * as Policy from "@maple/domain/policy"
 import { isClerkAuthEnabled } from "../../platform/auth-mode"
 import { NetworkErrorBody } from "@maple/web-data/lib/error-messages"
-import { Duration, Effect, Schema } from "effect"
+import { Duration, Effect, Option, Schema } from "effect"
 import { Command } from "foldkit"
 import { toLoadFailure, settleTo } from "@maple/views/data/load-failure"
 import { SessionTenant } from "../../data/session-tenant"
+import { DirectoryMe } from "../../data/directory-me"
 import { Message } from "./message"
 import { BillingCustomerCache } from "../../data/billing-customer"
 
@@ -23,11 +24,13 @@ export const FetchSettingsSession = Command.define("FetchSettingsSession", {
 		const flags = isClerkAuthEnabled
 			? organizationFeatureFlagsFrom(window.Clerk?.organization?.publicMetadata)
 			: ENABLED_ORGANIZATION_FEATURE_FLAGS
+		const directory = yield* (yield* DirectoryMe).get
 		return {
 			grants: Policy.grantsOf(session.roles),
 			userId: session.userId,
 			hasAiAutoTriage: flags.aiAutoTriage,
 			hasDataSources: flags.dataSources,
+			isDirectory: Option.isSome(directory),
 		}
 	}).pipe(settleTo((result) => Message.CompletedFetchSession({ result }))),
 })

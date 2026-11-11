@@ -15,6 +15,7 @@ import {
 	FocusElement,
 	FocusSiblingMenuItem,
 	FocusShortcutSearch,
+	LoadDirectory,
 	LogOut,
 	SaveCollapsedNavGroups,
 	SaveNoSchedules,
@@ -22,6 +23,7 @@ import {
 	SaveNamespace,
 	SaveSidebarState,
 	SaveTheme,
+	SwitchOrg,
 } from "./command"
 import { LoadInfraSurfaces, LoadNamespaces, LoadOnCall, LoadSources } from "./data"
 import { DismissQuotaBanner, OpenCustomerPortal } from "./billing-banners"
@@ -107,7 +109,12 @@ const requestSidebarData = (model: Model): UpdateReturn => {
 			hasRequestedSidebarData: () => true,
 			dashboards: () => DashboardsData.Loading(),
 		}),
-		commands: [...(surfaces.commands ?? []), ...(onCall.commands ?? [])],
+		commands: [
+			...(surfaces.commands ?? []),
+			...(onCall.commands ?? []),
+			// Self-hosted: the header's org switcher and the user menu's directory rows.
+			...(isClerkAuthEnabled ? [] : [LoadDirectory()]),
+		],
 	}
 }
 
@@ -512,6 +519,15 @@ const foldMessage = (model: Model, message: Message): UpdateReturn =>
 		}),
 		CompletedMountNamespaceSearch: () => ({ model }),
 		// Clerk signs out through the root (`useClerk().signOut()`); self-hosted clears its token.
+		LoadedDirectory: ({ viewer }) => ({ model: modifyFields(model, { directory: () => viewer }) }),
+		ClickedSwitchOrg: ({ orgId }) =>
+			model.isSwitchingOrg || model.directory?.activeOrgId === orgId
+				? { model: closeMenu(model) }
+				: {
+						model: modifyFields(closeMenu(model), { isSwitchingOrg: () => true }),
+						commands: [SwitchOrg({ orgId })],
+					},
+		FailedSwitchOrg: () => ({ model: modifyFields(model, { isSwitchingOrg: () => false }) }),
 		ClickedLogOut: () =>
 			isClerkAuthEnabled
 				? { model: closeMenu(model), outMessage: OutMessage.RequestedSignOut() }

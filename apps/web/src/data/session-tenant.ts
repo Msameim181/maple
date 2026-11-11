@@ -5,7 +5,7 @@ import { MapleApiClient } from "../platform/api-clients"
 import { SessionBearer } from "../platform/session-bearer"
 
 type Tenant = CurrentTenant.TenantSchema
-type Entry<E> = Readonly<{ token: Option.Option<string>; result: Deferred.Deferred<Tenant, E> }>
+type Entry<A, E> = Readonly<{ token: Option.Option<string>; result: Deferred.Deferred<A, E> }>
 type SessionError = Effect.Error<ReturnType<MapleApiClient["Service"]["auth"]["session"]>>
 
 const sameToken = (a: Option.Option<string>, b: Option.Option<string>): boolean =>
@@ -15,15 +15,15 @@ const sameToken = (a: Option.Option<string>, b: Option.Option<string>): boolean 
  * One read per session token, shared by every reader. A failed read is dropped once it settles,
  * so the next reader asks again rather than keeping the failure until the token renews.
  */
-export const makeSessionTenantCache = <E>(
-	fetchTenant: Effect.Effect<Tenant, E>,
+export const makeSessionTenantCache = <E, A = Tenant>(
+	fetchTenant: Effect.Effect<A, E>,
 	token: Effect.Effect<Option.Option<string>>,
-): Effect.Effect<{ readonly get: Effect.Effect<Tenant, E> }, never, Scope.Scope> =>
+): Effect.Effect<{ readonly get: Effect.Effect<A, E> }, never, Scope.Scope> =>
 	Effect.gen(function* () {
 		const scope = yield* Effect.scope
-		const current = yield* SynchronizedRef.make(Option.none<Entry<E>>())
+		const current = yield* SynchronizedRef.make(Option.none<Entry<A, E>>())
 
-		const dropIfCurrent = (result: Entry<E>["result"]) =>
+		const dropIfCurrent = (result: Entry<A, E>["result"]) =>
 			SynchronizedRef.update(current, (existing) =>
 				Option.isSome(existing) && existing.value.result === result ? Option.none() : existing,
 			)
@@ -33,10 +33,10 @@ export const makeSessionTenantCache = <E>(
 				if (Option.isSome(existing) && sameToken(existing.value.token, forToken))
 					return Effect.succeed([existing.value, existing] as const)
 				return Effect.gen(function* () {
-					const result = yield* Deferred.make<Tenant, E>()
+					const result = yield* Deferred.make<A, E>()
 					const read = fetchTenant.pipe(Effect.onError(() => dropIfCurrent(result)))
 					yield* Effect.forkIn(Deferred.complete(result, read), scope)
-					const entry: Entry<E> = { token: forToken, result }
+					const entry: Entry<A, E> = { token: forToken, result }
 					return [entry, Option.some(entry)] as const
 				})
 			})

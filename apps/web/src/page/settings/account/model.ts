@@ -30,13 +30,17 @@ export const Model = Schema.Struct({
 	search: AccountSearch,
 	/** The clock at entry, for relative times. */
 	nowMs: Schema.Number,
-	/** `null` while redirecting (self-hosted). */
+	/** `null` while redirecting (self-hosted), and with the OIDC directory. */
 	tab: Schema.NullOr(TabModel),
+	/** Self-hosted with OIDC: the identity provider's account page, which owns password, 2FA and sessions. */
+	accountUrl: Schema.NullOr(Schema.String),
 })
 export type Model = typeof Model.Type
 
 export const Message = defineMessageUnion({
 	ReadClock: { nowMs: Schema.Number },
+	/** `null`: no identity provider, so self-hosted has nothing to manage here. */
+	LoadedAccountUrl: { url: Schema.NullOr(Schema.String) },
 	ClickedTab: { tab: Schema.Literals(accountTabValues) },
 	GotProfileMessage: { message: Profile.Message },
 	GotEmailPreferencesMessage: { message: EmailPreferences.Message },

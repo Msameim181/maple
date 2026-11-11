@@ -2,6 +2,7 @@ import { InfraSurfaceLiteral } from "@maple/domain/http"
 import { V2Source } from "@maple/domain/http/v2"
 import { Schema } from "effect"
 import { defineMessageUnion } from "foldkit/message"
+import { DirectoryViewer } from "../data/directory-me"
 import { defineTaggedUnion } from "foldkit/schema"
 import { PopupPosition } from "@maple/views/ui/anchor"
 import * as Dialog from "@maple/views/ui/dialog"
@@ -60,6 +61,10 @@ export const Message = defineMessageUnion({
 	ChangedNamespaceQuery: { value: Schema.String },
 	CompletedMountNamespaceSearch: {},
 	ClickedLogOut: {},
+	/** Self-hosted directory: who is signed in and the orgs the switcher offers; `null` without one. */
+	LoadedDirectory: { viewer: Schema.NullOr(DirectoryViewer) },
+	ClickedSwitchOrg: { orgId: Schema.String },
+	FailedSwitchOrg: {},
 	CompletedFocusElement: {},
 	CompletedSaveTheme: {},
 	CompletedSaveNamespace: {},

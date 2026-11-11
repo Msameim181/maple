@@ -1,6 +1,6 @@
 import { isClerkAuthEnabled } from "./platform/auth-mode"
 import { Effect, Option, Schema } from "effect"
-import type { Runtime } from "foldkit"
+import { type Runtime, Update } from "foldkit"
 import type { Url } from "foldkit/url"
 import { CheckSession, LoadClerk } from "./command"
 import type { Message } from "./message"
@@ -15,7 +15,7 @@ import * as Toast from "@maple/views/ui/toast"
 import * as TooltipHost from "@maple/views/ui/tooltip-host"
 import { urlToAppRoute } from "./route"
 import * as Shell from "./shell"
-import { settle } from "./update"
+import { enterSignIn, settle } from "./update"
 
 export { Message } from "./message"
 export { Model } from "./model"
@@ -80,11 +80,13 @@ export const init: Runtime.RoutingApplicationInit<Model, Message, Flags, Resourc
 	}
 
 	if (flags.hasStoredSession) {
-		return {
-			model: { ...base, session: Session.Resolving(), clerk: ClerkPhase.Unused() },
-			commands: [CheckSession()],
-		}
+		const entered = enterSignIn({ ...base, session: Session.Resolving(), clerk: ClerkPhase.Unused() })
+		return { model: entered.model, commands: [CheckSession(), ...(entered.commands ?? [])] }
 	}
 
-	return settle({ ...base, session: Session.SignedOut(), clerk: ClerkPhase.Unused() })
+	return Update.combine([settle, enterSignIn])({
+		...base,
+		session: Session.SignedOut(),
+		clerk: ClerkPhase.Unused(),
+	})
 }

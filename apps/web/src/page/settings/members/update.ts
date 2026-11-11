@@ -2,7 +2,7 @@ import * as Policy from "@maple/domain/policy"
 import { orgRoleKeys, orgRoleNoun, toOrgRole } from "../kit/org-membership"
 import { Array, Effect, Option, Record as Rec, Result, Schema, String as Str } from "effect"
 import { AsyncData, Command } from "foldkit"
-import { settleTo } from "@maple/views/data/load-failure"
+import { type LoadFailure, settleTo } from "@maple/views/data/load-failure"
 import type {
 	ClerkInvitationResource,
 	ClerkMembershipResource,
@@ -16,7 +16,24 @@ import * as Select from "@maple/views/ui/select"
 import { PageOutMessage, type PageReturn } from "../../contract"
 import { revisitData } from "../kit/revisit"
 import { memberDisplayName, otherAdminName } from "../kit/members"
-import { canManage, type InvitationRow, type MemberRow, Message, type Model, OrgRole } from "./model"
+import {
+	canManage,
+	type InvitationRow,
+	type InvitationsPage,
+	type MemberRow,
+	type MembersPage,
+	Message,
+	type Model,
+	OrgRole,
+} from "./model"
+
+type MembersPageRows = typeof MembersPage.Type
+type InvitationsPageRows = typeof InvitationsPage.Type
+import { isClerkAuthEnabled } from "../../../platform/auth-mode"
+import { MapleApiClient } from "../../../platform/api-clients"
+import { activeOrgName, apiErrorMessage, DirectoryMe } from "../../../data/directory-me"
+import { CreateInvitationRequest, type DirectoryMember, UpdateMemberRequest } from "@maple/domain/http"
+import { UserId } from "@maple/domain"
 
 type Return = PageReturn<Model, Message>
 
@@ -33,23 +50,91 @@ const settleClerk =
 			Effect.map(toMessage),
 		)
 
+// Self-hosted, the tab only shows with the OIDC directory: each Command below reads and writes
+// `/api/directory` there, and Clerk otherwise.
+
+/** A directory member as the Clerk-shaped row the view draws; `id` is the user id the API takes. */
+export const directoryMemberRow = (member: DirectoryMember, viewerId: string | null): MemberRow => ({
+	id: member.user.id,
+	name: member.user.name ?? member.user.email,
+	identifier: member.user.email,
+	imageUrl: "",
+	role: member.role,
+	// The directory keeps no join date; the last sign-in stands in.
+	createdAtMs: member.user.lastSeenAt ?? 0,
+	isCurrentUser: member.user.id === viewerId,
+})
+
+const directory = Effect.gen(function* () {
+	return (yield* MapleApiClient).directory
+})
+
+const listDirectoryMembers = Effect.flatMap(directory, (api) => api.listMembers())
+
+// The directory's own user id, the one `listMembers` rows carry.
+const directoryViewerId = Effect.gen(function* () {
+	const viewer = yield* (yield* DirectoryMe).get
+	return Option.getOrNull(Option.map(viewer, (found) => found.userId))
+})
+
+const decodeUserId = (memberId: string) => Schema.decodeEffect(UserId)(memberId)
+
+/** A directory write settled as the Clerk writes are: `Result<void, message>`. */
+const settleDirectory =
+	<B>(fallback: string, toMessage: (result: Result.Result<void, string>) => B) =>
+	<A, E, R>(effect: Effect.Effect<A, E, R>) =>
+		effect.pipe(
+			Effect.asVoid,
+			Effect.mapError((error) => apiErrorMessage(error, fallback)),
+			Effect.result,
+			Effect.map(toMessage),
+		)
+
 export const FetchOrganization = Command.define("FetchMembersOrganization", {
 	messages: [Message.CompletedFetchOrganization],
-	execute: Effect.sync(() =>
-		Message.CompletedFetchOrganization({ name: window.Clerk?.organization?.name ?? null }),
-	),
+	execute: isClerkAuthEnabled
+		? Effect.sync(() =>
+				Message.CompletedFetchOrganization({ name: window.Clerk?.organization?.name ?? null }),
+			)
+		: Effect.gen(function* () {
+				return yield* (yield* DirectoryMe).get
+			}).pipe(
+				Effect.map((viewer) =>
+					Message.CompletedFetchOrganization({
+						name: Option.getOrNull(Option.map(viewer, activeOrgName)),
+					}),
+				),
+			),
 })
+
+const clerkAdminName = currentClerkOrganization.pipe(
+	Effect.flatMap((organization) =>
+		clerkTry("", () => organization.getMemberships({ role: ["org:admin"], pageSize: 2 })),
+	),
+	Effect.map((page) => otherAdminName(page.data, window.Clerk?.user?.id)),
+	Effect.orElseSucceed(() => null),
+	Effect.map((name) => Message.CompletedFetchAdminName({ name })),
+)
+
+const directoryAdminName = Effect.all([listDirectoryMembers, directoryViewerId]).pipe(
+	Effect.map(([response, viewerId]) =>
+		Option.getOrNull(
+			Option.map(
+				Array.findFirst(
+					response.members,
+					(member) => member.role === "org:admin" && member.user.id !== viewerId,
+				),
+				(admin) => admin.user.name ?? admin.user.email,
+			),
+		),
+	),
+	Effect.orElseSucceed(() => null),
+	Effect.map((name) => Message.CompletedFetchAdminName({ name })),
+)
 
 const FetchAdminName = Command.define("FetchMembersAdminName", {
 	messages: [Message.CompletedFetchAdminName],
-	execute: currentClerkOrganization.pipe(
-		Effect.flatMap((organization) =>
-			clerkTry("", () => organization.getMemberships({ role: ["org:admin"], pageSize: 2 })),
-		),
-		Effect.map((page) => otherAdminName(page.data, window.Clerk?.user?.id)),
-		Effect.orElseSucceed(() => null),
-		Effect.map((name) => Message.CompletedFetchAdminName({ name })),
-	),
+	execute: isClerkAuthEnabled ? clerkAdminName : directoryAdminName,
 })
 
 const memberRow = (member: ClerkMembershipResource, userId: string | null): MemberRow => ({
@@ -80,35 +165,76 @@ const invitationsPage = (organization: ClerkOrganizationResource, page: number) 
 		organization.getInvitations({ initialPage: page, pageSize: PAGE_SIZE, status: ["pending"] }),
 	)
 
+/** The directory answers every member and invitation at once: one page holds them all. */
+const directoryMembersPage = Effect.all([listDirectoryMembers, directoryViewerId]).pipe(
+	Effect.map(([response, viewerId]) => ({
+		rows: Array.map(response.members, (member) => directoryMemberRow(member, viewerId)),
+		total: response.members.length,
+	})),
+)
+
+const directoryInvitationsPage = listDirectoryMembers.pipe(
+	Effect.map((response) => ({
+		rows: Array.map(response.invitations, (invitation): InvitationRow => ({
+			id: invitation.id,
+			email: invitation.email,
+			role: invitation.role,
+			createdAtMs: invitation.createdAt,
+		})),
+		total: response.invitations.length,
+	})),
+)
+
+const directoryInvite = (email: string, role: OrgRole) =>
+	Effect.flatMap(directory, (api) =>
+		api.createInvitation({ payload: new CreateInvitationRequest({ email, role }) }),
+	)
+
+const directoryRevoke = (invitationId: string) =>
+	Effect.flatMap(directory, (api) => api.revokeInvitation({ params: { invitationId } }))
+
 const FetchMembers = Command.define("FetchClerkMemberships", {
 	args: { page: Schema.Number, generation: Schema.Number },
 	messages: [Message.CompletedFetchMembers],
-	execute: ({ page, generation }) =>
-		currentClerkOrganization.pipe(
-			Effect.flatMap((organization) => membershipsPage(organization, page)),
-			Effect.map((result) => {
-				const userId = window.Clerk?.user?.id ?? null
-				return {
-					rows: Array.map(result.data, (member) => memberRow(member, userId)),
-					total: result.total_count,
-				}
-			}),
-			settleTo((result) => Message.CompletedFetchMembers({ page, generation, result })),
-		),
+	execute: ({ page, generation }) => {
+		const settle = settleTo((result: Result.Result<MembersPageRows, LoadFailure>) =>
+			Message.CompletedFetchMembers({ page, generation, result }),
+		)
+		return isClerkAuthEnabled ? settle(clerkMembersPage(page)) : settle(directoryMembersPage)
+	},
 })
+
+const clerkMembersPage = (page: number) =>
+	currentClerkOrganization.pipe(
+		Effect.flatMap((organization) => membershipsPage(organization, page)),
+		Effect.map((result) => {
+			const userId = window.Clerk?.user?.id ?? null
+			return {
+				rows: Array.map(result.data, (member) => memberRow(member, userId)),
+				total: result.total_count,
+			}
+		}),
+	)
 
 const FetchInvitations = Command.define("FetchClerkInvitations", {
 	args: { page: Schema.Number, generation: Schema.Number },
 	messages: [Message.CompletedFetchInvitations],
-	execute: ({ page, generation }) =>
-		currentClerkOrganization.pipe(
-			Effect.flatMap((organization) => invitationsPage(organization, page)),
-			Effect.map((result) => ({
-				rows: Array.map(result.data, invitationRow),
-				total: result.total_count,
-			})),
-			settleTo((result) => Message.CompletedFetchInvitations({ page, generation, result })),
-		),
+	execute: ({ page, generation }) => {
+		const settle = settleTo((result: Result.Result<InvitationsPageRows, LoadFailure>) =>
+			Message.CompletedFetchInvitations({ page, generation, result }),
+		)
+		return isClerkAuthEnabled
+			? settle(
+					currentClerkOrganization.pipe(
+						Effect.flatMap((organization) => invitationsPage(organization, page)),
+						Effect.map((result) => ({
+							rows: Array.map(result.data, invitationRow),
+							total: result.total_count,
+						})),
+					),
+				)
+			: settle(directoryInvitationsPage)
+	},
 })
 
 /** The resource behind a row: the list pages are read again until the id turns up. */
@@ -160,71 +286,122 @@ const InviteMember = Command.define("InviteClerkMember", {
 	args: { email: Schema.String, role: OrgRole },
 	messages: [Message.CompletedInvite],
 	execute: ({ email, role }) =>
-		currentClerkOrganization.pipe(
-			Effect.flatMap((organization) =>
-				clerkTry("Couldn't send invitation", () =>
-					organization.inviteMember({ emailAddress: email, role }),
+		isClerkAuthEnabled
+			? currentClerkOrganization.pipe(
+					Effect.flatMap((organization) =>
+						clerkTry("Couldn't send invitation", () =>
+							organization.inviteMember({ emailAddress: email, role }),
+						),
+					),
+					settleClerk((result) => Message.CompletedInvite({ email, result })),
+				)
+			: directoryInvite(email, role).pipe(
+					settleDirectory("Couldn't send invitation", (result) =>
+						Message.CompletedInvite({ email, result }),
+					),
 				),
-			),
-			settleClerk((result) => Message.CompletedInvite({ email, result })),
-		),
 })
 
 const ChangeRole = Command.define("ChangeClerkMemberRole", {
 	args: { memberId: Schema.String, name: Schema.String, next: OrgRole },
 	messages: [Message.CompletedRoleChange],
 	execute: ({ memberId, name, next }) =>
-		withMembership(memberId, (member) =>
-			clerkTry("Couldn't change role", () => member.update({ role: next })),
-		).pipe(settleClerk((result) => Message.CompletedRoleChange({ memberId, name, next, result }))),
+		isClerkAuthEnabled
+			? withMembership(memberId, (member) =>
+					clerkTry("Couldn't change role", () => member.update({ role: next })),
+				).pipe(settleClerk((result) => Message.CompletedRoleChange({ memberId, name, next, result })))
+			: Effect.all([directory, decodeUserId(memberId)]).pipe(
+					Effect.flatMap(([api, userId]) =>
+						api.updateMember({
+							params: { userId },
+							payload: new UpdateMemberRequest({ role: next }),
+						}),
+					),
+					settleDirectory("Couldn't change role", (result) =>
+						Message.CompletedRoleChange({ memberId, name, next, result }),
+					),
+				),
 })
 
 const RemoveMember = Command.define("RemoveClerkMember", {
 	args: { memberId: Schema.String, name: Schema.String },
 	messages: [Message.CompletedRemove],
 	execute: ({ memberId, name }) =>
-		withMembership(memberId, (member) => clerkTry("Couldn't remove member", () => member.destroy())).pipe(
-			settleClerk((result) => Message.CompletedRemove({ name, result })),
-		),
+		isClerkAuthEnabled
+			? withMembership(memberId, (member) =>
+					clerkTry("Couldn't remove member", () => member.destroy()),
+				).pipe(settleClerk((result) => Message.CompletedRemove({ name, result })))
+			: Effect.all([directory, decodeUserId(memberId)]).pipe(
+					Effect.flatMap(([api, userId]) => api.removeMember({ params: { userId } })),
+					settleDirectory("Couldn't remove member", (result) =>
+						Message.CompletedRemove({ name, result }),
+					),
+				),
 })
 
 const RevokeInvitation = Command.define("RevokeClerkInvitation", {
 	args: { id: Schema.String, email: Schema.String },
 	messages: [Message.CompletedRevoke],
 	execute: ({ id, email }) =>
-		withInvitation(id, (invitation) =>
-			clerkTry("Couldn't revoke invitation", () => invitation.revoke()),
-		).pipe(settleClerk((result) => Message.CompletedRevoke({ email, result }))),
+		isClerkAuthEnabled
+			? withInvitation(id, (invitation) =>
+					clerkTry("Couldn't revoke invitation", () => invitation.revoke()),
+				).pipe(settleClerk((result) => Message.CompletedRevoke({ email, result })))
+			: directoryRevoke(id).pipe(
+					settleDirectory("Couldn't revoke invitation", (result) =>
+						Message.CompletedRevoke({ email, result }),
+					),
+				),
 })
+
+/** The directory has no resend either: revoke, then invite again, settled as the Clerk resend is. */
+const directoryResend = (id: string, email: string, role: OrgRole) =>
+	Effect.gen(function* () {
+		const revoked = yield* directoryRevoke(id).pipe(
+			settleDirectory("Couldn't resend invitation", (result) => result),
+		)
+		if (Result.isFailure(revoked))
+			return Message.CompletedResend({ id, email, isRevoked: false, result: revoked })
+		const sent = yield* directoryInvite(email, role).pipe(
+			settleDirectory(
+				`The old invitation was revoked but a new one could not be sent. Invite ${email} again.`,
+				(result) => result,
+			),
+		)
+		return Message.CompletedResend({ id, email, isRevoked: true, result: sent })
+	})
 
 /** Clerk has no resend: revoke the old invitation, then invite the same email with the same role. */
 const ResendInvitation = Command.define("ResendClerkInvitation", {
 	args: { id: Schema.String, email: Schema.String, role: OrgRole },
 	messages: [Message.CompletedResend],
 	execute: ({ id, email, role }) =>
-		Effect.gen(function* () {
-			const revoked = yield* withInvitation(id, (invitation) =>
-				clerkTry("Couldn't resend invitation", () => invitation.revoke()),
-			).pipe(Effect.result)
-			if (Result.isFailure(revoked))
-				return Message.CompletedResend({
-					id,
-					email,
-					isRevoked: false,
-					result: Result.fail(revoked.failure.message),
-				})
-			const sent = yield* currentClerkOrganization.pipe(
-				Effect.flatMap((organization) =>
-					clerkTry(
-						`The old invitation was revoked but a new one could not be sent. Invite ${email} again.`,
-						() => organization.inviteMember({ emailAddress: email, role }),
-					),
-				),
-				settleClerk((result) => result),
-			)
-			return Message.CompletedResend({ id, email, isRevoked: true, result: sent })
-		}),
+		isClerkAuthEnabled ? clerkResend(id, email, role) : directoryResend(id, email, role),
 })
+
+const clerkResend = (id: string, email: string, role: OrgRole) =>
+	Effect.gen(function* () {
+		const revoked = yield* withInvitation(id, (invitation) =>
+			clerkTry("Couldn't resend invitation", () => invitation.revoke()),
+		).pipe(Effect.result)
+		if (Result.isFailure(revoked))
+			return Message.CompletedResend({
+				id,
+				email,
+				isRevoked: false,
+				result: Result.fail(revoked.failure.message),
+			})
+		const sent = yield* currentClerkOrganization.pipe(
+			Effect.flatMap((organization) =>
+				clerkTry(
+					`The old invitation was revoked but a new one could not be sent. Invite ${email} again.`,
+					() => organization.inviteMember({ emailAddress: email, role }),
+				),
+			),
+			settleClerk((result) => result),
+		)
+		return Message.CompletedResend({ id, email, isRevoked: true, result: sent })
+	})
 
 export const roleSelectFor = (model: Model, member: MemberRow): Select.Model =>
 	model.roleSelects[member.id] ?? roleSelect(`member-role-${member.id}`, toOrgRole(member.role))

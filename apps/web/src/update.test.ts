@@ -313,3 +313,35 @@ describe("dashboard widget undo", () => {
 		expect(restored.toasts.toasts).toEqual([])
 	})
 })
+
+describe("OIDC sign-in at the root", () => {
+	const signedOut = (route: AppRoute): Model => ({ ...base(route), session: Session.SignedOut() })
+
+	test("landing on the provider's callback redeems its code", () => {
+		const landed = update(
+			signedOut(AppRoute.Home({ search: {} })),
+			Message.ChangedUrl({ url: urlOf("/sign-in?code=abc&state=s1") }),
+		)
+		expect(commandsOf(landed)).toContainEqual({
+			name: "CompleteOidcSignIn",
+			args: { code: "abc", state: "s1" },
+		})
+	})
+
+	test("a redeemed code saves the session token and replaces the callback URL with the return path", () => {
+		const result = update(
+			signedOut(AppRoute.SignIn({ search: {} })),
+			Message.GotSignInMessage({
+				message: SignIn.Message.SucceededSignInWithSso({
+					token: "oidc-token",
+					returnTo: "/services",
+				}),
+			}),
+		)
+		expect(commandsOf(result)).toEqual([
+			{ name: "SaveSessionToken", args: { token: "oidc-token" } },
+			{ name: "ReplaceUrl", args: { url: "/services" } },
+		])
+		expect(result.model.session).toEqual(Session.Resolving())
+	})
+})

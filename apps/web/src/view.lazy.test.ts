@@ -107,6 +107,7 @@ const SAMPLE_PATHS = [
 	"/investigations/inv_1",
 	"/settings",
 	"/mcp",
+	"/admin",
 	"/sources",
 	"/sources/new",
 	"/sources/src_1",
