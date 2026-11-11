@@ -1,0 +1,426 @@
+/* Maple tokens (DESIGN.md): dark, warm neutrals, orange primary, Geist for titles, Geist Mono for text. */
+@font-face {
+	font-family: "Geist Variable";
+	font-style: normal;
+	font-display: swap;
+	font-weight: 100 900;
+	src: url("../fonts/geist-latin-wght-normal.woff2") format("woff2-variations");
+}
+@font-face {
+	font-family: "Geist Mono Variable";
+	font-style: normal;
+	font-display: swap;
+	font-weight: 100 900;
+	src: url("../fonts/geist-mono-latin-wght-normal.woff2") format("woff2-variations");
+}
+
+:root {
+	--maple-bg: oklch(0.207 0.008 67);
+	--maple-card: oklch(0.224 0.009 75);
+	--maple-fg: oklch(0.91 0.016 74);
+	--maple-muted: oklch(0.26 0.012 67);
+	--maple-muted-fg: oklch(0.603 0.023 72);
+	--maple-border: oklch(0.268 0.012 67);
+	--maple-input: oklch(0.33 0.015 72);
+	--maple-ring: oklch(0.58 0.02 65);
+	--maple-primary: oklch(0.714 0.154 59);
+	--maple-primary-hover: oklch(0.66 0.16 59);
+	--maple-primary-fg: oklch(0.207 0.008 67);
+	--maple-destructive: oklch(0.654 0.176 30);
+	--maple-success: oklch(0.658 0.134 151);
+	--maple-sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+	--maple-mono: "Geist Mono Variable", ui-monospace, monospace;
+	color-scheme: dark;
+}
+
+/* Page */
+html.login-pf,
+.login-pf body {
+	background: var(--maple-bg) !important;
+	background-image: none !important;
+	color: var(--maple-fg);
+	font-family: var(--maple-mono);
+	font-size: 14px;
+}
+.login-pf-page {
+	padding-top: 9vh !important;
+}
+
+/* Logo instead of the realm name */
+#kc-header {
+	color: transparent;
+}
+#kc-header-wrapper {
+	font-size: 0 !important;
+	height: 44px;
+	padding: 0 !important;
+	margin-bottom: 28px;
+	background: url("../img/maple-lockup.svg") center / contain no-repeat;
+}
+
+/* Card */
+.login-pf-page .card-pf {
+	background: var(--maple-card) !important;
+	border: 1px solid var(--maple-border) !important;
+	border-radius: 12px !important;
+	box-shadow: 0 1px 0 oklch(1 0 0 / 0.03) inset, 0 12px 40px oklch(0 0 0 / 0.35) !important;
+	max-width: 420px !important;
+	padding: 32px 32px 24px !important;
+	margin: 0 auto !important;
+	color: var(--maple-fg);
+}
+.login-pf-page .login-pf-header {
+	margin-bottom: 20px !important;
+}
+#kc-page-title {
+	font-family: var(--maple-sans) !important;
+	font-size: 1.25rem !important;
+	font-weight: 600 !important;
+	letter-spacing: -0.01em;
+	color: var(--maple-fg) !important;
+	text-align: left !important;
+	margin: 0 !important;
+}
+
+/* Text */
+.login-pf-page p,
+.login-pf-page .instruction,
+#kc-content-wrapper,
+.login-pf-page span {
+	color: var(--maple-fg);
+}
+.login-pf-page label,
+.login-pf-page .pf-c-form__label,
+.login-pf-page .pf-c-form__label-text,
+.login-pf-page .control-label {
+	color: var(--maple-muted-fg) !important;
+	font-family: var(--maple-mono) !important;
+	font-size: 0.75rem !important;
+	font-weight: 500 !important;
+	letter-spacing: 0.02em;
+}
+.login-pf-page .required,
+.login-pf-page .pf-c-form__label-required {
+	color: var(--maple-primary) !important;
+}
+.login-pf-page a,
+.login-pf-page a:visited {
+	color: var(--maple-primary) !important;
+	text-decoration: none;
+}
+.login-pf-page a:hover {
+	color: var(--maple-primary-hover) !important;
+	text-decoration: underline;
+}
+
+/* Inputs */
+.login-pf-page .pf-c-form-control,
+.login-pf-page .form-control,
+.login-pf-page input[type="text"],
+.login-pf-page input[type="email"],
+.login-pf-page input[type="password"] {
+	background: var(--maple-bg) !important;
+	color: var(--maple-fg) !important;
+	border: 1px solid var(--maple-input) !important;
+	border-radius: 6px !important;
+	height: 36px;
+	padding: 6px 12px !important;
+	font-family: var(--maple-mono) !important;
+	font-size: 0.875rem !important;
+	box-shadow: none !important;
+	--pf-c-form-control--after--BorderBottomColor: transparent;
+	--pf-c-form-control--hover--after--BorderBottomColor: transparent;
+	--pf-c-form-control--focus--after--BorderBottomColor: transparent;
+}
+.login-pf-page .pf-c-form-control::after {
+	display: none !important;
+}
+.login-pf-page .pf-c-form-control:focus,
+.login-pf-page input:focus {
+	border-color: var(--maple-ring) !important;
+	outline: 2px solid oklch(0.714 0.154 59 / 0.35) !important;
+	outline-offset: 1px;
+}
+.login-pf-page .pf-c-form-control[aria-invalid="true"] {
+	border-color: var(--maple-destructive) !important;
+}
+.login-pf-page .pf-c-input-group,
+.login-pf-page .pf-c-input-group > * {
+	background: transparent !important;
+}
+.login-pf-page .pf-c-input-group .pf-c-button.pf-m-control {
+	background: var(--maple-muted) !important;
+	border: 1px solid var(--maple-input) !important;
+	border-left: 0 !important;
+	color: var(--maple-muted-fg) !important;
+	border-radius: 0 6px 6px 0 !important;
+}
+.login-pf-page .pf-c-input-group .pf-c-form-control {
+	border-radius: 6px 0 0 6px !important;
+}
+.login-pf-page .pf-c-button.pf-m-control::after {
+	display: none !important;
+}
+
+/* Buttons */
+.login-pf-page .pf-c-button.pf-m-primary,
+.login-pf-page input[type="submit"],
+.login-pf-page .btn-primary {
+	background: var(--maple-primary) !important;
+	color: var(--maple-primary-fg) !important;
+	border: 0 !important;
+	border-radius: 6px !important;
+	font-family: var(--maple-mono) !important;
+	font-weight: 600 !important;
+	font-size: 0.875rem !important;
+	height: 36px;
+	padding: 0 16px !important;
+	box-shadow: none !important;
+	text-shadow: none !important;
+}
+.login-pf-page .pf-c-button.pf-m-primary:hover,
+.login-pf-page input[type="submit"]:hover {
+	background: var(--maple-primary-hover) !important;
+}
+.login-pf-page .pf-c-button.pf-m-secondary,
+.login-pf-page .btn-default {
+	background: transparent !important;
+	color: var(--maple-fg) !important;
+	border: 1px solid var(--maple-input) !important;
+	border-radius: 6px !important;
+}
+.login-pf-page .pf-c-button::after {
+	border: 0 !important;
+}
+
+/* Checkboxes and "remember me" row */
+.login-pf-page input[type="checkbox"] {
+	accent-color: var(--maple-primary);
+}
+#kc-form-options .checkbox label,
+#kc-form-options label {
+	color: var(--maple-muted-fg) !important;
+	font-size: 0.8rem !important;
+}
+
+/* Page header: Keycloak's register page puts the title and a "Required fields" note in an old
+ * two-column grid; stack them, title first. */
+.login-pf-page .login-pf-header {
+	display: flex !important;
+	flex-direction: column;
+	gap: 6px;
+}
+.login-pf-page .login-pf-header > .row {
+	display: flex !important;
+	flex-direction: column;
+	gap: 6px;
+	margin: 0 !important;
+}
+.login-pf-page .login-pf-header [class*="col-"] {
+	width: 100% !important;
+	float: none !important;
+	padding: 0 !important;
+	margin: 0 !important;
+}
+.login-pf-page .login-pf-header .col-md-2,
+.login-pf-page .login-pf-header .subtitle {
+	order: 2;
+	text-align: left !important;
+	color: var(--maple-muted-fg) !important;
+	font-size: 0.75rem !important;
+}
+
+/* "New user? Register" footer */
+.login-pf-page #kc-info {
+	background: transparent !important;
+	border-top: 1px solid var(--maple-border) !important;
+	margin: 24px -32px -24px !important;
+	padding: 16px 32px !important;
+	color: var(--maple-muted-fg) !important;
+	font-size: 0.8rem;
+}
+.login-pf-page #kc-info-wrapper {
+	border: 0 !important;
+	background: transparent !important;
+	padding: 0 !important;
+	color: var(--maple-muted-fg) !important;
+	font-size: 0.8rem !important;
+}
+
+/* Alerts */
+.login-pf-page .pf-c-alert,
+.login-pf-page .alert {
+	background: var(--maple-muted) !important;
+	border: 1px solid var(--maple-border) !important;
+	border-left: 3px solid var(--maple-primary) !important;
+	border-radius: 6px !important;
+	color: var(--maple-fg) !important;
+	box-shadow: none !important;
+}
+.login-pf-page .pf-c-alert.pf-m-danger,
+.login-pf-page .alert-error {
+	border-left-color: var(--maple-destructive) !important;
+}
+.login-pf-page .pf-c-alert.pf-m-success,
+.login-pf-page .alert-success {
+	border-left-color: var(--maple-success) !important;
+}
+.login-pf-page .pf-c-alert__title,
+.login-pf-page .kc-feedback-text {
+	color: var(--maple-fg) !important;
+	font-weight: 500 !important;
+}
+.login-pf-page .pf-c-alert__icon {
+	color: var(--maple-primary) !important;
+}
+
+/* Field errors */
+.login-pf-page .pf-c-form__helper-text.pf-m-error,
+.login-pf-page #input-error,
+.login-pf-page [id^="input-error"] {
+	color: var(--maple-destructive) !important;
+	font-size: 0.75rem !important;
+}
+
+/* Language picker, social and misc chrome */
+.login-pf-page #kc-locale {
+	display: none;
+}
+.login-pf-page .kc-social-section hr,
+.login-pf-page hr {
+	border-color: var(--maple-border) !important;
+}
+.login-pf-page #kc-attempted-username,
+.login-pf-page #kc-username label {
+	color: var(--maple-fg) !important;
+}
+
+@media (max-width: 767px) {
+	.login-pf-page .card-pf {
+		border-radius: 0 !important;
+		border-left: 0 !important;
+		border-right: 0 !important;
+	}
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * Wide screens: Maple's own sign-in layout (apps/web account-layout). Artwork panel on the left,
+ * drawn with pseudo-elements so Keycloak's templates stay untouched; the form sits bare on the
+ * right, as in Maple. Narrow screens keep the centred card above.
+ */
+:root {
+	--maple-brand: #e9831a;
+	--maple-brand-ink: #241d16;
+	--maple-form-col: max(460px, 46vw);
+	--maple-art-col: calc(100vw - var(--maple-form-col));
+	--maple-headline: clamp(36px, 3.8vw, 60px);
+}
+
+@media (min-width: 900px) {
+	/* The orange panel */
+	html.login-pf::before {
+		content: "";
+		position: fixed;
+		inset: 0 auto 0 0;
+		width: var(--maple-art-col);
+		background: var(--maple-brand);
+		z-index: 0;
+	}
+	/* The engraving, filling the panel below the copy, its top edge blended into the panel */
+	html.login-pf::after {
+		content: "";
+		position: fixed;
+		left: 0;
+		bottom: 0;
+		width: var(--maple-art-col);
+		height: calc(100vh - 2.04 * var(--maple-headline) - 300px);
+		min-height: 260px;
+		background: url("../img/maple-auth-arch.webp") 60% center / cover no-repeat;
+		-webkit-mask-image: linear-gradient(to bottom, transparent, black 32px);
+		mask-image: linear-gradient(to bottom, transparent, black 32px);
+		z-index: 0;
+	}
+	/* Wordmark, top-left of the panel */
+	#kc-header {
+		position: fixed !important;
+		top: 40px;
+		left: 48px;
+		margin: 0 !important;
+		padding: 0 !important;
+		z-index: 2;
+	}
+	#kc-header-wrapper {
+		width: 128px;
+		height: 44px;
+		margin: 0 !important;
+		background-image: url("../img/maple-lockup-ink.svg");
+		background-position: left center;
+	}
+	/* Eyebrow */
+	#kc-header::after {
+		content: "Open-source observability";
+		position: fixed;
+		top: 148px;
+		left: 48px;
+		color: var(--maple-brand-ink);
+		font: 500 12px/1.4 var(--maple-mono);
+		letter-spacing: 0.02em;
+	}
+	/* Headline */
+	.login-pf body::before {
+		content: "Understand\A what's happening.";
+		white-space: pre;
+		position: fixed;
+		top: 186px;
+		left: 48px;
+		z-index: 1;
+		color: var(--maple-brand-ink);
+		font-family: var(--maple-sans);
+		font-size: var(--maple-headline);
+		font-weight: 750;
+		letter-spacing: -0.03em;
+		line-height: 1.02;
+	}
+	/* Tagline */
+	.login-pf body::after {
+		content: "Traces, logs, and metrics.\A One place to see the whole picture.";
+		white-space: pre;
+		position: fixed;
+		top: calc(186px + 2.04 * var(--maple-headline) + 24px);
+		left: 48px;
+		z-index: 1;
+		color: var(--maple-brand-ink);
+		font-family: var(--maple-sans);
+		font-size: 16px;
+		line-height: 1.6;
+	}
+
+	/* The form column */
+	.login-pf-page {
+		position: relative;
+		z-index: 1;
+		margin-left: var(--maple-art-col) !important;
+		min-height: 100vh;
+		display: flex;
+		flex-direction: column;
+		justify-content: center;
+		padding: 40px 48px !important;
+	}
+	.login-pf-page .card-pf {
+		background: transparent !important;
+		border: 0 !important;
+		box-shadow: none !important;
+		max-width: 380px !important;
+		width: 100%;
+		padding: 0 !important;
+	}
+	#kc-page-title {
+		font-size: 1.75rem !important;
+		letter-spacing: -0.02em;
+	}
+	.login-pf-page #kc-info {
+		border-top: 0 !important;
+		margin: 20px 0 0 !important;
+		padding: 0 !important;
+	}
+}

@@ -20,6 +20,9 @@ if ! kc get realms/maple >/dev/null 2>&1; then
 	echo "realm maple created"
 fi
 
+# Users see Maple-styled sign-in pages; only the admin console keeps Keycloak's look.
+kc update realms/maple -s loginTheme=maple -s "displayName=${REALM_DISPLAY_NAME:-Maple}"
+
 # SMTP for verification and password-reset mail, parsed from SMTP_URL (smtp[s]://user:pass@host:port).
 if [ -n "${SMTP_URL:-}" ]; then
 	scheme=${SMTP_URL%%://*}; rest=${SMTP_URL#*://}
@@ -50,7 +53,7 @@ if [ -z "$(kc get users -r maple -q email="$IT_EMAIL" -q exact=true --fields id 
 	temp=$(openssl rand -base64 18)
 	# A name up front, or Keycloak stops the first sign-in at "update your profile".
 	kc create users -r maple -s username="$IT_EMAIL" -s email="$IT_EMAIL" -s enabled=true -s emailVerified=true \
-		-s firstName=IT -s "lastName=${IT_EMAIL%%@*}"
+		-s firstName=IT -s lastName=Admin
 	kc set-password -r maple --username "$IT_EMAIL" --new-password "$temp" --temporary
 	echo "IT admin $IT_EMAIL created, temporary password: $temp (must change at first sign-in)"
 fi

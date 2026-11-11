@@ -66,6 +66,9 @@ services:
       KC_HEALTH_ENABLED: "true"
       KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER}
       KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    volumes:
+      # Maple-styled sign-in, registration and password pages (selected by scripts/bootstrap.sh).
+      - ./keycloak/themes/maple:/opt/keycloak/themes/maple:ro
     depends_on:
       postgres: { condition: service_healthy }
     restart: unless-stopped

@@ -70,6 +70,19 @@ Partners' identity providers (Entra ID, Google, LDAP) can be added in the Keyclo
 console (`https://<AUTH_HOST>/admin`, user `admin`, password in `.env`). Enforce 2FA for admins
 there under *Authentication → Required actions*.
 
+## Sign-in pages
+
+People never see Keycloak's own look. `keycloak/themes/maple` restyles the sign-in, registration,
+email-verification and password pages to match Maple: same layout, colors, fonts and artwork.
+`bootstrap.sh` selects it. Only IT, in the Keycloak admin console, sees stock Keycloak.
+
+- The page titles say "Maple". Set `REALM_DISPLAY_NAME` before `bootstrap.sh` to change the browser
+  tab title, e.g. `REALM_DISPLAY_NAME=AshkarAI`.
+- After editing the theme, run `docker compose up -d --force-recreate keycloak`. Keycloak caches
+  theme files in the container, so a plain restart keeps serving the old ones.
+- The "Manage your account" page (password, 2FA, sessions) is Keycloak's separate account app and
+  keeps Keycloak's look.
+
 ## Sending telemetry
 
 Each org's ingest key is in **Settings → Ingest keys**. Point any OpenTelemetry SDK at the ingest
