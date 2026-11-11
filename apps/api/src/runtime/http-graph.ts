@@ -14,6 +14,7 @@ import { HttpAiTriageLive } from "@/routes/internal/ai-triage.http"
 import { HttpOpenRouterKeyLive } from "@/routes/internal/openrouter-key.http"
 import { HttpServiceMapWorldLive } from "@/routes/internal/service-map-world.http"
 import { HttpAuthLive, HttpAuthPublicLive, HttpAuthSessionLive } from "@/routes/auth.http"
+import { HttpDirectoryLive, HttpDirectoryPublicLive } from "@/routes/directory.http"
 import { HttpBillingLive } from "@/routes/internal/billing.http"
 import { HttpBillingPublicLive } from "@/routes/billing-public.http"
 import { HttpEmailPublicLive } from "@/routes/email-public.http"
@@ -135,6 +136,8 @@ const ApiRoutes = HttpApiBuilder.layer(MapleApi).pipe(
 	Layer.provide(HttpAuthPublicLive),
 	Layer.provide(HttpAuthLive),
 	Layer.provide(HttpAuthSessionLive),
+	Layer.provide(HttpDirectoryPublicLive),
+	Layer.provide(HttpDirectoryLive),
 	Layer.provide(HttpBillingPublicLive),
 	Layer.provide(HttpEmailPublicLive),
 	Layer.provide(ApiErrorBoundaryLive),

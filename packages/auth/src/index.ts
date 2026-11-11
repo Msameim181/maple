@@ -209,7 +209,7 @@ const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
 
 const encodeBase64Url = (value: unknown): string => Buffer.from(encodeJson(value)).toString("base64url")
 
-const verifySelfHostedSessionToken = Effect.fn("AuthService.verifySelfHostedSessionToken")(function* (
+export const verifySelfHostedSessionToken = Effect.fn("AuthService.verifySelfHostedSessionToken")(function* (
 	token: string,
 	secret: string,
 ): Effect.fn.Return<SelfHostedSessionClaims, UnauthorizedError> {
@@ -301,34 +301,58 @@ const signHs256Jwt = (payload: SelfHostedTokenClaims, secret: string): string =>
 }
 
 /**
- * The single place a self-hosted session token is minted: login and renewal both
- * go through it, so they cannot drift apart on lifetime.
+ * The single place a self-hosted session token is minted: root-password login, renewal and the
+ * OIDC directory all go through it, so they cannot drift apart on lifetime.
  *
  * `sessionExpiresAt` is the absolute deadline of the login, chosen once at login
  * and carried forward by every renewal. Clamping `exp` to it is what stops the
  * last renewal before the deadline from handing out a token that outlives it.
+ * `nowSeconds` comes from the caller's `Clock`, so a minted token verifies under the same clock.
  */
-const mintSelfHostedSessionToken = (
-	tenant: TenantContext,
-	nowSeconds: number,
-	sessionExpiresAt: number,
+export const mintSessionToken = (
+	claims: {
+		readonly sub: UserId
+		readonly orgId: OrgId
+		readonly roles: ReadonlyArray<RoleName>
+		readonly nowSeconds: number
+		readonly ttlSeconds: number
+		readonly sessionExpiresAt: number
+	},
 	secret: string,
 ): { readonly token: string; readonly expiresAt: number } => {
-	const expiresAt = Math.min(nowSeconds + SELF_HOSTED_SESSION_TTL_SECONDS, sessionExpiresAt)
+	const expiresAt = Math.min(claims.nowSeconds + claims.ttlSeconds, claims.sessionExpiresAt)
 	const token = signHs256Jwt(
 		{
-			sub: tenant.userId,
-			org_id: tenant.orgId,
-			roles: [...tenant.roles],
+			sub: claims.sub,
+			org_id: claims.orgId,
+			roles: [...claims.roles],
 			authMode: "self_hosted",
-			iat: nowSeconds,
+			iat: claims.nowSeconds,
 			exp: expiresAt,
-			session_exp: sessionExpiresAt,
+			session_exp: claims.sessionExpiresAt,
 		},
 		secret,
 	)
 	return { token, expiresAt }
 }
+
+const mintSelfHostedSessionToken = (
+	tenant: TenantContext,
+	nowSeconds: number,
+	sessionExpiresAt: number,
+	secret: string,
+): { readonly token: string; readonly expiresAt: number } =>
+	mintSessionToken(
+		{
+			sub: tenant.userId,
+			orgId: tenant.orgId,
+			roles: tenant.roles,
+			nowSeconds,
+			ttlSeconds: SELF_HOSTED_SESSION_TTL_SECONDS,
+			sessionExpiresAt,
+		},
+		secret,
+	)
 
 const constantTimeEquals = (left: string, right: string): boolean => {
 	const leftBuffer = Buffer.from(left)
@@ -501,7 +525,26 @@ export const makeLoginSelfHosted = (
  * thing standing between a token and a new one, so it does its own checking. An
  * expired token cannot be renewed; that is the point of the expiry.
  */
-export const makeRefreshSelfHostedSession = (env: Pick<AuthEnv, "MAPLE_AUTH_MODE" | "MAPLE_ROOT_PASSWORD">) =>
+/** What a renewed token carries instead of the presented token's roles and the default lifetime. */
+export interface SelfHostedSessionRenewal {
+	readonly roles: ReadonlyArray<RoleName>
+	readonly ttlSeconds: number
+}
+
+/**
+ * Re-checks a session before it is renewed (the OIDC directory re-reads membership here).
+ * Failing refuses the renewal.
+ */
+export type RenewSelfHostedSession = (claims: {
+	readonly sub: UserId
+	readonly orgId: OrgId
+	readonly roles: ReadonlyArray<RoleName>
+}) => Effect.Effect<SelfHostedSessionRenewal, UnauthorizedError>
+
+export const makeRefreshSelfHostedSession = (
+	env: Pick<AuthEnv, "MAPLE_AUTH_MODE" | "MAPLE_ROOT_PASSWORD">,
+	renew?: RenewSelfHostedSession,
+) =>
 	Effect.fn("AuthService.refreshSelfHostedSession")(function* (
 		token: string,
 	): Effect.fn.Return<SelfHostedLoginResponse, SelfHostedAuthDisabledError | UnauthorizedError> {
@@ -521,15 +564,19 @@ export const makeRefreshSelfHostedSession = (env: Pick<AuthEnv, "MAPLE_AUTH_MODE
 		// against it. That is the rollout path: legacy sessions renew until they
 		// hit the cap, then the operator logs in again.
 		const sessionExpiresAt = claims.session_exp ?? claims.iat + SELF_HOSTED_SESSION_MAX_LIFETIME_SECONDS
-		const renewed = mintSelfHostedSessionToken(
+		const renewal =
+			renew === undefined
+				? { roles: claims.roles, ttlSeconds: SELF_HOSTED_SESSION_TTL_SECONDS }
+				: yield* renew({ sub: claims.sub, orgId: claims.org_id, roles: claims.roles })
+		const renewed = mintSessionToken(
 			{
+				sub: claims.sub,
 				orgId: claims.org_id,
-				userId: claims.sub,
-				roles: claims.roles,
-				authMode: claims.authMode,
+				roles: renewal.roles,
+				nowSeconds: now,
+				ttlSeconds: renewal.ttlSeconds,
+				sessionExpiresAt,
 			},
-			now,
-			sessionExpiresAt,
 			rootPassword,
 		)
 

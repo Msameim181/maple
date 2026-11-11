@@ -19,6 +19,8 @@ import {
 import { Context, Effect, Layer, Option } from "effect"
 import { Env } from "@maple/backend/platform/Env"
 import { OrgMembershipService } from "@maple/backend/services/auth/OrgMembershipService"
+import { Database } from "@maple/backend/platform/DatabaseLive"
+import { makeDirectoryRenewal, oidcEnabled } from "@maple/backend/services/directory/DirectoryService"
 
 // The pure tenant-resolution + self-hosted login primitives live in the shared
 // `@maple/auth` package (consumed by apps/api AND the standalone
@@ -77,7 +79,14 @@ export class AuthService extends Context.Service<AuthService, AuthServiceApi>()(
 			const resolveTenant = makeResolveTenant(env, undefined, undefined, verifyOrgMembership)
 			const resolveMcpTenant = makeResolveMcpTenant(env)
 			const loginSelfHosted = makeLoginSelfHosted(env)
-			const refreshSelfHostedSession = makeRefreshSelfHostedSession(env)
+			// With OIDC on, renewal re-reads directory membership (root-password sessions are exempt).
+			// The database is optional so hosts that never renew (maple-ai, tests) still build; without
+			// it an OIDC member's renewal fails closed.
+			const database = yield* Effect.serviceOption(Database)
+			const refreshSelfHostedSession = makeRefreshSelfHostedSession(
+				env,
+				oidcEnabled(env) ? makeDirectoryRenewal(database) : undefined,
+			)
 			const getUserEmail = makeGetUserEmail(env)
 			const getVerifiedPrimaryEmail = makeGetVerifiedPrimaryEmail(env)
 			const getCustomerData = makeGetCustomerData(env)

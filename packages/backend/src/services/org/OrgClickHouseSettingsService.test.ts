@@ -111,6 +111,25 @@ describe("validateClickHouseCredentialTransport", () => {
 		}),
 	)
 
+	it.effect("allows a password over HTTP only to the trusted self-hosted origin", () =>
+		Effect.gen(function* () {
+			const trusted = "http://clickhouse:8123"
+			yield* validateClickHouseCredentialTransport("http://clickhouse:8123/", "secret", trusted)
+			const elsewhere = yield* validateClickHouseCredentialTransport(
+				"http://clickhouse.example.test:8123",
+				"secret",
+				trusted,
+			).pipe(Effect.exit)
+			expect(getError(elsewhere)).toBeInstanceOf(OrgClickHouseSettingsValidationError)
+			const otherPort = yield* validateClickHouseCredentialTransport(
+				"http://clickhouse:9000",
+				"secret",
+				trusted,
+			).pipe(Effect.exit)
+			expect(getError(otherPort)).toBeInstanceOf(OrgClickHouseSettingsValidationError)
+		}),
+	)
+
 	it.effect("rejects URL-embedded userinfo even without a separate password", () =>
 		Effect.gen(function* () {
 			const exit = yield* validateClickHouseCredentialTransport(

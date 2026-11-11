@@ -245,6 +245,8 @@ export const mapleServerEnv = (
 		selfObservabilityEnv(stage, region),
 		// Dev-only; the runtime ignores it outside MAPLE_ENVIRONMENT=development.
 		optionalPlain("MAPLE_IGNORE_ORG_CLICKHOUSE"),
+		// Self-hosted only: every Worker reading an org's BYO ClickHouse trusts plain HTTP to this origin.
+		optionalPlain("MAPLE_SELFHOST_CLICKHOUSE_URL"),
 		// Without it billing and the BYOK entitlement fail open.
 		optionalSecret("AUTUMN_SECRET_KEY"),
 		optionalSecret("INTERNAL_SERVICE_TOKEN"),

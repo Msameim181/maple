@@ -221,6 +221,20 @@ export interface EnvConfig {
 	readonly SUPABASE_OAUTH_CLIENT_SECRET: Option.Option<Redacted.Redacted>
 	/** Base URL for the Supabase Management API, OAuth endpoints included (overridable for tests). */
 	readonly MAPLE_SUPABASE_API_BASE_URL: string
+	/**
+	 * Self-hosted OIDC sign-in (the directory, `services/directory`). Enabled iff the token URL and
+	 * client id are both set; unset, every directory endpoint answers `DirectoryDisabledError`.
+	 */
+	readonly MAPLE_OIDC_AUTHORIZE_URL: Option.Option<string>
+	readonly MAPLE_OIDC_TOKEN_URL: Option.Option<string>
+	readonly MAPLE_OIDC_CLIENT_ID: Option.Option<string>
+	readonly MAPLE_OIDC_ACCOUNT_URL: Option.Option<string>
+	/** The IdP role (realm or client) that marks IT staff, who get Maple's `root`. */
+	readonly MAPLE_OIDC_ROOT_ROLE: string
+	/** The self-hosted ClickHouse each directory org gets its own database and user on. */
+	readonly MAPLE_SELFHOST_CLICKHOUSE_URL: Option.Option<string>
+	readonly MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: Option.Option<string>
+	readonly MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: Option.Option<Redacted.Redacted>
 }
 
 const portConfig = Config.Number("PORT").pipe(Config.withDefault(3472))
@@ -391,6 +405,14 @@ const envConfig = Config.all({
 	SUPABASE_OAUTH_CLIENT_ID: optionalString("SUPABASE_OAUTH_CLIENT_ID"),
 	SUPABASE_OAUTH_CLIENT_SECRET: optionalRedacted("SUPABASE_OAUTH_CLIENT_SECRET"),
 	MAPLE_SUPABASE_API_BASE_URL: stringWithDefault("MAPLE_SUPABASE_API_BASE_URL", "https://api.supabase.com"),
+	MAPLE_OIDC_AUTHORIZE_URL: optionalString("MAPLE_OIDC_AUTHORIZE_URL"),
+	MAPLE_OIDC_TOKEN_URL: optionalString("MAPLE_OIDC_TOKEN_URL"),
+	MAPLE_OIDC_CLIENT_ID: optionalString("MAPLE_OIDC_CLIENT_ID"),
+	MAPLE_OIDC_ACCOUNT_URL: optionalString("MAPLE_OIDC_ACCOUNT_URL"),
+	MAPLE_OIDC_ROOT_ROLE: stringWithDefault("MAPLE_OIDC_ROOT_ROLE", "maple-root"),
+	MAPLE_SELFHOST_CLICKHOUSE_URL: optionalString("MAPLE_SELFHOST_CLICKHOUSE_URL"),
+	MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: optionalString("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER"),
+	MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: optionalRedacted("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD"),
 })
 
 const makeEnv = Effect.gen(function* () {

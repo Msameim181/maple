@@ -593,9 +593,14 @@ const normalizeHttpUrl = (raw: string): Effect.Effect<string, OrgClickHouseSetti
 		),
 	)
 
+/**
+ * `trustedHttpOrigin` is the self-hosted ClickHouse (`MAPLE_SELFHOST_CLICKHOUSE_URL`): a private
+ * network the operator owns, so plain `http:` with a password is allowed to that origin only.
+ */
 export const validateClickHouseCredentialTransport = (
 	url: string,
 	password: string,
+	trustedHttpOrigin?: string,
 ): Effect.Effect<void, OrgClickHouseSettingsValidationError> =>
 	Effect.try({
 		try: () => new URL(url),
@@ -617,7 +622,7 @@ export const validateClickHouseCredentialTransport = (
 					}),
 				)
 			}
-			return password.length > 0 && parsed.protocol !== "https:"
+			return password.length > 0 && parsed.protocol !== "https:" && parsed.origin !== trustedHttpOrigin
 				? Effect.fail(
 						new OrgClickHouseSettingsValidationError({
 							message: "ClickHouse URLs must use HTTPS when a password is configured",
@@ -915,6 +920,10 @@ export class OrgClickHouseSettingsService extends Context.Service<
 		const database = yield* Database
 		const dbExecute = makeDbExecute(database, "OrgClickHouseSettingsService", toPersistenceError)
 		const env = yield* Env
+		const trustedHttpOrigin = Option.match(env.MAPLE_SELFHOST_CLICKHOUSE_URL, {
+			onNone: () => undefined,
+			onSome: (raw) => (URL.canParse(raw) ? new URL(raw).origin : undefined),
+		})
 		const httpClient = yield* HttpClient.HttpClient
 		const keyring = yield* secretKeyringFromEnv(env, toEncryptionError)
 		// Dev-only way past a per-org BYO row; the environment gate keeps it off deploys.
@@ -1106,7 +1115,7 @@ export class OrgClickHouseSettingsService extends Context.Service<
 				}
 				plainPassword = yield* decryptStoredPassword(existing.orgId, existing)
 			}
-			yield* validateClickHouseCredentialTransport(url, plainPassword)
+			yield* validateClickHouseCredentialTransport(url, plainPassword, trustedHttpOrigin)
 
 			// Connect-and-validate: hit the cluster with `SELECT 1` so a typo'd
 			// host or token surfaces here rather than after the user closes the
@@ -1186,7 +1195,7 @@ export class OrgClickHouseSettingsService extends Context.Service<
 		const loadConfigForRow = (row: ActiveRow) =>
 			Effect.gen(function* () {
 				const password = yield* decryptStoredPassword(row.orgId, row)
-				yield* validateClickHouseCredentialTransport(row.chUrl, password)
+				yield* validateClickHouseCredentialTransport(row.chUrl, password, trustedHttpOrigin)
 				return {
 					url: row.chUrl,
 					user: row.chUser,
@@ -1756,7 +1765,11 @@ export class OrgClickHouseSettingsService extends Context.Service<
 					return Option.none<RuntimeBackendConfig>()
 				}
 				const { settings, password } = opened
-				yield* validateClickHouseCredentialTransport(settings.chUrl, password).pipe(
+				yield* validateClickHouseCredentialTransport(
+					settings.chUrl,
+					password,
+					trustedHttpOrigin,
+				).pipe(
 					Effect.mapError(
 						(cause) =>
 							new OrgClickHouseSettingsStoredConfigInvalidError({
@@ -1814,7 +1827,7 @@ export class OrgClickHouseSettingsService extends Context.Service<
 			yield* requireAdmin(roles)
 			const row = yield* requireActiveRow(orgId)
 			const password = yield* decryptStoredPassword(row.orgId, row)
-			yield* validateClickHouseCredentialTransport(row.chUrl, password)
+			yield* validateClickHouseCredentialTransport(row.chUrl, password, trustedHttpOrigin)
 			const yaml = renderCollectorYaml({
 				orgId,
 				endpoint: row.chUrl,

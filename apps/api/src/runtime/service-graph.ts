@@ -20,6 +20,7 @@ import { AnomalyDetectionService } from "@maple/backend/services/alerts/AnomalyD
 
 import { PlanetScaleOAuthService } from "@maple/backend/services/auth/PlanetScaleOAuthService"
 import { AuthService } from "@maple/backend/services/auth/AuthService"
+import { DirectoryService } from "@maple/backend/services/directory/DirectoryService"
 import { CliDeviceAuthService } from "@maple/backend/services/auth/CliDeviceAuthService"
 import { CloudflareOAuthService } from "@maple/backend/services/auth/CloudflareOAuthService"
 import { LinearOAuthService } from "@maple/backend/services/auth/LinearOAuthService"
@@ -124,6 +125,8 @@ export const HttpServicesLive = Layer.mergeAll(
 	PlanetScaleOAuthService.layer,
 	VcsSyncQueue.layer,
 	AuthService.layer,
+	// The self-hosted OIDC directory; every endpoint answers DirectoryDisabledError until MAPLE_OIDC_* is set.
+	DirectoryService.layer,
 	ApiKeysService.layer,
 	CliDeviceAuthService.layer,
 	McpOAuthService.layer,

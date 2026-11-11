@@ -64,4 +64,12 @@ export const apiConfiguredEnv = (stage: MapleStage, region: MapleRegion, domains
 		planetScaleOAuthEnv,
 		supabaseOAuthEnv,
 		optionalPlain("MAPLE_GCP_SERVICE_ACCOUNT_EMAIL"),
+		// Self-hosted OIDC directory and its per-org ClickHouse provisioning; all unset upstream.
+		optionalPlain("MAPLE_OIDC_AUTHORIZE_URL"),
+		optionalPlain("MAPLE_OIDC_TOKEN_URL"),
+		optionalPlain("MAPLE_OIDC_CLIENT_ID"),
+		optionalPlain("MAPLE_OIDC_ACCOUNT_URL"),
+		optionalPlain("MAPLE_OIDC_ROOT_ROLE"),
+		optionalPlain("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER"),
+		optionalSecret("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD"),
 	)
