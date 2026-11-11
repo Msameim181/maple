@@ -3776,7 +3776,10 @@ impl ExportWorker {
                     return Ok(ClickHouseExportOutcome::Dropped);
                 }
             };
-            if !target.password.is_empty() && request_url.scheme() != "https" {
+            if !target.password.is_empty()
+                && request_url.scheme() != "https"
+                && !is_selfhost_plaintext_clickhouse(&request_url)
+            {
                 span.record("maple.ingest.outcome", "dropped");
                 record_stage_error(
                     &span,
@@ -9497,4 +9500,20 @@ mod tests {
             assert_eq!(histogram["explicit_bounds"], serde_json::json!([0.1]));
         }
     }
+}
+
+/// Self-hosted deployments (deploy/docker) reach their own ClickHouse over the private compose
+/// network as plain http. Only that exact origin, named by `MAPLE_SELFHOST_CLICKHOUSE_URL`, is
+/// exempt from the https-with-password rule.
+pub fn is_trusted_plaintext_clickhouse(endpoint: &url::Url, trusted: Option<&str>) -> bool {
+    trusted
+        .and_then(|value| url::Url::parse(value.trim()).ok())
+        .is_some_and(|trusted| trusted.origin() == endpoint.origin())
+}
+
+pub fn is_selfhost_plaintext_clickhouse(endpoint: &url::Url) -> bool {
+    is_trusted_plaintext_clickhouse(
+        endpoint,
+        std::env::var("MAPLE_SELFHOST_CLICKHOUSE_URL").ok().as_deref(),
+    )
 }

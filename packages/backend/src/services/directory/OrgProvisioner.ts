@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto"
 import * as PG from "@maple-dev/effect-orm/postgres"
-import { DirectoryOrgs } from "@maple/db/tables"
+import { DirectoryOrgs, OrgClickHouseSchemaApplyRuns } from "@maple/db/tables"
 import {
 	DIRECTORY_ORG_ID_PATTERN,
 	DirectoryPersistenceError,
@@ -161,6 +161,10 @@ export class OrgProvisioner extends Context.Service<OrgProvisioner, OrgProvision
 				yield* organizations.delete(orgId, ROOT_ROLES).pipe(Effect.mapError(persistence))
 				yield* admin.exec(`DROP DATABASE IF EXISTS \`${name}\``)
 				yield* admin.exec(`DROP USER IF EXISTS \`${name}\``)
+				// The org purge keeps schema-apply history; a re-created id must not inherit a stale run.
+				yield* dbExecute((db) =>
+					db.run(PG.deleteFrom(OrgClickHouseSchemaApplyRuns).where(($) => [$.orgId.eq(orgId)])),
+				)
 				yield* dbExecute((db) => db.run(PG.deleteFrom(DirectoryOrgs).where(($) => [$.id.eq(orgId)])))
 			})
 

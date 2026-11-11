@@ -196,6 +196,15 @@ describe("OrgProvisioner", () => {
 					),
 				)
 				assert.strictEqual(invitations?.n, 0)
+				// A stale schema-apply run would block the re-created org's first apply.
+				const applyRuns = yield* Effect.promise(() =>
+					queryFirstRow<{ n: number }>(
+						testDb,
+						"SELECT count(*)::int AS n FROM org_clickhouse_schema_apply_runs WHERE org_id = $1",
+						[ACME],
+					),
+				)
+				assert.strictEqual(applyRuns?.n, 0)
 
 				const recreated = yield* createAcme
 				assert.strictEqual(recreated.status, "active")

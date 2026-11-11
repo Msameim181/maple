@@ -17,6 +17,9 @@ database. Design: [`docs/superpowers/specs/2026-11-11-selfhost-multitenant-desig
 ## Requirements
 
 - Linux, 8 vCPU / 16 GB RAM / 200 GB SSD for a few dozen orgs. Docker 24+, Compose v2.20+.
+  The `maple` container alone holds about 5 GB of RAM: alchemy's local runtime keeps an incremental
+  build of every Worker in memory. ClickHouse and Keycloak need another 1.5 GB. Below 12 GB the
+  kernel's OOM killer stops the runtime under load. Images need about 8 GB of disk.
 - Five DNS names pointing at the server (app, api, sync, auth, ingest). Ports 80 and 443 open.
 - An SMTP server for verification, password reset, invitation and alert mail.
 
@@ -101,6 +104,13 @@ Requests without a valid key are rejected, so the ingest host can be public.
 - **Moving an org to its own server later:** deploy this same stack there and copy the org's
   Postgres rows and its `org_<id>` ClickHouse database. The org id, users (Keycloak `sub`) and
   keys stay the same.
+
+## Known log noise
+
+- `alerting: errorActiveOrgsDiscovery failed … Tinybird HTTP transport failed`. Error-issue
+  discovery first scans a shared warehouse this deployment doesn't have. It then falls back to
+  the orgs with their own ClickHouse, which is every org here, so nothing is missed.
+- `Alerting colo lookup failed`: a Cloudflare-edge lookup with no meaning off Cloudflare.
 
 ## Not available in this deployment
 

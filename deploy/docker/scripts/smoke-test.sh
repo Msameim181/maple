@@ -46,9 +46,18 @@ wait_schema org_smoke_a && wait_schema org_smoke_b && pass "per-org ClickHouse s
 key_a=$(ingest_key smoke-a); key_b=$(ingest_key smoke-b)
 [ -n "$key_a" ] && [ -n "$key_b" ] && [ "$key_a" != "$key_b" ] && pass "distinct ingest keys" || fail "ingest keys"
 
-send_span "$key_a" smoke-svc-a; send_span "$key_b" smoke-svc-b
-wait_count org_smoke_a smoke-svc-a 1 && pass "org A span stored in org A" || fail "org A span"
-wait_count org_smoke_b smoke-svc-b 1 && pass "org B span stored in org B" || fail "org B span"
+# A new org's ingest route turns ready once its schema row is marked connected, and the gateway
+# caches readiness for up to a minute; until then it answers 503, which OTLP exporters retry.
+deliver() { # $1 key, $2 service, $3 db: send until the span lands, like an exporter retrying
+	for _ in $(seq 1 30); do
+		send_span "$1" "$2" 2>/dev/null || true
+		[ "$(count "$3" "$2")" -ge 1 ] && return 0
+		sleep 4
+	done
+	return 1
+}
+deliver "$key_a" smoke-svc-a org_smoke_a && pass "org A span stored in org A" || fail "org A span"
+deliver "$key_b" smoke-svc-b org_smoke_b && pass "org B span stored in org B" || fail "org B span"
 [ "$(count org_smoke_a smoke-svc-b)" = 0 ] && [ "$(count org_smoke_b smoke-svc-a)" = 0 ] \
 	&& pass "no cross-org rows" || fail "cross-org leak"
 
