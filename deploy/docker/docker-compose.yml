@@ -1,0 +1,151 @@
+# Self-hosted, multi-tenant Maple. See deploy/docker/README.md.
+name: maple
+
+x-maple-env: &maple-env
+  MAPLE_PG_URL: postgres://maple:${POSTGRES_PASSWORD}@postgres:5432/maple?sslmode=disable
+  MAPLE_ENVIRONMENT: selfhost
+  MAPLE_ROOT_PASSWORD: ${MAPLE_ROOT_PASSWORD}
+  MAPLE_DEFAULT_ORG_ID: default
+  MAPLE_INGEST_KEY_ENCRYPTION_KEY: ${MAPLE_INGEST_KEY_ENCRYPTION_KEY}
+  MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY: ${MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY}
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    command: ["postgres", "-c", "wal_level=logical"]
+    environment:
+      POSTGRES_USER: maple
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: maple
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maple -d maple"]
+      interval: 5s
+      retries: 20
+    restart: unless-stopped
+
+  electric:
+    image: electricsql/electric:latest
+    environment:
+      DATABASE_URL: postgres://maple:${POSTGRES_PASSWORD}@postgres:5432/maple?sslmode=disable
+      ELECTRIC_INSECURE: "true" # internal network only; electric-sync authenticates every shape
+      ELECTRIC_MANUAL_TABLE_PUBLISHING: "true"
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.8
+    environment:
+      CLICKHOUSE_USER: admin
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" # lets Maple create one database + user per org
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4
+    command: ["start"]
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: maple
+      KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+      KC_HOSTNAME: https://${AUTH_HOST}
+      KC_HTTP_ENABLED: "true"
+      KC_PROXY_HEADERS: xforwarded
+      KC_HEALTH_ENABLED: "true"
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KEYCLOAK_ADMIN_USER}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD}
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: unless-stopped
+
+  ingest:
+    build: ../../apps/ingest
+    environment:
+      <<: *maple-env
+      INGEST_KEY_STORE_BACKEND: postgres
+      INGEST_QUEUE_DIR: /data/wal
+    volumes:
+      - ingest-wal:/data/wal
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+    restart: unless-stopped
+
+  maple:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: maple
+    environment:
+      <<: *maple-env
+      ELECTRIC_URL: http://electric:3000
+      MAPLE_API_BASE_URL: https://${API_HOST}
+      MAPLE_APP_BASE_URL: https://${APP_HOST}
+      MAPLE_ELECTRIC_SYNC_URL: https://${SYNC_HOST}
+      MAPLE_INGEST_URL: https://${INGEST_HOST}
+      MAPLE_SHARE_TOKEN_HMAC_KEY: ${MAPLE_SHARE_TOKEN_HMAC_KEY}
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN}
+      SANDBOX_INTERNAL_SERVICE_TOKEN: ${SANDBOX_INTERNAL_SERVICE_TOKEN}
+      # The shared warehouse is never used: every org gets its own ClickHouse database below.
+      TINYBIRD_HOST: http://unused.invalid
+      TINYBIRD_TOKEN: unused
+      MAPLE_SELFHOST_CLICKHOUSE_URL: http://clickhouse:8123
+      MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: admin
+      MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
+      MAPLE_OIDC_AUTHORIZE_URL: https://${AUTH_HOST}/realms/maple/protocol/openid-connect/auth
+      MAPLE_OIDC_TOKEN_URL: http://keycloak:8080/realms/maple/protocol/openid-connect/token
+      MAPLE_OIDC_CLIENT_ID: maple-web
+      MAPLE_OIDC_ACCOUNT_URL: https://${AUTH_HOST}/realms/maple/account
+      EMAIL_FROM: ${EMAIL_FROM}
+      SMTP_URL: ${SMTP_URL}
+      SMTP_FROM: ${EMAIL_FROM}
+    volumes:
+      - maple-state:/app/.alchemy
+    depends_on:
+      postgres: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+      electric: { condition: service_started }
+    restart: unless-stopped
+
+  caddy:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: caddy
+      args:
+        PUBLIC_API_URL: https://${API_HOST}
+        PUBLIC_SYNC_URL: https://${SYNC_HOST}
+        PUBLIC_INGEST_URL: https://${INGEST_HOST}
+    environment:
+      ACME_EMAIL: ${ACME_EMAIL}
+      APP_HOST: ${APP_HOST}
+      API_HOST: ${API_HOST}
+      SYNC_HOST: ${SYNC_HOST}
+      AUTH_HOST: ${AUTH_HOST}
+      INGEST_HOST: ${INGEST_HOST}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+    depends_on: [maple, keycloak, ingest]
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  clickhouse-data:
+  maple-state:
+  ingest-wal:
+  caddy-data:

@@ -14,3 +14,6 @@ apps/api/.data/**
 **/.env.*
 !.env.example
 !**/.env.example
+.alchemy
+**/.alchemy
+**/dist

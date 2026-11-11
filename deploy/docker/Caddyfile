@@ -1,0 +1,32 @@
+# TLS edge. Public hostnames come from .env; Caddy gets Let's Encrypt certificates for them
+# (or local CA certificates for *.localhost when testing on one machine).
+{
+	email {$ACME_EMAIL}
+}
+
+{$APP_HOST} {
+	encode zstd gzip
+	root * /srv/web
+	try_files {path} /index.html
+	file_server
+}
+
+{$API_HOST} {
+	reverse_proxy maple:8701
+}
+
+{$SYNC_HOST} {
+	# Electric shapes are long polls; stream them unbuffered.
+	reverse_proxy maple:8705 {
+		flush_interval -1
+	}
+}
+
+{$AUTH_HOST} {
+	reverse_proxy keycloak:8080
+}
+
+# OTLP/HTTP from your apps, authenticated per org by ingest key.
+{$INGEST_HOST} {
+	reverse_proxy ingest:3474
+}

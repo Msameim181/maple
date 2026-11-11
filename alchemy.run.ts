@@ -90,12 +90,48 @@ const isDevServer = process.env.ALCHEMY_DEV === "true"
 /** The apps this dev run serves; undefined on a deploy, which is never partial. */
 const devApps = isDevServer ? selectedDevApps() : undefined
 
+/**
+ * `MAPLE_SELFHOST=1`: the Docker deployment in deploy/docker, which runs this stack on alchemy's
+ * local runtime. No AWS or portless; Workers listen on fixed ports, public URLs come from env.
+ */
+const isSelfhost = isDevServer && process.env.MAPLE_SELFHOST === "1"
+
+const SELFHOST_PORTS: Partial<Record<DevApp, number>> = {
+	api: 8701,
+	ai: 8702,
+	alerting: 8703,
+	"chat-bot": 8704,
+	"electric-sync": 8705,
+	status: 8706,
+}
+
+const selfhostWorkerDev = (app: DevApp): Portless.WorkerDev =>
+	SELFHOST_PORTS[app] === undefined
+		? Portless.workerUnserved
+		: { host: "0.0.0.0", port: SELFHOST_PORTS[app], strictPort: true }
+
 /** Every resource is declared on every run; a subset run only leaves the others unserved. */
 const workerDev = (app: DevApp) =>
-	devApps === undefined ? undefined : devApps.has(app) ? Portless.workerDev(app) : Portless.workerUnserved
+	devApps === undefined
+		? undefined
+		: !devApps.has(app)
+			? Portless.workerUnserved
+			: isSelfhost
+				? selfhostWorkerDev(app)
+				: Portless.workerDev(app)
+
+const selfhostEnv = (key: string) => process.env[key] ?? ""
 
 /** Inter-app URLs handed to the Workers as env, so `.env.local` cannot override them. */
-const devEnv = devApps
+const devEnv = isSelfhost
+	? {
+			MAPLE_API_BASE_URL: selfhostEnv("MAPLE_API_BASE_URL"),
+			MAPLE_APP_BASE_URL: selfhostEnv("MAPLE_APP_BASE_URL"),
+			MAPLE_ELECTRIC_SYNC_URL: selfhostEnv("MAPLE_ELECTRIC_SYNC_URL"),
+			MAPLE_INGEST_URL: selfhostEnv("MAPLE_INGEST_URL"),
+			MAPLE_STATUS_PAGE_BASE_URL: selfhostEnv("MAPLE_STATUS_PAGE_BASE_URL"),
+		}
+	: devApps
 	? {
 			MAPLE_API_BASE_URL: Portless.routeUrl("api"),
 			MAPLE_APP_BASE_URL: Portless.routeUrl("web"),
@@ -254,7 +290,7 @@ const MapleStackLive = Layer.effect(
 )
 
 const serveWorker = (app: DevApp, worker: Cloudflare.Worker) =>
-	devApps?.has(app)
+	!isSelfhost && devApps?.has(app)
 		? Effect.asVoid(Portless.Route(`${app}-route`, { name: app, port: Portless.workerPort(worker.url) }))
 		: Effect.void
 
@@ -276,9 +312,10 @@ const createDevProcess = (app: DevApp, route: Portless.Route) =>
 	})
 
 /** Both clouds, unconditionally: stack options are evaluated before the stage is readable. */
-const providers =
-	// `Acm.providers` needs the AWS credentials, so it is the layer provided TO.
-	Acm.providers.pipe(
+const providers = isSelfhost
+	? Cloudflare.providers()
+	: // `Acm.providers` needs the AWS credentials, so it is the layer provided TO.
+		Acm.providers.pipe(
 		Layer.provideMerge(Cloudflare.providers()),
 		Layer.provideMerge(AWS.providers()),
 		// Its credential lookup runs when the layer is built, and `bun dev` never yields the branch.
@@ -382,8 +419,9 @@ export default Alchemy.Stack(
 		yield* serveWorker("status", statusWorker)
 
 		// A vite-source Worker: alchemy owns its build and dev server. Binds api as `API`.
-		const web = yield* Effect.provideService(Web, ApiWorker, api)
-		yield* serveWorker("web", web)
+		// Self-hosted serves web as a static build (deploy/docker), so no vite dev server.
+		const web = isSelfhost ? undefined : yield* Effect.provideService(Web, ApiWorker, api)
+		if (web) yield* serveWorker("web", web)
 
 		// StaticSites run their production build even on `alchemy dev`, so dev uses
 		// `DEV_PROCESS_APPS` instead. Shared across instances: deployed by `us` alone.
