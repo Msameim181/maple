@@ -1,5 +1,5 @@
 # Self-hosted, multi-tenant Maple. See deploy/docker/README.md.
-name: maple
+name: maple-selfhost
 
 x-maple-env: &maple-env
   MAPLE_PG_URL: postgres://maple:${POSTGRES_PASSWORD}@postgres:5432/maple?sslmode=disable
@@ -76,6 +76,10 @@ services:
       <<: *maple-env
       INGEST_KEY_STORE_BACKEND: postgres
       INGEST_QUEUE_DIR: /data/wal
+      MAPLE_INTERNAL_ORG_ID: maple-internal # attribution for the gateway's own telemetry
+      # Every org has its own ClickHouse (org_clickhouse_settings), which the gateway writes to
+      # directly in any mode; `forward` just avoids requiring Tinybird for orgs without one.
+      INGEST_WRITE_MODE: forward
     volumes:
       - ingest-wal:/data/wal
     depends_on:
