@@ -23,6 +23,9 @@ database. Design: [`docs/superpowers/specs/2026-11-11-selfhost-multitenant-desig
 - Five DNS names pointing at the server (app, api, sync, auth, ingest). Ports 80 and 443 open.
 - An SMTP server for verification, password reset, invitation and alert mail.
 
+Already running Nginx or Caddy on the server? See [`proxy/README.md`](proxy/README.md).
+The default below runs Caddy inside Docker.
+
 ## Install
 
 ```bash

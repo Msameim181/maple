@@ -1,0 +1,31 @@
+# For a Caddy installed on the server itself (apt/dnf/brew), with the stack started using
+# docker-compose.host-proxy.yml. Replace the five hostnames, then:
+#   sudo cp Caddyfile.host /etc/caddy/Caddyfile   (or `import` it from your existing Caddyfile)
+#   sudo systemctl reload caddy
+# Caddy obtains and renews the Let's Encrypt certificates itself.
+
+maple.example.com {
+	reverse_proxy 127.0.0.1:8780
+}
+
+api.maple.example.com {
+	reverse_proxy 127.0.0.1:8701
+}
+
+sync.maple.example.com {
+	# Electric shapes are long polls; stream them unbuffered.
+	reverse_proxy 127.0.0.1:8705 {
+		flush_interval -1
+	}
+}
+
+auth.maple.example.com {
+	reverse_proxy 127.0.0.1:8080
+}
+
+ingest.maple.example.com {
+	request_body {
+		max_size 20MB
+	}
+	reverse_proxy 127.0.0.1:3474
+}

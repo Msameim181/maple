@@ -1,0 +1,12 @@
+# Host-proxy mode: the bundled Caddy only serves the dashboard's static build on :80 (bound to
+# 127.0.0.1 by docker-compose.host-proxy.yml). TLS is the host proxy's job.
+{
+	auto_https off
+}
+
+:80 {
+	encode zstd gzip
+	root * /srv/web
+	try_files {path} /index.html
+	file_server
+}

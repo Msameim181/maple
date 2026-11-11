@@ -1,0 +1,23 @@
+# Use when the server already runs Nginx or Caddy as a system service (see proxy/README.md).
+# The bundled Caddy then only serves the dashboard on loopback, and every service is published
+# on 127.0.0.1 for the host proxy, which owns ports 80/443 and the TLS certificates:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.host-proxy.yml up -d
+#
+# Requires Docker Compose v2.24+ (the !override tag).
+services:
+  caddy:
+    ports: !override
+      - "127.0.0.1:${WEB_PORT:-8780}:80"
+    volumes:
+      - ./proxy/caddy/Caddyfile.web:/etc/caddy/Caddyfile:ro
+  maple:
+    ports:
+      - "127.0.0.1:${API_PORT:-8701}:8701" # api
+      - "127.0.0.1:${SYNC_PORT:-8705}:8705" # electric-sync
+  keycloak:
+    ports:
+      - "127.0.0.1:${AUTH_PORT:-8080}:8080"
+  ingest:
+    ports:
+      - "127.0.0.1:${INGEST_PORT:-3474}:3474"

@@ -1,0 +1,122 @@
+# For an Nginx installed on the server itself, with the stack started using
+# docker-compose.host-proxy.yml. Render it with your hostnames (see proxy/README.md):
+#   envsubst '$APP_HOST $API_HOST $SYNC_HOST $AUTH_HOST $INGEST_HOST' \
+#     < maple.conf.template | sudo tee /etc/nginx/conf.d/maple.conf
+# One certificate covers all five names: /etc/letsencrypt/live/${APP_HOST}/.
+
+map $http_upgrade $maple_connection_upgrade {
+	default upgrade;
+	''      close;
+}
+
+# Plain HTTP only redirects (and answers Let's Encrypt's HTTP-01 challenges).
+server {
+	listen 80;
+	listen [::]:80;
+	server_name ${APP_HOST} ${API_HOST} ${SYNC_HOST} ${AUTH_HOST} ${INGEST_HOST};
+	location /.well-known/acme-challenge/ { root /var/www/html; }
+	location / { return 301 https://$host$request_uri; }
+}
+
+
+server {
+	listen 443 ssl;
+	listen [::]:443 ssl;
+	http2 on;
+	server_name ${APP_HOST};
+	ssl_certificate     /etc/letsencrypt/live/${APP_HOST}/fullchain.pem;
+	ssl_certificate_key /etc/letsencrypt/live/${APP_HOST}/privkey.pem;
+
+	location / {
+		proxy_pass http://127.0.0.1:8780;
+		proxy_set_header Host $host;
+		proxy_set_header X-Forwarded-Proto $scheme;
+	}
+}
+
+server {
+	listen 443 ssl;
+	listen [::]:443 ssl;
+	http2 on;
+	server_name ${API_HOST};
+	ssl_certificate     /etc/letsencrypt/live/${APP_HOST}/fullchain.pem;
+	ssl_certificate_key /etc/letsencrypt/live/${APP_HOST}/privkey.pem;
+	client_max_body_size 20m;
+
+	location / {
+		proxy_pass http://127.0.0.1:8701;
+		proxy_http_version 1.1;
+		proxy_set_header Host $host;
+		proxy_set_header X-Real-IP $remote_addr;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+		proxy_set_header X-Forwarded-Proto $scheme;
+		# Chat and MCP stream responses.
+		proxy_set_header Upgrade $http_upgrade;
+		proxy_set_header Connection $maple_connection_upgrade;
+		proxy_buffering off;
+		proxy_read_timeout 300s;
+	}
+}
+
+server {
+	listen 443 ssl;
+	listen [::]:443 ssl;
+	http2 on;
+	server_name ${SYNC_HOST};
+	ssl_certificate     /etc/letsencrypt/live/${APP_HOST}/fullchain.pem;
+	ssl_certificate_key /etc/letsencrypt/live/${APP_HOST}/privkey.pem;
+
+	location / {
+		proxy_pass http://127.0.0.1:8705;
+		proxy_http_version 1.1;
+		proxy_set_header Host $host;
+		proxy_set_header X-Forwarded-Proto $scheme;
+		# Electric shapes are long polls: never buffer, allow minutes per request.
+		proxy_buffering off;
+		proxy_cache off;
+		proxy_read_timeout 300s;
+	}
+}
+
+server {
+	listen 443 ssl;
+	listen [::]:443 ssl;
+	http2 on;
+	server_name ${AUTH_HOST};
+	ssl_certificate     /etc/letsencrypt/live/${APP_HOST}/fullchain.pem;
+	ssl_certificate_key /etc/letsencrypt/live/${APP_HOST}/privkey.pem;
+
+	location / {
+		proxy_pass http://127.0.0.1:8080;
+		proxy_set_header Host $host;
+		proxy_set_header X-Real-IP $remote_addr;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+		proxy_set_header X-Forwarded-Proto $scheme;
+		proxy_set_header X-Forwarded-Host $host;
+		proxy_set_header X-Forwarded-Port 443;
+		# Keycloak's login pages set large cookies.
+		proxy_buffer_size 128k;
+		proxy_buffers 4 256k;
+		proxy_busy_buffers_size 256k;
+	}
+}
+
+server {
+	listen 443 ssl;
+	listen [::]:443 ssl;
+	http2 on;
+	server_name ${INGEST_HOST};
+	ssl_certificate     /etc/letsencrypt/live/${APP_HOST}/fullchain.pem;
+	ssl_certificate_key /etc/letsencrypt/live/${APP_HOST}/privkey.pem;
+	# OTLP batches; the gateway itself caps a body at 20 MB.
+	client_max_body_size 20m;
+
+	location / {
+		proxy_pass http://127.0.0.1:3474;
+		proxy_http_version 1.1;
+		proxy_set_header Host $host;
+		proxy_set_header X-Real-IP $remote_addr;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+		proxy_set_header X-Forwarded-Proto $scheme;
+	}
+}
