@@ -48,7 +48,9 @@ kc get roles/maple-root -r maple >/dev/null 2>&1 || kc create roles -r maple -s 
 
 if [ -z "$(kc get users -r maple -q email="$IT_EMAIL" -q exact=true --fields id --format csv --noquotes)" ]; then
 	temp=$(openssl rand -base64 18)
-	kc create users -r maple -s username="$IT_EMAIL" -s email="$IT_EMAIL" -s enabled=true -s emailVerified=true
+	# A name up front, or Keycloak stops the first sign-in at "update your profile".
+	kc create users -r maple -s username="$IT_EMAIL" -s email="$IT_EMAIL" -s enabled=true -s emailVerified=true \
+		-s firstName=IT -s "lastName=${IT_EMAIL%%@*}"
 	kc set-password -r maple --username "$IT_EMAIL" --new-password "$temp" --temporary
 	echo "IT admin $IT_EMAIL created, temporary password: $temp (must change at first sign-in)"
 fi

@@ -52,7 +52,7 @@ proves neither can see the other, and proves delete + re-create starts empty:
 |---|---|---|
 | IT admin (Keycloak realm role `maple-root`) | **Admin** page | create / rename / delete orgs, name each org's first admin, see all users, open any org |
 | Org admin (`Admin` in an org) | **Settings → Members** | invite by email, change roles (Member, Engineer, Admin), remove people |
-| | **Settings → AI** | set the org's OpenRouter key; turn AI features on or off |
+| | **Settings → AI** | choose **Your OpenRouter key**, paste the org's key, and turn auto-triage and investigations on or off. "Maple managed" needs Maple's cloud and does nothing here. |
 | | **Settings → Ingest keys** | roll the org's ingest keys |
 | Everyone | **Manage your account** | password, 2FA, sessions (Keycloak account console) |
 
