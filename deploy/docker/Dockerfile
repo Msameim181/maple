@@ -10,7 +10,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY . .
-RUN bun install --frozen-lockfile && bun run alchemy:build-deps
+# The install cache would be a second copy of node_modules in the layer.
+RUN bun install --frozen-lockfile && bun run alchemy:build-deps \
+    && rm -rf /root/.bun/install/cache .turbo
 
 FROM deps AS web-build
 # Baked into the bundle: the browser's view of the public URLs.
