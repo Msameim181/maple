@@ -1,6 +1,7 @@
 import { HttpApi, OpenApi } from "effect/http-api"
 import { AuthApiGroup, AuthPublicApiGroup, AuthSessionApiGroup } from "./auth"
 import { BillingPublicApiGroup } from "./billing"
+import { DirectoryApiGroup, DirectoryPublicApiGroup } from "./directory"
 import { EmailPublicApiGroup } from "./digest"
 import { ApiSchemaErrors, ApiUnexpectedErrors } from "./api-boundary"
 
@@ -17,6 +18,8 @@ export class MapleApi extends HttpApi.make("MapleApi")
 	.add(AuthSessionApiGroup)
 	.add(BillingPublicApiGroup)
 	.add(EmailPublicApiGroup)
+	.add(DirectoryPublicApiGroup)
+	.add(DirectoryApiGroup)
 	.middleware(ApiSchemaErrors)
 	.middleware(ApiUnexpectedErrors)
 	.annotateMerge(
