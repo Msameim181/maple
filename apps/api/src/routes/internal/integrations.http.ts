@@ -23,6 +23,7 @@ import {
 	GithubSelectInstallationResponse,
 	InfraSurfaceLiteral,
 	IntegrationsForbiddenError,
+	IntegrationsNotConnectedError,
 	IntegrationsUpstreamError,
 	LinearDisconnectResponse,
 	LinearIntegrationStatus,
@@ -30,6 +31,7 @@ import {
 	LinearTeamsListResponse,
 	IntegrationsValidationError,
 	MapleInternalApi,
+	OrgId,
 	RailwayDisconnectResponse,
 	RoleName,
 	SearchConsoleAvailableSitesResponse,
@@ -48,6 +50,8 @@ import {
 	VcsCommitRangeResponse,
 	VcsCommitRangesResponse,
 	VcsPullRequestsResponse,
+	VercelDeploymentsResponse,
+	VercelDisconnectResponse,
 } from "@maple/domain/http"
 import { EdgeCacheService } from "@maple/cache"
 import { Effect, Option, Schema, Array as Arr, Record as Rec, String as Str } from "effect"
@@ -70,6 +74,7 @@ import { makeQueryRunners } from "@maple/backend/queries/query-runner"
 import { QueryEngineService } from "@maple/backend/services/warehouse/QueryEngineService"
 import { WarehouseQueryService } from "@maple/backend/services/warehouse/WarehouseQueryService"
 import { RailwayMetricsService } from "@maple/backend/services/integrations/RailwayMetricsService"
+import { VercelIntegrationService } from "@maple/backend/services/integrations/VercelIntegrationService"
 import { SupabaseConnectionService } from "@maple/backend/services/integrations/SupabaseConnectionService"
 import { SupabaseInsightsService } from "@maple/backend/services/integrations/SupabaseInsightsService"
 import { SupabaseLogsService } from "@maple/backend/services/integrations/SupabaseLogsService"
@@ -139,6 +144,24 @@ const requirePermission = (roles: ReadonlyArray<RoleName>, permission: Policy.Pe
 export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "integrations", (handlers) =>
 	Effect.gen(function* () {
 		const linear = yield* LinearOAuthService
+		const linearStatus = Effect.fn("HttpIntegrations.linearStatus")(function* (orgId: OrgId) {
+			const status = yield* linear.getStatus(orgId)
+			return status.connected
+				? new LinearIntegrationStatus({
+						connected: true,
+						workspaceName: status.workspaceName,
+						connectedByUserId: status.connectedByUserId,
+						revoked: status.revoked,
+						features: status.features,
+					})
+				: new LinearIntegrationStatus({
+						connected: false,
+						workspaceName: null,
+						connectedByUserId: null,
+						revoked: false,
+						features: yield* linear.getFeatures(orgId),
+					})
+		})
 		const google = yield* GoogleOAuthService
 		const searchConsole = yield* SearchConsoleService
 		const searchConsoleImport = yield* SearchConsoleImportService
@@ -148,6 +171,7 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 		const cloudflare = yield* CloudflareOAuthService
 		const cloudflareAnalytics = yield* CloudflareAnalyticsService
 		const railway = yield* RailwayMetricsService
+		const vercel = yield* VercelIntegrationService
 		const supabaseOAuth = yield* SupabaseOAuthService
 		const supabase = yield* SupabaseConnectionService
 		const supabaseLogs = yield* SupabaseLogsService
@@ -189,20 +213,25 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 				.handle("linearStatus", () =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
-						const status = yield* linear.getStatus(tenant.orgId)
-						return status.connected
-							? new LinearIntegrationStatus({
-									connected: true,
-									workspaceName: status.workspaceName,
-									connectedByUserId: status.connectedByUserId,
-									revoked: status.revoked,
-								})
-							: new LinearIntegrationStatus({
-									connected: false,
-									workspaceName: null,
-									connectedByUserId: null,
-									revoked: false,
-								})
+						return yield* linearStatus(tenant.orgId)
+					}),
+				)
+				.handle("linearFeatures", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						// Like Cloudflare's: switches are set on a connected integration only.
+						const current = yield* linear.getStatus(tenant.orgId)
+						if (!current.connected) {
+							return yield* new IntegrationsNotConnectedError({
+								message: "Linear is not connected",
+							})
+						}
+						const features = yield* linear.setFeatures(tenant.orgId, tenant.userId, payload)
+						yield* recordHttpAudit("linear_integration.features_updated", {
+							metadata: { ...features },
+						})
+						return yield* linearStatus(tenant.orgId)
 					}),
 				)
 				.handle("linearStart", ({ payload }) =>
@@ -308,6 +337,7 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 							),
 							cloudflare: connected(cloudflareAnalytics.getIntegrationStatus(tenant.orgId)),
 							railway: connected(railway.getStatus(tenant.orgId)),
+							vercel: connected(vercel.getStatus(tenant.orgId)),
 							planetscale: connected(planetscale.getStatus(tenant.orgId)),
 							// Google Cloud counts only with metrics on: the page reads metrics, not logs.
 							gcp: Effect.map(gcp.status(tenant.orgId), (status) =>
@@ -558,6 +588,21 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 						return yield* cloudflareAnalytics.getIntegrationStatus(tenant.orgId)
 					}),
 				)
+				.handle("cloudflareFeatures", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						const features = yield* cloudflareAnalytics.setFeatures(
+							tenant.orgId,
+							tenant.userId,
+							payload,
+						)
+						yield* recordHttpAudit("cloudflare_integration.features_updated", {
+							metadata: { ...features },
+						})
+						return yield* cloudflareAnalytics.getIntegrationStatus(tenant.orgId)
+					}),
+				)
 				.handle("cloudflareDisconnect", () =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
@@ -673,6 +718,95 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 						yield* requirePermission(tenant.roles, "integrations:manage")
 						const disconnected = yield* supabase.disconnect(tenant.orgId)
 						return new SupabaseDisconnectResponse(disconnected)
+					}),
+				)
+				.handle("vercelStatus", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						return yield* vercel.getStatus(tenant.orgId)
+					}),
+				)
+				.handle("vercelDiscover", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						return yield* vercel.discover(payload.token, payload.teamId)
+					}),
+				)
+				.handle("vercelConnect", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						const status = yield* vercel.connect(tenant.orgId, tenant.userId, payload)
+						yield* recordHttpAudit("vercel_integration.connected", {
+							metadata: {
+								teamId: payload.teamId,
+								projectScope: payload.projectScope,
+								projectCount: payload.projectIds.length,
+								samplingRate: payload.samplingRate,
+								logsEnabled: payload.logsEnabled,
+								tracesEnabled: payload.tracesEnabled,
+								aiGatewayEnabled: status.aiGatewayEnabled,
+								speedInsightsEnabled: status.speedInsightsEnabled,
+								webAnalyticsEnabled: status.webAnalyticsEnabled,
+								auditLogEnabled: status.auditLogEnabled,
+							},
+						})
+						return status
+					}),
+				)
+				.handle("vercelSettings", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						const status = yield* vercel.updateSettings(tenant.orgId, payload)
+						yield* recordHttpAudit("vercel_integration.updated", {
+							metadata: {
+								projectScope: status.projectScope,
+								projectCount: status.projectIds.length,
+								samplingRate: status.samplingRate,
+								logsEnabled: status.logsEnabled,
+								tracesEnabled: status.tracesEnabled,
+								aiGatewayEnabled: status.aiGatewayEnabled,
+								speedInsightsEnabled: status.speedInsightsEnabled,
+								webAnalyticsEnabled: status.webAnalyticsEnabled,
+								auditLogEnabled: status.auditLogEnabled,
+							},
+						})
+						return status
+					}),
+				)
+				.handle("vercelSync", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						// Spends the token's per-user Vercel rate limit, so it needs integrations:manage like connect.
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						return yield* vercel.sync(tenant.orgId)
+					}),
+				)
+				.handle("vercelDisconnect", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						const result = yield* vercel.disconnect(tenant.orgId)
+						if (result.disconnected) {
+							yield* recordHttpAudit("vercel_integration.disconnected", {
+								metadata: { drainsRemoved: result.drainsRemoved },
+							})
+						}
+						return new VercelDisconnectResponse(result)
+					}),
+				)
+				.handle("vercelDeployments", ({ query }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						return new VercelDeploymentsResponse({
+							deployments: yield* vercel.deployments(
+								tenant.orgId,
+								query.projectId,
+								query.limit ?? 20,
+							),
+						})
 					}),
 				)
 				.handle("gcpResources", ({ query }) =>

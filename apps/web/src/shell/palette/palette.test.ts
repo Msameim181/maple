@@ -22,7 +22,8 @@ const typed = (model: Model, value: string) =>
 const loadedWith = (serviceNames: ReadonlyArray<string>) =>
 	update(open().model, Message.SucceededLoadServices({ serviceNames }), context).model
 
-const ALL_FLAGGED = ["/releases", "/security"]
+/** Every flagged row but Cost, whose children the section tests hide. */
+const ALL_FLAGGED = ["/security"]
 
 describe("command palette", () => {
 	test("the input's own update shows the ranked results, with no browse list in between", () => {
@@ -106,7 +107,7 @@ describe("command palette", () => {
 		const model = typed(open().model, "logs").model
 		const pressed = update(
 			model,
-			Message.PressedEnter({ visibleFlagged: ["/releases", "/security"] }),
+			Message.PressedEnter({ visibleFlagged: ALL_FLAGGED, audience: "operator" }),
 			context,
 		)
 		expect(pressed.outMessage).toEqual(OutMessage.Navigated({ href: "/logs" }))
@@ -141,6 +142,7 @@ describe("command palette", () => {
 			"Connect AWS",
 			"Connect Railway",
 			"Connect Supabase",
+			"Connect Vercel",
 			"Connect Google Search Console",
 		])
 	})
@@ -150,11 +152,66 @@ describe("command palette", () => {
 		expect(titles).toEqual(expect.arrayContaining(["Connect Slack", "Connect Discord"]))
 	})
 
+	test("an analyst finds their own pages and dashboards, not setup or the explorers", () => {
+		const model = loadedWith(["storefront"])
+		const shown = (query: string) =>
+			Arr.map(
+				shownEntries(typed(model, query).model, context, ["/cost"], "analyst").entries,
+				(entry) => entry.title,
+			)
+		expect(shown("analytics")).toContain("Web analytics")
+		// Their sidebar calls the alerts inbox Incidents, so that is what they search for and see.
+		expect(shown("incidents")).toContain("Incidents")
+		expect(shown("alerts")).not.toContain("Alerts")
+		expect(shown("checkout")).toContain("Checkout health")
+		expect(shown("traces")).not.toContain("Traces")
+		expect(shown("connect")).toEqual([])
+		expect(shown("storefront")).not.toContain("storefront")
+		expect(shown("settings")).not.toContain("Settings")
+		// The same queries still find them for everyone else.
+		const operator = Arr.map(
+			shownEntries(typed(model, "traces").model, context, ALL_FLAGGED, "operator").entries,
+			(entry) => entry.title,
+		)
+		expect(operator).toContain("Traces")
+	})
+
+	test("Enter opens the page an analyst sees highlighted, not the full list's", () => {
+		const model = typed(loadedWith([]), "uptime").model
+		const result = update(
+			model,
+			Message.PressedEnter({ visibleFlagged: [], audience: "analyst" }),
+			context,
+		)
+		expect(result.outMessage).toEqual(OutMessage.Navigated({ href: "/alerts/uptime" }))
+	})
+
 	test("a flagged-off row is not shown", () => {
 		const titles = (visibleFlagged: ReadonlyArray<string>) =>
 			Arr.map(shownEntries(open().model, context, visibleFlagged).entries, (entry) => entry.title)
-		expect(titles(ALL_FLAGGED)).toEqual(expect.arrayContaining(["Releases", "Security"]))
-		expect(titles(["/security"])).not.toContain("Releases")
-		expect(titles(["/releases"])).not.toContain("Security")
+		expect(titles(["/cost", "/security"])).toEqual(expect.arrayContaining(["Cost", "Security"]))
+		expect(titles(["/security"])).not.toContain("Cost")
+		expect(titles(["/cost"])).not.toContain("Security")
+	})
+
+	test("a flagged-off section takes its children with it", () => {
+		const found = (visibleFlagged: ReadonlyArray<string>) =>
+			Arr.map(
+				shownEntries(typed(open().model, "budgets").model, context, visibleFlagged).entries,
+				(entry) => entry.title,
+			)
+		expect(found(["/cost"])).toContain("Cost budgets")
+		expect(found(ALL_FLAGGED)).not.toContain("Cost budgets")
+	})
+
+	// "Cost budgets" is the one title with a word starting "budgets". Hidden, it must not be what
+	// decides that the looser matches drop out.
+	test("a hidden row's better match does not push out what the viewer can open", () => {
+		const model = typed(loadedWith(["budgeting"]), "budgets").model
+		const ids = (visibleFlagged: ReadonlyArray<string>) =>
+			Arr.map(shownEntries(model, context, visibleFlagged).entries, (entry) => entry.id)
+
+		expect(ids(ALL_FLAGGED)).toContain("service:budgeting")
+		expect(ids(["/cost"])).not.toContain("service:budgeting")
 	})
 })

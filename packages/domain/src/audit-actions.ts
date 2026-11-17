@@ -67,6 +67,7 @@ export const AuditResources = {
 		verbs: [
 			"install_started",
 			"settings_updated",
+			"features_updated",
 			"uninstalled",
 			"identity_link_started",
 			"identity_unlinked",
@@ -77,6 +78,27 @@ export const AuditResources = {
 	device_credential: { prefix: PublicIdPrefixes.deviceCredential, verbs: ["registered", "revoked"] },
 	/** Verbs mirror the issue event types: `recordEvent` audits every one it attributes. */
 	error_issue: { prefix: PublicIdPrefixes.errorIssue, verbs: ErrorIssueEventType.literals },
+	/** Org-singleton SSO and SCIM setup; secrets (OIDC client secret, SCIM token) are never in `changes`. */
+	enterprise_sso: {
+		verbs: [
+			"domain_added",
+			"domain_verified",
+			"domain_removed",
+			"connection_created",
+			"connection_updated",
+			"connection_enforced",
+			"connection_relaxed",
+			"connection_deleted",
+			"directory_created",
+			"directory_key_rotated",
+			"directory_paused",
+			"directory_resumed",
+			"directory_deleted",
+			"role_mapping_updated",
+			"bypass_added",
+			"bypass_removed",
+		],
+	},
 	escalation_chain: {
 		prefix: PublicIdPrefixes.escalationChain,
 		verbs: ["created", "updated", "deleted"],
@@ -125,10 +147,22 @@ export const AuditResources = {
 	 * OAuth round trip completes at the provider's callback.
 	 */
 	planetscale_integration: {
-		verbs: ["connect_started", "organization_selected", "metrics_token_set", "disconnected"],
+		verbs: [
+			"connect_started",
+			"organization_selected",
+			"metrics_token_set",
+			"features_updated",
+			"disconnected",
+		],
 	},
 	/** Org-singleton connection; per-account zone choices ride in `metadata`. */
-	cloudflare_integration: { verbs: ["zones_updated"] },
+	cloudflare_integration: { verbs: ["zones_updated", "features_updated"] },
+	/** Org-singleton connection; the switches it saved ride in `metadata`. */
+	linear_integration: { verbs: ["features_updated"] },
+	/** A provider key the org's spend is read with, one per provider; the key is never in `changes`. */
+	cost_source_key: { verbs: ["updated", "deleted"] },
+	/** A cost source that reads through a connection the org already has; which one is in `metadata`. */
+	cost_source: { verbs: ["created", "deleted"] },
 	/**
 	 * Org membership, learned from Clerk's webhook; the web app changes members
 	 * in Clerk directly, so nothing reaches Maple's own API. The member is the
@@ -143,7 +177,10 @@ export const AuditResources = {
 	scrape_target: { prefix: PublicIdPrefixes.scrapeTarget, verbs: ["created", "updated", "deleted"] },
 	uptime_monitor: { prefix: PublicIdPrefixes.uptimeMonitor, verbs: ["created", "updated", "deleted"] },
 	slo: { prefix: PublicIdPrefixes.slo, verbs: ["created", "updated", "deleted"] },
-	/** A public status page; component reorders and break-glass token changes are page-level. */
+	/**
+	 * A public status page; component reorders, break-glass token and custom domain changes are
+	 * page-level (the hostname is in `metadata`).
+	 */
 	status_page: {
 		prefix: PublicIdPrefixes.statusPage,
 		verbs: [
@@ -155,6 +192,10 @@ export const AuditResources = {
 			"config_applied",
 			"break_glass_rotated",
 			"break_glass_revoked",
+			"custom_domain_set",
+			"custom_domain_removed",
+			"password_set",
+			"password_removed",
 		],
 	},
 	status_page_component: {
@@ -186,6 +227,8 @@ export const AuditResources = {
 	 */
 	telemetry: { verbs: ["read", "sql_executed"] },
 	/** Org-singleton BYO-ClickHouse connection; holds warehouse credentials. */
+	/** Org-singleton Vercel team connection; the team and what the drains forward are in `metadata`. */
+	vercel_integration: { verbs: ["connected", "updated", "disconnected"] },
 	warehouse_settings: { verbs: ["updated", "deleted", "schema_applied"] },
 	/** Short-lived device credentials for the mobile widget; keyed by installation. */
 	widget_credential: { verbs: ["minted", "revoked"] },
@@ -210,6 +253,7 @@ export const AuditResourceLabels = {
 	ai_provider_key: "AI provider key",
 	alert_destination: "Alert destination",
 	alert_rule: "Alert rule",
+	enterprise_sso: "SSO and SCIM",
 	escalation_chain: "Escalation chain",
 	oncall_schedule: "On-call schedule",
 	oncall_override: "On-call override",
@@ -231,11 +275,14 @@ export const AuditResourceLabels = {
 	aws_connection: "AWS connection",
 	ingest_key: "Ingest key",
 	mcp_connection: "MCP connection",
-	mcp_tool: "MCP tool",
+	mcp_tool: "Tool",
 	investigation: "Investigation",
 	onboarding_reward: "Onboarding reward",
 	planetscale_integration: "PlanetScale integration",
 	cloudflare_integration: "Cloudflare integration",
+	linear_integration: "Linear integration",
+	cost_source_key: "Cost source key",
+	cost_source: "Cost source",
 	member: "Member",
 	organization: "Organization",
 	scrape_target: "Scrape target",
@@ -251,6 +298,7 @@ export const AuditResourceLabels = {
 	session_replay: "Session replay",
 	support_channel: "Support channel",
 	telemetry: "Telemetry",
+	vercel_integration: "Vercel integration",
 	warehouse_settings: "Warehouse connection",
 	widget_credential: "Widget credential",
 } as const satisfies Record<AuditResourceType, string>
@@ -267,6 +315,22 @@ export const AuditActionLabels = {
 	"alert_rule.created": "Created alert rule",
 	"alert_rule.updated": "Updated alert rule",
 	"alert_rule.deleted": "Deleted alert rule",
+	"enterprise_sso.domain_added": "Added SSO domain",
+	"enterprise_sso.domain_verified": "Verified SSO domain",
+	"enterprise_sso.domain_removed": "Removed SSO domain",
+	"enterprise_sso.connection_created": "Connected identity provider",
+	"enterprise_sso.connection_updated": "Updated identity provider",
+	"enterprise_sso.connection_enforced": "Enforced SSO",
+	"enterprise_sso.connection_relaxed": "Stopped enforcing SSO",
+	"enterprise_sso.connection_deleted": "Removed identity provider",
+	"enterprise_sso.directory_created": "Set up SCIM provisioning",
+	"enterprise_sso.directory_key_rotated": "Rotated SCIM token",
+	"enterprise_sso.directory_paused": "Paused SCIM provisioning",
+	"enterprise_sso.directory_resumed": "Resumed SCIM provisioning",
+	"enterprise_sso.directory_deleted": "Removed SCIM provisioning",
+	"enterprise_sso.role_mapping_updated": "Updated SCIM role mapping",
+	"enterprise_sso.bypass_added": "Added SSO bypass user",
+	"enterprise_sso.bypass_removed": "Removed SSO bypass user",
 	"escalation_chain.created": "Created escalation chain",
 	"escalation_chain.updated": "Updated escalation chain",
 	"escalation_chain.deleted": "Deleted escalation chain",
@@ -305,6 +369,7 @@ export const AuditActionLabels = {
 	"dashboard.version_restored": "Restored dashboard version",
 	"chat_integration.install_started": "Started chat integration install",
 	"chat_integration.settings_updated": "Updated chat integration",
+	"chat_integration.features_updated": "Changed what the chat bot does",
 	"chat_integration.uninstalled": "Uninstalled chat integration",
 	"chat_integration.identity_link_started": "Started linking chat account",
 	"chat_integration.identity_unlinked": "Unlinked chat account",
@@ -350,7 +415,7 @@ export const AuditActionLabels = {
 	"source.rolled": "Rolled source token",
 	"source.deleted": "Deleted source",
 	"mcp_connection.revoked": "Revoked MCP connection",
-	"mcp_tool.called": "Called MCP tool",
+	"mcp_tool.called": "Called tool",
 	"investigation.created": "Started investigation",
 	"investigation.restarted": "Restarted investigation",
 	"investigation.status_changed": "Changed investigation status",
@@ -358,8 +423,15 @@ export const AuditActionLabels = {
 	"planetscale_integration.connect_started": "Started PlanetScale connection",
 	"planetscale_integration.organization_selected": "Selected PlanetScale organization",
 	"planetscale_integration.metrics_token_set": "Set PlanetScale metrics token",
+	"planetscale_integration.features_updated": "Changed what PlanetScale collects",
 	"planetscale_integration.disconnected": "Disconnected PlanetScale",
 	"cloudflare_integration.zones_updated": "Updated Cloudflare zones",
+	"cloudflare_integration.features_updated": "Changed what Cloudflare collects",
+	"linear_integration.features_updated": "Changed what Maple does in Linear",
+	"cost_source_key.updated": "Updated cost source key",
+	"cost_source_key.deleted": "Removed cost source key",
+	"cost_source.created": "Added cost source",
+	"cost_source.deleted": "Removed cost source",
 	"member.added": "Added member",
 	"member.role_changed": "Changed member role",
 	"member.removed": "Removed member",
@@ -382,6 +454,10 @@ export const AuditActionLabels = {
 	"status_page.config_applied": "Applied status page config",
 	"status_page.break_glass_rotated": "Rotated status page break-glass token",
 	"status_page.break_glass_revoked": "Revoked status page break-glass token",
+	"status_page.custom_domain_set": "Set status page custom domain",
+	"status_page.custom_domain_removed": "Removed status page custom domain",
+	"status_page.password_set": "Set status page password",
+	"status_page.password_removed": "Removed status page password",
 	"status_page_component.created": "Created status page component",
 	"status_page_component.updated": "Updated status page component",
 	"status_page_component.deleted": "Deleted status page component",
@@ -397,6 +473,9 @@ export const AuditActionLabels = {
 	"support_channel.invite_sent": "Sent support channel invite",
 	"telemetry.read": "Read telemetry",
 	"telemetry.sql_executed": "Ran SQL query",
+	"vercel_integration.connected": "Connected Vercel",
+	"vercel_integration.updated": "Updated Vercel forwarding",
+	"vercel_integration.disconnected": "Disconnected Vercel",
 	"warehouse_settings.updated": "Updated warehouse connection",
 	"warehouse_settings.deleted": "Disconnected warehouse",
 	"warehouse_settings.schema_applied": "Applied warehouse schema",
@@ -433,3 +512,53 @@ export const auditActionLabel = (action: string): string | null =>
 /** Label for a `resource_type` read off a row; null for one this build does not know. */
 export const auditResourceLabel = (type: string): string | null =>
 	isAuditResourceType(type) ? AuditResourceLabels[type] : null
+
+/**
+ * Who called a tool, as the `mcp_tool` Resource column names it. A public MCP call is the
+ * customer's own client; every other surface is one of Maple's agents using the same tools.
+ */
+const MAPLE_AGENT_LABELS = new Map<string, string>([
+	["default", "Maple chat"],
+	["investigate", "Maple investigation"],
+	["pr-review", "Maple code review"],
+	["pr-reply", "Maple code review"],
+])
+
+/** "Maple code review" for a `ChatMode`; null for a value this build does not know. */
+export const mapleAgentLabel = (agent: string): string | null => MAPLE_AGENT_LABELS.get(agent) ?? null
+
+export const auditToolCallerLabel = (surface: string | null, agent: string | null): string => {
+	if (surface === null || surface === "mcp") return "MCP tool"
+	if (surface === "bot") return "Maple bot"
+	return (agent !== null ? mapleAgentLabel(agent) : null) ?? "Maple agent"
+}
+
+const SURFACE_LABELS = new Map<string, string>([
+	["mcp", "MCP client"],
+	["chat", "Maple agent"],
+	["bot", "Maple bot"],
+	["workflow", "Maple agent"],
+	["rpc", "Maple internal"],
+])
+
+const SQL_CONTEXT_LABELS = new Map<string, string>([
+	["mcp.run_sql", "run_sql tool"],
+	["rawSql", "Dashboard or SQL editor"],
+])
+
+/**
+ * A metadata value as the audit detail shows it: the internal codes Maple writes (`surface`,
+ * `agent`, a SQL `context`) in words, or null to show the value as recorded.
+ */
+export const auditMetadataValueLabel = (key: string, value: string): string | null => {
+	switch (key) {
+		case "surface":
+			return SURFACE_LABELS.get(value) ?? null
+		case "agent":
+			return mapleAgentLabel(value)
+		case "context":
+			return SQL_CONTEXT_LABELS.get(value) ?? null
+		default:
+			return null
+	}
+}

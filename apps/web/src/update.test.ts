@@ -1,4 +1,5 @@
 import { OrgId, UserId } from "@maple/domain"
+import { BillingCustomer } from "@maple/domain/http"
 import { Option, Record as Rec, Result, Schema, Array as Arr, String as Str } from "effect"
 import { UrlRequest } from "foldkit/navigation"
 import { fromString as urlFromString } from "foldkit/url"
@@ -8,7 +9,8 @@ import { describe, expect, test, vi } from "vitest"
 vi.hoisted(() => Object.assign(globalThis, { window: new EventTarget() }))
 import { Message } from "./message"
 import { ClerkPhase, type Model, Session } from "./model"
-import { initCustomer } from "./page/onboarding/plan-gate"
+import * as PageHold from "./page/page-hold"
+import { CustomerData, initCustomer } from "./page/onboarding/plan-gate"
 import * as Preload from "./page/preload"
 import { enterRoute, pageIdentity } from "./page/registry"
 import { Message as ServicesMessage } from "./page/services/list/message"
@@ -40,6 +42,7 @@ const base = (route: AppRoute): Model => ({
 	page: null,
 	pageInstances: 0,
 	parkedPages: [],
+	pageHold: PageHold.Model.None(),
 	onboarding: null,
 	clerkSnapshot: null,
 	customer: initCustomer(),
@@ -161,6 +164,7 @@ describe("telemetry identity", () => {
 			maybeUser: Option.some({ fullName: "Ada Lovelace", email: "ada@acme.test", imageUrl: "" }),
 			maybeOrganization: Option.none(),
 			memberships: [],
+			maybeRole: Option.some("org:admin"),
 			maybePendingTask: Option.none(),
 		}
 		const loaded = update(
@@ -175,11 +179,51 @@ describe("telemetry identity", () => {
 					username: "Ada Lovelace",
 					email: "ada@acme.test",
 					groupId: "org_acme",
+					traits: { role: "org:admin" },
 				},
 			},
 		})
 		const again = update(loaded.model, Message.ChangedClerkSession({ snapshot }))
 		expect(Arr.map(commandsOf(again), ({ name }) => name)).not.toContain("IdentifySession")
+	})
+
+	test("the org's plan joins the identity once its customer read settles, and only then", () => {
+		const snapshot: ClerkSnapshot = {
+			maybeUserId: Option.some(UserId.make("user_ada")),
+			maybeOrgId: Option.some(orgId),
+			maybeUser: Option.none(),
+			maybeOrganization: Option.none(),
+			memberships: [],
+			maybeRole: Option.none(),
+			maybePendingTask: Option.none(),
+		}
+		const customer = Schema.decodeSync(BillingCustomer)({
+			id: "org_acme",
+			subscriptions: [
+				{
+					planId: "startup",
+					status: "active",
+					currentPeriodStart: 0,
+					currentPeriodEnd: 30 * 86_400_000,
+				},
+			],
+		})
+		// The org's customer read is out (`loadCustomer`), as it is for a served org.
+		const reading: Model = {
+			...base(AppRoute.Services({ search: {} })),
+			customer: { orgId: "org_acme", data: CustomerData.Loading() },
+		}
+		const loaded = update(reading, Message.CompletedLoadClerk({ snapshot }))
+		const settled = update(loaded.model, Message.SucceededLoadCustomer({ orgId: "org_acme", customer }))
+		expect(commandsOf(settled)).toContainEqual({
+			name: "IdentifySession",
+			args: { identity: { id: "user_ada", groupId: "org_acme", traits: { plan: "startup" } } },
+		})
+		const resettled = update(
+			settled.model,
+			Message.SucceededLoadCustomer({ orgId: "org_acme", customer }),
+		)
+		expect(Arr.map(commandsOf(resettled), ({ name }) => name)).not.toContain("IdentifySession")
 	})
 })
 
@@ -197,13 +241,16 @@ describe("re-render on change only", () => {
 			isRegionOpen: false,
 			flags: {
 				aiAutoTriage: false,
+				cloudCost: false,
+				cloudSecurity: false,
 				dataSources: false,
-				releases: false,
+				productAnalytics: false,
+				profiling: false,
 				securityAudit: false,
-				statusPages: false,
 			},
 		}),
 		memberships: [],
+		maybeRole: Option.none(),
 		maybePendingTask: Option.none(),
 	})
 	const loadedHome = () =>
@@ -343,5 +390,50 @@ describe("OIDC sign-in at the root", () => {
 			{ name: "ReplaceUrl", args: { url: "/services" } },
 		])
 		expect(result.model.session).toEqual(Session.Resolving())
+	})
+})
+
+describe("navigation hold", () => {
+	test("navigating to a loading page keeps the page left on screen until its timer, then shows it", () => {
+		const toServices = (model: Model, message: ServicesMessage): Model => {
+			const slot = model.page
+			return slot === null
+				? model
+				: update(
+						model,
+						Message.GotPageMessage({
+							message: {
+								_tag: "ServicesList",
+								key: slot.key,
+								orgId: slot.orgId,
+								instance: slot.instance,
+								message,
+							},
+						}),
+					).model
+		}
+		const entered = settle(base(AppRoute.Services({ search: {} }))).model
+		const window = { startTime: "2026-10-01 00:00:00", endTime: "2026-10-01 12:00:00" }
+		const windowed = toServices(
+			entered,
+			ServicesMessage.CompletedResolveWindow({ window, nowMs: NOW, mode: "Load" }),
+		)
+		const overviewKey =
+			windowed.page?._tag === "ServicesList" ? (windowed.page.model.overview.key ?? "") : ""
+		// The services list with rows on screen: the page a navigation leaves.
+		const onServices = toServices(
+			windowed,
+			ServicesMessage.CompletedFetchOverview({ key: overviewKey, result: Result.succeed([]) }),
+		)
+		expect(onServices.pageHold).toEqual(PageHold.Model.None())
+		const toLogs = update(onServices, Message.ChangedUrl({ url: urlOf("/logs") }))
+		const instance = toLogs.model.page?.instance ?? -1
+		expect(toLogs.model.page?._tag).toBe("LogsList")
+		expect(toLogs.model.pageHold).toEqual({ _tag: "Holding", leaving: onServices.page, instance })
+		expect(Arr.filter(commandsOf(toLogs), ({ name }) => name === "WaitPageHold")).toEqual([
+			{ name: "WaitPageHold", args: { instance } },
+		])
+		const shown = update(toLogs.model, Message.ElapsedPageHold({ instance }))
+		expect(shown.model.pageHold).toEqual(PageHold.Model.Waited({ instance }))
 	})
 })

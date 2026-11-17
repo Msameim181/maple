@@ -44,6 +44,7 @@ const flags = { isMobile: false, theme: "dark", pinnedNamespaces: {}, dashboardF
 const statuses = (connected: Partial<Record<Integration, boolean>> = {}) => ({
 	cloudflare: false,
 	railway: false,
+	vercel: false,
 	planetscale: false,
 	gcp: false,
 	supabase: false,
@@ -164,29 +165,26 @@ describe("sidebar collapse", () => {
 		)
 	})
 
-	test.each(["Releases", "Security"])(
-		"the flagged %s row shows its tooltip on the collapsed rail",
-		(title) => {
-			const row = role("link", { name: title })
-			scene(
-				{ update, view },
-				given(signedIn({ isSidebarOpen: false })),
-				Mount.resolve(MeasureSidebarOverflow, Message.MeasuredSidebarOverflow()),
-				hover(row),
-				Command.resolve(Tooltip.WaitOpenDelay, Tooltip.Message.ElapsedOpenDelay({ generation: 1 })),
-				Mount.resolve(Tooltip.MountTooltip, Tooltip.Message.CompletedMountTooltip()),
-				Command.resolve(
-					Animation.WaitForPaint,
-					Animation.Message.CompletedWaitForPaint({ generation: 1 }),
-				),
-				Command.resolve(
-					Animation.WaitForAnimationSettled,
-					Animation.Message.EndedAnimation({ generation: 1 }),
-				),
-				expect(selector('[data-slot="tooltip-popup"]')).toHaveText(title),
-			)
-		},
-	)
+	test.each(["Security"])("the flagged %s row shows its tooltip on the collapsed rail", (title) => {
+		const row = role("link", { name: title })
+		scene(
+			{ update, view },
+			given(signedIn({ isSidebarOpen: false })),
+			Mount.resolve(MeasureSidebarOverflow, Message.MeasuredSidebarOverflow()),
+			hover(row),
+			Command.resolve(Tooltip.WaitOpenDelay, Tooltip.Message.ElapsedOpenDelay({ generation: 1 })),
+			Mount.resolve(Tooltip.MountTooltip, Tooltip.Message.CompletedMountTooltip()),
+			Command.resolve(
+				Animation.WaitForPaint,
+				Animation.Message.CompletedWaitForPaint({ generation: 1 }),
+			),
+			Command.resolve(
+				Animation.WaitForAnimationSettled,
+				Animation.Message.EndedAnimation({ generation: 1 }),
+			),
+			expect(selector('[data-slot="tooltip-popup"]')).toHaveText(title),
+		)
+	})
 
 	test("below md the trigger opens the nav as a sheet, reading its data once, and the backdrop closes it", () => {
 		const open = () => [
@@ -367,6 +365,7 @@ describe("in-place org change", () => {
 			integrations: {
 				cloudflare: true,
 				railway: true,
+				vercel: false,
 				planetscale: false,
 				gcp: false,
 				supabase: false,
@@ -378,6 +377,7 @@ describe("in-place org change", () => {
 		expectVitest(onB.integrations).toEqual({
 			cloudflare: null,
 			railway: null,
+			vercel: null,
 			planetscale: null,
 			gcp: null,
 			supabase: null,
@@ -540,6 +540,7 @@ describe("infrastructure section", () => {
 					integrations: {
 						cloudflare: true,
 						railway: false,
+						vercel: true,
 						planetscale: false,
 						gcp: false,
 						supabase: false,
@@ -550,6 +551,7 @@ describe("infrastructure section", () => {
 			Mount.resolve(MeasureSidebarOverflow, Message.MeasuredSidebarOverflow()),
 			expect(role("link", { name: "Hosts" })).toExist(),
 			expect(role("link", { name: "Cloudflare" })).toExist(),
+			expect(role("link", { name: "Vercel" })).toHaveAttr("href", "/infra/vercel"),
 			expect(role("link", { name: "Kubernetes" })).toBeAbsent(),
 			expect(role("link", { name: "Railway" })).toBeAbsent(),
 		)

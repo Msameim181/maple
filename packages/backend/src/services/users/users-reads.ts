@@ -33,6 +33,7 @@ import { WarehouseQueryService } from "@maple/backend/services/warehouse/Warehou
 import {
 	isMissingUserActivityChannels,
 	isMissingUserActivityHourly,
+	isMissingUserActivityIdentity,
 } from "@maple/backend/services/warehouse/missing-table"
 import { readUserMcpSessions } from "@maple/backend/services/mcp/mcp-reads"
 import { readUserIssueItems, readUserIssueTotalsRow, userIssueTotals } from "./user-issues"
@@ -143,6 +144,36 @@ const rollupRead = <A, E, R>(read: Effect.Effect<A, E, R>): Effect.Effect<Option
 		Effect.catchIf(isMissingUserActivityHourly, () => Effect.succeed(Option.none<A>())),
 	)
 
+type IdentityRow = Readonly<{ name: string; email: string; nameAt: number; emailAt: number }>
+
+/**
+ * The newest non-empty name or email across the profile's sources, as the directory ranks them; on
+ * a tie the earlier source (replays, then MCP spans, then spans and logs) wins.
+ */
+export const newestIdentity = (
+	rows: ReadonlyArray<IdentityRow | undefined>,
+	field: "name" | "email",
+	at: "nameAt" | "emailAt",
+): string | null => {
+	const carried = Arr.filter(rows, (row): row is IdentityRow => row !== undefined && row[field] !== "")
+	const newest = Arr.reduce(carried, Option.none<IdentityRow>(), (best, row) =>
+		Option.match(best, {
+			onNone: () => Option.some(row),
+			onSome: (kept) => (row[at] > kept[at] ? Option.some(row) : best),
+		}),
+	)
+	return Option.match(newest, { onNone: () => null, onSome: (row) => row[field] })
+}
+
+/** A rollup identity read's one row, `None` on a cluster without migration 0056 or 0065. */
+const identityRead = <A, E, R>(
+	read: Effect.Effect<ReadonlyArray<A>, E, R>,
+): Effect.Effect<Option.Option<A>, E, R> =>
+	rollupRead(read).pipe(
+		Effect.map((found) => Option.flatMap(found, (rows) => Option.fromNullishOr(rows[0]))),
+		Effect.catchIf(isMissingUserActivityIdentity, () => Effect.succeedNone),
+	)
+
 /** A read over every source with the rollup, again without it on a cluster missing migration 0056. */
 const withRollupFallback = <A, E, R>(
 	scope: CH.UsersScope,
@@ -217,6 +248,92 @@ const readGroupNames = Effect.fn("UsersReads.groupNames")(function* (
 	return new Map(Arr.map(rows, (row) => [row.groupId, row.groupName] as const))
 })
 
+/**
+ * The newest rows a directory page ranks from, widened once when the filter leaves a page short.
+ * Aggregating every user of a large org (millions in a week) exceeds the query memory limit.
+ */
+const RECENT_ROWS = [20_000, 200_000] as const
+
+/** The most users a filter may match and still be read in full; `uniq` is exact up to 65536. */
+const MATCHING_USERS_MAX = 50_000
+
+/** The tie-breaking id of a cursor resuming below an empty first page; any id serves. */
+const RESUME_USER_ID = "0"
+
+interface ListPage<Row> {
+	readonly rows: ReadonlyArray<Row>
+	/**
+	 * Set when the page holds every user above its floor but not a full page: more may rank below
+	 * it, from this `toString` DateTime64 (the instant after the floor) down.
+	 */
+	readonly resume?: string
+}
+
+/**
+ * One directory page over a bounded set of users. A filter matching few users reads them all;
+ * otherwise only the users active after the newest {@link RECENT_ROWS} rows, who outrank the rest.
+ */
+const listPage = <Row, E, R>(
+	tenant: TenantContext,
+	params: Readonly<{ orgId: TenantContext["orgId"]; startTime: string; endTime: string }>,
+	scope: CH.UsersScope,
+	filter: CH.UsersListFilter,
+	limit: number,
+	run: (bound: CH.UsersListBound | undefined) => Effect.Effect<ReadonlyArray<Row>, E, R>,
+) =>
+	Effect.gen(function* () {
+		const warehouse = yield* WarehouseQueryService
+		const whole = (bound: CH.UsersListBound | undefined): Effect.Effect<ListPage<Row>, E, R> =>
+			Effect.map(run(bound), (rows) => ({ rows }))
+		if (CH.usersListFiltered(filter)) {
+			const matching = yield* warehouse
+				.compiledQuery(tenant, CH.compile(CH.usersMatchingCountQuery(scope, filter), params), {
+					profile: "list",
+					context: "usersMatching",
+				})
+				.pipe(Effect.map(Arr.head))
+			yield* Effect.annotateCurrentSpan({
+				"maple.users.matching": Option.getOrElse(
+					Option.map(matching, (row) => row.users),
+					() => 0,
+				),
+			})
+			if (Option.isSome(matching) && matching.value.users <= MATCHING_USERS_MAX)
+				return yield* whole({ matching: true })
+		}
+		/** The users active after the newest `rows` rows; none when the window holds fewer rows. */
+		const ranked = (rows: number) =>
+			warehouse
+				.compiledQuery(tenant, CH.compile(CH.usersRecentFloorQuery(scope, filter, rows), params), {
+					profile: "list",
+					context: "usersRecentFloor",
+				})
+				.pipe(
+					Effect.map(Arr.head),
+					Effect.flatMap((floor) =>
+						Option.isSome(floor) && floor.value.rows >= rows
+							? Effect.asSome(
+									Effect.map(run({ since: floor.value.floor }), (page) => ({
+										rows: page,
+										resume: floor.value.resume,
+									})),
+								)
+							: Effect.succeedNone,
+					),
+				)
+		// Fewer rows than that in the window: every user ranks, a cursor still bounds them.
+		const everyone = () => whole(filter.after === undefined ? undefined : {})
+		const [narrow, wide] = RECENT_ROWS
+		const first = yield* ranked(narrow)
+		if (Option.isNone(first)) return yield* everyone()
+		if (first.value.rows.length > limit) return { rows: first.value.rows }
+		yield* Effect.annotateCurrentSpan({ "maple.users.list_widened": true })
+		const second = yield* ranked(wide)
+		if (Option.isNone(second)) return yield* everyone()
+		const page = second.value
+		return page.rows.length > limit ? { rows: page.rows } : page
+	})
+
 export const readUsersList = Effect.fn("UsersReads.list")(function* (
 	tenant: TenantContext,
 	payload: UsersListRequest,
@@ -252,26 +369,46 @@ export const readUsersList = Effect.fn("UsersReads.list")(function* (
 					.pipe(Effect.map(Arr.map((row) => row.userId)))
 	const limit = payload.limit ?? DEFAULT_LIMIT
 	// One row of lookahead says whether a next page exists.
-	const listRows = (scope: CH.UsersScope, ids: ReadonlyArray<string>) =>
+	const listRows = (
+		scope: CH.UsersScope,
+		filter: CH.UsersListFilter,
+		bound: CH.UsersListBound | undefined,
+	) =>
 		warehouse.compiledQuery(
 			tenant,
-			CH.compile(CH.usersListQuery(scope, { ...filter, searchUserIds: ids }, limit + 1), params),
-			{ profile: "list", context: "usersList" },
+			CH.compile(CH.usersListQuery(scope, filter, limit + 1, bound), params),
+			{
+				profile: "list",
+				context: "usersList",
+			},
 		)
-	const fetched = yield* withRollupFallback(scope, [], (scope) =>
-		Effect.flatMap(searchUserIds(scope), (ids) =>
-			listRows({ ...scope, requestChannels: scope.activityRollup }, ids).pipe(
+	const fetched = yield* withRollupFallback(scope, { rows: [] }, (scope) =>
+		Effect.flatMap(searchUserIds(scope), (ids) => {
+			const scoped = { ...filter, searchUserIds: ids }
+			const page = (scope: CH.UsersScope) =>
+				listPage(tenant, params, scope, scoped, limit, (bound) => listRows(scope, scoped, bound))
+			const channels = { ...scope, requestChannels: scope.activityRollup }
+			return page({ ...channels, activityIdentity: scope.activityRollup }).pipe(
+				// A rollup without migration 0065's identity: the users, named from replays and MCP only.
+				Effect.catchIf(isMissingUserActivityIdentity, () => page(channels)),
 				// A rollup without migration 0058's channel counts: the users, without channels.
-				Effect.catchIf(isMissingUserActivityChannels, () => listRows(scope, ids)),
-			),
-		),
+				Effect.catchIf(isMissingUserActivityChannels, () => page(scope)),
+			)
+		}),
 	)
-	const rows = fetched.slice(0, limit)
+	const rows = fetched.rows.slice(0, limit)
 	const last = rows.at(-1)
+	// A partial page holds every user above its floor, not a full page: more may follow it, and
+	// an empty one resumes just above the floor. No user that passes the filter has a lastSeen in
+	// between, so the cursor's tie-breaking id excludes none of them.
 	const next =
-		fetched.length > limit && last !== undefined
-			? { lastSeen: last.lastSeenKey, userId: last.userId }
-			: undefined
+		fetched.rows.length > limit || (fetched.resume !== undefined && last !== undefined)
+			? last === undefined
+				? undefined
+				: { lastSeen: last.lastSeenKey, userId: last.userId }
+			: fetched.resume !== undefined
+				? { lastSeen: fetched.resume, userId: payload.after?.userId ?? RESUME_USER_ID }
+				: undefined
 	// The rollup keeps no name: a page's unnamed users take the one their MCP spans carry.
 	// A row missing either the name or the email takes the missing one from its MCP spans.
 	const unnamed = Arr.map(
@@ -760,67 +897,76 @@ const profileIn = Effect.fn("UsersReads.profile")(function* (
 	const readsServices = CH.readsServiceSources(scope)
 	const readsMcp = scope.mcpServices.length > 0
 	const userScope = { userId: payload.userId, namespaces: scope.namespaces }
-	const [replay, devices, events, mcp, services, visitors, summary, rollupServices, issueTotalsRow] =
-		yield* Effect.all(
-			[
-				readsServices
-					? warehouse.compiledQuery(tenant, CH.compile(CH.userReplayProfileQuery(scope), params), {
-							profile: "aggregation",
-							context: "userReplayProfile",
-						})
-					: Effect.succeed([]),
-				readsServices
-					? warehouse.compiledQuery(tenant, CH.compile(CH.userDevicesQuery(scope), params), {
-							profile: "aggregation",
-							context: "userDevices",
-						})
-					: Effect.succeed([]),
-				readsServices
-					? warehouse.compiledQuery(tenant, CH.compile(CH.userEventsSummaryQuery(scope), params), {
-							profile: "aggregation",
-							context: "userEventsSummary",
-						})
-					: Effect.succeed([]),
-				readsMcp
-					? warehouse.compiledQuery(tenant, CH.compile(CH.userMcpSummaryQuery(scope), params), {
-							profile: "aggregation",
-							context: "userMcpSummary",
-						})
-					: Effect.succeed([]),
-				CH.hasUserSources(scope)
-					? warehouse.compiledQuery(tenant, CH.compile(CH.userServicesQuery(scope), params), {
-							profile: "aggregation",
-							context: "userServices",
-						})
-					: Effect.succeed([]),
-				warehouse.compiledQuery(tenant, CH.compile(CH.userVisitorIdsQuery(), params), {
-					profile: "list",
-					context: "userVisitorIds",
+	const [
+		replay,
+		devices,
+		events,
+		mcp,
+		services,
+		visitors,
+		summary,
+		rollupServices,
+		issueTotalsRow,
+		identity,
+	] = yield* Effect.all(
+		[
+			readsServices
+				? warehouse.compiledQuery(tenant, CH.compile(CH.userReplayProfileQuery(scope), params), {
+						profile: "aggregation",
+						context: "userReplayProfile",
+					})
+				: Effect.succeed([]),
+			readsServices
+				? warehouse.compiledQuery(tenant, CH.compile(CH.userDevicesQuery(scope), params), {
+						profile: "aggregation",
+						context: "userDevices",
+					})
+				: Effect.succeed([]),
+			readsServices
+				? warehouse.compiledQuery(tenant, CH.compile(CH.userEventsSummaryQuery(scope), params), {
+						profile: "aggregation",
+						context: "userEventsSummary",
+					})
+				: Effect.succeed([]),
+			readsMcp
+				? warehouse.compiledQuery(tenant, CH.compile(CH.userMcpSummaryQuery(scope), params), {
+						profile: "aggregation",
+						context: "userMcpSummary",
+					})
+				: Effect.succeed([]),
+			CH.hasUserSources(scope)
+				? warehouse.compiledQuery(tenant, CH.compile(CH.userServicesQuery(scope), params), {
+						profile: "aggregation",
+						context: "userServices",
+					})
+				: Effect.succeed([]),
+			warehouse.compiledQuery(tenant, CH.compile(CH.userVisitorIdsQuery(), params), {
+				profile: "list",
+				context: "userVisitorIds",
+			}),
+			rollupRead(
+				warehouse.compiledQuery(tenant, CH.compile(CH.userActivitySummaryQuery(userScope), params), {
+					profile: "aggregation",
+					context: "userActivitySummary",
 				}),
-				rollupRead(
-					warehouse.compiledQuery(
-						tenant,
-						CH.compile(CH.userActivitySummaryQuery(userScope), params),
-						{
-							profile: "aggregation",
-							context: "userActivitySummary",
-						},
-					),
-				),
-				rollupRead(
-					warehouse.compiledQuery(
-						tenant,
-						CH.compile(CH.userActivityServicesQuery(userScope), params),
-						{
-							profile: "aggregation",
-							context: "userActivityServices",
-						},
-					),
-				),
-				readUserIssueTotalsRow(tenant, payload, resolvedServices(scope)),
-			],
-			{ concurrency: USERS_READ_CONCURRENCY },
-		)
+			),
+			rollupRead(
+				warehouse.compiledQuery(tenant, CH.compile(CH.userActivityServicesQuery(userScope), params), {
+					profile: "aggregation",
+					context: "userActivityServices",
+				}),
+			),
+			readUserIssueTotalsRow(tenant, payload, resolvedServices(scope)),
+			// The identity spans and logs carried; none on a cluster without migration 0065.
+			identityRead(
+				warehouse.compiledQuery(tenant, CH.compile(CH.userActivityIdentityQuery(userScope), params), {
+					profile: "list",
+					context: "userActivityIdentity",
+				}),
+			),
+		],
+		{ concurrency: USERS_READ_CONCURRENCY },
+	)
 	const sessions = replay[0]?.sessions ?? 0
 	const eventCount = events[0]?.events ?? 0
 	const mcpRequests = mcp[0]?.requests ?? 0
@@ -885,8 +1031,8 @@ const profileIn = Effect.fn("UsersReads.profile")(function* (
 		Option.match(activity, { onNone: () => null, onSome: read })
 	const profile: UserProfileItem = {
 		userId: payload.userId,
-		name: nullIfEmpty(replay[0]?.name ?? "") ?? nullIfEmpty(mcp[0]?.name ?? ""),
-		email: nullIfEmpty(replay[0]?.email ?? "") ?? nullIfEmpty(mcp[0]?.email ?? ""),
+		name: newestIdentity([replay[0], mcp[0], Option.getOrUndefined(identity)], "name", "nameAt"),
+		email: newestIdentity([replay[0], mcp[0], Option.getOrUndefined(identity)], "email", "emailAt"),
 		groupId,
 		groupName: profileGroupName,
 		traits: Arr.map(Arr.zip(traitKeys, traitValues), ([key, value]) => ({ key, value })),

@@ -7,6 +7,8 @@ const RETENTION_DAYS = {
 	// CI projections outlive their raw traces on purpose: a year of run history.
 	ci_jobs: 365,
 	ci_runs: 365,
+	// Two years and a month: every month keeps the same month a year earlier beside it.
+	cost_daily: 760,
 	// Raw-tier projection of `traces`: rebuilt from it, so holding
 	// it past the source's own retention would store rows detection can no
 	// longer cross-check against a raw trace.
@@ -15,6 +17,8 @@ const RETENTION_DAYS = {
 	ai_crawler_requests: 30,
 	// Six years — HIPAA's documentation retention floor. Never rebuildable.
 	audit_log: 2190,
+	// Thirteen months: a year of audit history plus a month to compare against.
+	audit_trail_events: 400,
 	attribute_keys_hourly: 90,
 	attribute_values_hourly: 90,
 	error_events: 90,
@@ -23,8 +27,12 @@ const RETENTION_DAYS = {
 	// Only read while a fingerprint version bump settles; the re-key needs a recent occurrence.
 	error_fingerprint_lineage: 30,
 	logs: 30,
+	// Two weeks: a release's profile stays comparable with the previous week's.
+	profiles: 14,
 	logs_aggregates_hourly: 365,
 	metric_catalog: 90,
+	// As long as the raw metrics it rolls up.
+	aws_metrics_hourly: 90,
 	metrics_exponential_histogram: 90,
 	metrics_gauge: 90,
 	metrics_histogram: 90,

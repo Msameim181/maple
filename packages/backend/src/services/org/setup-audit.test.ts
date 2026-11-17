@@ -1020,8 +1020,15 @@ describe("integration checks", () => {
 					cloudflareStates: [],
 					cloudflareLogpush: [],
 					cloudflareHyperdrives: [],
+					gcpConnectors: [],
+					gcpResourceCounts: [],
+					awsConnections: [],
+					supabaseConnection: null,
+					supabaseProjects: [],
 					railwayConnection: null,
 					railwayEnvironments: [],
+					vercelConnection: null,
+					vercelProjectCount: 0,
 					planetscaleConnection: null,
 					planetscaleDatabases: [],
 					planetscalePollStates: [],
@@ -1107,6 +1114,8 @@ describe("integration checks", () => {
 		const planetscaleConnection = {
 			psOrganization: "acme",
 			detectedPermissions: { readDatabases: true, readOrganization: true },
+			metricsEnabled: true,
+			eventsEnabled: true,
 			lastInventoryAt: NOW - 30 * 60_000,
 			lastInventoryError: null,
 			createdAt: NOW - 30 * 24 * HOUR,
@@ -1118,7 +1127,13 @@ describe("integration checks", () => {
 			region: "us-east",
 			state: "ready",
 		}
-		const neverPolled = { databaseId: "db-1", lastSuccessAt: null, lastErrorAt: null, lastError: null }
+		const neverPolled = {
+			databaseId: "db-1",
+			dataset: "deploy_requests",
+			lastSuccessAt: null,
+			lastErrorAt: null,
+			lastError: null,
+		}
 
 		it("CFG-INTEG-05 says a database never polled, instead of quoting its metadata as an error", () => {
 			const report = runSetupAudit(
@@ -1218,6 +1233,56 @@ describe("integration checks", () => {
 			const result = check(broken, "CFG-INTEG-06")
 			expect(result.status).toBe("fail")
 			expect(result.affected[0]?.note).toContain("HMAC signature mismatch")
+		})
+
+		it("CFG-INTEG-07 reports a rejected Vercel token and an errored drain", () => {
+			const vercelConnection = {
+				teamName: "acme",
+				authFailedAt: null,
+				logsEnabled: true,
+				tracesEnabled: true,
+				aiGatewayEnabled: true,
+				speedInsightsEnabled: false,
+				webAnalyticsEnabled: false,
+				auditLogEnabled: false,
+				logDrainState: { status: "enabled", lastError: null },
+				traceDrainState: { status: "errored", lastError: "limits-exceeded" },
+				aiGatewayDrainState: { status: "enabled", lastError: null },
+				speedInsightsDrainState: null,
+				webAnalyticsDrainState: null,
+				auditLogDrainState: null,
+				lastSuccessAt: NOW - 60_000,
+				lastErrorAt: null,
+				lastError: null,
+				createdAt: NOW - 30 * 24 * HOUR,
+			}
+			const errored = check(
+				runSetupAudit(inputs({ integrationInventory: inventoryOf({ vercelConnection }) })),
+				"CFG-INTEG-07",
+			)
+			expect(errored.status).toBe("fail")
+			expect(errored.affected).toEqual([
+				{ kind: "integration", name: "drain traces", note: "limits-exceeded" },
+			])
+			const rejected = check(
+				runSetupAudit(
+					inputs({
+						integrationInventory: inventoryOf({
+							vercelConnection: {
+								...vercelConnection,
+								authFailedAt: NOW - HOUR,
+								traceDrainState: { status: "enabled", lastError: null },
+							},
+						}),
+					}),
+				),
+				"CFG-INTEG-07",
+			)
+			expect(
+				Arr.some(rejected.affected, (entity) =>
+					Str.includes("Vercel rejected the access token")(entity.note ?? ""),
+				),
+			).toBe(true)
 		})
 
 		it("passes the inventory checks when the inventory could not be read", () => {

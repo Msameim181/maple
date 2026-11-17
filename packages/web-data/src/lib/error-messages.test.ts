@@ -2,7 +2,14 @@ import { Cause } from "effect"
 import { HttpClientError, HttpClientRequest } from "effect/http"
 import { describe, expect, it } from "vitest"
 import { QueryEngineExecutionError, WarehouseQuotaExceededError } from "@maple/domain"
-import { BillingConflictError, BillingPaymentRequiredError } from "@maple/domain/http"
+import {
+	BillingConflictError,
+	BillingPaymentRequiredError,
+	CostConnectionPersistenceError,
+	CostConnectionValidationError,
+	OpenRouterKeyPersistenceError,
+	OpenRouterKeyValidationError,
+} from "@maple/domain/http"
 import {
 	NetworkErrorTag,
 	UnexpectedErrorTag,
@@ -125,6 +132,38 @@ describe("displayError", () => {
 			title: "Query failed",
 			message: "The aggregation query could not be completed.",
 		})
+	})
+
+	it("keeps the reason a key was refused, and hides what a failed save answered", () => {
+		const refused = new OpenRouterKeyValidationError({
+			message: "This is a regular API key. Reading spend needs a management key.",
+		})
+		expect(displayError(refused).message).toBe(
+			"This is a regular API key. Reading spend needs a management key.",
+		)
+
+		const failed = new OpenRouterKeyPersistenceError({
+			message: 'insert into "openrouter_cost_connections" failed: connection reset',
+		})
+		expect(displayError(failed).message).toBe(
+			"The key could not be checked or saved right now. Try again in a few seconds.",
+		)
+	})
+
+	it("keeps the reason a cost credential was refused, and hides what a failed save answered", () => {
+		const refused = new CostConnectionValidationError({
+			message: "This token can read 3 accounts. Create one limited to a single account.",
+		})
+		expect(displayError(refused).message).toBe(
+			"This token can read 3 accounts. Create one limited to a single account.",
+		)
+
+		const failed = new CostConnectionPersistenceError({
+			message: 'insert into "cost_connections" failed: connection reset',
+		})
+		expect(displayError(failed).message).toBe(
+			"The credential could not be checked or saved right now. Try again in a few seconds.",
+		)
 	})
 
 	it("finds a declared error in an Effect cause", () => {

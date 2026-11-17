@@ -57,6 +57,7 @@ Tools that take an alert rule, alert destination, dashboard or error issue ID ac
 | `list_services`              | read   | Active services with throughput, error rate and P95 latency                                           |
 | `diagnose_service`           | read   | One service's health, top errors, recent traces and logs, and the platform resources behind it        |
 | `get_service_top_operations` | read   | A service's top operations (endpoints or spans), ranked by a chosen metric                            |
+| `profile_hotspots`           | read   | Where a service spent CPU or allocated memory: its heaviest functions from continuous profiling       |
 | `service_map`                | read   | Service-to-service dependencies with call counts, error rates and latency per edge                    |
 | `compare_periods`            | read   | Error rate, throughput and P95 across two periods, overall and per service, with regressions flagged  |
 | `explore_attributes`         | read   | Attribute keys and their values for filtering; `source=services` lists environments and commit SHAs   |
@@ -252,6 +253,7 @@ The write tools here need the org admin or engineer role.
 | Tool                   | Access | What it does                                                                     |
 | ---------------------- | ------ | -------------------------------------------------------------------------------- |
 | `sync_railway`         | write  | Poll Railway now and report each environment's last sync                         |
+| `sync_vercel`          | write  | Sync Vercel now: projects, deployments and the state of Maple's drains           |
 | `create_scrape_target` | write  | Start scraping a Prometheus endpoint that needs no credentials                   |
 | `update_scrape_target` | write  | Pause, resume or change a Prometheus scrape target                               |
 | `delete_scrape_target` | write  | Delete a Prometheus scrape target and its check history; its stored metrics stay |

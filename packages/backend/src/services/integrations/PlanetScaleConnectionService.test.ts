@@ -10,9 +10,15 @@ import {
 	String as Str,
 	Option,
 } from "effect"
-import { CreateScrapeTargetRequest, OrgId, PlanetScaleMetricsTokenRequest, UserId } from "@maple/domain/http"
+import {
+	CreateScrapeTargetRequest,
+	OrgId,
+	PlanetScaleFeaturesRequest,
+	PlanetScaleMetricsTokenRequest,
+	UserId,
+} from "@maple/domain/http"
 import { FetchHttpClient } from "effect/http"
-import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import {
 	cleanupTestDbs,
 	createTestDb,
@@ -72,7 +78,7 @@ const makeLayer = (testDb: TestDb) => {
 		webhooksLive,
 		scrapeTargetsLive,
 		oauthLive,
-	).pipe(Layer.provide(testDb.layer), Layer.provide(Env.layer), Layer.provide(makeConfig()))
+	).pipe(Layer.provide(testDb.layer), Layer.provide(EnvTestLive), Layer.provide(makeConfig()))
 }
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)
@@ -198,6 +204,47 @@ const integrationSources = (testDb: TestDb) =>
 			FROM sources s WHERE s.kind = 'integration'`,
 		),
 	).pipe(Effect.map((result) => result.rows))
+
+/**
+ * The org's organization as a cost source on its connection, as the Cost page adds it, then held
+ * by a failed sync with a pull in flight.
+ */
+const addHeldCostSource = (testDb: TestDb) =>
+	Effect.promise(() =>
+		executeSql(
+			testDb,
+			`INSERT INTO cost_sources
+			   (id, org_id, provider, connection_ref, account_id, created_at, updated_at, watermark_date,
+			    last_synced_at, last_error, last_error_reason, next_attempt_at, consecutive_failures, lease_until)
+			 SELECT '0190f2b3-0000-7000-8000-0000000000f2', org_id, 'planetscale', id, ps_organization, now(), now(),
+			        '2026-11-11', now(), 'Reconnect PlanetScale to grant Maple access to invoices.', 'not_ready',
+			        now() + interval '6 hours', 3, now() + interval '20 minutes'
+			   FROM planetscale_connections`,
+			[],
+		),
+	)
+
+interface CostSourceState {
+	readonly id: string
+	readonly ref: string
+	readonly account: string
+	readonly held: boolean
+	readonly synced: boolean
+	readonly error: string | null
+	readonly failures: number
+	readonly leased: boolean
+}
+
+const costSource = (testDb: TestDb) =>
+	Effect.promise(() =>
+		queryFirstRow<CostSourceState>(
+			testDb,
+			`SELECT id, connection_ref AS ref, account_id AS account, next_attempt_at IS NOT NULL AS held,
+			        last_synced_at IS NOT NULL AS synced, last_error AS error,
+			        consecutive_failures AS failures, lease_until IS NOT NULL AS leased
+			   FROM cost_sources WHERE provider = 'planetscale'`,
+		),
+	)
 
 describe("PlanetScaleConnectionService", () => {
 	it.effect("finalizeOrgSelection provisions a managed scrape target and persists the binding", () => {
@@ -543,6 +590,146 @@ describe("PlanetScaleConnectionService", () => {
 		)
 	})
 
+	it.effect(
+		"a reconnect of the same organization keeps the Cost page's source and makes it due at once",
+		() => {
+			const testDb = createTestDb(trackedDbs)
+			const stub = stubPlanetScaleApi()
+
+			return Effect.gen(function* () {
+				const service = yield* PlanetScaleConnectionService
+				const orgId = asOrgId("org_1")
+				yield* storeGrant(orgId)
+				yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+				// The org added its organization as a cost source; the sync has held it since, on a
+				// grant made before Maple asked for invoices.
+				yield* addHeldCostSource(testDb)
+				const before = yield* costSource(testDb)
+				assert.deepStrictEqual([before?.held, before?.synced], [true, true])
+
+				// Authorizing again ends where the first connect did: the same organization, bound again.
+				yield* storeGrant(orgId)
+				yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+				// The same source on the same connection, with no hold and no last sync to wait a day from.
+				assert.deepStrictEqual(yield* costSource(testDb), {
+					...before,
+					held: false,
+					synced: false,
+					error: null,
+					failures: 0,
+					leased: false,
+				})
+			}).pipe(
+				Effect.provideService(FetchHttpClient.Fetch, stub),
+				Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+			)
+		},
+	)
+
+	it.effect(
+		"a reconnect that sees several organizations makes the source due though nothing is bound again",
+		() => {
+			const testDb = createTestDb(trackedDbs)
+			const stub = stubPlanetScaleApi({
+				organizations: [
+					{ id: "psorg_1", name: "acme" },
+					{ id: "psorg_2", name: "beta" },
+				],
+			})
+
+			return Effect.gen(function* () {
+				const service = yield* PlanetScaleConnectionService
+				const orgId = asOrgId("org_1")
+				yield* storeGrant(orgId)
+				yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+				yield* addHeldCostSource(testDb)
+				const before = yield* costSource(testDb)
+
+				// With two organizations the callback binds none, and the picker is not asked: the
+				// connection is bound already. The new grant alone has to release the source.
+				yield* storeGrant(orgId)
+				assert.deepStrictEqual(yield* costSource(testDb), {
+					...before,
+					held: false,
+					synced: false,
+					error: null,
+					failures: 0,
+					leased: false,
+				})
+			}).pipe(
+				Effect.provideService(FetchHttpClient.Fetch, stub),
+				Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+			)
+		},
+	)
+
+	it.effect("binding removes a source of another organization by the source's own account", () => {
+		const testDb = createTestDb(trackedDbs)
+		const stub = stubPlanetScaleApi()
+
+		return Effect.gen(function* () {
+			const service = yield* PlanetScaleConnectionService
+			const orgId = asOrgId("org_1")
+			yield* storeGrant(orgId)
+			yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+			yield* addHeldCostSource(testDb)
+			// The source reads another organization than the connection says it is bound to, as when
+			// a bind raced the read the removal used to be decided from.
+			yield* Effect.promise(() =>
+				executeSql(testDb, "UPDATE cost_sources SET account_id = 'earlier-org'", []),
+			)
+			yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+			assert.isUndefined(yield* costSource(testDb))
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
+	it.effect("binding another organization removes the Cost page's source of the old one", () => {
+		const testDb = createTestDb(trackedDbs)
+		const stub = stubPlanetScaleApi({
+			organizations: [
+				{ id: "psorg_1", name: "acme" },
+				{ id: "psorg_2", name: "beta" },
+			],
+		})
+
+		return Effect.gen(function* () {
+			const service = yield* PlanetScaleConnectionService
+			const orgId = asOrgId("org_1")
+			yield* storeGrant(orgId)
+			yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+			yield* addHeldCostSource(testDb)
+
+			// The connection keeps its id, so the source would go on reading: now another organization's invoices.
+			yield* service.finalizeOrgSelection(orgId, { organization: "beta" })
+			assert.isUndefined(yield* costSource(testDb))
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
+	it.effect("disconnect removes the Cost page's source with the connection it read through", () => {
+		const testDb = createTestDb(trackedDbs)
+		const stub = stubPlanetScaleApi()
+
+		return Effect.gen(function* () {
+			const service = yield* PlanetScaleConnectionService
+			const orgId = asOrgId("org_1")
+			yield* storeGrant(orgId)
+			yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+			yield* addHeldCostSource(testDb)
+
+			yield* service.disconnect(orgId)
+			assert.isUndefined(yield* costSource(testDb))
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
 	it.effect("never deletes a retired target whose ownership changed", () => {
 		const testDb = createTestDb(trackedDbs)
 		const stub = stubPlanetScaleApi({
@@ -630,6 +817,128 @@ describe("PlanetScaleConnectionService", () => {
 			const list = yield* scrapeTargetsService.list(orgId)
 			assert.strictEqual(list.targets.length, 0)
 			assert.deepStrictEqual(yield* integrationSources(testDb), [])
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
+	it.effect("events off deletes Maple's webhooks at PlanetScale and keeps the switch", () => {
+		const testDb = createTestDb(trackedDbs)
+		const calls: Array<{ url: string; authorization: string | null }> = []
+		const stub = stubPlanetScaleApi({ calls })
+
+		return Effect.gen(function* () {
+			const service = yield* PlanetScaleConnectionService
+			const orgId = asOrgId("org_1")
+			yield* storeGrant(orgId)
+			yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+			yield* Effect.promise(async () => {
+				await executeSql(
+					testDb,
+					"UPDATE oauth_connections SET scope = 'write_databases' WHERE org_id = $1",
+					[orgId],
+				)
+				await executeSql(
+					testDb,
+					`INSERT INTO planetscale_databases (id, org_id, database_id, name, webhook_id, created_at, updated_at)
+					 VALUES ('psdb-1', $1, 'db_1', 'shop', 'wh_1', now(), now())`,
+					[orgId],
+				)
+			})
+
+			const status = yield* service.setFeatures(
+				orgId,
+				new PlanetScaleFeaturesRequest({ eventsEnabled: false }),
+			)
+			assert.isFalse(status.eventsEnabled)
+			assert.isTrue(status.metricsEnabled)
+			assert.isTrue(Arr.some(calls, (call) => Str.includes("/databases/shop/webhooks/wh_1")(call.url)))
+			const database = yield* Effect.promise(() =>
+				queryFirstRow<{ webhook_id: string | null }>(
+					testDb,
+					"SELECT webhook_id FROM planetscale_databases WHERE id = 'psdb-1'",
+				),
+			)
+			assert.isNull(database?.webhook_id)
+			assert.isFalse((yield* service.getStatus(orgId)).eventsEnabled)
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
+	it.effect("metrics off takes the managed target out of the scraper's list until it is on again", () => {
+		const testDb = createTestDb(trackedDbs)
+		const stub = stubPlanetScaleApi()
+
+		return Effect.gen(function* () {
+			const service = yield* PlanetScaleConnectionService
+			const scrapeTargets = yield* ScrapeTargetsService
+			const orgId = asOrgId("org_1")
+			yield* storeGrant(orgId)
+			const bound = yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+			const targetId = bound.scrapeTarget?.id ?? ""
+			yield* Effect.promise(() =>
+				executeSql(testDb, "UPDATE scrape_targets SET enabled = true WHERE id = $1", [targetId]),
+			)
+			const scraped = scrapeTargets
+				.listAllEnabled()
+				.pipe(Effect.map((rows) => Arr.some(rows, (row) => row.id === targetId)))
+			assert.isTrue(yield* scraped)
+
+			const off = yield* service.setFeatures(
+				orgId,
+				new PlanetScaleFeaturesRequest({ metricsEnabled: false }),
+			)
+			assert.isFalse(off.metricsEnabled)
+			assert.isTrue(off.eventsEnabled)
+			assert.isFalse(yield* scraped)
+
+			yield* service.setFeatures(orgId, new PlanetScaleFeaturesRequest({ metricsEnabled: true }))
+			assert.isTrue(yield* scraped)
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
+	it.effect("two switches saved at once both stick", () => {
+		const testDb = createTestDb(trackedDbs)
+		const stub = stubPlanetScaleApi()
+		return Effect.gen(function* () {
+			const service = yield* PlanetScaleConnectionService
+			const orgId = asOrgId("org_1")
+			yield* storeGrant(orgId)
+			yield* service.finalizeOrgSelection(orgId, { organization: "acme" })
+			yield* Effect.all(
+				[
+					service.setFeatures(orgId, new PlanetScaleFeaturesRequest({ metricsEnabled: false })),
+					service.setFeatures(orgId, new PlanetScaleFeaturesRequest({ eventsEnabled: false })),
+				],
+				{ concurrency: "unbounded" },
+			)
+			const status = yield* service.getStatus(orgId)
+			assert.isFalse(status.metricsEnabled)
+			assert.isFalse(status.eventsEnabled)
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
+	it.effect("setFeatures refuses an org with no PlanetScale connection", () => {
+		const testDb = createTestDb(trackedDbs)
+		const stub = stubPlanetScaleApi()
+		return Effect.gen(function* () {
+			const service = yield* PlanetScaleConnectionService
+			const error = yield* Effect.flip(
+				service.setFeatures(
+					asOrgId("org_1"),
+					new PlanetScaleFeaturesRequest({ metricsEnabled: false }),
+				),
+			)
+			assert.strictEqual(error._tag, "@maple/http/errors/IntegrationsNotConnectedError")
 		}).pipe(
 			Effect.provideService(FetchHttpClient.Fetch, stub),
 			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),

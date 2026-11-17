@@ -21,6 +21,7 @@ import { ChatIdentities } from "./chat-identities"
 import { ChatWorkspaces } from "./chat-workspaces"
 import { CliDeviceAuthorizations } from "./cli-device-authorizations"
 import { CloudflareAnalyticsState } from "./cloudflare-analytics-state"
+import { CloudflareFeatureSettings } from "./cloudflare-feature-settings"
 import { CloudflareHyperdriveConfigs } from "./cloudflare-hyperdrive-configs"
 import { CloudflareLogpushConnectors } from "./cloudflare-logpush-connectors"
 import { CloudflareZoneSettings } from "./cloudflare-zone-settings"
@@ -53,9 +54,12 @@ import { IssueEscalationPolicies, IssueEscalations } from "./escalations"
 import { AlertEscalationRuns, AlertMemberNotifications, EscalationChains } from "./escalation-chains"
 import { OnCallOverrides, OnCallSchedules } from "./oncall-schedules"
 import { AwsConnections } from "./aws-connections"
+import { CloudSecurityFindings, CloudSecurityServiceStates } from "./cloud-security"
+import { CostSources } from "./cost-sources"
 import { GcpConnectors } from "./gcp-connectors"
 import { GcpResources } from "./gcp-resources"
 import { Investigations } from "./investigations"
+import { LinearFeatureSettings } from "./linear-feature-settings"
 import { LiveActivities } from "./live-activities"
 import { McpOAuthClients, McpOAuthAuthorizations, McpOAuthRefreshTokens } from "./mcp-oauth"
 import { MobileDevices } from "./mobile-devices"
@@ -77,8 +81,12 @@ import {
 	PlanetscaleEvents,
 	PlanetscaleIssueReceipts,
 } from "./planetscale-inventory"
+import { CostConnections } from "./cost-connections"
+import { OpenRouterCostConnections } from "./openrouter-cost-connections"
 import { OrgOpenRouterKeys } from "./openrouter-keys"
+import { OrgDirectoryGroups, OrgSsoConnections, OrgSsoDomains } from "./enterprise-sso"
 import { RailwayConnections, RailwayEnvironments } from "./railway"
+import { SavedViews } from "./saved-views"
 import { ScrapeTargets, ScrapeTargetChecks } from "./scrape-targets"
 import { SearchConsoleSites } from "./search-console-sites"
 import { ServiceMapWorldEntities } from "./service-map-world"
@@ -99,6 +107,7 @@ import {
 	StatusPageComponents,
 	StatusPageIncidentComponents,
 	StatusPageCleanups,
+	StatusPageCustomDomains,
 	StatusPageIncidentUpdates,
 	StatusPageIncidents,
 	StatusPages,
@@ -118,6 +127,7 @@ import {
 	PrReviewEdits,
 	PrReviewSettings,
 } from "./vcs"
+import { VercelConnections, VercelDeployments, VercelProjects } from "./vercel"
 
 export * from "./agent-feedback"
 export * from "./ai-triage"
@@ -126,6 +136,7 @@ export * from "./anomalies"
 export * from "./api-keys"
 export * from "./billing-links"
 export * from "./cancellation-reviews"
+export * from "./cloud-security"
 export * from "./dependency-scan"
 export * from "./chat-identities"
 export * from "./chat-workspaces"
@@ -133,6 +144,7 @@ export * from "./cli-device-authorizations"
 export * from "./cloudflare-analytics-state"
 export * from "./cloudflare-hyperdrive-configs"
 export * from "./cloudflare-logpush-connectors"
+export * from "./cloudflare-feature-settings"
 export * from "./cloudflare-zone-settings"
 export * from "./dashboard-shares"
 export * from "./dashboards"
@@ -145,9 +157,11 @@ export * from "./escalations"
 export * from "./escalation-chains"
 export * from "./oncall-schedules"
 export * from "./aws-connections"
+export * from "./cost-sources"
 export * from "./gcp-connectors"
 export * from "./gcp-resources"
 export * from "./investigations"
+export * from "./linear-feature-settings"
 export * from "./live-activities"
 export * from "./mcp-oauth"
 export * from "./mobile-devices"
@@ -162,8 +176,12 @@ export * from "./org-ingest-sampling-policies"
 export * from "./org-recommendation-issues"
 export * from "./planetscale-connections"
 export * from "./planetscale-inventory"
+export * from "./cost-connections"
+export * from "./openrouter-cost-connections"
 export * from "./openrouter-keys"
+export * from "./enterprise-sso"
 export * from "./railway"
+export * from "./saved-views"
 export * from "./scrape-targets"
 export * from "./search-console-sites"
 export * from "./security-audit"
@@ -175,6 +193,7 @@ export * from "./support-channels"
 export * from "./uptime"
 export * from "./slos"
 export * from "./vcs"
+export * from "./vercel"
 
 /** Every table the application database has, for schema checks and DDL. */
 export const allTables: ReadonlyArray<PgSchemaTable<string, ColumnDefs>> = [
@@ -199,6 +218,7 @@ export const allTables: ReadonlyArray<PgSchemaTable<string, ColumnDefs>> = [
 	ChatWorkspaces,
 	CliDeviceAuthorizations,
 	CloudflareAnalyticsState,
+	CloudflareFeatureSettings,
 	CloudflareHyperdriveConfigs,
 	CloudflareLogpushConnectors,
 	CloudflareZoneSettings,
@@ -235,7 +255,11 @@ export const allTables: ReadonlyArray<PgSchemaTable<string, ColumnDefs>> = [
 	GcpConnectors,
 	GcpResources,
 	AwsConnections,
+	CloudSecurityFindings,
+	CloudSecurityServiceStates,
+	CostSources,
 	Investigations,
+	LinearFeatureSettings,
 	LiveActivities,
 	McpOAuthClients,
 	McpOAuthAuthorizations,
@@ -252,7 +276,12 @@ export const allTables: ReadonlyArray<PgSchemaTable<string, ColumnDefs>> = [
 	OrgIngestRuleStats,
 	OrgIngestKeys,
 	OrgIngestSamplingPolicies,
+	OpenRouterCostConnections,
+	CostConnections,
 	OrgOpenRouterKeys,
+	OrgSsoDomains,
+	OrgSsoConnections,
+	OrgDirectoryGroups,
 	OrgBillingLinks,
 	Sources,
 	ExternalDataSources,
@@ -265,6 +294,7 @@ export const allTables: ReadonlyArray<PgSchemaTable<string, ColumnDefs>> = [
 	PlanetscaleIssueReceipts,
 	RailwayConnections,
 	RailwayEnvironments,
+	SavedViews,
 	ScrapeTargets,
 	ServiceMapWorldEntities,
 	ScrapeTargetChecks,
@@ -294,6 +324,7 @@ export const allTables: ReadonlyArray<PgSchemaTable<string, ColumnDefs>> = [
 	StatusPageIncidentUpdates,
 	StatusPageIncidentComponents,
 	StatusPageCleanups,
+	StatusPageCustomDomains,
 	VcsInstallations,
 	VcsRepositories,
 	VcsCommits,
@@ -305,4 +336,7 @@ export const allTables: ReadonlyArray<PgSchemaTable<string, ColumnDefs>> = [
 	PrReviewReplies,
 	PrReviewEdits,
 	PrReviewSettings,
+	VercelConnections,
+	VercelProjects,
+	VercelDeployments,
 ]

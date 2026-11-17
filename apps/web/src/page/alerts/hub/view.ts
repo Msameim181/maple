@@ -1,4 +1,4 @@
-import { type AlertIncidentId, isManagedSignalType } from "@maple/domain/http"
+import type { AlertIncidentId } from "@maple/domain/http"
 import type { AlertsOverviewReady } from "@maple/web-data/alerts/overview"
 import { makeClientErrorBody } from "@maple/web-data/lib/error-messages"
 import { Option, Array as Arr } from "effect"
@@ -25,6 +25,7 @@ import {
 	anomalyOverviewOf,
 	destinationsOf,
 	isAboutService,
+	isFirstRun,
 	overviewOf,
 	resolveIncidentStatus,
 	resolveSignal,
@@ -50,7 +51,7 @@ import { slosTab } from "./view-slos"
 import { deleteScheduleDialog, hasSchedules, oncallTab, whoIsOnCallStrip } from "./view-oncall"
 import { hstack, vstack } from "@maple/views/ui/stack"
 import { typography } from "@maple/views/ui/typography"
-import { canManageAlerts } from "../../kit/session-grants"
+import { canManageAlerts, canRespondToIncidents } from "../../kit/session-grants"
 
 type H = HtmlBuilder<Message>
 
@@ -179,20 +180,6 @@ const primaryButton = (h: H, onClick: Message, label: string, isDisabled = false
 	button(h, { size: "sm", isDisabled, attributes: [h.OnClick(onClick)] }, [icon(h, "PlusIcon"), label])
 
 /**
- * The first-run empty state fills the section: no rules yet, and on the Inbox nothing else to list
- * (an org with only monitors or SLOs has no visible rules but may have incidents to show).
- */
-const isFirstRun = (model: Model, data: AlertsOverviewReady, tab: "inbox" | "rules"): boolean => {
-	if (data.rules.length > 0) return false
-	if (tab === "rules") return true
-	return (
-		resolveSignal(model.search.signal) === null &&
-		!Arr.some(data.openIncidents, (incident) => isManagedSignalType(incident.signalType)) &&
-		!Arr.some(data.incidents, (incident) => incident.signalType === "anomaly")
-	)
-}
-
-/**
  * The header's one primary action: what the open section lists. A section whose empty state
  * already offers it shows none until it has rows, and a viewer who can't create it sees none.
  */
@@ -201,7 +188,10 @@ const headerActions = (
 	model: Model,
 	tab: AlertsTab,
 	overview: Option.Option<AlertsOverviewReady>,
+	audience: PageViewInputs["context"]["audience"],
 ): Html | undefined => {
+	// An analyst follows incidents and sets nothing up.
+	if (audience === "analyst") return undefined
 	if (tab === "inbox" || tab === "rules")
 		// The first-run empty state offers the templates and "Start from scratch" to who can create.
 		return canManageAlerts(model) && Option.exists(overview, (data) => isFirstRun(model, data, tab))
@@ -274,11 +264,13 @@ const hubBody = (
 				serviceName: model.search.serviceName,
 				onAddDestination: canManageAlerts(model) ? Message.ClickedNewDestination() : undefined,
 			})
-			const acknowledge = {
-				onAcknowledge: (incidentId: AlertIncidentId, acknowledged: boolean) =>
-					Message.ClickedAcknowledgeIncident({ incidentId, acknowledged }),
-				pendingIds: model.acknowledgingIncidentIds,
-			}
+			const acknowledge = canRespondToIncidents(model)
+				? {
+						onAcknowledge: (incidentId: AlertIncidentId, acknowledged: boolean) =>
+							Message.ClickedAcknowledgeIncident({ incidentId, acknowledged }),
+						pendingIds: model.acknowledgingIncidentIds,
+					}
+				: null
 			if (tab === "inbox") {
 				const signal = resolveSignal(model.search.signal)
 				// A team can set up on-call before its first rule, so the strip shows on the empty inbox too.
@@ -309,7 +301,7 @@ const hubBody = (
 										acknowledge,
 									}),
 							})
-						: inboxTab(h, data, acknowledge)
+						: inboxTab(h, data, acknowledge, model.focusedIncidentId)
 				return h.div([h.Class("space-y-6")], [...whoIsOnCallStrip(h, model), ...filters, body])
 			}
 			return rulesTab(h, model, {
@@ -352,7 +344,7 @@ export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, 
 				h,
 				{
 					title: TAB_LABEL[tab],
-					actions: headerActions(h, model, tab, overview),
+					actions: headerActions(h, model, tab, overview, inputs.context.audience),
 				},
 				[
 					tab === "routing"

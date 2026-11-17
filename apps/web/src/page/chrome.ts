@@ -1,11 +1,10 @@
-import { Option } from "effect"
+import { Array as Arr, String as Str } from "effect"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { AppRoute, isPublicRoute } from "../route"
 import type { BreadcrumbEntry } from "../shell"
 import { skeleton, skeletonList } from "@maple/views/ui/skeleton"
 import { dashboardPage, pageBody, pageContent } from "./kit/dashboard-page"
 import { resourceNotFound } from "./kit/resource-not-found"
-import { resolveLegacySettingsTab } from "./settings/nav"
 import { vstack } from "@maple/views/ui/stack"
 
 /**
@@ -16,13 +15,6 @@ const isBareRoute = AppRoute.isAnyOf(["CliLogin", "McpAuthorize", "QuickStart", 
 
 export const rendersShell = (route: AppRoute): boolean => !isPublicRoute(route) && !isBareRoute(route)
 
-/**
- * A retired settings tab only redirects, with no dashboard shell, so the top bar's pill is not
- * mounted and the redirect re-reads nothing.
- */
-export const isRedirectOnlyRoute = (route: AppRoute): boolean =>
-	route._tag === "Settings" && Option.isSome(resolveLegacySettingsTab(route.search.tab))
-
 /** The trail each page passes to the shell; pages without one show their route tag. */
 export const breadcrumbsOf = (route: AppRoute): ReadonlyArray<BreadcrumbEntry> =>
 	AppRoute.matchOrElse<ReadonlyArray<BreadcrumbEntry>>(
@@ -30,6 +22,23 @@ export const breadcrumbsOf = (route: AppRoute): ReadonlyArray<BreadcrumbEntry> =
 		{ Home: () => [{ label: "Overview" }], NotFound: () => [{ label: "Page not found" }] },
 		() => [{ label: route._tag }],
 	)
+
+const APP_NAME = "Maple"
+
+/** A crumb standing in for a name that has not loaded ("Loading…") names nothing yet. */
+const isPendingLabel = (label: string) => Str.endsWith("…")(label)
+
+/**
+ * The tab title: the page's own name first, then its parent, so a row of narrow tabs still tells
+ * them apart ("checkout-api · Services · Maple").
+ */
+export const documentTitleOf = (breadcrumbs: ReadonlyArray<BreadcrumbEntry>): string => {
+	const names = Arr.filter(
+		Arr.map(breadcrumbs, (crumb) => crumb.label),
+		(label) => label !== "" && !isPendingLabel(label),
+	)
+	return Arr.join([...Arr.reverse(Arr.takeRight(names, 2)), APP_NAME], " · ")
+}
 
 /**
  * The page content while the page has no slot or context yet (no org open, a plan-gate

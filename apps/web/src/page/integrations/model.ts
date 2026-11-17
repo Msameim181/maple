@@ -5,6 +5,7 @@ import {
 	GithubIntegrationStatus,
 	LinearIntegrationStatus,
 	RailwayIntegrationStatus,
+	VercelIntegrationStatus,
 	SearchConsoleIntegrationStatus,
 	SupabaseIntegrationStatus,
 } from "@maple/domain/http"
@@ -27,6 +28,7 @@ import { CloudflareCardModel } from "../infra-integrations/cloudflare/integratio
 import { GithubCardModel } from "./github"
 import { PrometheusCardModel } from "./prometheus"
 import { RailwayCardModel } from "../infra-integrations/railway/integration/railway"
+import { LinearCardModel } from "./linear"
 import { PlanetscaleCardModel } from "../infra-integrations/planetscale/integration/planetscale"
 import { GcpCardModel } from "../infra-integrations/gcp/integration/gcp"
 import { AwsCardModel } from "../infra-integrations/aws/integration/aws"
@@ -34,6 +36,7 @@ import { SupabaseCardModel } from "../infra-integrations/supabase/integration/su
 import { SearchConsoleCardModel } from "./search-console"
 import { ConnectModel } from "./connect"
 import { HubFilter } from "./catalog"
+import { VercelCardModel } from "../infra-integrations/vercel/integration/vercel-schema"
 
 const keyed = <A, AI>(schema: Schema.Codec<A, AI>) => KeyedSchema(schema, LoadFailure)
 
@@ -41,6 +44,7 @@ const keyed = <A, AI>(schema: Schema.Codec<A, AI>) => KeyedSchema(schema, LoadFa
 export const Statuses = Schema.Struct({
 	cloudflare: keyed(CloudflareIntegrationStatus),
 	railway: keyed(RailwayIntegrationStatus),
+	vercel: keyed(VercelIntegrationStatus),
 	planetscale: keyed(V2PlanetScaleIntegration),
 	planetscaleDatabases: keyed(V2PlanetScaleDatabaseList),
 	gcp: keyed(V2GcpIntegration),
@@ -73,10 +77,12 @@ export const Model = Schema.Struct({
 	/** The page's disconnect confirmation and its in-flight flag (one integration shows at a time). */
 	disconnect: Schema.Struct({ dialog: Dialog.Model, isPending: Schema.Boolean }),
 	chatCard: ChatCardModel,
+	linearCard: LinearCardModel,
 	githubCard: GithubCardModel,
 	cloudflareCard: CloudflareCardModel,
 	prometheusCard: PrometheusCardModel,
 	railwayCard: RailwayCardModel,
+	vercelCard: VercelCardModel,
 	planetscaleCard: PlanetscaleCardModel,
 	gcpCard: GcpCardModel,
 	awsCard: AwsCardModel,

@@ -37,6 +37,7 @@ import {
 	ListIntegrationsOutput,
 	ScrapeTargetMutationOutput,
 	SyncRailwayOutput,
+	SyncVercelOutput,
 } from "./integrations"
 import { CiRunsOutput, CompareCommitsOutput } from "./ci"
 import { AlertSilenceMutationOutput, ListAlertSilencesOutput } from "./alert-silences"
@@ -149,6 +150,7 @@ import {
 	RouteUsageOutput,
 	ServiceDeploymentsOutput,
 } from "./service-activity"
+import { ProfileHotspotsOutput } from "./profiles"
 import {
 	FindSlowTracesOutput,
 	InspectSpanOutput,
@@ -209,6 +211,7 @@ export const McpToolOutputs = {
 	get_investigation: GetInvestigationOutput,
 	get_instrumentation_recommendations: GetInstrumentationRecommendationsOutput,
 	get_service_top_operations: GetServiceTopOperationsOutput,
+	profile_hotspots: ProfileHotspotsOutput,
 	get_session_traces: GetSessionTracesOutput,
 	get_session_transcript: GetSessionTranscriptOutput,
 	ingest_freshness: IngestFreshnessOutput,
@@ -287,6 +290,7 @@ export const McpToolOutputs = {
 	service_deployments: ServiceDeploymentsOutput,
 	service_map: ServiceMapOutput,
 	sync_railway: SyncRailwayOutput,
+	sync_vercel: SyncVercelOutput,
 	set_issue_severity: SetIssueSeverityOutput,
 	merge_error_issues: MergeErrorIssuesOutput,
 	transition_error_issue: TransitionErrorIssueOutput,

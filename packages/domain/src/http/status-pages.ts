@@ -11,6 +11,7 @@ import {
 	StatusPageIncidentStatus,
 	StatusPageIncidentUpdateId,
 	StatusPageUpdateSource,
+	StatusPageVisibility,
 	UptimeMonitorId,
 	UserId,
 } from "@maple/primitives"
@@ -141,17 +142,56 @@ export class StatusPagePersistenceError extends HttpTaggedError<StatusPagePersis
 	},
 ) {}
 
-/** The org is not in the `statusPages` rollout. */
-export class StatusPagesDisabledError extends HttpTaggedError<StatusPagesDisabledError>()(
-	"@maple/http/errors/StatusPagesDisabledError",
+/** The page has no custom domain to check or remove. */
+export class StatusPageCustomDomainNotFoundError extends HttpTaggedError<StatusPageCustomDomainNotFoundError>()(
+	"@maple/http/errors/StatusPageCustomDomainNotFoundError",
+	{
+		pageId: StatusPageId,
+		message: Schema.String,
+	},
+	{
+		status: 404,
+		code: "status_page_custom_domain_not_found",
+		title: "No custom domain",
+		message: "This status page has no custom domain.",
+		param: "id",
+		retry: "never",
+		recovery: "none",
+		exposure: "redacted",
+	},
+) {}
+
+/** Another status page, in any organization, already uses the hostname. */
+export class StatusPageCustomDomainTakenError extends HttpTaggedError<StatusPageCustomDomainTakenError>()(
+	"@maple/http/errors/StatusPageCustomDomainTakenError",
+	{
+		hostname: Schema.String,
+		message: Schema.String,
+	},
+	{
+		status: 409,
+		code: "status_page_custom_domain_taken",
+		title: "Custom domain is taken",
+		message: "Another status page already uses this hostname.",
+		param: "hostname",
+		retry: "never",
+		recovery: "fix_request",
+		exposure: "redacted",
+	},
+) {}
+
+/** This deployment has no Cloudflare for SaaS zone set up, so pages cannot take custom domains. */
+export class StatusPageCustomDomainsUnavailableError extends HttpTaggedError<StatusPageCustomDomainsUnavailableError>()(
+	"@maple/http/errors/StatusPageCustomDomainsUnavailableError",
 	{ message: Schema.String },
 	{
-		status: 403,
-		code: "status_pages_disabled",
-		title: "Status pages are not enabled",
+		status: 503,
+		code: "status_page_custom_domains_unavailable",
+		title: "Custom domains are unavailable",
+		message: "Custom domains are not available on this Maple deployment.",
 		retry: "never",
 		recovery: "contact_support",
-		exposure: "public_message",
+		exposure: "redacted",
 	},
 ) {}
 
@@ -164,12 +204,18 @@ export const StatusPageRecord = Schema.Struct({
 	description: Schema.NullOr(Schema.String),
 	websiteUrl: Schema.NullOr(Schema.String),
 	logoUrl: Schema.NullOr(Schema.String),
+	logoDarkUrl: Schema.NullOr(Schema.String),
+	faviconUrl: Schema.NullOr(Schema.String),
+	supportUrl: Schema.NullOr(Schema.String),
 	privacyUrl: Schema.NullOr(Schema.String),
 	termsUrl: Schema.NullOr(Schema.String),
 	theme: StatusPageTheme,
 	showPoweredBy: Schema.Boolean,
 	autoIncidents: StatusPageAutoIncidents,
 	breakGlassTokenSuffix: Schema.NullOr(Schema.String),
+	visibility: StatusPageVisibility,
+	/** Whether a password is set; the hash itself never leaves the service. */
+	hasPassword: Schema.Boolean,
 	/** Not public until published; the publisher skips a draft. */
 	draft: Schema.Boolean,
 	revision: Schema.Number,
@@ -217,6 +263,8 @@ export const StatusPageIncidentRecord = Schema.Struct({
 	published: Schema.Boolean,
 	scheduledStart: Schema.NullOr(Schema.Number),
 	scheduledEnd: Schema.NullOr(Schema.Number),
+	/** Maintenance only: the sweep completes it when its window ends. */
+	autoComplete: Schema.Boolean,
 	startedAt: Schema.Number,
 	resolvedAt: Schema.NullOr(Schema.Number),
 	componentIds: Schema.Array(StatusPageComponentId),

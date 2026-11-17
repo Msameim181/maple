@@ -2,6 +2,7 @@ import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { Effect, Schema, Array as Arr } from "effect"
 import { AiCreditSource } from "../billing"
 import { TAX_ID_TYPE_VALUES } from "../billing-tax-ids"
+import { CodeReviewSpend } from "./code-review"
 import { SessionAuthorization } from "./current-tenant"
 import { HttpTaggedError } from "./error-policy"
 import { OrgId } from "@maple/primitives"
@@ -14,6 +15,7 @@ import {
 	LinkBillingOrgRequest,
 } from "./billing-account"
 import { WarehouseQueryError } from "./warehouse-errors"
+import { AnalystAccess } from "./analyst-access"
 
 // Contract for raw Autumn proxy responses. Schemas model only consumed fields
 // and tolerate additive upstream fields.
@@ -100,6 +102,7 @@ export const BillingFeatureId = Schema.Literals([
 	"logs",
 	"traces",
 	"metrics",
+	"profiles",
 	"browser_sessions",
 	"product_events",
 	"ai_credits",
@@ -209,7 +212,7 @@ export class BillingUsageFeature extends Schema.Class<BillingUsageFeature>("Bill
 }) {}
 
 export class BillingUsage extends Schema.Class<BillingUsage>("BillingUsage")({
-	// Keyed by Autumn featureId (logs/traces/metrics/browser_sessions/product_events).
+	// Keyed by Autumn featureId (logs/traces/metrics/profiles/browser_sessions/product_events).
 	total: Schema.optionalKey(Schema.Record(Schema.String, BillingUsageFeature)),
 }) {}
 
@@ -231,6 +234,8 @@ export class DailyVolume extends Schema.Class<DailyVolume>("DailyVolume")({
 	logsGB: Schema.Number,
 	tracesGB: Schema.Number,
 	metricsGB: Schema.Number,
+	/** Continuous profiling GB metered that day. Absent until the warehouse records profile bytes. */
+	profilesGB: Schema.optionalKey(Schema.Number),
 	browserSessions: Schema.Number,
 	/** Product events (browser `track()` + server events) metered that day. Absent until the API emits it. */
 	productEvents: Schema.optionalKey(Schema.Number),
@@ -258,12 +263,26 @@ export class AiCreditDay extends Schema.Class<AiCreditDay>("AiCreditDay")({
 	credits: Schema.Number,
 }) {}
 
-/** This cycle's AI credit spend, split by surface and by day. One credit is one dollar. */
+/** AI credits one model's calls spent this cycle. */
+export class AiCreditModelUsage extends Schema.Class<AiCreditModelUsage>("AiCreditModelUsage")({
+	/** As tracked, `<provider>/<model>`: `openrouter/deepseek/deepseek-v4.1-flash`. */
+	model: Schema.String,
+	credits: Schema.Number,
+}) {}
+
+/** This cycle's AI credit spend, split by surface, by day and by model. One credit is one dollar. */
 export class AiCreditUsageResponse extends Schema.Class<AiCreditUsageResponse>("AiCreditUsageResponse")({
+	/** The billing cycle the figures cover, epoch ms. */
+	cycleStartMs: Schema.Number,
+	cycleEndMs: Schema.Number,
 	/** Largest first with `other` last, surfaces that spent nothing left out. */
 	bySource: Schema.Array(AiCreditSourceUsage),
 	/** Ascending by date, days that spent nothing left out. */
 	days: Schema.Array(AiCreditDay),
+	/** Largest first, models that spent nothing left out. */
+	byModel: Schema.Array(AiCreditModelUsage),
+	/** This org's code reviews over the cycle; null when it ran none or they could not be read. */
+	codeReview: Schema.NullOr(CodeReviewSpend),
 }) {}
 
 const NonNegativeFiniteNumber = Schema.Number.pipe(
@@ -710,7 +729,7 @@ export class BillingApiGroup extends HttpApiGroup.make("billing")
 			payload: PreviewAttachRequest,
 			success: PreviewAttachResult,
 			error: [BillingManagedByBillingOrgError, ...billingRequestErrors],
-		}),
+		}).annotate(AnalystAccess, "read"),
 	)
 	.add(
 		HttpApiEndpoint.post("openCustomerPortal", "/portal", {

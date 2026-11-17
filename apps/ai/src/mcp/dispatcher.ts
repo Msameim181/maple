@@ -15,9 +15,11 @@ import { FEEDBACK_TOOL, type McpToolResult } from "./tools/types"
 import { McpRuntimeServicesLive, type McpToolRuntimeRequirements } from "./tools/runtime-services"
 import { CurrentMcpRequestTenant, CurrentMcpTenant } from "./tenant"
 import { recordExpectedMcpFailure, spanFailureMessage } from "./expected-failures"
-import { loadRegistry } from "./tool-catalog"
+import { executeRegisteredTool, type McpToolLookup } from "./tools/registry-core"
+import { makeModuleToolLookup, mcpToolTitle } from "./tools/tool-lookup"
 import { recordMcpToolAudit } from "@maple/backend/services/audit/audit-access"
 import type { TenantContext } from "@maple/domain/http"
+import { productEventSpanAttributes } from "@maple/domain/tinybird/product-event-attributes"
 
 /**
  * How a failure reads to the model: one short lead naming the kind of failure, never an error tag.
@@ -41,6 +43,7 @@ export const withFeedbackHint = (text: string, name: string, surface: McpToolSur
 		: text
 
 const dispatchInSpan = Effect.fn("McpToolDispatcher.call")(function* (
+	tools: McpToolLookup,
 	name: string,
 	input: unknown,
 	surface: McpToolSurface,
@@ -49,8 +52,7 @@ const dispatchInSpan = Effect.fn("McpToolDispatcher.call")(function* (
 	// solely because each handler happens to carry its own `McpTool.<name>` span
 	// — every usage query had to reconstruct it with `substring(SpanName, 9)`.
 	yield* Effect.annotateCurrentSpan("maple.mcp.tool", name)
-	const registry = yield* loadRegistry
-	return yield* registry.executeRegisteredMcpToolUnscoped(name, input, surface).pipe(
+	return yield* executeRegisteredTool(tools, name, input, surface).pipe(
 		Effect.catchTag("@maple/mcp/errors/McpDecodeError", (error) =>
 			recordExpectedMcpFailure(error, "Invalid parameters").pipe(
 				Effect.as(failureResult(error.message, "invalid_parameters")),
@@ -142,8 +144,8 @@ const dispatchInSpan = Effect.fn("McpToolDispatcher.call")(function* (
 })
 
 /** Raw dispatcher. Executable handlers stay private so callers cannot omit the request tenant. */
-const callMcpToolUnscoped = (name: string, input: unknown, surface: McpToolSurface) =>
-	dispatchInSpan(name, input, surface).pipe(
+const callMcpToolUnscoped = (tools: McpToolLookup, name: string, input: unknown, surface: McpToolSurface) =>
+	dispatchInSpan(tools, name, input, surface).pipe(
 		Effect.catchTag("@maple/mcp/errors/McpQueryError", (error) =>
 			Effect.logError("MCP tool execution failed").pipe(
 				Effect.annotateLogs({
@@ -213,6 +215,8 @@ export class McpToolExecutor extends Context.Service<McpToolExecutor, McpToolExe
 			const source = yield* VcsSourceService
 			const dataSources = yield* ExternalDataSourceService
 			const featureFlags = yield* OrganizationFeatureFlagsService
+			// Each tool's module loads on the first call that names it, not the whole registry.
+			const tools = yield* makeModuleToolLookup
 
 			const execute = Effect.fn("McpToolExecutor.execute")(function* (
 				tenant: TenantContext,
@@ -224,7 +228,23 @@ export class McpToolExecutor extends Context.Service<McpToolExecutor, McpToolExe
 					"maple.mcp.tool": name,
 					"maple.mcp.surface": surface,
 				})
-				const result = yield* callMcpToolUnscoped(name, input, surface).pipe(
+				// A public MCP call is also Maple's own `mcp_tool_called` product event,
+				// projected from this span. Agent turns (`chat`, `bot`) are not: the
+				// investigation that ran them is the event.
+				if (surface === "mcp") {
+					const base = { tool: name, source: "mcp" }
+					const props =
+						tenant.mcpClientName === undefined ? base : { ...base, client: tenant.mcpClientName }
+					yield* Effect.annotateCurrentSpan(
+						productEventSpanAttributes({
+							name: "mcp_tool_called",
+							userId: tenant.userId,
+							groupId: tenant.orgId,
+							props,
+						}),
+					)
+				}
+				const result = yield* callMcpToolUnscoped(tools, name, input, surface).pipe(
 					Effect.provideService(CurrentMcpTenant, tenant),
 					Effect.provide(runtimeServices),
 				)
@@ -233,6 +253,7 @@ export class McpToolExecutor extends Context.Service<McpToolExecutor, McpToolExe
 				yield* recordMcpToolAudit({
 					tenant,
 					name,
+					title: mcpToolTitle(name),
 					input,
 					surface,
 					isError: result.isError === true,

@@ -9,7 +9,9 @@ import {
 	tableHeaderStickyStyles,
 	tableHeaderStyles,
 	tableRowLinkLiftStyles,
+	tableGroupCellStyles,
 	tableRowLinkStyles,
+	tableRowNameLinkStyles,
 	tableRowStyles,
 	tableSortButtonStyles,
 	tableSortIconStyles,
@@ -99,6 +101,28 @@ export const tableRow = <M>(
 			...attributes,
 		],
 		children,
+	)
+
+/** A row that heads the rows under it (a day in a list grouped by day): one header cell across every column. */
+export const tableGroupRow = <M>(
+	h: HtmlBuilder<M>,
+	options: Readonly<{ colSpan: number; key: string; className?: string }>,
+	children: Children,
+): Html =>
+	tableRow(
+		h,
+		[
+			h.th(
+				[
+					h.Attribute("class", cn(tableCellStyles, tableGroupCellStyles, options.className)),
+					h.DataAttribute("slot", "table-group"),
+					h.Attribute("colspan", String(options.colSpan)),
+				],
+				children,
+			),
+		],
+		"hover:bg-transparent active:bg-transparent",
+		[h.Key(options.key)],
 	)
 
 /** A `tableRow` whose whole row opens something: the pointer and the sunken hover, strong while selected. */
@@ -191,6 +215,29 @@ export const rowLink = <M>(
 			...(options.attributes ?? []),
 		],
 		children,
+	)
+
+/**
+ * A row's name as its `rowLink`: one truncating medium line, muted for a row that is switched off.
+ * The full name is its tooltip, so a cut-off name can still be told from its neighbours.
+ */
+export const rowNameLink = <M>(
+	h: HtmlBuilder<M>,
+	options: {
+		readonly href: string
+		readonly name: string
+		readonly isMuted?: boolean
+		readonly attributes?: ReadonlyArray<Attribute<M>>
+	},
+): Html =>
+	rowLink(
+		h,
+		{
+			href: options.href,
+			className: cn(tableRowNameLinkStyles, options.isMuted === true && "text-muted-foreground"),
+			attributes: [h.Title(options.name), ...(options.attributes ?? [])],
+		},
+		[options.name],
 	)
 
 export type SortDirection = "asc" | "desc"

@@ -11,17 +11,22 @@ import {
 	Exit,
 	Layer,
 	Option,
+	Record as Rec,
 	Schema,
 } from "effect"
 import type { TestDb } from "@maple/backend/testing/test-pglite"
-import { Env } from "@maple/backend/platform/Env"
-import { HttpClient, HttpClientResponse } from "effect/http"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
+import { FetchHttpClient, type HttpClient } from "effect/http"
+import * as VendorFake from "@maple/backend/testing/vendor-fake"
 import { VcsRepository } from "@maple/backend/services/integrations/vcs/VcsRepository"
+import { VcsProviderRegistry } from "@maple/backend/services/integrations/vcs/VcsProviderRegistry"
 import {
 	clampQueueDelaySeconds,
 	VcsSyncQueue,
 	type VcsSyncQueueApi,
 } from "@maple/backend/services/integrations/vcs/VcsSyncQueue"
+import { GithubAppClient } from "@maple/backend/services/integrations/vcs/vendor/github/GithubAppClient"
+import { GithubProvider } from "@maple/backend/services/integrations/vcs/vendor/github/GithubProvider"
 
 // Shared test harness for the GitHub / VCS integration. The id-resolver
 // helpers, config/env layers, scripted-HTTP seam, recording queue, and
@@ -73,7 +78,7 @@ const baseConfigValues = {
 const testConfig = (extra?: Record<string, unknown>) =>
 	ConfigProvider.layer(ConfigProvider.fromUnknown({ ...baseConfigValues, ...extra }))
 
-export const testEnv = (extra?: Record<string, unknown>) => Env.layer.pipe(Layer.provide(testConfig(extra)))
+export const testEnv = (extra?: Record<string, unknown>) => EnvTestLive.pipe(Layer.provide(testConfig(extra)))
 
 export const testRepoLayer = (testDb: TestDb, extra?: Record<string, unknown>) =>
 	VcsRepository.layer.pipe(Layer.provide(testDb.layer), Layer.provide(testEnv(extra)))
@@ -92,25 +97,38 @@ export interface FakeGithubRequest {
 	readonly body: string | undefined
 }
 
-// An HttpClient seam for the GitHub App client: `respond` answers each request
-// with a web `Response`, so rate-limit and pagination handling run unchanged.
+// An HttpClient seam for the GitHub App client over a VendorFake: `respond` answers each request
+// with a web `Response`, so rate-limit, redirect and pagination handling run unchanged.
 export const fakeGithubHttp = (respond: (request: FakeGithubRequest) => Response | Promise<Response>) =>
-	Layer.succeed(
-		HttpClient.HttpClient,
-		HttpClient.make((request, url) =>
-			Effect.promise(async () =>
-				respond({
-					url: url.toString(),
-					method: request.method,
-					headers: request.headers,
-					body:
-						request.body._tag === "Raw" && typeof request.body.body === "string"
-							? request.body.body
-							: undefined,
-				}),
-			).pipe(Effect.map((response) => HttpClientResponse.fromWeb(request, response))),
+	FetchHttpClient.layer.pipe(
+		Layer.provide(
+			VendorFake.make({
+				routes: [
+					{
+						respond: (request) =>
+							respond({
+								url: request.url.href,
+								method: request.method,
+								headers: Rec.fromEntries(Arr.fromIterable(request.headers.entries())),
+								body: request.body === "" ? undefined : request.body,
+							}),
+					},
+				],
+			}).layer,
 		),
 	)
+
+// The provider registry with the real GitHub provider and App client over an HttpClient seam,
+// for tests outside the VCS layer that reach GitHub through the port.
+export const registryOverHttp = (http: Layer.Layer<HttpClient.HttpClient>) => {
+	const env = testEnv(GITHUB_APP_CONFIG)
+	return Layer.effect(VcsProviderRegistry, VcsProviderRegistry.make).pipe(
+		Layer.provide(Layer.effect(GithubProvider, GithubProvider.make)),
+		Layer.provide(Layer.effect(GithubAppClient, GithubAppClient.make)),
+		Layer.provide(http),
+		Layer.provide(env),
+	)
+}
 
 // A GitHub HttpClient seam replaying canned responses in call order; once the script is
 // exhausted the last responder repeats (so rate-limit loops can keep replying).

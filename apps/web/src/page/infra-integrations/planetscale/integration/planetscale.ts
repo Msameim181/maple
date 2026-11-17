@@ -1,4 +1,5 @@
 import {
+	V2PlanetScaleFeaturesRequest,
 	type V2PlanetScaleIntegration,
 	V2PlanetScaleMetricsTokenRequest,
 	V2PlanetScaleOrganizationList,
@@ -6,17 +7,70 @@ import {
 } from "@maple/domain/http/v2"
 import { Effect, Schema, Array as Arr, String as Str } from "effect"
 import { AsyncData, Command } from "foldkit"
+import { defineMessageUnion } from "foldkit/message"
 import { KeyedSchema } from "@maple/views/data/keyed"
 import { LoadFailure, toLoadFailure, settleTo } from "@maple/views/data/load-failure"
 import { MapleApiV2Client } from "../../../../platform/api-clients"
 import * as Dialog from "@maple/views/ui/dialog"
 import * as Field from "@maple/views/ui/field"
 import { derivePlanetScaleSetup } from "../setup-steps"
-import { Message } from "../../../integrations/message"
+import { IntegrationStatuses } from "../../../../data/integration-statuses"
+import { FeatureSwitchesModel, initFeatureSwitches } from "../../../integrations/feature-switches"
+
+/** The `INTEGRATION_FEATURES.planetscale` switches, as the card edits them. */
+export const PlanetscaleFeatureSwitches = Schema.Struct({
+	metricsEnabled: Schema.Boolean,
+	eventsEnabled: Schema.Boolean,
+})
+export type PlanetscaleFeatureSwitches = typeof PlanetscaleFeatureSwitches.Type
+export const PlanetscaleFeatureFlag = Schema.Literals(["metricsEnabled", "eventsEnabled"])
+
+/** The switches as saved; an older API that sends none has both on. */
+export const savedPlanetscaleFeatures = (
+	status: V2PlanetScaleIntegration | null,
+): PlanetscaleFeatureSwitches => ({
+	metricsEnabled: status?.metrics_enabled ?? true,
+	eventsEnabled: status?.events_enabled ?? true,
+})
 
 /** Where branch metrics come from: the OAuth grant's metrics API, or a Prometheus service token. */
 export const PlanetscaleMetricsMethod = Schema.Literals(["api", "service_token"])
 export type PlanetscaleMetricsMethod = typeof PlanetscaleMetricsMethod.Type
+
+/** The PlanetScale module's own messages; the hub carries them in `GotPlanetscaleMessage`. */
+export const PlanetscaleMessage = defineMessageUnion({
+	CompletedFetchOrganizations: {
+		key: Schema.String,
+		result: Schema.Result(V2PlanetScaleOrganizationList, LoadFailure),
+	},
+	ClickedChangeOrganization: {},
+	GotPickerDialogMessage: { message: Dialog.Message },
+	SelectedOrganization: { name: Schema.String },
+	GotBranchFieldMessage: { field: Schema.Literals(["include", "exclude"]), message: Field.Message },
+	ClickedPickerCancel: {},
+	SubmittedOrganization: {},
+	CompletedSelectOrganization: { organization: Schema.String, failure: Schema.NullOr(LoadFailure) },
+	ClickedMetricsDetails: {},
+	SelectedMetricsMethod: { method: Schema.Literals(["api", "service_token"]) },
+	GotTokenField: { field: Schema.Literals(["id", "secret"]), message: Field.Message },
+	SubmittedToken: {},
+	CompletedToken: { failure: Schema.NullOr(LoadFailure) },
+	ClickedReplaceToken: {},
+	/** While the first metrics are awaited: every 5 s, then every minute, for 30 minutes. */
+	TickedWatch: {},
+	/** Restarts the watch once it ran out. */
+	ClickedCheckAgain: {},
+	ToggledFeature: { flag: PlanetscaleFeatureFlag },
+	CompletedFeatures: { failure: Schema.NullOr(LoadFailure) },
+})
+export type PlanetscaleMessage = typeof PlanetscaleMessage.Type
+
+/** The hub's status read for PlanetScale, shared with the sidebar. */
+export const PLANETSCALE_STATUS_READ = {
+	name: "LoadIntegrationsPlanetscaleStatus",
+	read: (refresh: boolean) =>
+		Effect.flatMap(IntegrationStatuses, (statuses) => statuses.planetscale({ refresh })),
+}
 
 export const PlanetscaleCardModel = Schema.Struct({
 	/** The org picker: inline on the flow's Choose data step, in a dialog for Edit data. */
@@ -39,6 +93,8 @@ export const PlanetscaleCardModel = Schema.Struct({
 	isReplacingToken: Schema.Boolean,
 	/** The first clock read while awaiting first metrics; null while not awaiting. */
 	watchStartedAt: Schema.NullOr(Schema.Number),
+	/** The feature switches: each toggle saves at once. */
+	features: FeatureSwitchesModel(PlanetscaleFeatureSwitches),
 })
 export type PlanetscaleCardModel = typeof PlanetscaleCardModel.Type
 
@@ -57,6 +113,7 @@ export const initPlanetscaleCard = (): PlanetscaleCardModel => ({
 	tokenError: null,
 	isReplacingToken: false,
 	watchStartedAt: null,
+	features: initFeatureSwitches,
 })
 
 /** The card stops watching for first metrics after this long and offers "Check again". */
@@ -78,12 +135,12 @@ export const parsePatternList = (value: string): ReadonlyArray<string> =>
 
 export const FetchOrganizations = Command.define("FetchPlanetscaleOrganizations", {
 	args: { key: Schema.String },
-	messages: [Message.CompletedFetchOrganizations],
+	messages: [PlanetscaleMessage.CompletedFetchOrganizations],
 	execute: ({ key }) =>
 		Effect.gen(function* () {
 			const client = yield* MapleApiV2Client
 			return yield* client.planetscaleIntegration.organizations()
-		}).pipe(settleTo((result) => Message.CompletedFetchOrganizations({ key, result }))),
+		}).pipe(settleTo((result) => PlanetscaleMessage.CompletedFetchOrganizations({ key, result }))),
 })
 
 export const SelectOrganization = Command.define("SelectPlanetscaleOrganization", {
@@ -92,7 +149,7 @@ export const SelectOrganization = Command.define("SelectPlanetscaleOrganization"
 		includeBranches: Schema.Array(Schema.String),
 		excludeBranches: Schema.Array(Schema.String),
 	},
-	messages: [Message.CompletedSelectOrganization],
+	messages: [PlanetscaleMessage.CompletedSelectOrganization],
 	execute: ({ organization, includeBranches, excludeBranches }) =>
 		Effect.gen(function* () {
 			const client = yield* MapleApiV2Client
@@ -107,15 +164,19 @@ export const SelectOrganization = Command.define("SelectPlanetscaleOrganization"
 		}).pipe(
 			Effect.match({
 				onFailure: (error) =>
-					Message.CompletedSelectOrganization({ organization, failure: toLoadFailure(error) }),
-				onSuccess: () => Message.CompletedSelectOrganization({ organization, failure: null }),
+					PlanetscaleMessage.CompletedSelectOrganization({
+						organization,
+						failure: toLoadFailure(error),
+					}),
+				onSuccess: () =>
+					PlanetscaleMessage.CompletedSelectOrganization({ organization, failure: null }),
 			}),
 		),
 })
 
 export const SetMetricsToken = Command.define("SetPlanetscaleMetricsToken", {
 	args: { tokenId: Schema.String, tokenSecret: Schema.String },
-	messages: [Message.CompletedPlanetscaleToken],
+	messages: [PlanetscaleMessage.CompletedToken],
 	execute: ({ tokenId, tokenSecret }) =>
 		Effect.gen(function* () {
 			const client = yield* MapleApiV2Client
@@ -126,8 +187,27 @@ export const SetMetricsToken = Command.define("SetPlanetscaleMetricsToken", {
 			yield* client.planetscaleIntegration.setMetricsToken({ payload })
 		}).pipe(
 			Effect.match({
-				onFailure: (error) => Message.CompletedPlanetscaleToken({ failure: toLoadFailure(error) }),
-				onSuccess: () => Message.CompletedPlanetscaleToken({ failure: null }),
+				onFailure: (error) => PlanetscaleMessage.CompletedToken({ failure: toLoadFailure(error) }),
+				onSuccess: () => PlanetscaleMessage.CompletedToken({ failure: null }),
+			}),
+		),
+})
+
+/** `updateFeatures` with only the toggled switch, so a stale tab never rewrites the other. */
+export const SavePlanetscaleFeatures = Command.define("SavePlanetscaleFeatures", {
+	args: { flag: PlanetscaleFeatureFlag, enabled: Schema.Boolean },
+	messages: [PlanetscaleMessage.CompletedFeatures],
+	execute: ({ flag, enabled }) =>
+		Effect.gen(function* () {
+			const client = yield* MapleApiV2Client
+			const payload = yield* Schema.decodeEffect(V2PlanetScaleFeaturesRequest)(
+				flag === "metricsEnabled" ? { metrics_enabled: enabled } : { events_enabled: enabled },
+			)
+			yield* client.planetscaleIntegration.updateFeatures({ payload })
+		}).pipe(
+			Effect.match({
+				onFailure: (error) => PlanetscaleMessage.CompletedFeatures({ failure: toLoadFailure(error) }),
+				onSuccess: () => PlanetscaleMessage.CompletedFeatures({ failure: null }),
 			}),
 		),
 })

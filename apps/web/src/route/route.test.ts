@@ -3,7 +3,14 @@ import { Option, String as Str } from "effect"
 import { fromString } from "foldkit/url"
 import { describe, expect, test } from "vitest"
 import { DATA_INTEGRATIONS } from "./data-integrations"
-import { AppRoute, flaggedRouteRedirect, hrefOf, routeRedirect, urlToAppRoute } from "./index"
+import {
+	AppRoute,
+	flaggedRouteRedirect,
+	hrefOf,
+	routeRedirect,
+	securityRouteRedirect,
+	urlToAppRoute,
+} from "./index"
 
 const parse = (path: string) => urlToAppRoute(Option.getOrThrow(fromString(`http://maple.test${path}`)))
 
@@ -134,6 +141,29 @@ describe("routes", () => {
 		expect(parse("/alerts/nope")._tag).toBe("NotFound")
 	})
 
+	test("the retired Releases pages send old links to the services and a release to its deploy drawer", () => {
+		const redirectOf = (url: string) => Option.map(routeRedirect(parse(url)), (to) => to.url)
+		expect(redirectOf("/releases?timePreset=7d&impact=regressed")).toEqual(
+			Option.some("/services?timePreset=7d"),
+		)
+		expect(
+			redirectOf(
+				"/releases/abc123?service=checkout&environments=%5B%22production%22%5D&timePreset=24h",
+			),
+		).toEqual(
+			Option.some(
+				"/services/checkout?deploy=abc123&environments=%5B%22production%22%5D&timePreset=24h",
+			),
+		)
+		// A release link with no window opens on the week the Releases page read by default.
+		expect(redirectOf("/releases/abc123?service=checkout")).toEqual(
+			Option.some("/services/checkout?deploy=abc123&timePreset=7d"),
+		)
+		// Without a service there is no page to open the deploy on: the services, in the same window.
+		expect(redirectOf("/releases/abc123?timePreset=24h")).toEqual(Option.some("/services?timePreset=24h"))
+		expect(routeRedirect(parse("/releases"))).toEqual(Option.some({ url: "/services", isReplace: true }))
+	})
+
 	test("an old `?tab=` link replaces itself with its section's path and keeps its other params", () => {
 		const redirectOf = (url: string) => Option.map(routeRedirect(parse(url)), (to) => to.url)
 		expect(redirectOf("/alerts?tab=rules&status=firing")).toEqual(
@@ -217,14 +247,86 @@ describe("routes", () => {
 		expect(routeRedirect(parse("/integrations?integration=chat-hazel"))).toEqual(Option.none())
 	})
 
-	test("an org outside the statusPages rollout is sent home from every status page route", () => {
+	test("every org opens the status page routes, whatever its rollouts", () => {
 		for (const path of ["/status-pages", "/status-pages/new", "/status-pages/stp_abc"]) {
-			expect(flaggedRouteRedirect(parse(path), { statusPages: false })).toEqual(
+			expect(flaggedRouteRedirect(parse(path), { cloudCost: false, productAnalytics: false })).toEqual(
+				Option.none(),
+			)
+		}
+	})
+
+	test("an org outside the productAnalytics rollout is sent home from /product-analytics", () => {
+		const flags = { cloudCost: true }
+		for (const path of ["/product-analytics", "/product-analytics?tab=funnels&timePreset=7d"]) {
+			expect(flaggedRouteRedirect(parse(path), { ...flags, productAnalytics: false })).toEqual(
 				Option.some({ url: "/", isReplace: true }),
 			)
-			expect(flaggedRouteRedirect(parse(path), { statusPages: true })).toEqual(Option.none())
+			expect(flaggedRouteRedirect(parse(path), { ...flags, productAnalytics: true })).toEqual(
+				Option.none(),
+			)
 		}
-		expect(flaggedRouteRedirect(parse("/services"), { statusPages: false })).toEqual(Option.none())
+	})
+
+	test("the budgets list and the budget editor have their own paths under /cost", () => {
+		expect(parse("/cost/budgets")._tag).toBe("CostBudgets")
+		const prefilled = parse(hrefOf(AppRoute.CostBudgetNew({ search: { provider: ["aws"] } })))
+		expect(prefilled).toMatchObject({ _tag: "CostBudgetNew", search: { provider: ["aws"] } })
+		expect(parse("/cost/budgets/new?budgetId=abc")).toMatchObject({
+			_tag: "CostBudgetNew",
+			search: { budgetId: "abc" },
+		})
+	})
+
+	test("an org outside the cloudCost rollout is sent home from /cost, filters and all", () => {
+		for (const path of [
+			"/cost",
+			"/cost?groupBy=region&region=%5B%22eu-west-1%22%5D",
+			"/cost/budgets",
+			"/cost/budgets/new",
+		]) {
+			expect(
+				flaggedRouteRedirect(parse(path), {
+					cloudCost: false,
+					productAnalytics: true,
+				}),
+			).toEqual(Option.some({ url: "/", isReplace: true }))
+			expect(
+				flaggedRouteRedirect(parse(path), {
+					cloudCost: true,
+					productAnalytics: true,
+				}),
+			).toEqual(Option.none())
+		}
+	})
+
+	test("a cost view's grouping, order, range and filters survive the URL", () => {
+		const search = {
+			timePreset: "3mo",
+			groupBy: "region",
+			sort: "change",
+			cloud_service: ["Amazon Elastic Compute Cloud"],
+			region: [""],
+		} as const
+		expect(parse(hrefOf(AppRoute.Cost({ search })))).toEqual(AppRoute.Cost({ search }))
+	})
+
+	test("someone who cannot read security is sent home from every Security route", () => {
+		const paths = [
+			"/security",
+			"/security/code",
+			"/security/code/findings",
+			"/security/code/runs",
+			"/security/dependencies",
+			"/security/exposure",
+			"/security/runtimes",
+		]
+		for (const path of paths) {
+			expect(securityRouteRedirect(parse(path), false)).toEqual(
+				Option.some({ url: "/", isReplace: true }),
+			)
+			expect(securityRouteRedirect(parse(path), true)).toEqual(Option.none())
+		}
+		expect(securityRouteRedirect(parse("/services"), false)).toEqual(Option.none())
 	})
 
 	test("a literal sibling wins over a param route", () => {
@@ -295,6 +397,19 @@ describe("routes", () => {
 			_tag: "SecurityDependencies",
 			search: { repo: "repo_1" },
 		})
+		expect(parse("/security/audit-log?category=credential&outcome=denied")).toMatchObject({
+			_tag: "SecurityAuditLog",
+			search: { category: "credential", outcome: "denied" },
+		})
+		expect(parse("/security/detections")._tag).toBe("SecurityDetections")
+		const prefilled = parse("/security/detections/new?provider=vercel&action=team.member.role.updated")
+		expect(prefilled).toMatchObject({
+			_tag: "SecurityDetectionNew",
+			search: { provider: "vercel", action: "team.member.role.updated" },
+		})
+		expect(hrefOf(prefilled)).toBe(
+			"/security/detections/new?provider=vercel&action=team.member.role.updated",
+		)
 		expect(parse("/security/code/runs/run_9f3c2a1e7b")).toMatchObject({
 			_tag: "SecurityRun",
 			runId: "run_9f3c2a1e7b",

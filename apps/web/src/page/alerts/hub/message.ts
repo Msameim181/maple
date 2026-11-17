@@ -57,6 +57,9 @@ export const Message = defineMessageUnion({
 	UpdatedDestinations: rows(AlertDestinationRowSchema),
 	FailedLoadAlerts: { orgId: Schema.String },
 	ClickedRetryLoad: {},
+	/** A list key over the Inbox's open incidents: J / K / arrows, Enter, Escape. */
+	PressedListKey: { key: Schema.String },
+	CompletedScrollFocusedRow: {},
 	CompletedFetchDeliveries: {
 		key: Schema.String,
 		result: LoadOutcome(Schema.Array(AlertDeliveryEventDocument)),
@@ -81,6 +84,8 @@ export const Message = defineMessageUnion({
 		acknowledged: Schema.Boolean,
 		result: LoadOutcome(V2AlertIncident),
 	},
+	/** `trackProduct("alert_incident_acknowledged")` was handed to the session SDK. */
+	CompletedTrackAcknowledged: {},
 	ClickedToggleDestination: { destinationId: AlertDestinationId },
 	CompletedUpdateDestination: { destinationId: AlertDestinationId, result: LoadOutcome(Schema.Void) },
 	ClickedTestDestination: { destinationId: AlertDestinationId },

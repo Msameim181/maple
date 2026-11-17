@@ -1,42 +1,50 @@
 import * as Policy from "@maple/domain/policy"
-import { Option, Result, Array as Arr, String as Str } from "effect"
-import { Command as FoldkitCommand } from "foldkit"
+import { Option, Result, Array as Arr } from "effect"
 import * as Keyed from "@maple/views/data/keyed"
 import { requestKey } from "@maple/views/data/request-key"
 import { AppRoute, hrefOf } from "../../route"
 import { type PageContext, PageOutMessage, type PageReturn } from "../contract"
 import * as Dialog from "@maple/views/ui/dialog"
-import { chatConnectorOf, integrationOfSearch } from "./catalog"
+import { integrationOfSearch } from "./catalog"
 import { chatCallbackOf } from "./chat-callback"
 import { initConnect } from "./connect"
 import { Disconnect, DISCONNECTS } from "./disconnect"
 import { initGithubCard } from "./github"
-import * as Chat from "./update-chat"
 import * as Github from "./update-github"
-import * as CloudflareCard from "../infra-integrations/cloudflare/integration/update-cloudflare"
-import { initCloudflareCard } from "../infra-integrations/cloudflare/integration/cloudflare"
 import { initPrometheusCard } from "./prometheus"
-import { initRailwayCard } from "../infra-integrations/railway/integration/railway"
-import { initPlanetscaleCard } from "../infra-integrations/planetscale/integration/planetscale"
 import { initGcpCard } from "../infra-integrations/gcp/integration/gcp"
 import { initAwsCard } from "../infra-integrations/aws/integration/aws"
 import * as Aws from "../infra-integrations/aws/integration/update-aws"
-import { initSupabaseCard } from "../infra-integrations/supabase/integration/supabase"
-import * as Supabase from "../infra-integrations/supabase/integration/update-supabase"
-import * as SearchConsole from "./update-search-console"
-import { initSearchConsoleCard } from "./search-console"
 import * as Gcp from "../infra-integrations/gcp/integration/update-gcp"
 import * as Configure from "../infra-integrations/gcp/integration/update-gcp-configure"
-import * as Planetscale from "../infra-integrations/planetscale/integration/update-planetscale"
-import * as Railway from "../infra-integrations/railway/integration/update-railway"
 import * as Prometheus from "./update-prometheus"
-import { ChartRuntime } from "@maple/views/charts/chart-runtime"
 import { isMultiAccount } from "../infra-integrations/cloudflare/integration/view-cloudflare"
 import * as Connect from "./update-connect"
 import { isClerkAuthEnabled } from "../../platform/auth-mode"
-import { CompleteOAuthReturn, LoadCustomer, LoadSession, ReadClock, StripChatParams } from "./command"
+import {
+	CompleteOAuthReturn,
+	LoadCustomer,
+	LoadSession,
+	ReadClock,
+	StripChatParams,
+	TrackDisconnected,
+} from "./command"
 import type { OAuthReturnOutcome } from "./oauth-return"
 import { chain, requestStatus, statusNamesOf } from "./update-status"
+import {
+	CHAT_PROVIDER,
+	CLOUDFLARE_PROVIDER,
+	everyProvider,
+	LINEAR_PROVIDER,
+	PLANETSCALE_PROVIDER,
+	PROVIDER_MODULES,
+	providerModuleOf,
+	RAILWAY_PROVIDER,
+	SEARCH_CONSOLE_PROVIDER,
+	SUPABASE_PROVIDER,
+	VERCEL_PROVIDER,
+	withDisconnectDialog,
+} from "./provider-modules"
 import { Message } from "./message"
 import type { Model, Statuses } from "./model"
 
@@ -132,6 +140,7 @@ export const init = (route: { readonly search: Search }, context: PageContext): 
 		statuses: {
 			cloudflare: Keyed.idle(),
 			railway: Keyed.idle(),
+			vercel: Keyed.idle(),
 			planetscale: Keyed.idle(),
 			planetscaleDatabases: Keyed.idle(),
 			gcp: Keyed.idle(),
@@ -150,16 +159,18 @@ export const init = (route: { readonly search: Search }, context: PageContext): 
 		filter: "all",
 		connect: initConnect(),
 		disconnect: { dialog: Dialog.init("integration-disconnect", "alert-dialog"), isPending: false },
-		chatCard: { busy: null, confirmId: null, identityBusy: false },
+		chatCard: CHAT_PROVIDER.initial(),
+		linearCard: LINEAR_PROVIDER.initial(),
 		githubCard: initGithubCard(),
-		cloudflareCard: initCloudflareCard(),
+		cloudflareCard: CLOUDFLARE_PROVIDER.initial(),
 		prometheusCard: initPrometheusCard(),
-		planetscaleCard: initPlanetscaleCard(),
+		planetscaleCard: PLANETSCALE_PROVIDER.initial(),
 		gcpCard: initGcpCard(),
 		awsCard: initAwsCard(),
-		railwayCard: initRailwayCard(),
-		supabaseCard: initSupabaseCard(),
-		searchConsoleCard: initSearchConsoleCard(),
+		railwayCard: RAILWAY_PROVIDER.initial(),
+		vercelCard: VERCEL_PROVIDER.initial(),
+		supabaseCard: SUPABASE_PROVIDER.initial(),
+		searchConsoleCard: SEARCH_CONSOLE_PROVIDER.initial(),
 	}
 	const loaded = chain(model, [
 		...Arr.map(
@@ -192,14 +203,10 @@ export const routeChanged = (
 /** The reads an integration's card mounts (Cloudflare's usage, PlanetScale's watch clock). */
 const enterIntegration = (model: Model, context: PageContext): Return => {
 	const integration = integrationOfSearch(model.search.integration)
-	if (integration === "cloudflare") return CloudflareCard.enterCloudflare(model, context)
 	if (integration === "aws") return Aws.enterAws(model, context)
 	if (integration === "gcp")
 		return chain(model, [(next) => Gcp.enterGcp(next, context), (next) => Gcp.requestBand(next, context)])
-	if (integration === "supabase") return Supabase.requestMetricsRows(model, context, "Load")
-	if (integration === "planetscale") return Planetscale.enterPlanetscale(model)
-	if (integration === "google-search-console") return SearchConsole.requestSites(model, context, "Load")
-	return { model }
+	return providerModuleOf(integration)?.onEnter(model, context) ?? { model }
 }
 
 /** The GCP band's reads wait on the status and the clock. */
@@ -214,27 +221,26 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 	const s = model.statuses
 	return Message.match<Return>(message, {
 		CompletedReadClock: ({ nowMs }) =>
-			chain(Planetscale.withWatchStart({ ...model, nowMs }, nowMs), [
+			chain({ ...model, nowMs }, [
 				(next) => gcpBand(next, context),
-				(next) => Supabase.requestMetricsRows(next, context, "Load"),
+				(next) => everyProvider(next, (provider) => (each) => provider.onClock(each, context)),
 			]),
 		CompletedLoadCloudflare: ({ key, result }) =>
 			accepted(model, { ...s, cloudflare: Keyed.accept(s.cloudflare, key, result) }),
 		CompletedLoadRailway: ({ key, result }) =>
-			accepted(model, { ...s, railway: Keyed.accept(s.railway, key, result) }),
-		CompletedLoadPlanetscale: ({ key, result }) => {
-			const read = accepted(model, {
-				...s,
-				planetscale: Keyed.accept(s.planetscale, key, result),
-			}).model
-			return chain(read, [
-				(next) => Planetscale.loadedStatus(next),
-				(next) =>
-					integrationOfSearch(next.search.integration) === "planetscale"
-						? Planetscale.ensurePicker(next, context)
-						: { model: next },
-			])
-		},
+			RAILWAY_PROVIDER.onStatus(
+				accepted(model, { ...s, railway: Keyed.accept(s.railway, key, result) }).model,
+				context,
+				{ isCurrent: s.railway.key === key, previous: s.railway },
+			),
+		CompletedLoadVercel: ({ key, result }) =>
+			accepted(model, { ...s, vercel: Keyed.accept(s.vercel, key, result) }),
+		CompletedLoadPlanetscale: ({ key, result }) =>
+			PLANETSCALE_PROVIDER.onStatus(
+				accepted(model, { ...s, planetscale: Keyed.accept(s.planetscale, key, result) }).model,
+				context,
+				{ isCurrent: s.planetscale.key === key, previous: s.planetscale },
+			),
 		CompletedLoadPlanetscaleDatabases: ({ key, result }) =>
 			accepted(model, {
 				...s,
@@ -252,44 +258,41 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 				context,
 				Aws.connectionsOf(model),
 			),
-		CompletedLoadSupabase: ({ key, result }) => {
-			const read = accepted(model, { ...s, supabase: Keyed.accept(s.supabase, key, result) }).model
-			// Any answer to the current read retires saved flips; a failed one shows the last known value.
-			return Supabase.requestMetricsRows(
-				s.supabase.key === key ? Supabase.settledStatus(read) : read,
+		CompletedLoadSupabase: ({ key, result }) =>
+			SUPABASE_PROVIDER.onStatus(
+				accepted(model, { ...s, supabase: Keyed.accept(s.supabase, key, result) }).model,
 				context,
-				"Load",
-			)
-		},
-		CompletedLoadSupabaseMetrics: ({ key, result }) => Supabase.completedMetricsRows(model, key, result),
+				{ isCurrent: s.supabase.key === key, previous: s.supabase },
+			),
+		GotRailwayMessage: ({ message: child }) => RAILWAY_PROVIDER.update(model, child, context),
+		GotSupabaseMessage: ({ message: child }) => SUPABASE_PROVIDER.update(model, child, context),
 		CompletedLoadLinear: ({ key, result }) =>
-			accepted(model, { ...s, linear: Keyed.accept(s.linear, key, result) }),
+			LINEAR_PROVIDER.onStatus(
+				accepted(model, { ...s, linear: Keyed.accept(s.linear, key, result) }).model,
+				context,
+				{ isCurrent: s.linear.key === key, previous: s.linear },
+			),
+		GotLinearMessage: ({ message: child }) => LINEAR_PROVIDER.update(model, child, context),
+		CompletedLoadChat: ({ key, result }) =>
+			CHAT_PROVIDER.onStatus(
+				accepted(model, { ...s, chat: Keyed.accept(s.chat, key, result) }).model,
+				context,
+				{ isCurrent: s.chat.key === key, previous: s.chat },
+			),
 		CompletedLoadGithub: ({ key, result }) =>
 			accepted(model, { ...s, github: Keyed.accept(s.github, key, result) }),
-		CompletedLoadSearchConsole: ({ key, result }) => {
-			const read = SearchConsole.resetOnGrantChange(
-				model,
-				accepted(model, {
-					...s,
-					searchConsole: Keyed.accept(s.searchConsole, key, result),
-				}).model,
-			)
-			return SearchConsole.requestSites(
-				s.searchConsole.key === key ? SearchConsole.settledStatus(read) : read,
+		CompletedLoadSearchConsole: ({ key, result }) =>
+			SEARCH_CONSOLE_PROVIDER.onStatus(
+				accepted(model, { ...s, searchConsole: Keyed.accept(s.searchConsole, key, result) }).model,
 				context,
-				"Load",
-			)
-		},
-		CompletedLoadSearchConsoleSites: ({ key, result }) =>
-			SearchConsole.completedSites(model, key, result),
-		ToggledSearchConsoleSite: ({ siteUrl }) => SearchConsole.toggledSite(model, siteUrl),
-		ClickedSaveSearchConsoleSites: () => SearchConsole.clickedSave(model),
-		ClickedRetrySearchConsoleSites: () => SearchConsole.requestSites(model, context, "Refresh"),
-		CompletedSaveSearchConsoleSites: ({ failure }) =>
-			SearchConsole.completedSave(model, context, failure),
-		CompletedSearchConsolePrime: () => SearchConsole.completedPrime(model, context),
-		CompletedLoadChat: ({ key, result }) =>
-			accepted(model, { ...s, chat: Keyed.accept(s.chat, key, result) }),
+				{ isCurrent: s.searchConsole.key === key, previous: s.searchConsole },
+			),
+		GotSearchConsoleMessage: ({ message: child }) =>
+			SEARCH_CONSOLE_PROVIDER.update(model, child, context),
+		GotChatMessage: ({ message: child }) => CHAT_PROVIDER.update(model, child, context),
+		GotVercelMessage: ({ message: child }) => VERCEL_PROVIDER.update(model, child, context),
+		GotPlanetscaleMessage: ({ message: child }) => PLANETSCALE_PROVIDER.update(model, child, context),
+		GotCloudflareMessage: ({ message: child }) => CLOUDFLARE_PROVIDER.update(model, child, context),
 		CompletedLoadScrapeTargets: ({ key, result }) =>
 			accepted(model, { ...s, scrapeTargets: Keyed.accept(s.scrapeTargets, key, result) }),
 		CompletedLoadCustomer: ({ key, result }) => ({
@@ -317,6 +320,7 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 				false,
 			),
 		CompletedTrackConnected: () => ({ model }),
+		CompletedTrackDisconnected: () => ({ model }),
 		ClickedIntegration: ({ integration }) =>
 			navigateTo(model, hrefOfSearch(integration === null ? {} : { integration }), false),
 		ClickedSettingsTab: ({ tab }) => navigateTo(model, `/settings?tab=${encodeURIComponent(tab)}`, false),
@@ -324,51 +328,12 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 			const callback = chatCallbackOf(model.search)
 			return callback === null ? { model } : navigateTo(model, hrefOfSearch(callback.next), true)
 		},
-		ClickedConnect: () => Connect.clickedConnect(model),
-		ClickedOpenGithubInstallPage: () => Connect.clickedConnect(model, "install"),
+		ClickedConnect: () => Connect.clickedConnect(model, context),
+		ClickedOpenGithubInstallPage: () => Connect.clickedConnect(model, context, "install"),
 		ClickedSelectGithubInstallation: ({ installationId }) =>
 			Github.clickedInstallation(model, installationId),
 		CompletedSelectGithubInstallation: ({ state, installationId, failure }) =>
 			Github.completedInstallation(model, context, state, installationId, failure),
-		ClickedChatInstall: () => Chat.clickedInstall(model),
-		CompletedLoadCloudflareUsage: ({ key, result }) => ({
-			model: {
-				...model,
-				cloudflareCard: {
-					...model.cloudflareCard,
-					usage: Keyed.accept(model.cloudflareCard.usage, key, result),
-				},
-			},
-		}),
-		CompletedCloudflarePrime: ({ isOk, isConnected }) =>
-			CloudflareCard.completedPrime(model, context, isOk, isConnected),
-		TickedCloudflareIngest: () => {
-			// The ingest phase (stalled, backfill) follows the clock, so each tick rereads it.
-			const refreshed = CloudflareCard.refreshCloudflare(model, context)
-			return { ...refreshed, commands: [...(refreshed.commands ?? []), ReadClock()] }
-		},
-		GotZoneFilterMessage: ({ message: child }) => CloudflareCard.gotZoneFilter(model, child),
-		ChangedZoneSearch: ({ value }) => CloudflareCard.updateBoard(model, { zoneSearch: value }),
-		ClickedZoneSort: ({ key }) => CloudflareCard.clickedZoneSort(model, key),
-		ClickedWorkersExpand: () =>
-			CloudflareCard.updateBoard(model, { workersExpanded: !model.cloudflareCard.workersExpanded }),
-		ClickedManageZones: () => CloudflareCard.clickedManageZones(model),
-		GotZoneDialogMessage: ({ message: child }) => CloudflareCard.gotZoneDialog(model, child),
-		ToggledManagedZone: ({ accountId, zoneId }) =>
-			CloudflareCard.toggledManagedZone(model, accountId, zoneId),
-		ToggledWatchNewZones: ({ accountId }) => CloudflareCard.toggledWatchNewZones(model, accountId),
-		ClickedSetAccountZones: ({ accountId, watched }) =>
-			CloudflareCard.clickedSetAccountZones(model, accountId, watched),
-		ChangedManagedZoneSearch: ({ value }) =>
-			CloudflareCard.updateBoard(model, { zoneDraftSearch: value }),
-		SubmittedZoneSettings: () => CloudflareCard.submittedZoneSettings(model),
-		CompletedCloudflareZones: ({ failure }) =>
-			CloudflareCard.completedZoneSettings(model, context, failure),
-		CompletedLoadChartRuntime: () =>
-			CloudflareCard.updateBoard(model, { chartRuntime: ChartRuntime.Ready() }),
-		FailedLoadChartRuntime: ({ reason }) =>
-			CloudflareCard.updateBoard(model, { chartRuntime: ChartRuntime.Failed({ reason }) }),
-		GotSparklineMessage: () => ({ model }),
 		ClickedTarget: ({ id }) => Prometheus.clickedTarget(model, context, id),
 		CompletedFetchChecks: ({ key, result }) => ({
 			model: {
@@ -398,16 +363,6 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 		GotTargetDeleteDialogMessage: ({ message: child }) => Prometheus.gotDeleteDialog(model, child),
 		ConfirmedTargetDelete: () => Prometheus.confirmedDelete(model),
 		CompletedTargetDelete: ({ id, failure }) => Prometheus.completedDelete(model, context, id, failure),
-		GotRailwayTokenMessage: ({ message: child }) => Railway.gotToken(model, child),
-		SubmittedRailwayToken: () => Railway.submittedToken(model),
-		SucceededRailwayConnect: ({ title, description }) =>
-			Railway.succeededConnect(model, context, title, description),
-		FailedRailwayConnect: ({ error }) => Railway.failedConnect(model, error),
-		ClickedRailwaySync: () => Railway.clickedSync(model),
-		CompletedRailwaySync: ({ failure }) => Railway.completedSync(model, context, failure),
-		ClickedRailwayRotate: () => Railway.setRotating(model, true),
-		ClickedRailwayRotateCancel: () => Railway.setRotating(model, false),
-		TickedRailwaySettle: () => requestStatus(model, context, "railway", "Refresh"),
 		GotAwsAccountIdMessage: ({ message: child }) => Aws.gotAccountId(model, child),
 		SubmittedAwsAccount: () => Aws.submittedAccount(model),
 		SucceededAwsCreate: ({ connection }) => Aws.succeededCreate(model, context, connection),
@@ -440,44 +395,10 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 		SubmittedAwsMetrics: ({ id }) => Aws.submittedMetrics(model, id),
 		CompletedAwsMetricStream: ({ id, connection, error }) =>
 			Aws.completedMetricStream(model, context, id, connection, error),
-		// Advances the card's window and "Last data" ages; the fresh clock re-reads rows on a new key.
-		TickedSupabaseClock: () => ({ model, commands: [ReadClock()] }),
-		CompletedReadSupabaseClock: ({ nowMs }) => Supabase.completedReadClock(model, context, nowMs),
-		ClickedSupabaseSync: () => Supabase.clickedSync(model),
-		CompletedSupabaseSync: ({ failure }) => Supabase.completedSync(model, context, failure),
-		ToggledSupabaseMetrics: ({ ref, enabled }) => Supabase.toggledSwitch(model, ref, "metrics", enabled),
-		CompletedSupabaseMetrics: ({ ref, enabled, failure }) =>
-			Supabase.completedSwitch(model, context, ref, "metrics", enabled, failure),
-		ToggledSupabaseLogs: ({ ref, enabled }) => Supabase.toggledSwitch(model, ref, "logs", enabled),
-		CompletedSupabaseLogs: ({ ref, enabled, failure }) =>
-			Supabase.completedSwitch(model, context, ref, "logs", enabled, failure),
-		ToggledSupabaseLogDrain: ({ ref, enabled }) => Supabase.toggledSwitch(model, ref, "drain", enabled),
-		CompletedSupabaseLogDrain: ({ ref, enabled, failure }) =>
-			Supabase.completedSwitch(model, context, ref, "drain", enabled, failure),
-		CompletedFetchOrganizations: ({ key, result }) =>
-			Planetscale.updateCard(model, {
-				organizations: Keyed.accept(model.planetscaleCard.organizations, key, result),
-			}),
-		ClickedChangeOrganization: () => Planetscale.clickedChange(model, context),
-		GotPickerDialogMessage: ({ message: child }) => Planetscale.gotPickerDialog(model, child),
-		SelectedOrganization: ({ name }) => Planetscale.updateCard(model, { selectedOrg: name }),
-		GotBranchFieldMessage: ({ field, message: child }) => Planetscale.gotBranchField(model, field, child),
-		ClickedPickerCancel: () => Planetscale.clickedPickerCancel(model),
-		SubmittedOrganization: () => Planetscale.submittedOrganization(model),
-		CompletedSelectOrganization: ({ organization, failure }) =>
-			Planetscale.completedSelect(model, context, organization, failure),
-		ClickedMetricsDetails: () =>
-			Planetscale.updateCard(model, { isDetailsOpen: !model.planetscaleCard.isDetailsOpen }),
-		SelectedPlanetscaleMetricsMethod: ({ method }) =>
-			Planetscale.updateCard(model, { metricsMethod: method, tokenError: null }),
-		GotPlanetscaleTokenField: ({ field, message: child }) =>
-			Planetscale.gotTokenField(model, field, child),
-		SubmittedPlanetscaleToken: () => Planetscale.submittedToken(model),
-		CompletedPlanetscaleToken: ({ failure }) => Planetscale.completedToken(model, context, failure),
-		ClickedPlanetscaleReplaceToken: () =>
-			Planetscale.updateCard(model, { isReplacingToken: !model.planetscaleCard.isReplacingToken }),
-		TickedPlanetscaleWatch: () => Planetscale.refreshWatch(model, context),
-		ClickedPlanetscaleCheckAgain: () => Planetscale.clickedCheckAgain(model, context),
+		ToggledAwsModule: ({ id, module }) => Aws.toggledModule(model, id, module),
+		CompletedAwsModules: ({ id, connection, error }) =>
+			Aws.completedModules(model, context, id, connection, error),
+		ToggledAwsNewModule: ({ module }) => Aws.toggledNewModule(model, module),
 		CompletedGcpLogVolume: ({ key, result }) =>
 			Gcp.updateGcpCard(model, { logVolume: Keyed.accept(model.gcpCard.logVolume, key, result) }),
 		CompletedGcpFleet: ({ key, result }) =>
@@ -510,6 +431,7 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 		GotGcpScopeFieldMessage: ({ field, message: child }) => Configure.gotScopeField(model, field, child),
 		SubmittedGcpCreate: () => Configure.submittedCreate(model),
 		ToggledGcpCollect: ({ capability }) => Configure.toggledCollect(model, capability),
+		ToggledGcpFeature: ({ id, capability }) => Configure.toggledFeature(model, id, capability),
 		ClickedGcpLogFilter: () => Configure.clickedLogFilter(model),
 		GotGcpFilterModeMessage: ({ message: child }) => Configure.gotFilterMode(model, context, child),
 		ClickedGcpForwardOutput: () => Configure.clickedForwardOutput(model, context),
@@ -563,11 +485,6 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 		ConfirmedBranch: () => Github.confirmedBranch(model),
 		CompletedTrackedBranch: ({ repoId, branch, backfillQueued, failure }) =>
 			Github.completedTrackedBranch(model, context, repoId, branch, backfillQueued, failure),
-		CompletedChatInstall: ({ failure }) => Chat.completedInstall(model, context, failure),
-		ClickedChatIdentity: () => Chat.clickedIdentity(model),
-		CompletedChatIdentity: ({ kind, failure }) => Chat.completedIdentity(model, context, kind, failure),
-		ClickedChatDisconnect: ({ workspaceId }) => Chat.clickedDisconnect(model, workspaceId),
-		CompletedChatDisconnect: ({ failure }) => Chat.completedDisconnect(model, context, failure),
 		SucceededStartConnect: ({ attempt }) => Connect.succeededStart(model, context, attempt),
 		FailedStartConnect: ({ attempt, title, description }) =>
 			Connect.failedStart(model, attempt, title, description),
@@ -595,13 +512,13 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 		ClickedDisconnect: () => withDisconnectDialog(model, Dialog.open(model.disconnect.dialog)),
 		GotDisconnectDialogMessage: ({ message: child }) =>
 			model.disconnect.isPending ||
-			(model.chatCard.busy !== null && model.chatCard.busy === model.chatCard.confirmId)
+			Arr.some(PROVIDER_MODULES, (provider) => provider.isDisconnecting(model))
 				? { model }
 				: withDisconnectDialog(model, Dialog.update(model.disconnect.dialog, child)),
 		ConfirmedDisconnect: () => {
 			const integration = integrationOfSearch(model.search.integration)
-			if (integration !== null && chatConnectorOf(integration) !== null)
-				return Chat.confirmedDisconnect(model)
+			const ownDisconnect = providerModuleOf(integration)?.onConfirmDisconnect ?? null
+			if (ownDisconnect !== null) return ownDisconnect(model, context)
 			if (integration === null || model.disconnect.isPending) return { model }
 			// The dialog stays open, its confirm pending, until `CompletedDisconnect` closes it.
 			return {
@@ -626,27 +543,40 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 			if (spec === undefined) return closed
 			const toast = PageOutMessage.RequestedToast(
 				failure === null
-					? { type: "success", title: spec.success, description: "" }
+					? {
+							type: spec.successType ?? "success",
+							title: spec.success,
+							description: spec.successDescription ?? "",
+						}
 					: { type: "error", title: spec.error, description: failure.message },
 			)
 			return chain(settled, [
 				(next) => ({ model: next, commands: closed.commands, outMessage: toast }),
+				(next) =>
+					failure === null
+						? {
+								model: next,
+								commands: [
+									TrackDisconnected({
+										provider:
+											integration === "cloudflare-multi" ? "cloudflare" : integration,
+									}),
+								],
+							}
+						: { model: next },
 				...Arr.map(
 					failure === null ? spec.refresh : [],
 					(name) => (next: Model) => requestStatus(next, context, name, "Supersede"),
 				),
 				(next) =>
-					failure === null && Str.startsWith("cloudflare")(integration)
-						? CloudflareCard.requestUsage(next, context, "Refresh")
+					failure === null
+						? (providerModuleOf(
+								integrationOfSearch(
+									integration === "cloudflare-multi" ? "cloudflare" : integration,
+								),
+							)?.onDisconnected(next, context) ?? { model: next })
 						: { model: next },
 			])
 		},
 	})
 }
-
-const withDisconnectDialog = (model: Model, step: ReturnType<typeof Dialog.update>): Return => ({
-	model: { ...model, disconnect: { ...model.disconnect, dialog: step.model } },
-	commands: FoldkitCommand.mapMessages(step.commands ?? [], (message) =>
-		Message.GotDisconnectDialogMessage({ message }),
-	),
-})

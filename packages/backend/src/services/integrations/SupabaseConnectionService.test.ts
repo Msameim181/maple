@@ -1,10 +1,9 @@
 import { afterEach, assert, describe, it } from "@effect/vitest"
 import { ConfigProvider, Effect, Layer, Schema, Array as Arr, String as Str, Option } from "effect"
 import { TestClock } from "effect/testing"
-import { FetchHttpClient } from "effect/http"
 import { OrgId, UserId, SupabaseProjectUpdateRequest } from "@maple/domain/http"
 import { SupabaseProjectRef } from "@maple/primitives"
-import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import {
 	cleanupTestDbs,
 	createTestDb,
@@ -45,9 +44,9 @@ type Fake = ReturnType<typeof makeFakeSupabase>
 const makeLayer = (testDb: TestDb, fake: Fake) =>
 	Layer.mergeAll(SupabaseConnectionService.layer, SupabaseOAuthService.layer).pipe(
 		Layer.provide(testDb.layer),
-		Layer.provide(Env.layer),
+		Layer.provide(EnvTestLive),
 		Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(config))),
-		Layer.merge(Layer.succeed(FetchHttpClient.Fetch, fake.fetch)),
+		Layer.merge(fake.layer),
 	)
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)

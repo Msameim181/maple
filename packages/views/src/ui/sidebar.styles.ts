@@ -1,7 +1,7 @@
 import { cva } from "class-variance-authority"
 
 export const sidebarMenuButtonVariants = cva(
-	"peer/menu-button flex w-full items-center gap-2 overflow-hidden rounded-lg p-2 text-left text-xs outline-hidden ring-sidebar-ring transition-[width,height,padding] duration-200 ease-move group-data-instant:transition-none hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground focus-visible:ring-2 active:bg-sidebar-accent/50 active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-64 group-has-data-[sidebar=menu-action]/menu-item:pe-8 aria-disabled:pointer-events-none aria-disabled:opacity-64 data-[active=child]:font-medium data-[active=true]:bg-sidebar-accent data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:active:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground data-[state=open]:active:text-sidebar-accent-foreground group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! [&>span:last-child]:truncate [&>svg:not([class*='size-'])]:size-4 [&>svg]:shrink-0",
+	"peer/menu-button flex w-full items-center gap-2 overflow-hidden rounded-lg p-2 text-left text-ui outline-hidden ring-sidebar-ring transition-[width,height,padding] duration-200 ease-move group-data-instant:transition-none hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-inset active:bg-sidebar-accent/50 active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-64 group-has-data-[sidebar=menu-action]/menu-item:pe-8 aria-disabled:pointer-events-none aria-disabled:opacity-64 data-[active=child]:font-medium data-[active=true]:bg-sidebar-accent data-[active=true]:font-medium data-[active=true]:text-sidebar-accent-foreground data-[state=open]:hover:bg-sidebar-accent data-[state=open]:active:bg-sidebar-accent data-[state=open]:hover:text-sidebar-accent-foreground data-[state=open]:active:text-sidebar-accent-foreground group-data-[collapsible=icon]:size-8! group-data-[collapsible=icon]:p-2! [&>span:last-child]:truncate [&>svg:not([class*='size-'])]:size-4 [&>svg]:shrink-0",
 	{
 		defaultVariants: {
 			size: "default",
@@ -9,9 +9,9 @@ export const sidebarMenuButtonVariants = cva(
 		},
 		variants: {
 			size: {
-				default: "h-8 text-xs",
-				lg: "h-12 text-xs group-data-[collapsible=icon]:p-0!",
-				sm: "h-7 text-xs",
+				default: "h-8 text-ui",
+				lg: "h-12 text-ui group-data-[collapsible=icon]:p-0!",
+				sm: "h-7 text-ui",
 			},
 			variant: {
 				// Hover is the selected tint at half strength, so the full tint stays the selected row's.
@@ -52,7 +52,7 @@ export const sidebarContainerLeftStyles =
 	"left-0 group-data-[collapsible=offcanvas]:left-[calc(var(--sidebar-width)*-1)]"
 
 export const sidebarContainerDefaultStyles =
-	"group-data-[collapsible=icon]:w-(--sidebar-width-icon) group-data-[side=left]:border-r group-data-[side=right]:border-l"
+	"group-data-[collapsible=icon]:w-(--sidebar-width-icon) group-data-[variant=sidebar]:group-data-[side=left]:border-r group-data-[variant=sidebar]:group-data-[side=right]:border-l"
 
 export const sidebarInnerStyles =
 	"flex h-full w-full flex-col bg-sidebar group-data-[variant=floating]:rounded-lg group-data-[variant=floating]:border group-data-[variant=floating]:border-sidebar-border group-data-[variant=floating]:shadow-raised"
@@ -72,7 +72,7 @@ export const sidebarRailStyles = [
 
 export const sidebarInsetStyles = [
 	"relative flex h-svh w-full min-h-0 min-w-0 flex-1 flex-col bg-background",
-	"md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ms-2 md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ms-0 md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:shadow-raised",
+	"md:peer-data-[variant=inset]:peer-data-[state=collapsed]:ms-2 md:peer-data-[variant=inset]:m-2 md:peer-data-[variant=inset]:ms-0 md:peer-data-[variant=inset]:h-[calc(100svh-(--spacing(4)))] md:peer-data-[variant=inset]:overflow-hidden md:peer-data-[variant=inset]:rounded-xl md:peer-data-[variant=inset]:border md:peer-data-[variant=inset]:shadow-raised",
 ] as const
 
 export const sidebarHeaderStyles = "flex flex-col gap-2 p-2"
@@ -89,7 +89,7 @@ export const sidebarContentStyles =
 export const sidebarGroupStyles = "relative flex w-full min-w-0 flex-col p-2"
 
 export const sidebarGroupLabelStyles = [
-	"flex h-8 shrink-0 items-center rounded-lg px-2 font-semibold text-2xs text-sidebar-foreground uppercase tracking-overline outline-hidden ring-sidebar-ring transition-[margin,opacity] duration-200 ease-move group-data-instant:transition-none focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
+	"flex h-8 shrink-0 items-center rounded-lg px-2 font-medium text-xs text-sidebar-foreground outline-hidden ring-sidebar-ring transition-[margin,opacity] duration-200 ease-move group-data-instant:transition-none focus-visible:ring-2 [&>svg]:size-4 [&>svg]:shrink-0",
 	"group-data-[collapsible=icon]:-mt-8 group-data-[collapsible=icon]:pointer-events-none group-data-[collapsible=icon]:opacity-0",
 ] as const
 
@@ -100,7 +100,7 @@ export const sidebarGroupActionStyles = [
 	"group-data-[collapsible=icon]:hidden",
 ] as const
 
-export const sidebarGroupContentStyles = "w-full text-xs"
+export const sidebarGroupContentStyles = "w-full text-ui"
 
 export const sidebarMenuStyles = "flex w-full min-w-0 flex-col gap-1"
 
@@ -116,18 +116,26 @@ export const sidebarMenuBadgeStyles = [
 ] as const
 
 export const sidebarMenuSubStyles = [
-	"mx-3.5 flex min-w-0 translate-x-px flex-col gap-1 border-sidebar-border border-l px-2.5 py-0.5",
+	// What the marker's offset is counted in: the sub button's height, the marker's own and the group gap.
+	"relative ms-4 flex min-w-0 flex-col ps-3 [--sub-row:--spacing(9)] md:[--sub-row:--spacing(7)] [--sub-marker-h:--spacing(4)] [--sub-group-gap:--spacing(1)]",
+	// One unbroken hairline, 1px out so the 2px marker on it centres under the section's icon.
+	"before:absolute before:inset-y-1 before:-left-px before:w-px before:bg-sidebar-border",
+	// The marker: 2px of `sidebar-primary` that slides to the current row.
+	"after:absolute after:top-0 after:-left-px after:h-(--sub-marker-h) after:w-0.5 after:translate-y-(--sub-marker-y) after:rounded-full after:bg-sidebar-primary after:transition-[translate] after:duration-200 after:ease-move motion-reduce:after:transition-none data-[marker=false]:after:hidden",
 	"group-data-[collapsible=icon]:hidden",
 ] as const
 
 export const sidebarMenuSubItemStyles = "group/menu-sub-item relative"
 
+/** The 4px gap, not a rule, that sets a group of sub-rows apart. */
+export const sidebarMenuSubItemGroupStyles = "mt-(--sub-group-gap)"
+
 export const sidebarMenuSubButtonStyles = [
 	// 36px in the mobile sheet (below `md`, a touch target), 28px on the desktop rail.
-	"flex h-9 min-w-0 -translate-x-px items-center gap-2 overflow-hidden rounded-lg px-2 text-sidebar-foreground outline-hidden ring-sidebar-ring hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground focus-visible:ring-2 active:bg-sidebar-accent/50 active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-64 aria-disabled:pointer-events-none aria-disabled:opacity-64 md:h-7 [&>span:last-child]:truncate [&>svg:not([class*='size-'])]:size-4 [&>svg]:shrink-0 [&>svg]:text-sidebar-accent-foreground",
+	"flex h-9 min-w-0 items-center gap-2 overflow-hidden rounded-lg px-2 text-sidebar-foreground outline-hidden ring-sidebar-ring hover:bg-sidebar-accent/50 hover:text-sidebar-accent-foreground focus-visible:ring-2 focus-visible:ring-inset active:bg-sidebar-accent/50 active:text-sidebar-accent-foreground disabled:pointer-events-none disabled:opacity-64 aria-disabled:pointer-events-none aria-disabled:opacity-64 md:h-7 [&>span:last-child]:truncate [&>svg:not([class*='size-'])]:size-4 [&>svg]:shrink-0 [&>svg]:text-sidebar-accent-foreground",
 	"data-[active=true]:bg-sidebar-accent data-[active=true]:text-sidebar-accent-foreground",
 ] as const
 
-export const sidebarMenuSubButtonMdStyles = "text-xs"
+export const sidebarMenuSubButtonMdStyles = "text-ui"
 
 export const sidebarMenuSubButtonIconCollapsibleStyles = "group-data-[collapsible=icon]:hidden"

@@ -17,6 +17,10 @@ export type DbIconKey =
 	| "clickhouse"
 	| "mongodb"
 	| "redis"
+	| "sqlserver"
+	| "kafka"
+	| "nats"
+	| "rabbitmq"
 	| "database"
 	| "fire"
 	| "paper-plane"
@@ -120,6 +124,40 @@ export function getDbStyle(system: string | undefined): DbStyle {
 				color: "var(--color-brand-redis)",
 				branded: true,
 			}
+		case "mssql":
+		case "microsoft.sql_server":
+		case "sqlserver":
+			return {
+				category: "database",
+				icon: "sqlserver",
+				label: "SQL Server",
+				color: "var(--color-brand-mssql)",
+				branded: true,
+			}
+		case "kafka":
+			return {
+				category: "queue",
+				icon: "kafka",
+				label: "Kafka",
+				color: CATEGORY_COLOR.queue,
+				branded: false,
+			}
+		case "nats":
+			return {
+				category: "queue",
+				icon: "nats",
+				label: "NATS",
+				color: CATEGORY_COLOR.queue,
+				branded: true,
+			}
+		case "rabbitmq":
+			return {
+				category: "queue",
+				icon: "rabbitmq",
+				label: "RabbitMQ",
+				color: CATEGORY_COLOR.queue,
+				branded: true,
+			}
 		case "tinybird":
 			// No Nucleo/brand icon for Tinybird yet, so the generic database glyph
 			// carries the brand color rather than shipping an invented mark. The
@@ -148,7 +186,7 @@ export function getDbStyle(system: string | undefined): DbStyle {
 export interface DbNodeStyle {
 	/** Node title: the database identity, or "Hyperdrive" for the collapsed proxy node. */
 	title: string
-	/** Small uppercase badge: the underlying system, or the coarse category. */
+	/** Small badge: the underlying system, or the coarse category. */
 	badge: string
 	icon: DbIconKey
 	color: string

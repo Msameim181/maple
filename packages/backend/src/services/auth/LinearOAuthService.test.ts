@@ -1,25 +1,18 @@
 import { afterEach, assert, describe, it } from "@effect/vitest"
 import { ConfigProvider, Effect, Layer, Schema, Array as Arr, String as Str } from "effect"
-import { FetchHttpClient } from "effect/http"
-import { OrgId, UserId } from "@maple/domain/http"
-import { Env } from "@maple/backend/platform/Env"
+import { LinearFeatureSettingsRequest, LinearFeatureSwitches, OrgId, UserId } from "@maple/domain/http"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import { cleanupTestDbs, createTestDb, queryFirstRow, type TestDb } from "@maple/backend/testing/test-pglite"
-import { LinearOAuthService } from "./LinearOAuthService"
+import * as VendorFake from "@maple/backend/testing/vendor-fake"
+import { ALL_LINEAR_FEATURES, LinearOAuthService } from "./LinearOAuthService"
 
 const trackedDbs: TestDb[] = []
 
 afterEach(() => cleanupTestDbs(trackedDbs))
 
-const jsonResponse = (body: unknown, status = 200) =>
-	new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } })
-
-const readBody = (url: string, init?: RequestInit) =>
-	new Request(url, {
-		method: "POST",
-		body: init?.body,
-		// @ts-expect-error duplex is required for streaming bodies in undici/Bun
-		duplex: "half",
-	}).text()
+const decodeOperation = Schema.decodeUnknownSync(
+	Schema.fromJsonString(Schema.Struct({ operationName: Schema.String })),
+)
 
 interface MockOptions {
 	/** Bearer tokens the GraphQL API rejects as unauthenticated. */
@@ -27,7 +20,7 @@ interface MockOptions {
 }
 
 interface MockLinear {
-	readonly fetch: typeof globalThis.fetch
+	readonly fake: VendorFake.VendorFake
 	readonly revoked: string[]
 	readonly graphqlTokens: string[]
 }
@@ -36,71 +29,81 @@ interface MockLinear {
 const mockLinear = (options: MockOptions = {}): MockLinear => {
 	const revoked: string[] = []
 	const graphqlTokens: string[] = []
-	const fetch: typeof globalThis.fetch = async (input, init) => {
-		const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
-		if (url === "https://api.linear.app/oauth/token") {
-			const body = new URLSearchParams(await readBody(url, init))
-			if (
-				body.get("client_id") !== "lin-client-id" ||
-				body.get("client_secret") !== "lin-client-secret"
-			) {
-				return jsonResponse({ error: "invalid_client" }, 400)
-			}
-			if (body.get("grant_type") === "refresh_token") {
-				return jsonResponse({
-					access_token: "lin-access-refreshed",
-					refresh_token: "lin-refresh-rotated",
-					expires_in: 86399,
-					scope: "read,write",
-				})
-			}
-			return jsonResponse({
-				access_token: "lin-access",
-				refresh_token: "lin-refresh",
-				expires_in: 86399,
-				scope: "read,write",
-			})
-		}
-		if (url === "https://api.linear.app/oauth/revoke") {
-			revoked.push(new URLSearchParams(await readBody(url, init)).get("token") ?? "")
-			return new Response(null, { status: 200 })
-		}
-		if (url === "https://api.linear.app/graphql") {
-			const token = Str.replace("Bearer ", "")(new Headers(init?.headers).get("authorization") ?? "")
-			graphqlTokens.push(token)
-			if (options.rejectedTokens?.includes(token)) {
-				return jsonResponse(
-					{
-						errors: [
+	const fake = VendorFake.make({
+		routes: [
+			{
+				path: "/oauth/token",
+				respond: (request) => {
+					const body = new URLSearchParams(request.body)
+					if (
+						body.get("client_id") !== "lin-client-id" ||
+						body.get("client_secret") !== "lin-client-secret"
+					) {
+						return VendorFake.json({ error: "invalid_client" }, 400)
+					}
+					if (body.get("grant_type") === "refresh_token") {
+						return VendorFake.json({
+							access_token: "lin-access-refreshed",
+							refresh_token: "lin-refresh-rotated",
+							expires_in: 86399,
+							scope: "read,write",
+						})
+					}
+					return VendorFake.json({
+						access_token: "lin-access",
+						refresh_token: "lin-refresh",
+						expires_in: 86399,
+						scope: "read,write",
+					})
+				},
+			},
+			{
+				path: "/oauth/revoke",
+				respond: (request) => {
+					revoked.push(new URLSearchParams(request.body).get("token") ?? "")
+					return VendorFake.empty(200)
+				},
+			},
+			{
+				path: "/graphql",
+				respond: (request) => {
+					const token = Str.replace("Bearer ", "")(request.authorization ?? "")
+					graphqlTokens.push(token)
+					if (options.rejectedTokens?.includes(token)) {
+						return VendorFake.json(
 							{
-								message: "Authentication required, not authenticated",
-								extensions: { code: "AUTHENTICATION_ERROR" },
+								errors: [
+									{
+										message: "Authentication required, not authenticated",
+										extensions: { code: "AUTHENTICATION_ERROR" },
+									},
+								],
 							},
-						],
-					},
-					400,
-				)
-			}
-			const { operationName } = JSON.parse(await readBody(url, init))
-			if (operationName === "MapleConnectedWorkspace") {
-				return jsonResponse({ data: { organization: { id: "lin_org_1", name: "Acme" } } })
-			}
-			if (operationName === "MapleTeams") {
-				return jsonResponse({
-					data: {
-						teams: {
-							nodes: [
-								{ id: "team_2", key: "OPS", name: "Operations" },
-								{ id: "team_1", key: "ENG", name: "Engineering" },
-							],
-						},
-					},
-				})
-			}
-		}
-		return jsonResponse({ message: "not found" }, 404)
-	}
-	return { fetch, revoked, graphqlTokens }
+							400,
+						)
+					}
+					const { operationName } = decodeOperation(request.body)
+					if (operationName === "MapleConnectedWorkspace") {
+						return VendorFake.json({ data: { organization: { id: "lin_org_1", name: "Acme" } } })
+					}
+					if (operationName === "MapleTeams") {
+						return VendorFake.json({
+							data: {
+								teams: {
+									nodes: [
+										{ id: "team_2", key: "OPS", name: "Operations" },
+										{ id: "team_1", key: "ENG", name: "Engineering" },
+									],
+								},
+							},
+						})
+					}
+					return undefined
+				},
+			},
+		],
+	})
+	return { fake, revoked, graphqlTokens }
 }
 
 const baseConfig = {
@@ -123,9 +126,9 @@ const withOAuthApp = {
 const makeLayer = (testDb: TestDb, linear: MockLinear, extra: Record<string, string> = withOAuthApp) =>
 	LinearOAuthService.layer.pipe(
 		Layer.provide(testDb.layer),
-		Layer.provide(Env.layer),
+		Layer.provide(EnvTestLive),
 		Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown({ ...baseConfig, ...extra }))),
-		Layer.provideMerge(Layer.succeed(FetchHttpClient.Fetch, linear.fetch)),
+		Layer.provideMerge(linear.fake.layer),
 	)
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)
@@ -181,7 +184,20 @@ describe("LinearOAuthService", () => {
 				workspaceName: "Acme",
 				connectedByUserId: userA,
 				revoked: false,
+				features: ALL_LINEAR_FEATURES,
 			})
+			// A switch saved here is the one every later read sees; the others stay on.
+			const saved = yield* (yield* LinearOAuthService).setFeatures(
+				orgA,
+				userA,
+				new LinearFeatureSettingsRequest({ reopenIssuesEnabled: false }),
+			)
+			assert.isFalse(saved.reopenIssuesEnabled)
+			const reread = yield* (yield* LinearOAuthService).getFeatures(orgA)
+			assert.deepStrictEqual(
+				reread,
+				new LinearFeatureSwitches({ ...ALL_LINEAR_FEATURES, reopenIssuesEnabled: false }),
+			)
 			const row = yield* Effect.promise(() =>
 				queryFirstRow<{ external_user_id: string; access_token_ciphertext: string }>(
 					testDb,
@@ -191,6 +207,39 @@ describe("LinearOAuthService", () => {
 			)
 			assert.strictEqual(row?.external_user_id, "lin_org_1")
 			assert.notStrictEqual(row?.access_token_ciphertext, "lin-access")
+		}).pipe(Effect.provide(makeLayer(testDb, mockLinear())))
+	})
+
+	it.effect("two switches saved at once both stick", () => {
+		const testDb = createTestDb(trackedDbs)
+		return Effect.gen(function* () {
+			yield* connect
+			const linear = yield* LinearOAuthService
+			// The first save inserts the row; the concurrent pair then race on the update path.
+			yield* linear.setFeatures(orgA, userA, new LinearFeatureSettingsRequest({}))
+			yield* Effect.all(
+				[
+					linear.setFeatures(
+						orgA,
+						userA,
+						new LinearFeatureSettingsRequest({ openIssuesEnabled: false }),
+					),
+					linear.setFeatures(
+						orgA,
+						userA,
+						new LinearFeatureSettingsRequest({ reopenIssuesEnabled: false }),
+					),
+				],
+				{ concurrency: "unbounded" },
+			)
+			assert.deepStrictEqual(
+				yield* linear.getFeatures(orgA),
+				new LinearFeatureSwitches({
+					...ALL_LINEAR_FEATURES,
+					openIssuesEnabled: false,
+					reopenIssuesEnabled: false,
+				}),
+			)
 		}).pipe(Effect.provide(makeLayer(testDb, mockLinear())))
 	})
 

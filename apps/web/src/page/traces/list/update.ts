@@ -1,5 +1,6 @@
 import { pickerStep } from "../../kit/page-time"
 import type { RequestMode } from "@maple/views/data/keyed"
+import { MAX_TRACES_LIST_OFFSET } from "@maple/domain/query-engine"
 import { Array as Arr, Option, Result } from "effect"
 import { AsyncData, Command } from "foldkit"
 import * as Keyed from "@maple/views/data/keyed"
@@ -11,6 +12,7 @@ import * as FilterSections from "@maple/views/ui/filters/filter-sections"
 import { type PageContext, PageOutMessage, type PageReturn, pickCommands } from "../../contract"
 import { SignalPresenceData } from "@maple/views/data/signal-presence"
 import { routeWindowStep, snapModeOf } from "../../kit/route-window"
+import * as SavedViews from "../../kit/saved-views"
 import * as TimeRangePicker from "../../kit/time-range-picker"
 import {
 	CompleteReloadSpin,
@@ -38,8 +40,10 @@ import {
 } from "./peek"
 import { Message } from "./message"
 import type { Model, Pagination, TraceRow } from "./model"
+import { viewsExplorer } from "./saved-views"
 import { durationDraftOf } from "./search-edits"
 import { appendedPage, fetchingNext, freshLaterPages, pagedRows } from "../../kit/infinite-pages"
+import { listStepOf, steppedFocus } from "../../kit/list-keys"
 
 type Return = PageReturn<Model, Message>
 type Cmd = Command.Command<Message, never, Resources>
@@ -64,9 +68,11 @@ export const hiddenCount = (model: Model): number =>
 			first.hiddenCount + Arr.reduce(model.pagination.pages, 0, (sum, page) => sum + page.hiddenCount),
 	})
 
-/** More pages exist when the last warehouse page came back full before the noise filter. */
-export const hasNextPage = (model: Model): boolean => {
-	if (allRows(model).length >= MAX_RETAINED_TRACES || model.pagination.isStopped) return false
+/** The warehouse rows the pages so far consumed: the next page starts there. */
+const nextOffset = (pagination: Pagination): number => (pagination.pages.length + 1) * PAGE_SIZE
+
+/** The last warehouse page came back full before the noise filter, so more rows may follow. */
+const isLastPageFull = (model: Model): boolean => {
 	const first = AsyncData.getData(model.firstPage.data)
 	if (Option.isNone(first) || AsyncData.isFailure(model.firstPage.data)) return false
 	const last = Arr.last(model.pagination.pages)
@@ -77,6 +83,18 @@ export const hasNextPage = (model: Model): boolean => {
 		) === PAGE_SIZE
 	)
 }
+
+/**
+ * The list hit a limit rather than its end: the rows it keeps, or the deepest offset the API reads
+ * (hidden noise traces keep the shown rows under the first while the offset passes the second).
+ */
+export const isCapped = (model: Model): boolean =>
+	allRows(model).length >= MAX_RETAINED_TRACES ||
+	(nextOffset(model.pagination) > MAX_TRACES_LIST_OFFSET && isLastPageFull(model))
+
+/** More pages exist when the last page came back full and no cap stops the list. */
+export const hasNextPage = (model: Model): boolean =>
+	!model.pagination.isStopped && !isCapped(model) && isLastPageFull(model)
 
 const resolveCommand = (model: Model, context: PageContext, mode: RequestMode): Cmd =>
 	ResolveWindow({
@@ -130,33 +148,22 @@ const requestAll = (model: Model, context: PageContext, window: TimeWindow, mode
 				cached === undefined
 					? Option.getOrElse(firstPage, () => model.firstPage)
 					: { key: listKey, data: AsyncData.Success({ data: cached }) },
+			// A reload of the same list keeps its pages and lets a failed one be asked again.
 			pagination:
 				model.pagination.key === listKey
-					? model.pagination
+					? mode === "Refresh"
+						? { ...model.pagination, isFailed: false }
+						: model.pagination
 					: freshPagination(listKey, model.pagination.generation + 1),
 		},
 		commands,
 	}
 }
 
-const nextOffset = (pagination: Pagination): number => (pagination.pages.length + 1) * PAGE_SIZE
-
-/** The rendered window nears the end of the loaded rows. */
-const reachEnd = (model: Model, context: PageContext): Return => {
-	const lastIndex = Option.getOrElse(
-		Option.map(Arr.last(model.virtualRows), (row) => row.index),
-		() => -1,
-	)
-	const count = allRows(model).length
+/** Asks for the next page, one at a time; also the retry of a page that failed. */
+const fetchNext = (model: Model, context: PageContext): Return => {
 	const { window, pagination } = model
-	if (
-		lastIndex < 0 ||
-		window === null ||
-		pagination.key === null ||
-		pagination.isFetching ||
-		!hasNextPage(model) ||
-		lastIndex < count - FETCH_THRESHOLD
-	)
+	if (window === null || pagination.key === null || pagination.isFetching || !hasNextPage(model))
 		return { model }
 	return {
 		model: { ...model, pagination: fetchingNext(pagination) },
@@ -173,10 +180,23 @@ const reachEnd = (model: Model, context: PageContext): Return => {
 	}
 }
 
+/** The rendered window nears the end of the loaded rows. A failed page waits for its retry. */
+const reachEnd = (model: Model, context: PageContext): Return => {
+	const lastIndex = Option.getOrElse(
+		Option.map(Arr.last(model.virtualRows), (row) => row.index),
+		() => -1,
+	)
+	if (lastIndex < 0 || model.pagination.isFailed || lastIndex < allRows(model).length - FETCH_THRESHOLD)
+		return { model }
+	return fetchNext(model, context)
+}
+
 const navigate = (model: Model, search: Search, isReplace = false): Return => ({
 	model,
 	outMessage: PageOutMessage.RequestedNavigation({ url: hrefOf(AppRoute.Traces({ search })), isReplace }),
 })
+
+const toSavedViews = (message: SavedViews.Message) => Message.GotSavedViewsMessage({ message })
 
 export const init = (route: { readonly search: Search }, context: PageContext): Return => {
 	const model: Model = {
@@ -193,6 +213,7 @@ export const init = (route: { readonly search: Search }, context: PageContext): 
 		presence: SignalPresenceData.Loading(),
 		filterSections: FilterSections.init(),
 		timePicker: TimeRangePicker.init("traces-time-range"),
+		savedViews: SavedViews.init("traces-views"),
 		durationDraft: durationDraftOf(route.search),
 		durationDraftVersion: 0,
 		refreshVersion: 0,
@@ -212,6 +233,7 @@ export const init = (route: { readonly search: Search }, context: PageContext): 
 				Message.GotFilterSectionsMessage({ message }),
 			),
 			...(peeked.commands ?? []),
+			SavedViews.loadCommand(viewsExplorer([model.search]), toSavedViews),
 		],
 	}
 }
@@ -243,11 +265,7 @@ export const preload = (route: { readonly search: Search }, context: PageContext
 	return pickCommands(requestAll(model, context, window, "Load"), [FetchFacets.name])
 }
 
-export const routeChanged = (
-	model: Model,
-	route: { readonly search: Search },
-	context: PageContext,
-): Return => {
+const routed = (model: Model, route: { readonly search: Search }, context: PageContext): Return => {
 	if (searchHref(model.search) === searchHref(route.search)) return { model }
 	if (searchHref(listSearchOf(model.search)) === searchHref(listSearchOf(route.search)))
 		return syncPeek({ ...model, search: route.search }, context)
@@ -315,24 +333,14 @@ const openRow = (model: Model, index: number): Return => {
 
 /** List navigation over the rows, and the peek's own keys while it is open. */
 const pressedListKey = (model: Model, key: string, isMobile: boolean, context: PageContext): Return => {
-	const isDown = key === "j" || key === "J" || key === "ArrowDown"
-	const isUp = key === "k" || key === "K" || key === "ArrowUp"
+	const step = listStepOf(key)
 	if (model.search.peek !== undefined && !isMobile) {
-		if (isDown || isUp) return steppedPeek(model, isDown ? 1 : -1)
+		if (step !== null) return steppedPeek(model, step)
 		return key === "Enter" ? openPeekedTrace(model) : { model }
 	}
 	const count = allRows(model).length
-	if ((isDown || isUp) && count > 0) {
-		const current = model.focusedIndex ?? -1
-		const next = isDown
-			? current < 0
-				? 0
-				: Math.min(current + 1, count - 1)
-			: current <= 0
-				? 0
-				: current - 1
-		return { model: { ...model, focusedIndex: next } }
-	}
+	if (step !== null && count > 0)
+		return { model: { ...model, focusedIndex: steppedFocus(model.focusedIndex, step, count) } }
 	if (key === "Enter" && model.focusedIndex !== null)
 		return isMobile ? openRow(model, model.focusedIndex) : peekRow(model, model.focusedIndex)
 	if (key === "Escape") return { model: { ...model, focusedIndex: null } }
@@ -371,11 +379,12 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 				offset !== nextOffset(current)
 			)
 				return { model }
-			// A failed page ends pagination, so the list stops asking (a backend offset cap).
+			// A failed page pauses pagination: the footer says so and offers the retry.
 			return settled({ ...model, pagination: appendedPage(current, result) }, context)
 		},
 		ChangedVirtualWindow: ({ rows, totalSize }) =>
 			reachEnd({ ...model, virtualRows: rows, totalSize }, context),
+		ClickedRetryNextPage: () => fetchNext(model, context),
 		CompletedLoadSignalPresence: ({ result }) => ({
 			model: { ...model, presence: AsyncData.settle(model.presence, result) },
 		}),
@@ -420,6 +429,8 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 				filterSections: next.model,
 			})
 		},
+		GotSavedViewsMessage: ({ message: inner }) =>
+			SavedViews.pageStep(model, inner, viewsExplorer([model.search]), toSavedViews, draftFromView),
 		GotTimePickerMessage: ({ message: inner }) => {
 			return pickerStep(
 				model,
@@ -433,3 +444,28 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 			)
 		},
 	})
+
+const durationOf = (value: unknown): number | undefined => (typeof value === "number" ? value : undefined)
+
+// A picked view replaces the duration draft, and a commit still pending from the old draft
+// must not put it back over the view's bounds.
+const draftFromView = (model: Model, search: SavedViews.ViewSearch): Model => ({
+	...model,
+	durationDraft: durationDraftOf({
+		minDurationMs: durationOf(search["minDurationMs"]),
+		maxDurationMs: durationOf(search["maxDurationMs"]),
+	}),
+	durationDraftVersion: model.durationDraftVersion + 1,
+})
+
+/** The view the old URL was stays the page's view as the URL moves on. */
+const withRememberedView = (model: Model): Model => {
+	const savedViews = SavedViews.remembered(model.savedViews, viewsExplorer([model.search]))
+	return savedViews === model.savedViews ? model : { ...model, savedViews }
+}
+
+export const routeChanged = (
+	model: Model,
+	route: { readonly search: Search },
+	context: PageContext,
+): Return => routed(withRememberedView(model), route, context)

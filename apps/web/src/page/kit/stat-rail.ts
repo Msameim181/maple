@@ -6,6 +6,7 @@ import type { Html, HtmlBuilder } from "foldkit/html"
 import { miniBars } from "@maple/views/ui/mini-bars"
 import { skeleton } from "@maple/views/ui/skeleton"
 import { statFigure } from "@maple/views/ui/stat-figure"
+import { infoHint } from "@maple/views/ui/info-hint"
 
 // A rail of stat tiles (label, value, delta, spark) and its loading skeletons.
 
@@ -44,8 +45,40 @@ export const statRail = <M>(
 		children,
 	)
 
+/**
+ * `statRail`'s grid for a page with a filter rail: two or four columns by the page's width, not
+ * the viewport's. `divide-*` would double the outer border at row ends, so each tile rules its
+ * own inner right and top edges per column count. Its tiles take `METRIC_TILE`.
+ */
+export const metricGrid = <M>(
+	h: HtmlBuilder<M>,
+	options: Readonly<{ isBusy?: boolean }>,
+	children: ReadonlyArray<Html>,
+): Html =>
+	h.div(
+		[
+			...(options.isBusy === true ? [h.AriaBusy(true)] : []),
+			h.Class(
+				cn(
+					"grid grid-cols-2 overflow-hidden rounded-md border bg-card @min-[880px]/page:grid-cols-4",
+					"[&>*]:border-border [&>*:nth-child(odd)]:border-r @min-[880px]/page:[&>*:not(:nth-child(4n))]:border-r",
+					"@max-[879px]/page:[&>*:nth-child(n+3)]:border-t @min-[880px]/page:[&>*:nth-child(n+5)]:border-t",
+				),
+			),
+		],
+		children,
+	)
+
+/** A `metricGrid` tile's narrow-page padding and value size, spread into `statRailItem`. */
+export const METRIC_TILE = {
+	className: "@max-[560px]/page:px-4 @max-[560px]/page:py-3",
+	valueClassName: "@max-[560px]/page:text-xl",
+} as const
+
 export type StatRailItemOptions<M> = Readonly<{
 	eyebrow: string
+	/** What the eyebrow means: a question mark beside it that explains it on hover (`infoHint`). */
+	eyebrowTooltip?: string
 	value: Html | string
 	tone?: Tone
 	delta?: Html | string
@@ -64,8 +97,6 @@ export type StatRailItemOptions<M> = Readonly<{
 	ariaLabel?: string
 	size?: "md" | "sm"
 	hint?: Html | string
-	/** Title the tile like a chart card (the uppercase label eyebrow), for rails above chart grids. */
-	isCardTitle?: boolean
 }>
 
 export const statRailItem = <M>(h: HtmlBuilder<M>, options: StatRailItemOptions<M>): Html => {
@@ -83,19 +114,30 @@ export const statRailItem = <M>(h: HtmlBuilder<M>, options: StatRailItemOptions<
 		h.div(
 			[h.Class("flex items-baseline justify-between gap-3")],
 			[
+				// The hint stays beside its label when a delta takes the corner.
 				h.span(
+					[h.Class("flex min-w-0 items-center gap-1.5")],
 					[
-						h.Class(
-							cn(
-								"truncate text-2xs font-medium",
-								options.isCardTitle === true && "uppercase tracking-caption",
-								isSelected ? "text-primary" : "text-muted-foreground",
-							),
+						h.span(
+							[
+								h.Class(
+									cn(
+										"truncate text-2xs font-medium",
+										isSelected ? "text-primary" : "text-muted-foreground",
+									),
+								),
+							],
+							[options.eyebrow],
 						),
+						...(options.eyebrowTooltip === undefined
+							? []
+							: [infoHint(h, options.eyebrowTooltip)]),
 					],
-					[options.eyebrow],
 				),
-				...(corner === undefined ? [] : [h.span([h.Class("shrink-0 whitespace-nowrap")], [corner])]),
+				// Centred, not on the baseline: a delta's arrow would otherwise make its tile's header taller.
+				...(corner === undefined
+					? []
+					: [h.span([h.Class("shrink-0 self-center leading-none whitespace-nowrap")], [corner])]),
 			],
 		),
 		h.div(
@@ -119,7 +161,7 @@ export const statRailItem = <M>(h: HtmlBuilder<M>, options: StatRailItemOptions<
 								values: options.spark.slice(-28),
 								color: options.sparkColor ?? SPARK_COLOR[options.tone ?? "neutral"],
 								opacityRamp: true,
-								className: "h-7 w-24 min-w-0 shrink",
+								className: "hidden h-7 w-24 min-w-0 shrink @min-[14rem]/stat:block",
 							}),
 						]
 					: options.compact === true || isSmall
@@ -132,7 +174,7 @@ export const statRailItem = <M>(h: HtmlBuilder<M>, options: StatRailItemOptions<
 			: [h.div([h.Class("mt-2 truncate text-2xs text-muted-foreground")], [options.subline])]),
 	]
 	// No entry animation: tiles remount on every refetch and tab switch, so it would replay each time.
-	const shell = cn("relative", isSmall ? "px-4 py-3" : "px-5 py-4", options.className)
+	const shell = cn("@container/stat relative", isSmall ? "px-4 py-3" : "px-5 py-4", options.className)
 	if (options.onSelect === undefined) return h.div([h.Class(shell)], body)
 	const isDisabled = options.isDisabled === true
 	return h.button(

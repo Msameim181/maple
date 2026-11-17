@@ -17,14 +17,22 @@ import { hstack } from "../ui/stack"
 import { swatch } from "../ui/swatch"
 import { Array as Arr } from "effect"
 import { typography } from "../ui/typography"
+import { icon, type IconName } from "../ui/icon"
 
 // The timeseries legend: the compact legend or the Min/Max/Mean/Last table, below or beside the
 // plot; shared by the line, area and bar charts.
+
+/** A mark drawn beside a series' name: a provider's logo, a model vendor's, a category's glyph. */
+export interface SeriesMark {
+	readonly icon: IconName
+	readonly className?: string
+}
 
 export interface LegendSeries {
 	readonly key: string
 	readonly label: string
 	readonly color: string
+	readonly mark?: SeriesMark | undefined
 }
 
 type LegendLayout = Readonly<{ isRight: boolean; maxHeight: number | null }>
@@ -60,12 +68,24 @@ const compactLegend = (
 				{
 					onClick: Message.ToggledLegendSeries({ key: entry.key, keys }),
 					className: cn(
-						"hover:bg-surface-sunken active:bg-surface-sunken flex min-w-0 max-w-full items-center gap-1.5 rounded-sm px-1 py-0.5 select-none",
+						// Labels sit one step under the card title, like the plot legend's; the hovered one reads full strength.
+						"text-muted-foreground hover:bg-surface-sunken hover:text-foreground active:bg-surface-sunken active:text-foreground flex min-w-0 max-w-full items-center gap-1.5 rounded-sm px-1 py-0.5 select-none",
 						hidden.includes(entry.key) && "opacity-40",
 					),
 					attributes: [h.Key(entry.key), h.Title(entry.label)],
 				},
-				[swatch(h, { color: entry.color }), typography(h, { truncate: true }, [entry.label])],
+				[
+					swatch(h, { color: entry.color }),
+					...(entry.mark === undefined
+						? []
+						: [
+								icon(h, entry.mark.icon, {
+									size: 12,
+									className: cn("shrink-0", entry.mark.className),
+								}),
+							]),
+					typography(h, { truncate: true }, [entry.label]),
+				],
 			),
 		),
 	)
@@ -156,7 +176,7 @@ const statsTable = (
 														? [entryStats === null ? EMPTY_VALUE : "0"]
 														: [],
 													cn(
-														"px-2 py-0 text-right font-mono leading-4 tabular-nums text-foreground-subtle last:pr-0",
+														"px-2 py-0 text-right leading-4 tabular-nums text-foreground-subtle last:pr-0",
 														column.className,
 													),
 												)
@@ -164,7 +184,7 @@ const statsTable = (
 													h,
 													[formatValueByUnit(entryStats[column.field], unit)],
 													cn(
-														"px-2 py-0 text-right font-mono leading-4 tabular-nums last:pr-0",
+														"px-2 py-0 text-right leading-4 tabular-nums last:pr-0",
 														column.className,
 													),
 												),

@@ -42,6 +42,10 @@ with `packageManager`.
 - LLM code (Effect AI + `@yielded/agent`) is only in `apps/ai`; Maple-specific wiring lives in
   `apps/ai/src/platform/Llm.ts`.
 - Shared services live in `packages/backend`, imported via `@maple/backend/*` subpaths.
+- Analysts (`org:analyst`) read everything and build dashboards. The auth middlewares refuse them every
+  other non-GET endpoint unless it is marked `AnalystAccess` (`packages/domain/src/http/analyst-access.ts`):
+  `read` for a POST that only queries, `personal` for the caller's own state, `author` for dashboards. An
+  unmarked read-only POST is a 403 for them.
 
 ### Service conventions
 
@@ -50,6 +54,29 @@ with `packageManager`.
   tenant, actor) stays on the invocation, never captured at construction.
 - Each service owns `static readonly layer = Layer.effect(this, this.make)` with internal deps via
   `Layer.provide`. `Env`, `Database`, caches, and bindings come from the app root.
+
+## Deployment secrets
+
+Maple's own deployment secrets are classes in `packages/infra/src/secrets.ts`, each listing the
+deployables allowed to bind it (`consumers`, a `SecretConsumer` from `secret.ts`). A deploy reads one
+only through `resolveWorkerEnv(consumer, config)` (a Worker's env) or `resolveAs(consumer, config)`
+(anything else) from `@maple/infra/secret-guard`. The stack's config is default-deny over those keys:
+read by a deployable outside `consumers`, or outside any scope (a Worker's init included), the
+deploy fails.
+
+- A new secret is a class there, bound with `Secrets.X.required` / `.optional` in the deployable's
+  `src/resources/env.ts` (`alchemy/secrets.ts` for a stack file). Widening access is an edit to
+  `consumers`.
+- `environments` lists the Infisical environments (`dev`, `preview`, `prod`, `prod-eu`) that may
+  hold a secret; a deploy loading one elsewhere fails. dev and preview must hold their own value
+  unless `sharesProdValueWith` names it. `bun run secrets:drift` checks Infisical against all of this (names
+  and value hashes only); run it after changing either.
+- The chat connectors declare their own secret keys (`requiredConfig`), bound by `configKeysEnv`.
+  Those are not in the catalog and not scoped by deployable.
+- `test/alchemy/secret-grants.test.ts` holds every deployable's grants exact and needs a row per
+  `SecretConsumer`. Run it with `bunx vitest run --config test/alchemy/vitest.config.mts secret-grants`.
+- At runtime a secret can be its own service (`yield* Secrets.X`, its layer at the app root beside
+  `Env.layer`); most are still fields on `Env`.
 
 ## Warehouse queries
 
@@ -91,7 +118,7 @@ truthiness.
   `parity.test.ts` fails when the tables and the migrations disagree.
 - One pool per invocation via `withPgConnectionScope`; connections never outlive the invocation.
   Fork DB work off a request only with `forkRequestScoped`.
-- Tests use `createTestDb()` (PGlite, `packages/backend/src/platform/test-pglite.ts`).
+- Tests use `createTestDb()` (PGlite, `packages/backend/src/testing/test-pglite.ts`).
 - **Migrations apply in the prd alchemy deploy.** `db:migrate` is for local databases; never point it at prd.
 - PR previews (only with the `preview` label) get their own Neon branch, migrated by the deploy (`docs/pr-previews.md`).
 
@@ -108,7 +135,7 @@ truthiness.
   `node_modules/alchemy/src/` for APIs at the installed version.
 - **Span status codes:** Title case: `"Ok"`, `"Error"`, `"Unset"`. Only 5xx is `Error` for server
   spans. Custom attributes use `maple.*`.
-- **Self-tracing:** the API traces itself through ingest; keep `withTracerDisabledWhen()` and avoid
+- **Self-tracing:** the API traces itself through ingest; keep the `TracerDisabledWhen` filters (`apps/api/src/http/api-observability.ts`) and avoid
   spans on hot paths like token validation.
 - **UI:** the dashboard (`apps/web`) and Maple Local (`apps/local-ui`) are Foldkit + `@foldkit/ui` +
   Tailwind 4, Nucleo icons. Dashboard pages are built from the kit only; read `apps/web/CLAUDE.md`
@@ -176,4 +203,4 @@ form on the sign-in page with `PREVIEW_SIGNIN_KEY` (Infisical `dev`).
 Read the relevant doc before touching an area: `error-issue-lifecycle.md` (anything in
 `packages/backend/src/services/errors/`), `warehouse-rollups.md`, `service-map-architecture.md`,
 `ingest-wal-durability.md`, `secret-encryption.md` (any `*_ciphertext` column), `local-mode.md`, `infra.md`, `api-v2.md`, `otel-spec/`,
-`dashboard-grid.md` (the dashboard canvas and `lib/grid-engine`), `design-rules.md` (tokens and the `maple/*` design lint rules for `apps/web` and `packages/ui`).
+`dashboard-grid.md` (the dashboard canvas and `lib/grid-engine`), `status-page-custom-domains.md` (Cloudflare for SaaS on status pages), `design-rules.md` (tokens and the `maple/*` design lint rules for `apps/web` and `packages/ui`).

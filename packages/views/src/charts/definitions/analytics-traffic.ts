@@ -1,8 +1,8 @@
-import { formatNumber } from "@maple/ui/lib/format"
+import { formatNumber, formatPercent } from "@maple/ui/lib/format"
 import { ANALYTICS_METRICS, findMetric } from "../../lib/analytics-metrics"
 import { bucketDate, makeBucketAxis } from "../plot/bucket-axis"
 import { focusCrosshair, focusDot } from "../plot/plot-focus"
-import { DASHED_Y_GRID } from "../plot/plot-grid"
+import { Y_GRID } from "../plot/plot-grid"
 import { seriesRuns, silenceBridges } from "../plot/series-gaps"
 import { areaY, d3Curve, defineChart, dot, lineY, type ChartPoint, type ChartValue } from "@tanstack/charts"
 import { scaleLinear } from "@tanstack/charts-scales/linear"
@@ -33,10 +33,18 @@ const metricOf = (key: string) =>
 		() => findMetric("visitors"),
 	)
 
-/** A series' tooltip label and format: its own label (a plain count) or its metric's. */
-const seriesOf = (entry: { readonly metric: string; readonly label?: string }) => {
+const VALUE_FORMATS = {
+	count: formatNumber,
+	percent: formatPercent,
+	decimal: (value: number) => value.toFixed(1),
+} as const satisfies Record<NonNullable<TrafficSpec["valueFormat"]>, (value: number) => string>
+
+/** A series' tooltip label and format: its metric's, or its own label in the spec's format (a count without one). */
+const seriesOf = (spec: TrafficSpec, entry: { readonly metric: string; readonly label?: string }) => {
 	const metric = metricOf(entry.metric)
-	return entry.label === undefined ? metric : { label: entry.label, format: formatNumber }
+	return entry.label === undefined
+		? metric
+		: { label: entry.label, format: VALUE_FORMATS[spec.valueFormat ?? "count"] }
 }
 
 export const buildAnalyticsTraffic = (spec: TrafficSpec): BuiltChart<TrafficPoint, ChartValue, number> => {
@@ -56,7 +64,8 @@ export const buildAnalyticsTraffic = (spec: TrafficSpec): BuiltChart<TrafficPoin
 		return typeof value === "number" ? value : null
 	}
 	const curve = d3Curve(curveMonotoneX)
-	const tickMetric = metricOf(spec.tickMetric)
+	const tickFormat =
+		spec.valueFormat === undefined ? metricOf(spec.tickMetric).format : VALUE_FORMATS[spec.valueFormat]
 	const focus = tooltipFocusCapture()
 	const definition = defineChart({
 		gradients: Arr.map(spec.series, (entry) =>
@@ -104,14 +113,14 @@ export const buildAnalyticsTraffic = (spec: TrafficSpec): BuiltChart<TrafficPoin
 		scales: {
 			x: axis.x,
 			y: {
-				grid: DASHED_Y_GRID,
+				grid: Y_GRID,
 				scale: scaleLinear,
 				axis: {
 					line: false,
 					ticks: {
 						size: 0,
 						padding: 8,
-						format: (value: number) => (value === 0 ? "0" : tickMetric.format(value)),
+						format: (value: number) => (value === 0 ? "0" : tickFormat(value)),
 					},
 				},
 			},
@@ -125,7 +134,7 @@ export const buildAnalyticsTraffic = (spec: TrafficSpec): BuiltChart<TrafficPoin
 		Option.map(Option.fromNullishOr(points[0]), ({ datum }) => {
 			const highlighted = focus.highlight(
 				Arr.map(spec.series, (entry): readonly [string, number | null] => [
-					seriesOf(entry).label,
+					seriesOf(spec, entry).label,
 					valueOf(entry.key)(datum),
 				]),
 			)
@@ -133,7 +142,7 @@ export const buildAnalyticsTraffic = (spec: TrafficSpec): BuiltChart<TrafficPoin
 				heading: axis.heading(datum.bucket),
 				rows: Arr.flatMap(spec.series, (entry) => {
 					const value = valueOf(entry.key)(datum)
-					const metric = seriesOf(entry)
+					const metric = seriesOf(spec, entry)
 					return value === null
 						? []
 						: [

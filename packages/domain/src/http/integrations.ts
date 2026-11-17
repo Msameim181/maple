@@ -35,6 +35,7 @@ import { GcpCloudSqlSettings } from "../gcp"
 export { GcpCloudSqlSettings } from "../gcp"
 
 import { SupabaseAdvisorLint, SupabaseLogDrainSummary, SupabaseTopQuery } from "../supabase"
+import { AnalystAccess } from "./analyst-access"
 export {
 	SupabaseAdvisorKind,
 	SupabaseAdvisorLevel,
@@ -80,6 +81,14 @@ export const validateIntegrationReturnPath = (raw: string | null | undefined): s
 		? raw
 		: null
 
+/** What Maple does in Linear, one switch per feature of `INTEGRATION_FEATURES.linear`. */
+export class LinearFeatureSwitches extends Schema.Class<LinearFeatureSwitches>("LinearFeatureSwitches")({
+	openIssuesEnabled: Schema.Boolean,
+	updateCommentsEnabled: Schema.Boolean,
+	reopenIssuesEnabled: Schema.Boolean,
+	resolveCommentsEnabled: Schema.Boolean,
+}) {}
+
 export class LinearIntegrationStatus extends Schema.Class<LinearIntegrationStatus>("LinearIntegrationStatus")(
 	{
 		connected: Schema.Boolean,
@@ -88,8 +97,20 @@ export class LinearIntegrationStatus extends Schema.Class<LinearIntegrationStatu
 		connectedByUserId: Schema.NullOr(UserId),
 		/** Set once Linear rejected the grant; the org must reconnect. */
 		revoked: Schema.Boolean,
+		/** optionalKey only for deploy-window compat; always sent. */
+		features: Schema.optionalKey(LinearFeatureSwitches),
 	},
 ) {}
+
+/** Turns Linear features on or off; a field left out keeps its switch. */
+export class LinearFeatureSettingsRequest extends Schema.Class<LinearFeatureSettingsRequest>(
+	"LinearFeatureSettingsRequest",
+)({
+	openIssuesEnabled: Schema.optionalKey(Schema.Boolean),
+	updateCommentsEnabled: Schema.optionalKey(Schema.Boolean),
+	reopenIssuesEnabled: Schema.optionalKey(Schema.Boolean),
+	resolveCommentsEnabled: Schema.optionalKey(Schema.Boolean),
+}) {}
 
 export class LinearTeamSummary extends Schema.Class<LinearTeamSummary>("LinearTeamSummary")({
 	id: Schema.String,
@@ -280,6 +301,18 @@ export class CloudflareConnectedAccountStatus extends Schema.Class<CloudflareCon
  * the pre-multi-account single-account view (first account + all accounts' zones merged),
  * kept so bundles from before `accounts` existed keep rendering during a deploy window.
  */
+/** What the grant collects, one switch per feature of `INTEGRATION_FEATURES.cloudflare`. */
+export class CloudflareFeatureSwitches extends Schema.Class<CloudflareFeatureSwitches>(
+	"CloudflareFeatureSwitches",
+)({
+	httpTrafficEnabled: Schema.Boolean,
+	firewallEnabled: Schema.Boolean,
+	dnsEnabled: Schema.Boolean,
+	workersEnabled: Schema.Boolean,
+	queuesEnabled: Schema.Boolean,
+	durableObjectsEnabled: Schema.Boolean,
+}) {}
+
 export class CloudflareIntegrationStatus extends Schema.Class<CloudflareIntegrationStatus>(
 	"CloudflareIntegrationStatus",
 )({
@@ -299,6 +332,8 @@ export class CloudflareIntegrationStatus extends Schema.Class<CloudflareIntegrat
 	accounts: Schema.optionalKey(Schema.Array(CloudflareConnectedAccountStatus)),
 	zones: Schema.Array(CloudflareAnalyticsZoneStatus),
 	workers: Schema.NullOr(CloudflareAnalyticsWorkersStatus),
+	/** optionalKey only for deploy-window compat; always sent. */
+	features: Schema.optionalKey(CloudflareFeatureSwitches),
 }) {}
 
 /**
@@ -430,6 +465,18 @@ export class CloudflareZoneSettingsRequest extends Schema.Class<CloudflareZoneSe
 	zones: Schema.Array(CloudflareZoneWatchSetting).check(Schema.isMaxLength(5000)),
 }) {}
 
+/** Turns Cloudflare features on or off; a field left out keeps its switch. */
+export class CloudflareFeatureSettingsRequest extends Schema.Class<CloudflareFeatureSettingsRequest>(
+	"CloudflareFeatureSettingsRequest",
+)({
+	httpTrafficEnabled: Schema.optionalKey(Schema.Boolean),
+	firewallEnabled: Schema.optionalKey(Schema.Boolean),
+	dnsEnabled: Schema.optionalKey(Schema.Boolean),
+	workersEnabled: Schema.optionalKey(Schema.Boolean),
+	queuesEnabled: Schema.optionalKey(Schema.Boolean),
+	durableObjectsEnabled: Schema.optionalKey(Schema.Boolean),
+}) {}
+
 export class CloudflareDisconnectResponse extends Schema.Class<CloudflareDisconnectResponse>(
 	"CloudflareDisconnectResponse",
 )({
@@ -530,6 +577,9 @@ export class PlanetScaleIntegrationStatus extends Schema.Class<PlanetScaleIntegr
 	scrapeTarget: Schema.NullOr(PlanetScaleScrapeTargetSummary),
 	/** Null until an organization is bound. */
 	webhooks: Schema.NullOr(PlanetScaleWebhookStatus),
+	/** The person's switches (`INTEGRATION_FEATURES.planetscale`); both on until changed. */
+	metricsEnabled: Schema.Boolean,
+	eventsEnabled: Schema.Boolean,
 	/** Epoch ms of the last successful inventory refresh; null before the first. */
 	lastInventoryAt: Schema.NullOr(Schema.Number),
 	lastInventoryError: Schema.NullOr(Schema.String),
@@ -542,6 +592,14 @@ export class PlanetScaleIntegrationStatus extends Schema.Class<PlanetScaleIntegr
 	revokedAt: Schema.NullOr(Schema.Number),
 	/** Epoch ms the access token expires; refresh happens well before this. */
 	expiresAt: Schema.NullOr(Schema.Number),
+}) {}
+
+/** Turns PlanetScale features on or off; a field left out keeps its switch. */
+export class PlanetScaleFeaturesRequest extends Schema.Class<PlanetScaleFeaturesRequest>(
+	"PlanetScaleFeaturesRequest",
+)({
+	metricsEnabled: Schema.optionalKey(Schema.Boolean),
+	eventsEnabled: Schema.optionalKey(Schema.Boolean),
 }) {}
 
 export class PlanetScaleStartConnectRequest extends Schema.Class<PlanetScaleStartConnectRequest>(
@@ -1112,6 +1170,172 @@ export class RailwayDisconnectResponse extends Schema.Class<RailwayDisconnectRes
 	disconnected: Schema.Boolean,
 }) {}
 
+export const VercelProjectScope = Schema.Literals(["all", "some"])
+export type VercelProjectScope = Schema.Schema.Type<typeof VercelProjectScope>
+
+export const VercelDrainStatusValue = Schema.Literals([
+	"enabled",
+	"disabled",
+	"errored",
+	"missing",
+	"unknown",
+])
+export type VercelDrainStatusValue = Schema.Schema.Type<typeof VercelDrainStatusValue>
+
+/** What the last check of one drain found (stored on the connection row). */
+export const VercelDrainState = Schema.Struct({
+	status: VercelDrainStatusValue,
+	lastError: Schema.NullOr(Schema.String),
+})
+export type VercelDrainState = Schema.Schema.Type<typeof VercelDrainState>
+
+const VercelProjectIds = Schema.Array(
+	Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+).check(Schema.isMaxLength(500))
+const VercelSamplingRate = Schema.Number.check(
+	Schema.isGreaterThanOrEqualTo(0.01),
+	Schema.isLessThanOrEqualTo(1),
+)
+/** Trimmed on decode: a pasted token often carries a trailing newline. */
+const VercelToken = Schema.Trim.check(Schema.isMinLength(8), Schema.isMaxLength(512))
+const VercelTeamId = Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(1), Schema.isMaxLength(128))
+
+export class VercelTeam extends Schema.Class<VercelTeam>("VercelTeam")({
+	id: Schema.String,
+	slug: Schema.String,
+	name: Schema.String,
+	/** Vercel's `billing.plan` (`hobby`, `pro`, `enterprise`) when the lookup read it; drains need Pro or Enterprise. */
+	plan: Schema.optionalKey(Schema.NullOr(Schema.String)),
+}) {}
+
+export class VercelDrainStatus extends Schema.Class<VercelDrainStatus>("VercelDrainStatus")({
+	/** Null when the drain is missing on Vercel and could not be re-created. */
+	id: Schema.NullOr(Schema.String),
+	status: VercelDrainStatusValue,
+	lastError: Schema.NullOr(Schema.String),
+}) {}
+
+export class VercelDeploymentSummary extends Schema.Class<VercelDeploymentSummary>("VercelDeploymentSummary")(
+	{
+		id: Schema.String,
+		projectId: Schema.String,
+		url: Schema.String,
+		target: Schema.NullOr(Schema.String),
+		/** Vercel's `readyState`: `READY`, `ERROR`, `CANCELED`, `BUILDING`, `QUEUED`, … */
+		state: Schema.String,
+		branch: Schema.NullOr(Schema.String),
+		commitSha: Schema.NullOr(Schema.String),
+		commitMessage: Schema.NullOr(Schema.String),
+		creator: Schema.NullOr(Schema.String),
+		createdAt: Schema.Number,
+		/** When the build started; with `readyAt`, the build's duration. */
+		buildingAt: Schema.NullOr(Schema.Number),
+		readyAt: Schema.NullOr(Schema.Number),
+		/** Why an `ERROR` or `CANCELED` deployment stopped, as Vercel reports it. */
+		errorCode: Schema.NullOr(Schema.String),
+		errorMessage: Schema.NullOr(Schema.String),
+		inspectorUrl: Schema.NullOr(Schema.String),
+	},
+) {}
+
+export class VercelProjectStatus extends Schema.Class<VercelProjectStatus>("VercelProjectStatus")({
+	id: Schema.String,
+	name: Schema.String,
+	framework: Schema.NullOr(Schema.String),
+	/** Whether the drains forward this project (scope `all`, or listed in `projectIds`). */
+	forwarded: Schema.Boolean,
+	productionDeployment: Schema.NullOr(VercelDeploymentSummary),
+	latestDeployment: Schema.NullOr(VercelDeploymentSummary),
+}) {}
+
+/** Connection state of the Vercel integration (token-based, one team per org). */
+export class VercelIntegrationStatus extends Schema.Class<VercelIntegrationStatus>("VercelIntegrationStatus")(
+	{
+		connected: Schema.Boolean,
+		team: Schema.NullOr(VercelTeam),
+		projectScope: VercelProjectScope,
+		projectIds: Schema.Array(Schema.String),
+		samplingRate: Schema.Number,
+		logsEnabled: Schema.Boolean,
+		tracesEnabled: Schema.Boolean,
+		aiGatewayEnabled: Schema.Boolean,
+		speedInsightsEnabled: Schema.Boolean,
+		webAnalyticsEnabled: Schema.Boolean,
+		auditLogEnabled: Schema.Boolean,
+		drains: Schema.Struct({
+			logs: Schema.NullOr(VercelDrainStatus),
+			traces: Schema.NullOr(VercelDrainStatus),
+			aiGateway: Schema.NullOr(VercelDrainStatus),
+			speedInsights: Schema.NullOr(VercelDrainStatus),
+			webAnalytics: Schema.NullOr(VercelDrainStatus),
+			auditLog: Schema.NullOr(VercelDrainStatus),
+		}),
+		projects: Schema.Array(VercelProjectStatus),
+		/** True when Vercel rejected the stored token; polling is paused until a new one is saved. */
+		authFailed: Schema.Boolean,
+		connectedAt: Schema.NullOr(Schema.Number),
+		lastSuccessAt: Schema.NullOr(Schema.Number),
+		lastError: Schema.NullOr(Schema.String),
+	},
+) {}
+
+export class VercelDiscoverRequest extends Schema.Class<VercelDiscoverRequest>("VercelDiscoverRequest")({
+	token: VercelToken,
+	teamId: Schema.optionalKey(VercelTeamId),
+}) {}
+
+export class VercelDiscoverResponse extends Schema.Class<VercelDiscoverResponse>("VercelDiscoverResponse")({
+	teams: Schema.Array(VercelTeam),
+	/** Projects of the requested team, or of the only team; empty when the team is ambiguous. */
+	projects: Schema.Array(
+		Schema.Struct({ id: Schema.String, name: Schema.String, framework: Schema.NullOr(Schema.String) }),
+	),
+}) {}
+
+export class VercelConnectRequest extends Schema.Class<VercelConnectRequest>("VercelConnectRequest")({
+	token: VercelToken,
+	teamId: VercelTeamId,
+	projectScope: VercelProjectScope,
+	projectIds: VercelProjectIds,
+	samplingRate: VercelSamplingRate,
+	logsEnabled: Schema.Boolean,
+	tracesEnabled: Schema.Boolean,
+	/** Absent from older clients; treated as true. */
+	aiGatewayEnabled: Schema.optionalKey(Schema.Boolean),
+	/** Opt-in drains; absent is false. */
+	speedInsightsEnabled: Schema.optionalKey(Schema.Boolean),
+	webAnalyticsEnabled: Schema.optionalKey(Schema.Boolean),
+	auditLogEnabled: Schema.optionalKey(Schema.Boolean),
+}) {}
+
+export class VercelSettingsRequest extends Schema.Class<VercelSettingsRequest>("VercelSettingsRequest")({
+	projectScope: Schema.optionalKey(VercelProjectScope),
+	projectIds: Schema.optionalKey(VercelProjectIds),
+	samplingRate: Schema.optionalKey(VercelSamplingRate),
+	logsEnabled: Schema.optionalKey(Schema.Boolean),
+	tracesEnabled: Schema.optionalKey(Schema.Boolean),
+	aiGatewayEnabled: Schema.optionalKey(Schema.Boolean),
+	speedInsightsEnabled: Schema.optionalKey(Schema.Boolean),
+	webAnalyticsEnabled: Schema.optionalKey(Schema.Boolean),
+	auditLogEnabled: Schema.optionalKey(Schema.Boolean),
+}) {}
+
+export class VercelDisconnectResponse extends Schema.Class<VercelDisconnectResponse>(
+	"VercelDisconnectResponse",
+)({
+	disconnected: Schema.Boolean,
+	/** False when a drain could not be deleted on Vercel; remove it in the team's drain settings. */
+	drainsRemoved: Schema.Boolean,
+}) {}
+
+export const VERCEL_DEPLOYMENTS_MAX_LIMIT = 50
+
+export class VercelDeploymentsResponse extends Schema.Class<VercelDeploymentsResponse>(
+	"VercelDeploymentsResponse",
+)({
+	deployments: Schema.Array(VercelDeploymentSummary),
+}) {}
+
 /** One project discovered under the connected Supabase organization. */
 export class SupabaseProjectStatus extends Schema.Class<SupabaseProjectStatus>("SupabaseProjectStatus")({
 	ref: SupabaseProjectRef,
@@ -1460,6 +1684,7 @@ export class InfraSurfacesResponse extends Schema.Class<InfraSurfacesResponse>("
 	integrations: Schema.Struct({
 		cloudflare: ProviderConnected,
 		railway: ProviderConnected,
+		vercel: ProviderConnected,
 		planetscale: ProviderConnected,
 		gcp: ProviderConnected,
 		supabase: ProviderConnected,
@@ -1500,6 +1725,14 @@ export class IntegrationsApiGroup extends HttpApiGroup.make("integrations")
 				IntegrationsUpstreamError,
 				IntegrationsPersistenceError,
 			],
+		}),
+	)
+	.add(
+		// Read by the next delivery; nothing is set up in Linear for them.
+		HttpApiEndpoint.patch("linearFeatures", "/linear/features", {
+			payload: LinearFeatureSettingsRequest,
+			success: LinearIntegrationStatus,
+			error: [IntegrationsForbiddenError, IntegrationsNotConnectedError, IntegrationsPersistenceError],
 		}),
 	)
 	.add(
@@ -1568,7 +1801,7 @@ export class IntegrationsApiGroup extends HttpApiGroup.make("integrations")
 		HttpApiEndpoint.post("infraSurfaces", "/infra-surfaces", {
 			payload: InfraPresenceRequest,
 			success: InfraSurfacesResponse,
-		}),
+		}).annotate(AnalystAccess, "read"),
 	)
 	.add(
 		HttpApiEndpoint.get("cloudflareStatus", "/cloudflare/status", {
@@ -1593,7 +1826,7 @@ export class IntegrationsApiGroup extends HttpApiGroup.make("integrations")
 				IntegrationsUpstreamError,
 				IntegrationsPersistenceError,
 			],
-		}),
+		}).annotate(AnalystAccess, "read"),
 	)
 	.add(
 		HttpApiEndpoint.post("cloudflareStart", "/cloudflare/start", {
@@ -1612,6 +1845,14 @@ export class IntegrationsApiGroup extends HttpApiGroup.make("integrations")
 			payload: CloudflareZoneSettingsRequest,
 			success: CloudflareIntegrationStatus,
 			error: [IntegrationsForbiddenError, IntegrationsValidationError, IntegrationsPersistenceError],
+		}),
+	)
+	.add(
+		// The next poll reads the switches; nothing is set up at Cloudflare for them.
+		HttpApiEndpoint.patch("cloudflareFeatures", "/cloudflare/features", {
+			payload: CloudflareFeatureSettingsRequest,
+			success: CloudflareIntegrationStatus,
+			error: [IntegrationsForbiddenError, IntegrationsNotConnectedError, IntegrationsPersistenceError],
 		}),
 	)
 	.add(
@@ -1717,6 +1958,77 @@ export class IntegrationsApiGroup extends HttpApiGroup.make("integrations")
 		HttpApiEndpoint.delete("supabaseDisconnect", "/supabase", {
 			success: SupabaseDisconnectResponse,
 			error: [IntegrationsForbiddenError, IntegrationsPersistenceError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.get("vercelStatus", "/vercel/status", {
+			success: VercelIntegrationStatus,
+			error: IntegrationsPersistenceError,
+		}),
+	)
+	.add(
+		// Lists the teams a pasted token sees, and one team's projects, before anything is stored.
+		HttpApiEndpoint.post("vercelDiscover", "/vercel/discover", {
+			payload: VercelDiscoverRequest,
+			success: VercelDiscoverResponse,
+			error: [IntegrationsForbiddenError, IntegrationsValidationError, IntegrationsUpstreamError],
+		}),
+	)
+	.add(
+		// Validates the token, creates the drains on the team, stores the token and syncs once.
+		HttpApiEndpoint.put("vercelConnect", "/vercel", {
+			payload: VercelConnectRequest,
+			success: VercelIntegrationStatus,
+			error: [
+				IntegrationsForbiddenError,
+				IntegrationsValidationError,
+				IntegrationsUpstreamError,
+				IntegrationsPersistenceError,
+			],
+		}),
+	)
+	.add(
+		// Saves what the drains forward and re-applies them on Vercel.
+		HttpApiEndpoint.patch("vercelSettings", "/vercel", {
+			payload: VercelSettingsRequest,
+			success: VercelIntegrationStatus,
+			error: [
+				IntegrationsForbiddenError,
+				IntegrationsNotConnectedError,
+				IntegrationsValidationError,
+				IntegrationsUpstreamError,
+				IntegrationsPersistenceError,
+			],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelSync", "/vercel/sync", {
+			success: VercelIntegrationStatus,
+			error: [IntegrationsForbiddenError, IntegrationsPersistenceError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.delete("vercelDisconnect", "/vercel", {
+			success: VercelDisconnectResponse,
+			error: [IntegrationsForbiddenError, IntegrationsPersistenceError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.get("vercelDeployments", "/vercel/deployments", {
+			query: Schema.Struct({
+				/** The whole team's newest deployments when absent. */
+				projectId: Schema.optional(
+					Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128)),
+				),
+				limit: Schema.optional(
+					Schema.NumberFromString.check(
+						Schema.isInt(),
+						Schema.isBetween({ minimum: 1, maximum: VERCEL_DEPLOYMENTS_MAX_LIMIT }),
+					),
+				),
+			}),
+			success: VercelDeploymentsResponse,
+			error: IntegrationsPersistenceError,
 		}),
 	)
 	.add(

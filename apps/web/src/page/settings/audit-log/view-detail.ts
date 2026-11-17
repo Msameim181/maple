@@ -1,4 +1,4 @@
-import { auditActionLabel, auditResourceLabel } from "@maple/domain/audit-actions"
+import { auditActionLabel, auditMetadataValueLabel, auditResourceLabel } from "@maple/domain/audit-actions"
 import {
 	encodePublicId,
 	PublicIdPrefixes,
@@ -6,7 +6,7 @@ import {
 	type V2AuditLogEntry,
 } from "@maple/domain/http/v2"
 import { EMPTY_VALUE } from "@maple/ui/lib/format"
-import type { AuditResourceLink } from "../kit/audit-log-resource"
+import { auditActorName, type AuditResourceLink } from "../kit/audit-log-resource"
 import { DateTime, Option, Schema, Array as Arr, Record as Rec, String as Str } from "effect"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { AppRoute, hrefOf } from "../../../route"
@@ -25,6 +25,8 @@ import { hstack } from "@maple/views/ui/stack"
 import { timestamp } from "@maple/views/ui/timestamp"
 import { textLink } from "@maple/views/ui/text-link"
 import { iconButton } from "@maple/views/ui/icon-button"
+import { auditEntryHref } from "../../kit/audit-entry-link"
+import { jsonBlock, prettyJson } from "../../kit/json-block"
 
 type H = HtmlBuilder<Message>
 
@@ -42,6 +44,8 @@ export const resourceHref = (link: AuditResourceLink): string => {
 			return `/anomalies/${encodeURIComponent(link.params.incidentId)}`
 		case "/alerts/routing":
 			return hrefOf(AppRoute.AlertsSection({ section: "routing", search: {} }))
+		case "/cost":
+			return hrefOf(AppRoute.Cost({ search: {} }))
 		case "/integrations":
 			return hrefOf(AppRoute.Integrations({ search: link.search }))
 		case "/settings":
@@ -57,7 +61,6 @@ const formatScalar = (value: unknown): string =>
 	typeof value === "string" ? value : Option.getOrElse(encodeJsonOption(value), () => "undefined")
 
 const parseJson = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))
-const encodePrettyJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown, { space: 2 }))
 
 /** Structured or long metadata renders as a block. */
 const metadataBlock = (value: unknown): string | null => {
@@ -67,10 +70,10 @@ const metadataBlock = (value: unknown): string | null => {
 			Str.startsWith("{")(trimmed) || Str.startsWith("[")(trimmed)
 				? Option.getOrNull(parseJson(trimmed))
 				: null
-		if (parsed !== null && typeof parsed === "object") return encodePrettyJson(parsed)
+		if (parsed !== null && typeof parsed === "object") return prettyJson(parsed)
 		return value.length > 72 || Str.includes("\n")(value) ? value : null
 	}
-	if (value !== null && typeof value === "object") return encodePrettyJson(value)
+	if (value !== null && typeof value === "object") return prettyJson(value)
 	return null
 }
 
@@ -142,17 +145,13 @@ const metadataList = (h: H, metadata: Readonly<Record<string, unknown>>): Readon
 			h,
 			{ layout: "grid" },
 			Arr.map(keys, (key) => {
-				const block = metadataBlock(metadata[key])
+				const raw = metadata[key]
+				const named = typeof raw === "string" ? auditMetadataValueLabel(key, raw) : null
+				if (named !== null) return field(h, { label: metadataLabel(key) }, [h.span([], [named])])
+				const block = metadataBlock(raw)
 				return field(h, { label: metadataLabel(key) }, [
 					block !== null
-						? h.pre(
-								[
-									h.Class(
-										"bg-surface-well max-h-64 overflow-auto rounded-md border px-2.5 py-2 font-mono text-2xs leading-relaxed whitespace-pre-wrap wrap-anywhere",
-									),
-								],
-								[block],
-							)
+						? jsonBlock(h, block)
 						: typography(h, { size: "2xs", mono: true, className: "wrap-anywhere" }, [
 								changeValue(h, metadata[key]),
 							]),
@@ -212,8 +211,10 @@ const METADATA_LABELS = {
 	path: "Path",
 	status: "HTTP status",
 	body: "Request body",
-	tool: "Tool",
-	surface: "Surface",
+	tool: "Tool ID",
+	tool_title: "Tool",
+	agent: "Maple agent",
+	surface: "Called from",
 	is_error: "Failed",
 	params: "Parameters",
 	sql: "SQL",
@@ -238,24 +239,13 @@ const isLabelledKey = (key: string): key is keyof typeof METADATA_LABELS =>
 const metadataLabel = (key: string): string =>
 	isLabelledKey(key) ? METADATA_LABELS[key] : Str.capitalize(Str.replaceAll("_", " ")(key))
 
-/**
- * The audit log ending at one entry, with that entry open. Newest first, so the entry heads the
- * first page however busy the minute was, and the minute before it follows as context.
- */
-export const entryHref = (entry: V2AuditLogEntry): string => {
-	const at = DateTime.toEpochMillis(DateTime.makeUnsafe(entry.occurred_at))
-	return hrefOf(
-		AppRoute.Settings({
-			search: {
-				tab: "audit-log",
-				kind: "all",
-				since: new Date(at - 60_000).toISOString(),
-				until: entry.occurred_at,
-				entry: encodePublicId(PublicIdPrefixes.auditLogEntry, entry.id),
-			},
-		}),
+/** The audit log ending at one entry, with that entry open. */
+export const entryHref = (entry: V2AuditLogEntry): string =>
+	auditEntryHref(
+		DateTime.toEpochMillis(DateTime.makeUnsafe(entry.occurred_at)),
+		encodePublicId(PublicIdPrefixes.auditLogEntry, entry.id),
+		entry.occurred_at,
 	)
-}
 
 // Every entry has a surface, so the section shows even when Maple itself acted and nothing else is known.
 const originSection = (h: H, model: Model, entry: V2AuditLogEntry): ReadonlyArray<Html> => {
@@ -325,7 +315,7 @@ export const auditDetail = (
 	const actionText = auditActionLabel(entry.action)
 	const changes = entry.changes
 	const metadata = entry.metadata
-	const actorName = entry.actor_name ?? memberName(model, entry.actor_id)
+	const actorName = auditActorName(entry.actor_name, entry.actor_type) ?? memberName(model, entry.actor_id)
 	const affectedName = memberName(model, entry.affected_user)
 	return h.div(
 		[h.Class("border-border-subtle space-y-4 border-t px-4 py-3 @md:pl-11")],

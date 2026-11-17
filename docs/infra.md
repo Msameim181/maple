@@ -111,7 +111,13 @@ because the EU Workers are bound to none. Plan and rationale: `docs/eu-region-pl
   data and there is one `maple.dev`, so `profile.deploys.sharedApps` keeps them off the EU
   deploy.
 - **Secrets** come from a per-instance Infisical environment (`prod`, `prod-eu`) holding the
-  same variable names with that instance's values. `deploy-prd-instance.yml` picks the
+  same variable names with that instance's values. Which deployable may bind which secret is
+  declared in `packages/infra/src/secrets.ts` and enforced where the stack reads config
+  (`withSecretGuard` in `alchemy.run.ts`, `packages/infra/src/secret-guard.ts`). A secret's
+  `environments` also bounds where it may live: a deploy whose environment holds one outside
+  that list fails, and `bun run secrets:drift` checks all four environments, including dev
+  or preview holding a prd value. The deploy process itself sees its whole environment, so
+  everything in `preview` is readable by the code of any PR with a preview label. `deploy-prd-instance.yml` picks the
   environment, the stage and the AWS region from one `region` input, and the stack refuses
   an `AWS_REGION` that disagrees with the stage. The EU deploy is opt-in through the
   `MAPLE_DEPLOY_EU` repository variable until its accounts exist.
@@ -391,13 +397,14 @@ What each kind of Worker keeps beside the module:
   `env.ASSETS` and hands the web `Response` back through `HttpServerResponse.fromWeb`.
   landing's negotiation is a plain function in `src/handler.ts`, so a test can drive it
   without a runtime.
-- **The application database** (`api`, `ai`, `alerting`, `chat-bot`): on dev stages and the
-  US prd, `yield* MapleDb(consumer)` in the init binds `MAPLE_DB`:
-  `Hyperdrive.Connect(ManagedMapleDb)` on dev stages, `Hyperdrive.Connect` of a
-  `Hyperdrive.lookup` of the dashboard-managed config by id on the US prd (a lookup has no
-  state row, so destroy and nuke never touch it). On the EU prd the props bind the
-  declared config through `mapleDbEnv`, and so do previews (one shared config on their Neon
-  branch). The api's Workflow yields it
+- **The application database** (`api`, `ai`, `alerting`, `chat-bot`): on dev stages,
+  `yield* MapleDb` in the init binds `MAPLE_DB` with
+  `Hyperdrive.Connect(ManagedMapleDb)`. Everywhere else the props bind it through
+  `mapleDbEnv`: on the US prd a `Hyperdrive.Connection.lookup` of the dashboard-managed
+  config by id (`refMapleDbHyperdrives`; a lookup has no state row, so destroy and nuke never
+  touch it), on the EU prd the declared config, and on previews one shared config on their
+  Neon branch. A lookup is never `Connect`ed: its binding would be named after the config id,
+  not `MAPLE_DB`. The api's Workflow yields it
   too, from its outer phase. The root yields `ManagedMapleDb` first on dev stages so its
   `MAPLE_PG_URL` read happens outside any init, where alchemy's plan-time ConfigProvider
   would bind it as a secret. Every Postgres layer reads the `MapleDbConnection` port
@@ -515,6 +522,8 @@ writes to `apps/scraper/dist`, and ECS replaces the task when its `/health` stop
   stage shares the account: `profile.deploys.awsSecurityBaseline` gives US prd the one
   multi-region CloudTrail trail (S3 + CloudWatch Logs) plus Config and GuardDuty in us-east-1,
   and EU prd Config and GuardDuty in eu-central-1. Its buckets and log group are retained.
+  Config takes a daily snapshot and skips network interfaces: it bills per recorded change,
+  and preview deploys churn the shared account. CloudTrail still logs every change.
 - **Every workflow that deploys the stack must set `AWS_ACCOUNT_ID`.** Without it alchemy's
   `CI=true` credential path self-deadlocks on an STS lookup with no log line (#378).
 - **The binary is compiled outside the image build** (`build-ingest-binary.yml`, native
@@ -561,10 +570,21 @@ the database rather than at the pool.
 `stg`. A new shared stage needs its own PlanetScale branch and per-consumer configs before
 it gets a `MAPLE_DB` binding at all.
 
-Binding a dashboard-managed config by id is a `Hyperdrive.lookup` read at plan time from the
-Worker's init (`MapleDb`, `packages/infra/src/cloudflare/maple-db.ts`); no cloud resource is
-created and the origin credentials stay in the dashboard. A config id that no longer exists
+Binding a dashboard-managed config by id is a `Hyperdrive.Connection.lookup` read at plan time
+and bound from the Worker's props (`refMapleDbHyperdrives` and `mapleDbEnv`,
+`packages/infra/src/cloudflare/maple-db.ts`); no cloud resource is created and the origin
+credentials stay in the dashboard. A config id that no longer exists
 fails the plan.
+
+## Status page custom domains
+
+Customer domains reach the status Worker through Cloudflare for SaaS on `maple.dev`: the zone's
+fallback origin is the originless `status-domains.maple.dev` (declared by US prd only, a zone
+singleton, skipped until `MAPLE_STATUS_DOMAINS_ZONE_ID` is set), and each custom hostname gets
+its own Worker route to its stage's status Worker, created at runtime by the api and alerting
+Workers with `MAPLE_STATUS_DOMAINS_API_TOKEN`. Never a `*/*` route on the zone: it would catch
+proxied hostnames without a Worker, such as ingest. Setup steps and the lifecycle are in
+[`status-page-custom-domains.md`](status-page-custom-domains.md).
 
 ## Cost decisions
 

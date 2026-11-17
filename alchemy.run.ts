@@ -16,10 +16,12 @@ import * as Effect from "effect/Effect"
 import * as Layer from "effect/Layer"
 import * as Redacted from "effect/Redacted"
 import { AwsRegionMismatchError, resolveAwsRegion } from "@maple/infra/aws"
+import { withSecretGuard } from "@maple/infra/secret-guard"
 import {
 	ApiWorker,
 	AiWorker,
 	SandboxWorker,
+	declareStatusDomainsOrigin,
 	formatMapleDeployment,
 	formatMapleStage,
 	ManagedMapleDb,
@@ -31,6 +33,7 @@ import {
 	type MapleStackContext,
 	parseMapleDeploymentEffect,
 	prdOrigin,
+	refMapleDbHyperdrives,
 	resolveMapleDomains,
 	resolvePlanetscaleDatabase,
 	resolveWorkerName,
@@ -180,8 +183,8 @@ const declarePreviewDb = ({ stage, region }: MapleDeployment, profile: MapleProf
 
 /**
  * prd's `main` branch (its deploy applies migrations) and the ECS services' roles. On EU, also a
- * role and a Hyperdrive config per consumer on the role's direct origin; US prd binds dashboard
- * configs by id.
+ * role and a Hyperdrive config per consumer on the role's direct origin; US prd looks up its
+ * dashboard configs by id.
  */
 const declarePrdDb = ({ stage, region }: MapleDeployment, profile: MapleProfile) =>
 	Effect.gen(function* () {
@@ -213,6 +216,8 @@ const declarePrdDb = ({ stage, region }: MapleDeployment, profile: MapleProfile)
 			ingest: { id: ingestRole.id, url: ingestRole.connectionUrlPooled },
 			electric: electricRole && { id: electricRole.id, url: electricRole.connectionUrl },
 		}
+		if (profile.database === "ref")
+			return { ...resources, hyperdrives: refMapleDbHyperdrives(stage) } satisfies MapleDbResources
 		if (profile.database !== "declared")
 			return { ...resources, hyperdrives: undefined } satisfies MapleDbResources
 		// Distinct ids on purpose: alchemy keys state by id alone, across resource types.
@@ -417,6 +422,8 @@ export default Alchemy.Stack(
 		// Public status pages, served from edge storage alone so they outlive a Maple outage.
 		const statusWorker = yield* StatusWorker
 		yield* serveWorker("status", statusWorker)
+		// Custom domains' CNAME target and the zone's fallback origin: one per zone, owned by US prd.
+		if (!isDevServer && stage.kind === "prd" && region === "us") yield* declareStatusDomainsOrigin
 
 		// A vite-source Worker: alchemy owns its build and dev server. Binds api as `API`.
 		// Self-hosted serves web as a static build (deploy/docker), so no vite dev server.
@@ -487,6 +494,9 @@ export default Alchemy.Stack(
 		// The stack IS the entry point: the one place `MapleStack` is provided.
 		// oxlint-disable-next-line effecttsgo/strict-effect-provide
 		Effect.provide(MapleStackLive),
+		// Default-deny, over the stack layer's build too: a catalog secret read outside a
+		// deployable's scope fails the deploy.
+		withSecretGuard,
 		// `Alchemy.Stack` admits only `ConfigError`.
 		Effect.catchTags({
 			"@maple/infra/MapleStageError": asConfigError,

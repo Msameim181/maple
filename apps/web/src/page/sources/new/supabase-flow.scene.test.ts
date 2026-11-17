@@ -12,7 +12,9 @@ import type { Model } from "./model"
 import { init, update } from "./update"
 import { view as pageView } from "./view"
 import { Message as IntegrationMessage } from "../../integrations/embed"
+import { SupabaseMessage } from "../../infra-integrations/supabase/integration/supabase"
 
+const supabase = (message: SupabaseMessage) => IntegrationMessage.GotSupabaseMessage({ message })
 const context: PageContext = {
 	orgId: Schema.decodeSync(OrgId)("org_acme"),
 	pinnedNamespace: null,
@@ -72,10 +74,12 @@ const withStatus = (value: SupabaseIntegrationStatus): Model => {
 const withRows = (model: Model, rows: ReadonlyArray<SupabaseProjectRow>): Model =>
 	inner(
 		model,
-		IntegrationMessage.CompletedLoadSupabaseMetrics({
-			key: model.integrations.supabaseCard.metrics.key ?? "",
-			result: Result.succeed(rows),
-		}),
+		supabase(
+			SupabaseMessage.CompletedLoadMetrics({
+				key: model.integrations.supabaseCard.metrics.key ?? "",
+				result: Result.succeed(rows),
+			}),
+		),
 	)
 
 const row = (lastSeen: string): SupabaseProjectRow => ({
@@ -135,7 +139,7 @@ describe("supabase connect flow", () => {
 			click(role("button", { name: "Continue" })),
 			Command.resolve(ScrollToTop, Message.CompletedScrollToTop()),
 			expectView(role("listitem", { current: "step", name: "Choose data" })).toExist(),
-			expectView(role("listitem", { name: "Acme" })).toExist(),
+			expectView(role("listitem", { name: "Acme (done)" })).toExist(),
 			expectView(role("switch", { name: "Collect metrics for storefront" })).toBeEnabled(),
 			expectView(text("Turn on at least one project to continue.")).toExist(),
 			expectView(role("button", { name: "Continue" })).toBeDisabled(),
@@ -147,7 +151,9 @@ describe("supabase connect flow", () => {
 		const flipped = pageUpdate(
 			choosing,
 			Message.GotIntegrationsMessage({
-				message: IntegrationMessage.ToggledSupabaseMetrics({ ref: REF, enabled: true }),
+				message: supabase(
+					SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: true }),
+				),
 			}),
 		)
 		expect(Arr.map(flipped.commands ?? [], ({ name }) => name)).toContain("SetSupabaseProjectMetrics")
@@ -173,7 +179,7 @@ describe("supabase connect flow", () => {
 		scene(
 			{ update: pageUpdate, view },
 			given(live(withRows(collecting, [row("2026-10-01 11:59:37")]))),
-			expectView(role("listitem", { name: "Live" })).toExist(),
+			expectView(role("listitem", { name: "Live (done)" })).toExist(),
 			expectView(text("1 of 1 projects reporting CPU, memory, disk and Postgres")).toExist(),
 		)
 	})

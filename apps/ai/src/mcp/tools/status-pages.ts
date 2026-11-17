@@ -37,7 +37,6 @@ import { auditAttribution, originMetadata } from "@maple/backend/services/audit/
 import { CurrentAuditActor } from "@maple/backend/services/auth/audit-actor"
 import * as Policy from "@maple/domain/policy"
 import { stringifyJsonPretty } from "../lib/json"
-import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/OrganizationFeatureFlagsService"
 import { StatusPagesService } from "@maple/backend/services/status-pages/StatusPagesService"
 import { StatusPageSnapshotBuilder } from "@maple/backend/services/status-pages/StatusPageSnapshotBuilder"
 import { McpInvalidInputError, McpQueryError, McpUnavailableError, type McpToolRegistrar } from "./types"
@@ -90,6 +89,7 @@ const toPageRow = (page: StatusPageRecord): typeof StatusPageRow.Type => ({
 	name: page.name,
 	slug: page.slug,
 	autoIncidents: page.autoIncidents,
+	visibility: page.visibility,
 	draft: page.draft,
 	revision: page.revision,
 	publishedRevision: page.publishedRevision,
@@ -111,6 +111,7 @@ const toIncidentRow = (incident: StatusPageIncidentRecord): typeof StatusPageInc
 		resolvedAt: isoOrNull(incident.resolvedAt),
 		scheduledStart: isoOrNull(incident.scheduledStart),
 		scheduledEnd: isoOrNull(incident.scheduledEnd),
+		autoComplete: incident.autoComplete,
 		componentIds: Arr.map(incident.componentIds, (id) =>
 			encodePublicId(PublicIdPrefixes.statusPageComponent, id),
 		),
@@ -121,19 +122,6 @@ const toIncidentRow = (incident: StatusPageIncidentRecord): typeof StatusPageInc
 		updateCount: incident.updates.length,
 	}
 }
-
-/** The caller's tenant, once its org is in the `statusPages` rollout. */
-const tenantInRollout = Effect.fnUntraced(function* (tool: string) {
-	const tenant = yield* CurrentMcpTenant
-	const flags = yield* (yield* OrganizationFeatureFlagsService).flags(tenant.orgId)
-	if (!flags.statusPages) {
-		return yield* new McpUnavailableError({
-			message: `${tool} needs status pages, which are not enabled for this organization.`,
-			capability: "status_pages",
-		})
-	}
-	return tenant
-})
 
 /** The same resource entries the REST routes write, so MCP edits show up per incident. */
 const auditIncidentCreated = Effect.fnUntraced(function* (incident: StatusPageIncidentRecord) {
@@ -279,6 +267,14 @@ const renderIncident = (title: string, output: typeof StatusPageIncidentMutation
 					incident.scheduledStart === null
 						? undefined
 						: `${incident.scheduledStart} to ${incident.scheduledEnd ?? "?"}`,
+				],
+				[
+					"When the window ends",
+					incident.kind === "maintenance"
+						? incident.autoComplete
+							? "completes on its own"
+							: "stays in progress until someone completes it"
+						: undefined,
 				],
 				["Latest update", incident.latestUpdate?.body],
 			]),
@@ -478,10 +474,12 @@ export function registerStatusPageTools(server: McpToolRegistrar) {
 			),
 		}),
 		hints: { readOnly: true, destructive: false, idempotent: true },
+		// One page's detail lists its incidents, drafts included.
+		scopeFamily: ["status_pages", "status_page_incidents"],
 		phrases: ["Reading status pages"],
 		handler: Effect.fn("McpTool.getStatusPage")(function* (params) {
 			const tool = "get_status_page"
-			const tenant = yield* tenantInRollout(tool)
+			const tenant = yield* CurrentMcpTenant
 			const service = yield* StatusPagesService
 			if (params.page === undefined) {
 				if (params.include_config === true) {
@@ -517,7 +515,7 @@ export function registerStatusPageTools(server: McpToolRegistrar) {
 			incident: P.optionalText(
 				"The incident's id (sti_… or its UUID; get_status_page lists open ones). Omit to open a new one",
 			),
-			message: P.text("The public update, written for customers"),
+			message: P.text("The public update, written for customers (up to 20,000 characters)"),
 			status: P.optionalOneOf(
 				UPDATE_STATUSES,
 				"Incidents: investigating, identified, monitoring, resolved. Maintenance: scheduled, in_progress, completed. Required on an existing incident; a new incident starts investigating, new maintenance scheduled",
@@ -527,7 +525,12 @@ export function registerStatusPageTools(server: McpToolRegistrar) {
 				"Opening only: public title, e.g. `Elevated API errors` or `Database upgrade`",
 			),
 			starts_at: P.optionalTimestamp("Opening maintenance only: when it starts"),
-			ends_at: P.optionalTimestamp("Opening maintenance only: when it ends"),
+			ends_at: P.optionalTimestamp(
+				"Opening maintenance only: when it ends. It moves to in_progress at the start and completed at the end on its own",
+			),
+			auto_complete: P.optionalFlag(
+				"Opening maintenance only: false keeps it in_progress past `ends_at` until someone posts completed. Default true",
+			),
 			impact: P.optionalOneOf(
 				StatusPageIncidentImpact.literals,
 				"How hard it hits the components (new incident default minor, new maintenance none; omit on an update to keep it)",
@@ -538,10 +541,11 @@ export function registerStatusPageTools(server: McpToolRegistrar) {
 			publish: publishParameter,
 		}),
 		hints: MUTATION_HINTS,
+		scopeFamily: "status_page_incidents",
 		phrases: ["Posting a status page update"],
 		handler: Effect.fn("McpTool.postStatusPageUpdate")(function* (params) {
 			const tool = "post_status_page_update"
-			const tenant = yield* tenantInRollout(tool)
+			const tenant = yield* CurrentMcpTenant
 			const service = yield* StatusPagesService
 
 			if (params.incident === undefined) {
@@ -590,6 +594,9 @@ export function registerStatusPageTools(server: McpToolRegistrar) {
 									scheduledStart: parseWarehouseDateTime(params.starts_at),
 									scheduledEnd: parseWarehouseDateTime(params.ends_at),
 								}),
+						...(params.auto_complete === undefined
+							? undefined
+							: { autoComplete: params.auto_complete }),
 						source: "mcp",
 						createdBy: tenant.userId,
 					})
@@ -606,6 +613,7 @@ export function registerStatusPageTools(server: McpToolRegistrar) {
 			if (params.title !== undefined) return yield* opensOnlyParameter("title")
 			if (params.starts_at !== undefined) return yield* opensOnlyParameter("starts_at")
 			if (params.ends_at !== undefined) return yield* opensOnlyParameter("ends_at")
+			if (params.auto_complete !== undefined) return yield* opensOnlyParameter("auto_complete")
 			const requestedStatus = params.status
 			if (requestedStatus === undefined) {
 				return yield* new McpInvalidInputError({
@@ -675,10 +683,11 @@ export function registerStatusPageTools(server: McpToolRegistrar) {
 		}),
 		rejectUnknownKeys: true,
 		hints: { readOnly: false, destructive: true, idempotent: false, openWorld: true },
+		scopeFamily: "status_pages",
 		phrases: ["Applying a status page config"],
 		handler: Effect.fn("McpTool.applyStatusPageConfig")(function* (params) {
 			const tool = "apply_status_page_config"
-			const tenant = yield* tenantInRollout(tool)
+			const tenant = yield* CurrentMcpTenant
 			yield* Policy.check(
 				tenant.roles,
 				"status_pages:edit",
@@ -690,6 +699,17 @@ export function registerStatusPageTools(server: McpToolRegistrar) {
 			)
 			const service = yield* StatusPagesService
 			const page = yield* resolvePage(tool, tenant.orgId, params.page)
+			const visibility = params.config.visibility
+			if (visibility !== undefined && visibility !== page.visibility)
+				yield* Policy.check(
+					tenant.roles,
+					"status_pages:access",
+					() =>
+						new McpUnavailableError({
+							message: `${tool} would change who can read the page, which only org admins may do. Leave \`visibility\` as it is, or ask an admin.`,
+							capability: "org_admin",
+						}),
+				)
 			const { config, changes } = yield* service
 				.applyConfig(tenant.orgId, page.id, params.config, tenant.userId, {
 					ifVersion: params.if_version ?? params.config.version,

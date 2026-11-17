@@ -20,27 +20,36 @@ const DisabledByDefaultFeatureFlag = Schema.Unknown.pipe(
  */
 export const OrganizationFeatureFlags = Schema.Struct({
 	aiAutoTriage: DisabledByDefaultFeatureFlag,
+	/** Gates cloud cost: the cost reads and the AWS connection's `cost` module. */
+	cloudCost: DisabledByDefaultFeatureFlag,
+	/** Gates cloud security findings: the AWS connection's `security` module and the Cloud findings tab. */
+	cloudSecurity: DisabledByDefaultFeatureFlag,
 	/**
 	 * Gates external data sources: the Settings tab, the v2 API, and the agent tools and prompt
 	 * section that read them.
 	 */
 	dataSources: DisabledByDefaultFeatureFlag,
 	/**
-	 * Gates the Releases row under Monitor. The `/releases` routes stay
-	 * reachable by URL for anyone; the flag only decides who is shown the door.
+	 * Gates the Product analytics page: the nav row, the `/product-analytics` route and the link to
+	 * it from Web analytics. Dashboard funnel and paths widgets are not gated.
 	 */
-	releases: DisabledByDefaultFeatureFlag,
+	productAnalytics: DisabledByDefaultFeatureFlag,
+	/**
+	 * Gates continuous profiling in the dashboard: the service page's Profiles tab and the span
+	 * panel's Profile tab. Off until profile ingest is live for customers.
+	 */
+	profiling: DisabledByDefaultFeatureFlag,
 	/** Gates the scheduled security audit API; internal-only while it is built out. */
 	securityAudit: DisabledByDefaultFeatureFlag,
-	/** Gates customer status pages: the nav row, the `/status-pages` routes, the API and MCP tools. */
-	statusPages: DisabledByDefaultFeatureFlag,
 }).pipe(
 	Schema.encodeKeys({
 		aiAutoTriage: "aiautotriage",
+		cloudCost: "cloudcost",
+		cloudSecurity: "cloudsecurity",
 		dataSources: "datasources",
-		releases: "releases",
+		productAnalytics: "productanalytics",
+		profiling: "profiling",
 		securityAudit: "securityaudit",
-		statusPages: "statuspages",
 	}),
 )
 
@@ -51,10 +60,12 @@ const decodeOrganizationFeatureFlags = Schema.decodeUnknownOption(OrganizationFe
 /** Every rollout off: the value for malformed metadata, and for the pre-load window. */
 export const DISABLED_ORGANIZATION_FEATURE_FLAGS: OrganizationFeatureFlags = {
 	aiAutoTriage: false,
+	cloudCost: false,
+	cloudSecurity: false,
 	dataSources: false,
-	releases: false,
+	productAnalytics: false,
+	profiling: false,
 	securityAudit: false,
-	statusPages: false,
 }
 
 /**
@@ -64,10 +75,12 @@ export const DISABLED_ORGANIZATION_FEATURE_FLAGS: OrganizationFeatureFlags = {
  */
 export const ENABLED_ORGANIZATION_FEATURE_FLAGS: OrganizationFeatureFlags = {
 	aiAutoTriage: true,
+	cloudCost: true,
+	cloudSecurity: true,
 	dataSources: true,
-	releases: true,
+	productAnalytics: true,
+	profiling: true,
 	securityAudit: true,
-	statusPages: true,
 }
 
 /** Decode Clerk metadata, falling back to every rollout disabled for non-object input. */

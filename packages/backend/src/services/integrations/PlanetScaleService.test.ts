@@ -14,8 +14,8 @@ import {
 } from "effect"
 import { TestClock } from "effect/testing"
 import { FetchHttpClient } from "effect/http"
-import { OrgId, UserId } from "@maple/domain/http"
-import { Env } from "@maple/backend/platform/Env"
+import { OrgId, PlanetScaleFeaturesRequest, UserId } from "@maple/domain/http"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import {
 	cleanupTestDbs,
 	createTestDb,
@@ -55,7 +55,11 @@ const makeConfig = () =>
 		}),
 	)
 
-const makeLayer = (testDb: TestDb) => {
+const makeLayer = (
+	testDb: TestDb,
+	/** Replaces the webhook service the poller calls; the connection service keeps the real one. */
+	pollerWebhooks?: Layer.Layer<PlanetScaleWebhookService>,
+) => {
 	const oauthLive = PlanetScaleOAuthService.layer
 	const discoveryLive = Layer.effect(PlanetScaleDiscoveryService, PlanetScaleDiscoveryService.make).pipe(
 		Layer.provide(FetchHttpClient.layer),
@@ -72,7 +76,7 @@ const makeLayer = (testDb: TestDb) => {
 	return Layer.mergeAll(
 		Layer.effect(PlanetScaleService, PlanetScaleService.make).pipe(
 			Layer.provide(FetchHttpClient.layer),
-			Layer.provide(Layer.mergeAll(webhooksLive, oauthLive)),
+			Layer.provide(Layer.mergeAll(pollerWebhooks ?? webhooksLive, oauthLive)),
 		),
 		Layer.effect(PlanetScaleConnectionService, PlanetScaleConnectionService.make).pipe(
 			Layer.provide(FetchHttpClient.layer),
@@ -80,7 +84,7 @@ const makeLayer = (testDb: TestDb) => {
 		),
 		webhooksLive,
 		oauthLive,
-	).pipe(Layer.provide(testDb.layer), Layer.provide(Env.layer), Layer.provide(makeConfig()))
+	).pipe(Layer.provide(testDb.layer), Layer.provide(EnvTestLive), Layer.provide(makeConfig()))
 }
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)
@@ -620,6 +624,31 @@ describe("PlanetScaleService", () => {
 		)
 	})
 
+	it.effect("reclaims an inventory lease written too far ahead to be a live tick's", () => {
+		const testDb = createTestDb(trackedDbs)
+		const stub = stubApi({
+			databases: [{ id: "db_1", name: "main-db" }],
+			branchesByDatabase: { "main-db": [{ id: "br_1", name: "main", production: true }] },
+		})
+		return Effect.gen(function* () {
+			yield* connect("org_1")
+			const service = yield* PlanetScaleService
+			yield* service.pollAllOrgs
+			// A clock jump or a crashed writer left a lease a day ahead, and the inventory is stale.
+			yield* Effect.promise(() =>
+				executeSql(
+					testDb,
+					`UPDATE planetscale_poll_state SET last_success_at = to_timestamp(0) - interval '2 hours',
+					   lease_until = to_timestamp(0) + interval '1 day' WHERE dataset = 'inventory'`,
+				),
+			)
+			assert.strictEqual((yield* service.pollAllOrgs).refreshed, 1)
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
 	it.effect("soft-deletes databases that disappeared upstream", () => {
 		const testDb = createTestDb(trackedDbs)
 		const stub = stubApi({
@@ -1083,6 +1112,132 @@ describe("PlanetScaleService deploy-request backfill", () => {
 			// The inventory still landed despite the unusable deploy payload.
 			const rows = yield* service.listDatabases(asOrgId("org_1"))
 			assert.strictEqual(rows.length, 1)
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
+	interface DeployPollState {
+		readonly lease_until: Date | null
+		readonly last_success_at: Date | null
+		readonly last_error: string | null
+		readonly watermark_at: Date | null
+	}
+	const deployPollState = (testDb: TestDb) =>
+		Effect.promise(() =>
+			queryFirstRow<DeployPollState>(
+				testDb,
+				`SELECT lease_until, last_success_at, last_error, watermark_at FROM planetscale_poll_state
+				 WHERE org_id = 'org_1' AND dataset = 'deploy_requests' AND database_id = 'db_1'`,
+			),
+		).pipe(Effect.map((row) => row!))
+
+	/** `stubApi`, with the deploy-request listing answered by `deployRequests` instead. */
+	const withDeployRequests = (base: typeof fetch, deployRequests: () => Promise<Response>) =>
+		(async (input: string | URL | Request, init?: RequestInit) => {
+			const url =
+				typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url
+			return Str.includes("/deploy-requests")(url) ? deployRequests() : base(input, init)
+		}) as typeof fetch
+
+	it.effect("events turned back on backfill no deploy request from the time they were off", () => {
+		const testDb = createTestDb(trackedDbs)
+		const stub = stubApi({
+			databases: [{ id: "db_1", name: "main-db" }],
+			branchesByDatabase: { "main-db": [{ id: "br_1", name: "main", production: true }] },
+			// Opened, deployed and closed between 10:00 and 10:20, while events were off.
+			deployRequestsByDatabase: { "main-db": [deployRequest()] },
+		})
+		const setEvents = (eventsEnabled: boolean) =>
+			Effect.flatMap(PlanetScaleConnectionService, (connections) =>
+				connections.setFeatures(asOrgId("org_1"), new PlanetScaleFeaturesRequest({ eventsEnabled })),
+			)
+
+		return Effect.gen(function* () {
+			yield* TestClock.setTime(Date.parse("2026-08-04T09:00:00Z"))
+			yield* connect("org_1")
+			yield* setEvents(false)
+			const service = yield* PlanetScaleService
+			yield* service.pollAllOrgs
+			yield* TestClock.setTime(Date.parse("2026-08-04T12:00:00Z"))
+			yield* service.pollAllOrgs
+
+			yield* setEvents(true)
+			const resumed = yield* service.pollAllOrgs
+
+			assert.strictEqual(resumed.deployEvents, 0)
+			assert.strictEqual((yield* countEvents(testDb))?.n, 0)
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
+	it.effect("hands a failed backfill's lease back and records why on its row", () => {
+		const testDb = createTestDb(trackedDbs)
+		let failing = false
+		const stub = withDeployRequests(
+			stubApi({
+				databases: [{ id: "db_1", name: "main-db" }],
+				branchesByDatabase: { "main-db": [{ id: "br_1", name: "main", production: true }] },
+			}),
+			async () =>
+				new Response(JSON.stringify(failing ? { code: "internal" } : { data: [] }), {
+					status: failing ? 500 : 200,
+					headers: { "content-type": "application/json" },
+				}),
+		)
+		return Effect.gen(function* () {
+			yield* connect("org_1")
+			const service = yield* PlanetScaleService
+			yield* service.pollAllOrgs
+			failing = true
+			yield* service.pollAllOrgs
+			const state = yield* deployPollState(testDb)
+			assert.isNull(state.lease_until)
+			assert.isNull(state.last_success_at)
+			assert.isNotNull(state.last_error)
+		}).pipe(
+			Effect.provideService(FetchHttpClient.Fetch, stub),
+			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),
+		)
+	})
+
+	it.effect("drops the result of a backfill that lost its lease to a later tick", () => {
+		const testDb = createTestDb(trackedDbs)
+		let stealLease = false
+		const stub = withDeployRequests(
+			stubApi({
+				databases: [{ id: "db_1", name: "main-db" }],
+				branchesByDatabase: { "main-db": [{ id: "br_1", name: "main", production: true }] },
+			}),
+			async () => {
+				// A successor claims the row while this tick is still reading PlanetScale.
+				if (stealLease) {
+					await executeSql(
+						testDb,
+						`UPDATE planetscale_poll_state SET lease_until = lease_until + interval '1 minute'
+						 WHERE dataset = 'deploy_requests'`,
+					)
+				}
+				return new Response(JSON.stringify({ data: [deployRequest()] }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				})
+			},
+		)
+		return Effect.gen(function* () {
+			yield* connect("org_1")
+			const service = yield* PlanetScaleService
+			yield* service.pollAllOrgs
+			stealLease = true
+			yield* service.pollAllOrgs
+			const state = yield* deployPollState(testDb)
+			// Neither the success nor the watermark lands on the successor's row.
+			assert.isNull(state.last_success_at)
+			assert.isNull(state.watermark_at)
+			assert.isNotNull(state.lease_until)
 		}).pipe(
 			Effect.provideService(FetchHttpClient.Fetch, stub),
 			Effect.provide([makeLayer(testDb), Layer.succeed(FetchHttpClient.Fetch, stub)]),

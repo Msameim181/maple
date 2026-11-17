@@ -21,10 +21,11 @@ import type { PageViewInputs } from "../../contract"
 import { dashboardPage } from "../../kit/dashboard-page"
 import { resourceNotFound } from "../../kit/resource-not-found"
 import { settingsSection } from "../../kit/settings-section"
-import { publicAddress, statusPagesHref } from "../shared/commands"
+import { publicAddress, publicUrl, STATUS_PAGE_BASE_URL, statusPagesHref } from "../shared/commands"
 import { textField } from "../shared/fields"
 import { APPEARANCES, presetCards } from "../shared/look"
 import { monitorStatusOf } from "../shared/derive"
+import { orNull } from "../shared/form"
 import { checkedRows } from "../shared/picker"
 import { pickerView } from "../shared/picker-view"
 import { daysOf, previewDocument, previewFrame, previewTheme } from "../shared/preview"
@@ -160,8 +161,13 @@ const draftDocument = (model: Model): string => {
 			description: null,
 			websiteUrl: null,
 			logoUrl: null,
+			logoDarkUrl: null,
+			faviconUrl: null,
+			supportUrl: null,
 			privacyUrl: null,
 			termsUrl: null,
+			customDomain: null,
+			visibility: "public",
 			showPoweredBy: true,
 			theme: previewTheme(
 				{
@@ -177,7 +183,7 @@ const draftDocument = (model: Model): string => {
 			id: draftComponentId(index),
 			name: Str.trim(row.name) === "" ? "Untitled component" : Str.trim(row.name),
 			description: null,
-			group: Str.trim(row.group) === "" ? null : Str.trim(row.group),
+			group: orNull(row.group),
 			monitorStatus: monitorStatusOf(monitors, row.monitorId),
 			manualStatus: row.monitorId === null ? row.manualStatus : null,
 			showUptime: true,
@@ -187,7 +193,12 @@ const draftDocument = (model: Model): string => {
 		incidents: [],
 		nowMs,
 	})
-	return previewDocument({ snapshot, nowMs, isSelectable: false, selectedIds: [] })
+	return previewDocument({
+		snapshot,
+		nowMs,
+		isSelectable: false,
+		publicUrl: isSlug(model.slug) ? publicUrl(STATUS_PAGE_BASE_URL, model.slug) : null,
+	})
 }
 
 const previewPanel = (h: H, model: Model): Html =>

@@ -18,7 +18,7 @@ import { placementOf, popupIdOf, triggerIdOf } from "./menus"
 import { billingBanners } from "./billing-banners"
 import * as SupportChannelView from "./support-channel-view"
 import { Message } from "./message"
-import type { Model, ShellClerk } from "./model"
+import { type Model, type ShellClerk, shellAudience } from "./model"
 import { MeasureSidebarOverflow, PositionMenu } from "./mounts"
 import { isMenuKey } from "./update"
 import { menuContent } from "./view-menus"
@@ -68,8 +68,7 @@ const railTipTitles = (model: Model, clerk: ShellClerk | null): ReadonlyArray<st
 		"Search",
 		...Arr.flatMap(shellNavGroups(clerk), (group) => Arr.map(group.items, (item) => item.title)),
 		...(isPillShown(onCall) ? [onCallDetail(onCall)] : []),
-		"Sources",
-		"Settings",
+		...(shellAudience(clerk) === "analyst" ? [] : ["Sources", "Settings"]),
 	]
 }
 
@@ -125,6 +124,9 @@ export type FrameInputs = Readonly<{
 	topbarActions: () => Html
 	/** The page's source, linked from the top bar. */
 	sourceLink?: SourceLink | null
+	/** `held`: the page left is drawn while the next loads; `waited`: the next page, shown after the hold
+	 * with no skeleton delay (`page/page-hold.ts`). */
+	pageHold?: "held" | "waited" | null
 }>
 
 const supportChannelDialog = (h: HtmlBuilder<Message>, model: Model, clerk: ShellClerk): Html =>
@@ -189,25 +191,33 @@ export const frameView = Submodel.defineView<Model, Message, FrameInputs>((model
 					],
 					["Skip to main content"],
 				),
-				pageLayoutRoot(h, [
-					topbar(
-						h,
-						model,
-						inputs.breadcrumbs,
-						inputs.topbarActions(),
-						railTriggers,
-						!hidesTopbarConnect(inputs.currentPath),
-						inputs.sourceLink ?? null,
-					),
-					...(inputs.clerk === undefined || inputs.clerk === null
+				pageLayoutRoot(
+					h,
+					[
+						topbar(
+							h,
+							model,
+							inputs.breadcrumbs,
+							inputs.topbarActions(),
+							railTriggers,
+							!hidesTopbarConnect(inputs.currentPath) &&
+								shellAudience(inputs.clerk ?? null) !== "analyst",
+							inputs.sourceLink ?? null,
+						),
+						...(inputs.clerk === undefined || inputs.clerk === null
+							? []
+							: billingBanners(
+									h,
+									Option.fromNullishOr(inputs.clerk.customer),
+									model.isQuotaApproachingDismissed,
+								)),
+						page.body,
+					],
+					undefined,
+					inputs.pageHold === undefined || inputs.pageHold === null
 						? []
-						: billingBanners(
-								h,
-								Option.fromNullishOr(inputs.clerk.customer),
-								model.isQuotaApproachingDismissed,
-							)),
-					page.body,
-				]),
+						: [h.DataAttribute("page-hold", inputs.pageHold)],
+				),
 				...(model.isAppOutdated ? [appUpdatePill(h)] : []),
 				// The rails' sheets below `lg` (each portal moves itself to <body> while open).
 				...railSheets,
@@ -301,9 +311,13 @@ export const paletteLayerView = Submodel.defineView<Model, Message, OverlayInput
 						model.palette,
 						{
 							context: paletteContextOf(model),
+							audience: shellAudience(inputs.clerk ?? null),
 							visibleFlagged: Arr.flatMap(shellNavGroups(inputs.clerk ?? null), (group) =>
 								Arr.flatMap(group.items, (item) =>
-									FLAGGED_HREFS.has(item.href) ? [item.href] : [],
+									Arr.filter(
+										[item.href, ...Arr.map(item.subItems ?? [], (sub) => sub.href)],
+										(href) => FLAGGED_HREFS.has(href),
+									),
 								),
 							),
 						},

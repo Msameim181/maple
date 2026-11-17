@@ -6,6 +6,7 @@ import {
 	pageHeaderTextStyles,
 	pageLayoutStyles,
 	pageTitleStyles,
+	pageTitleWrapStyles,
 } from "./page-layout.styles"
 import type { Attribute, Html, HtmlBuilder } from "foldkit/html"
 
@@ -13,8 +14,16 @@ import type { Attribute, Html, HtmlBuilder } from "foldkit/html"
 
 type Children = ReadonlyArray<Html | string>
 
-export const pageLayoutRoot = <M>(h: HtmlBuilder<M>, children: Children, className?: string): Html =>
-	h.div([h.DataAttribute("slot", "page-layout"), h.Class(cn(pageLayoutStyles, className))], children)
+export const pageLayoutRoot = <M>(
+	h: HtmlBuilder<M>,
+	children: Children,
+	className?: string,
+	attributes: ReadonlyArray<Attribute<M>> = [],
+): Html =>
+	h.div(
+		[h.DataAttribute("slot", "page-layout"), h.Class(cn(pageLayoutStyles, className)), ...attributes],
+		children,
+	)
 
 /** `PageLayout.Title`: the one canonical page `<h1>`; `title` is the native tooltip when it truncates. */
 export const pageTitle = <M>(
@@ -26,12 +35,14 @@ export const pageTitle = <M>(
 		readonly attributes?: ReadonlyArray<Attribute<M>>
 		/** `2` when the page title sits under another page's `h1` (a flow in a drawer). */
 		readonly level?: 1 | 2
+		/** A title that is a sentence (a status line): wraps onto a second line, never truncates. */
+		readonly wrap?: boolean
 	},
 	children: Children,
 ): Html => {
 	const attributes = [
 		h.DataAttribute("slot", "page-title"),
-		h.Class(cn(pageTitleStyles, options.className)),
+		h.Class(cn(options.wrap === true ? pageTitleWrapStyles : pageTitleStyles, options.className)),
 		...(options.title === undefined ? [] : [h.Title(options.title)]),
 		...(options.attributes ?? []),
 	]

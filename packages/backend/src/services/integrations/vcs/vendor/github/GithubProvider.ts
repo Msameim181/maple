@@ -40,6 +40,7 @@ import {
 	Array as Arr,
 } from "effect"
 import { Env } from "@maple/backend/platform/Env"
+import { GithubAppWebhookSecret } from "@maple/infra/secrets"
 import type {
 	PullRequestDelta,
 	VcsProviderClient,
@@ -58,6 +59,7 @@ import {
 	isGoneStatus,
 	type RepositoryListingError,
 } from "./GithubAppClient"
+import { githubWebBaseUrl } from "./github-hosts"
 import { timestampMs } from "@maple/backend/platform/time"
 import { secretsEqual } from "@maple/backend/services/auth/secret-equal"
 
@@ -377,6 +379,18 @@ const toVcsCommitError = (
 		: mapped
 }
 
+// The billing report has no repository scope: what is left is the rate limit, the installation
+// being gone, and everything else.
+const toBillingError = (
+	error: GithubAppError,
+): VcsProviderError | VcsInstallationGoneError | VcsRateLimitedError => {
+	const mapped = toVcsError(error)
+	return mapped._tag === "@maple/http/errors/VcsRepoUnavailableError" ||
+		mapped._tag === "@maple/http/errors/VcsRepositoryBlockedError"
+		? new VcsProviderError({ message: mapped.message })
+		: mapped
+}
+
 const finiteOrNull = (value: number) => (Number.isFinite(value) ? value : null)
 
 const decodeJsonBody = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))
@@ -467,6 +481,7 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 	{
 		make: Effect.gen(function* () {
 			const env = yield* Env
+			const webhookSecret = yield* GithubAppWebhookSecret
 			const client = yield* GithubAppClient
 			const reviewerMention = reviewerMentionFor(Option.getOrUndefined(env.GITHUB_APP_SLUG))
 			/** The login the App comments as; unknown without a slug, when any bot's comment is read. */
@@ -493,7 +508,7 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 
 			const verifySignature = Effect.fn("GithubProvider.verifySignature")(
 				function* (rawBody: string, signatureHeader: string | undefined) {
-					const secret = env.GITHUB_APP_WEBHOOK_SECRET
+					const secret = webhookSecret
 					if (Option.isNone(secret)) {
 						yield* Effect.logWarning(
 							"[GitHub] Webhook secret is not configured (GITHUB_APP_WEBHOOK_SECRET)",
@@ -1435,6 +1450,7 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 													? null
 													: String(comment.databaseId),
 											author: comment.author?.login ?? "(deleted user)",
+											isBot: comment.author?.__typename === "Bot",
 											body: comment.body,
 											thumbsUp: count("THUMBS_UP"),
 											thumbsDown: count("THUMBS_DOWN"),
@@ -1918,6 +1934,23 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 						}),
 					)
 
+			const fetchBillingUsage: VcsProviderClient["fetchBillingUsage"] = (installation, month) =>
+				client
+					.getOrganizationBillingUsage(
+						installation.externalInstallationId,
+						installation.accountLogin,
+						month,
+					)
+					.pipe(Effect.mapError(toBillingError))
+
+			const webBaseUrl = githubWebBaseUrl(env.GITHUB_API_BASE_URL)
+			const installationSettingsUrl: VcsProviderClient["installationSettingsUrl"] = (installation) => {
+				const id = encodeURIComponent(installation.externalInstallationId)
+				return installation.accountType === "organization"
+					? `${webBaseUrl}/organizations/${encodeURIComponent(installation.accountLogin)}/settings/installations/${id}`
+					: `${webBaseUrl}/settings/installations/${id}`
+			}
+
 			return {
 				id: PROVIDER,
 				reviewerMention,
@@ -1953,6 +1986,8 @@ export class GithubProvider extends Context.Service<GithubProvider, VcsProviderC
 				fetchWorkflowJobAnnotations,
 				streamWorkflowJobLog,
 				canReadWorkflowLogs,
+				fetchBillingUsage,
+				installationSettingsUrl,
 			} satisfies VcsProviderClient
 		}),
 	},

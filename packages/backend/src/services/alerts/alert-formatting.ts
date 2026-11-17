@@ -8,6 +8,7 @@ import {
 import { Match, Option, String as Str } from "effect"
 import { resolveSignalDisplay, type SignalDisplay } from "./alert-signal-display"
 import type { NotificationTemplateConfig } from "./alert-templating/renderer"
+import { UPTIME_CERTIFICATE_GROUP_KEY } from "@maple/domain/uptime"
 
 export interface TemplateRenderContext {
 	readonly ruleId: string
@@ -162,6 +163,15 @@ export const formatWindow = (minutes: number): string => {
 	return hours % 1 === 0 ? `${hours}h` : `${minutes}m`
 }
 
+/**
+ * A rule's window as a notification names it. A cost budget has no rolling one: its check
+ * reads the period to date, which its detail names.
+ */
+export const formatRuleWindow = (rule: {
+	readonly signalType: string
+	readonly windowMinutes: number
+}): string => (rule.signalType === "cost_budget" ? "budget period" : formatWindow(rule.windowMinutes))
+
 export const severityEmoji = (severity: AlertSeverity): string =>
 	Match.value(severity).pipe(
 		Match.when("critical", () => "\u{1F534}"),
@@ -207,7 +217,11 @@ const uptimeObserved = (context: Pick<ObservedContext, "value" | "detail">): str
 
 /** Whether a rule's notifications carry the evaluator's reason as their `detail`. */
 export const signalCarriesDetail = (signalType: string): boolean =>
-	signalType === "uptime" || signalType === "slo_burn_rate" || signalType === "anomaly"
+	signalType === "uptime" ||
+	signalType === "slo_burn_rate" ||
+	signalType === "anomaly" ||
+	signalType === "audit" ||
+	signalType === "cost_budget"
 
 /** An anomaly rule's value is its severity code; what it says is the detector's sentence. */
 const anomalyObserved = (context: Pick<ObservedContext, "value" | "detail">): string =>
@@ -233,7 +247,10 @@ export const formatObservedSummary = (context: ObservedContext): string =>
 		? uptimeObserved(context)
 		: context.signalType === "anomaly"
 			? anomalyObserved(context)
-			: context.signalType === "slo_burn_rate" && context.detail != null
+			: (context.signalType === "slo_burn_rate" ||
+						context.signalType === "audit" ||
+						context.signalType === "cost_budget") &&
+				  context.detail != null
 				? context.detail
 				: context.value === null
 					? `No data (threshold ${formatThresholdSummary(context)})`
@@ -245,7 +262,7 @@ export const formatObservedSummary = (context: ObservedContext): string =>
  */
 export const formatAlertHeadline = (
 	context: Pick<TemplateRenderContext, "signalType" | "ruleName" | "eventType" | "value"> &
-		Partial<Pick<TemplateRenderContext, "severity" | "detail">>,
+		Partial<Pick<TemplateRenderContext, "severity" | "detail" | "groupKey">>,
 ): string => {
 	// An anomaly names what moved, e.g. `Critical anomaly: error rate 4.2% vs baseline 0.3% in checkout`.
 	if (context.signalType === "anomaly" && context.detail != null) {
@@ -254,6 +271,12 @@ export const formatAlertHeadline = (
 			const severity = context.severity === undefined ? "" : `${formatSeverityLabel(context.severity)} `
 			return Str.capitalize(`${severity}anomaly: ${context.detail}`)
 		}
+	}
+	// A monitor's certificate group is a warning ahead of expiry, never an outage.
+	if (context.signalType === "uptime" && context.groupKey === UPTIME_CERTIFICATE_GROUP_KEY) {
+		if (context.eventType === "trigger") return `${context.ruleName}: certificate expires soon`
+		if (context.eventType === "renotify") return `${context.ruleName}: certificate still expiring`
+		if (context.eventType === "resolve") return `${context.ruleName}: certificate renewed`
 	}
 	if (context.signalType === "uptime") {
 		if (context.eventType === "trigger") return `${context.ruleName} is down`

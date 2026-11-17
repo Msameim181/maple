@@ -15,10 +15,12 @@ const organization: ClerkOrganization = {
 	isRegionOpen: false,
 	flags: {
 		aiAutoTriage: false,
+		cloudCost: false,
+		cloudSecurity: false,
 		dataSources: false,
-		releases: false,
+		productAnalytics: false,
+		profiling: false,
 		securityAudit: false,
-		statusPages: false,
 	},
 }
 

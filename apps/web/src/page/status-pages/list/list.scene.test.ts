@@ -1,6 +1,5 @@
 import * as Policy from "@maple/domain/policy"
 import { OrgId } from "@maple/domain"
-import { StatusPagesDisabledError } from "@maple/domain/http"
 import { Result, Schema, Array as Arr } from "effect"
 import { expect as expectView, given, role, scene, text, withViewInputs } from "foldkit/scene"
 import { describe, expect, test } from "vitest"
@@ -9,7 +8,7 @@ import type { PageContext } from "../../contract"
 import { NOW, ORG } from "../../kit/alert-test-rows"
 import { newStatusPageHref, statusPageHref } from "../shared/commands"
 import type { StatusPageSummary } from "../shared/derive"
-import { statusPage } from "../shared/test-pages"
+import { pageId, statusPage } from "../shared/test-pages"
 import { Message } from "./message"
 import type { Model } from "./model"
 import { init, update } from "./update"
@@ -67,6 +66,28 @@ describe("status pages list", () => {
 			given(withPages([], false)),
 			expectView(role("link", { name: "Create a status page" })).not.toExist(),
 			expectView(text("Ask an org admin to create one.")).toExist(),
+		)
+	})
+
+	test("each row says who can view the page; an internal one has no public address", () => {
+		const row = (page: ReturnType<typeof statusPage>): StatusPageSummary => ({
+			page,
+			overall: "operational",
+			componentCount: 1,
+			openIncidents: 0,
+		})
+		scene(
+			{ update: listUpdate, view },
+			given(
+				withPages([
+					row(statusPage({ visibility: "password", has_password: true })),
+					row(statusPage({ id: pageId(2), slug: "acme-internal", visibility: "internal" })),
+				]),
+			),
+			expectView(text("Password")).toExist(),
+			expectView(text("Internal")).toExist(),
+			expectView(text("Members only, in Maple")).toExist(),
+			expectView(text("/s/acme-internal")).not.toExist(),
 		)
 	})
 
@@ -129,31 +150,5 @@ describe("status pages list", () => {
 		expect(names(listUpdate(failed, Message.ClickedRetry()).commands)).toEqual([
 			"FetchStatusPageSummaries",
 		])
-	})
-
-	test("an org outside the rollout is told so, not shown a failed load", () => {
-		const model = entered()
-		const refused = listUpdate(
-			model,
-			Message.CompletedFetchPages({
-				key: model.pages.key ?? "",
-				result: Result.fail(
-					toLoadFailure(
-						new StatusPagesDisabledError({
-							message: "Status pages are not enabled for this organization.",
-						}),
-					),
-				),
-			}),
-		).model
-		scene(
-			{ update: listUpdate, view },
-			given(refused),
-			expectView(text("Status pages are not enabled")).toExist(),
-			expectView(text("Couldn't load status pages")).not.toExist(),
-			// Neither helps until the org is in the rollout.
-			expectView(role("button", { name: "Try again" })).not.toExist(),
-			expectView(role("link", { name: "Create a status page" })).not.toExist(),
-		)
 	})
 })

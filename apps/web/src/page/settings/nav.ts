@@ -11,6 +11,8 @@ export type LegacySettingsTab = (typeof legacySettingsTabValues)[number]
 export const settingsTabLabels = {
 	general: "General",
 	members: "Members",
+	domains: "Verified domains",
+	sso: "SSO & SCIM",
 	billing: "Billing & usage",
 	"audit-log": "Audit log",
 	keys: "Keys",
@@ -61,6 +63,7 @@ const navSections: ReadonlyArray<NavShellSection<SettingsTab>> = [
 		items: [
 			tab("general", "GearIcon"),
 			tab("members", "UserIcon"),
+			tab("domains", "GlobeIcon"),
 			tab("billing", "CreditCardIcon"),
 			tab("audit-log", "HistoryIcon"),
 		],
@@ -76,6 +79,7 @@ const navSections: ReadonlyArray<NavShellSection<SettingsTab>> = [
 				icon: "GridIcon",
 				href: "/integrations",
 			},
+			tab("sso", "ShieldIcon"),
 			tab("keys", "KeyIcon"),
 			tab("mcp", "SquareTerminalIcon"),
 			tab("ai", "ChatBubbleSparkleIcon"),
@@ -110,6 +114,10 @@ export type Visibility = Readonly<{
 const isVisible = (id: string, visibility: Visibility): boolean => {
 	if (id === "members") return visibility.isClerk || visibility.isDirectory === true
 	if (id === "general" || id === "billing") return visibility.isClerk
+	// SSO lives in Clerk; every member reads it, admins change it.
+	if (id === "sso") return visibility.isClerk
+	// Clerk refuses a member reading the domains, so the tab is for admins only.
+	if (id === "domains") return visibility.isClerk && Policy.has(visibility.grants, "organization:manage")
 	if (!visibility.isClerk) return true
 	if (id === "data-platform")
 		return visibility.canAccessDataPlatform || visibility.isDataPlatformLocked === true

@@ -1,11 +1,11 @@
 ---
 title: "Web analytics"
-description: "What the Web Analytics page shows: visitors, sessions, page views, referrers, devices, countries and custom events from the Maple browser SDK, AI traffic, Google Search Console data, and what data each part needs."
+description: "What the Web analytics page shows: visitors, sessions, page views, referrers, devices, countries and custom events from the Maple browser SDK, AI traffic, Google Search Console data, and what data each part needs."
 group: "Product Events"
 order: 4
 ---
 
-**Web Analytics** shows who visited your sites, which pages they read, and where they came from. It reads the sessions, page views and `track()` events that the Maple browser SDK already sends for session replay. There is no separate analytics script.
+**Web analytics** shows who visited your sites, which pages they read, and where they came from. It reads the sessions, page views and `track()` events that the Maple browser SDK already sends for session replay. There is no separate analytics script.
 
 ## Prerequisites
 
@@ -17,7 +17,7 @@ The page has three tabs: **Overview**, described below, **AI traffic** and **Sea
 
 <figure class="shot">
   <img src="/screenshots/docs/web-analytics-01-overview.webp" alt="The Web Analytics page over the last 7 days: a live visitors badge, a note that 17% of sessions were bots and are excluded, eight headline metric tiles with sparklines, and a unique visitors and page views chart." loading="lazy" />
-  <figcaption>Web Analytics over the last 7 days. Bot sessions are excluded from every number.</figcaption>
+  <figcaption>Web analytics over the last 7 days. Bot sessions are excluded from every number.</figcaption>
 </figure>
 
 ### Live visitors
@@ -65,7 +65,7 @@ When the **Event** filter names an event that annotated spans also produce, a **
 
 ### Search
 
-**Search** shows Google Search Console data next to your sessions: **Clicks**, **Impressions**, **CTR** and **Avg position**, the **Top queries**, and **Landing pages** with their **Entry sessions**, **Bounce rate** and, with an **Event** filter, **Conversions**. Click **Connect Search Console** and choose the properties to import. Google reports with a delay of 2 to 3 days. Only the **Event** filter applies on this tab.
+**Search** shows Google Search Console data next to your sessions. Four tiles give **Clicks**, **Impressions**, **CTR** and **Avg position**; pick one to chart it by day. **Queries** lists what people searched. **Pages** lists the pages they found, with the **Sessions** that started on each, its **Bounce** rate and, with an **Event** filter, **Conversions**. Sort either table by a column, type to filter it, or open it larger with **Expand table**. Click **Connect Search Console** and choose the properties to import. Google reports with a delay of 2 to 3 days. Only the **Event** filter applies on this tab.
 
 ## What each part needs
 
@@ -82,7 +82,7 @@ See [Consent](/docs/session-replay/browser-sdk#consent) for how the SDK handles 
 
 ## Verify
 
-Open your site in a browser with the SDK installed, visit two pages, then open **Web Analytics**. Within a minute, the live badge counts you, **Page views** includes your two pages, and both pages are listed under **Pages**.
+Open your site in a browser with the SDK installed, visit two pages, then open **Web analytics**. Within a minute, the live badge counts you, **Page views** includes your two pages, and both pages are listed under **Pages**.
 
 ## Troubleshooting
 

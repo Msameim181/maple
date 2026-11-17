@@ -23,7 +23,7 @@ import { compactSearchInput } from "@maple/views/ui/compact-search-input"
 import { removableChip } from "@maple/views/ui/removable-chip"
 import type { Message as SelectMessage } from "@maple/views/ui/select"
 import * as CustomRangeView from "../../kit/custom-range-view"
-import { auditResourceDisplay } from "../kit/audit-log-resource"
+import { auditActorName, auditResourceDisplay } from "../kit/audit-log-resource"
 import { formatTimestampInTimezone } from "@maple/ui/lib/timezone-format"
 import { Submodel } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
@@ -54,7 +54,9 @@ import { auditDetail, memberName, resourceHref } from "./view-detail"
 import { typography, typographyClass } from "@maple/views/ui/typography"
 import { hstack, hstackClass, vstack } from "@maple/views/ui/stack"
 import { Array as Arr, DateTime, String as Str, Option, Order, Record as Rec } from "effect"
-import { dayKey, dayLabel } from "../../kit/day-label"
+import { dayEyebrow, dayKey } from "../../kit/day-label"
+import { expandChevron } from "../../kit/expand-chevron"
+import { refusedBadge } from "../../kit/refused-badge"
 import { textLink } from "@maple/views/ui/text-link"
 
 type H = HtmlBuilder<Message>
@@ -140,7 +142,7 @@ const abbreviateId = (id: string): string => {
 
 /** The name frozen on the entry, else the member's current name, else a short id. */
 const actorDisplayName = (model: Model, entry: V2AuditLogEntry): string | null =>
-	entry.actor_name ??
+	auditActorName(entry.actor_name, entry.actor_type) ??
 	memberName(model, entry.actor_id) ??
 	(entry.actor_id === null ? null : abbreviateId(entry.actor_id))
 
@@ -424,11 +426,7 @@ const actionLabel = (h: H, action: string, isQuiet: boolean): ReadonlyArray<Html
 }
 
 /** The refused outcome, as the rows and an entry's detail both show it. */
-export const deniedBadge = (h: H): Html =>
-	badge(h, { variant: "crit", size: "sm", className: "shrink-0" }, [
-		icon(h, OUTCOME_ICONS.denied),
-		"Denied",
-	])
+export const deniedBadge = (h: H): Html => refusedBadge(h, "Denied")
 
 /**
  * A non-person actor in a row: its glyph alone, the size of a person's avatar. It names the actor
@@ -524,13 +522,7 @@ const auditRow = (h: H, model: Model, entry: V2AuditLogEntry, inputs: ViewInputs
 					h.span(
 						[h.Class(cn(COL.time, typographyClass({ size: "xs", tone: "muted" })))],
 						[
-							icon(h, "ChevronRightIcon", {
-								size: 12,
-								className: cn(
-									"text-foreground-subtle shrink-0 transition-transform",
-									isExpanded && "rotate-90",
-								),
-							}),
+							expandChevron(h, isExpanded),
 							relativeTime(h, {
 								value: entry.occurred_at,
 								nowMs: inputs.nowMs,
@@ -675,9 +667,7 @@ const withDayHeadings = (
 							],
 							[
 								// The gap the time column has, so the day sits above the times.
-								eyebrow(h, { variant: "mono", icon: "CalendarIcon", className: "gap-2" }, [
-									dayLabel(atMs(entry), clock),
-								]),
+								dayEyebrow(h, atMs(entry), clock),
 							],
 						),
 					]

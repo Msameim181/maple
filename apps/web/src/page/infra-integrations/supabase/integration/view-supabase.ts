@@ -17,6 +17,10 @@ import { SUPABASE_BRAND, SUPABASE_NOT_CONFIGURED } from "../connect"
 import { integrationNotice } from "../../../integrations/kit/notice"
 import { Message } from "../../../integrations/message"
 import type { Model } from "../../../integrations/model"
+import { SupabaseMessage, type SupabaseSwitchKind } from "./supabase"
+import { featureAcross, projectSwitches } from "./supabase-features"
+import { INTEGRATION_FEATURES, type IntegrationFeatureId } from "@maple/domain/integration-features"
+import { featureList } from "../../../kit/feature-list"
 import {
 	connectedIntegrationCard,
 	disconnectButton,
@@ -37,6 +41,9 @@ type Project = SupabaseIntegrationStatus["projects"][number]
 type Drain = Project["logDrains"][number]
 
 type Metrics = Model["supabaseCard"]["metrics"]
+
+/** A Supabase message, as the hub carries it. */
+export const toHub = (message: SupabaseMessage): Message => Message.GotSupabaseMessage({ message })
 
 /** The project's metrics row, or `null` while the rows load, failed, or hold none for it. */
 export const metricsRowOf = (metrics: Metrics, ref: string): SupabaseProjectRow | null =>
@@ -134,30 +141,10 @@ const noteLine = (h: H, text: string, tone: "muted" | "error"): Html =>
 		[text],
 	)
 
-/** A project's lock and the values its switches show: a flip in flight shows its intended value. */
-const switchState = (model: Model, project: Project) => {
-	const pending = Arr.findFirst(model.supabaseCard.pending, (entry) => entry.ref === project.ref)
-	const pendingOf = (kind: string) => Option.filter(pending, (entry) => entry.kind === kind)
-	const isLocked = lifecycleOf(project.status)._tag === "Paused" || Option.isSome(pending)
-	const metricsEnabled = Option.match(pendingOf("metrics"), {
-		onNone: () => project.metricsEnabled,
-		onSome: (entry) => entry.enabled,
-	})
-	const drainEnabled = Option.match(pendingOf("drain"), {
-		onNone: () => project.logDrainEnabled,
-		onSome: (entry) => entry.enabled,
-	})
-	// Turning a drain on stops polling server-side; show that while the write is in flight.
-	const logsEnabled = Option.match(pendingOf("logs"), {
-		onNone: () => (drainEnabled ? false : project.logsEnabled),
-		onSome: (entry) => entry.enabled,
-	})
-	return { isLocked, metricsEnabled, drainEnabled, logsEnabled }
-}
-
 /** The project's Metrics, Logs and Drain switches, shared by the card and the flow's Choose data. */
 export const supabaseProjectSwitches = (h: H, model: Model, project: Project): ReadonlyArray<Html> => {
-	const { isLocked, metricsEnabled, drainEnabled, logsEnabled } = switchState(model, project)
+	const { isLocked, values } = projectSwitches(model.supabaseCard.pending, project)
+	const { metrics: metricsEnabled, logs: logsEnabled, drain: drainEnabled } = values
 	const manual = manualMapleDrain(project)
 	return [
 		projectSwitch(h, {
@@ -165,7 +152,13 @@ export const supabaseProjectSwitches = (h: H, model: Model, project: Project): R
 			isChecked: metricsEnabled,
 			isDisabled: isLocked,
 			label: `Collect metrics for ${project.name}`,
-			onToggle: Message.ToggledSupabaseMetrics({ ref: project.ref, enabled: !metricsEnabled }),
+			onToggle: toHub(
+				SupabaseMessage.ToggledSwitch({
+					ref: project.ref,
+					kind: "metrics",
+					enabled: !metricsEnabled,
+				}),
+			),
 		}),
 		projectSwitch(h, {
 			id: `supabase-logs-${project.ref}`,
@@ -174,7 +167,9 @@ export const supabaseProjectSwitches = (h: H, model: Model, project: Project): R
 			// Polling already on can always be turned off.
 			isDisabled: isLocked || (!logsEnabled && (drainEnabled || manual !== undefined)),
 			label: `Collect logs for ${project.name}`,
-			onToggle: Message.ToggledSupabaseLogs({ ref: project.ref, enabled: !logsEnabled }),
+			onToggle: toHub(
+				SupabaseMessage.ToggledSwitch({ ref: project.ref, kind: "logs", enabled: !logsEnabled }),
+			),
 		}),
 		projectSwitch(h, {
 			id: `supabase-drain-${project.ref}`,
@@ -184,7 +179,9 @@ export const supabaseProjectSwitches = (h: H, model: Model, project: Project): R
 				manual === undefined
 					? `Send ${project.name}'s logs through a Supabase log drain`
 					: `${project.name} already sends logs to Maple through the drain ${manual.name}`,
-			onToggle: Message.ToggledSupabaseLogDrain({ ref: project.ref, enabled: !drainEnabled }),
+			onToggle: toHub(
+				SupabaseMessage.ToggledSwitch({ ref: project.ref, kind: "drain", enabled: !drainEnabled }),
+			),
 		}),
 	]
 }
@@ -270,6 +267,38 @@ const projectsTable = (h: H, model: Model, status: SupabaseIntegrationStatus, ti
 			: Arr.map(status.projects, (project) => projectRow(h, model, project, timeZone)),
 	)
 
+/** The Features row's switch kind, by catalog id. */
+const FEATURE_KIND = {
+	metrics: "metrics",
+	logs: "logs",
+	logDrain: "drain",
+} as const satisfies Record<IntegrationFeatureId<"supabase">, SupabaseSwitchKind>
+
+/** Each feature across the organization's projects: a switch sets it on every project. */
+export const supabaseFeatures = (h: H, model: Model, status: SupabaseIntegrationStatus): Html =>
+	featureList(h, {
+		idPrefix: "supabase-feature",
+		className: "bg-card",
+		rows: Arr.map(INTEGRATION_FEATURES.supabase, (spec) => {
+			const kind = FEATURE_KIND[spec.id]
+			const across = featureAcross(model.supabaseCard.pending, status.projects, kind)
+			return {
+				spec,
+				isChecked: across.isChecked,
+				isDisabled: across.isSaving || across.targets.length === 0,
+				onToggle: toHub(SupabaseMessage.ToggledFeature({ kind })),
+				note: across.isSaving
+					? { _tag: "Pending", text: "Saving" }
+					: {
+							_tag: "Info",
+							text:
+								across.blockedReason ??
+								`${across.onCount} of ${countLabel(across.total, "project")}`,
+						},
+			}
+		}),
+	})
+
 export const SUPABASE_LOGS_NOTE =
 	"Logs are pulled every minute through your grant and count toward ingest. A log drain has Supabase push them instead: it needs a Pro plan and Supabase bills it per drain."
 
@@ -352,7 +381,7 @@ const actions = (h: H, model: Model, status: SupabaseIntegrationStatus): Html =>
 						size: "sm",
 						variant: "outline",
 						isLoading: model.supabaseCard.isSyncing,
-						attributes: [h.OnClick(Message.ClickedSupabaseSync())],
+						attributes: [h.OnClick(toHub(SupabaseMessage.ClickedSync()))],
 					},
 					[icon(h, "ArrowRotateAnticlockwiseIcon"), "Sync now"],
 				),
@@ -369,7 +398,10 @@ const byStatus = (h: H, model: Model, status: SupabaseIntegrationStatus, timeZon
 		summary: summaryLine(h, model, status, timeZone),
 		notice: notice(h, status),
 		actions: actions(h, model, status),
-		table: projectsTable(h, model, status, timeZone),
+		table: vstack(h, { gap: "4" }, [
+			supabaseFeatures(h, model, status),
+			projectsTable(h, model, status, timeZone),
+		]),
 		actionsAtEnd: true,
 		footer: footer(h),
 	})

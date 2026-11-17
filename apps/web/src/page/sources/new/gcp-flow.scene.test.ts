@@ -106,7 +106,7 @@ describe("google cloud connect flow", () => {
 			click(role("button", { name: "Continue" })),
 			Command.resolve(ScrollToTop, PageMessage.CompletedScrollToTop()),
 			expectView(role("listitem", { current: "step", name: "Choose data" })).toExist(),
-			expectView(role("listitem", { name: "Project acme-prod" })).toExist(),
+			expectView(role("listitem", { name: "Project acme-prod (done)" })).toExist(),
 			expectView(role("button", { name: "Create connection" })).toExist(),
 			expectView(role("button", { name: "Continue" })).toBeDisabled(),
 		)
@@ -127,7 +127,7 @@ describe("google cloud connect flow", () => {
 			{ update: pageUpdate, view },
 			given(created()),
 			expectView(role("listitem", { current: "step", name: "Go live" })).toExist(),
-			expectView(role("listitem", { name: "Logs + metrics" })).toExist(),
+			expectView(role("listitem", { name: "Logs + metrics (done)" })).toExist(),
 			expectView(text("Run this script in Cloud Shell")).toExist(),
 			expectView(role("listitem", { name: /Script run/ })).toExist(),
 			expectView(role("listitem", { name: /Logs arrive/ })).toExist(),
@@ -148,8 +148,8 @@ describe("google cloud connect flow", () => {
 					last_metrics_received_at: "2026-10-24T11:59:50.000Z",
 				}),
 			),
-			expectView(role("listitem", { name: "Live" })).toExist(),
-			expectView(text("Confirmed: data shows up in Maple on its own from now on.")).toExist(),
+			expectView(role("listitem", { name: "Live (done)" })).toExist(),
+			expectView(text("Google Cloud is live")).toExist(),
 			expectView(text("Run this script in Cloud Shell")).not.toExist(),
 		)
 	})

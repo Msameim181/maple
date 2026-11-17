@@ -1,3 +1,4 @@
+import * as Animation from "@foldkit/ui/animation"
 import * as Policy from "@maple/domain/policy"
 import { OrgId } from "@maple/domain"
 import {
@@ -5,29 +6,38 @@ import {
 	type StatusPageConfig,
 	StatusPagePublicId,
 	type V2StatusPage,
+	type V2StatusPageCustomDomain,
 } from "@maple/domain/http/v2"
 import { DEFAULT_STATUS_PAGE_THEME } from "@maple/domain/status-page"
-import { Option, Result, Schema, Array as Arr } from "effect"
+import { Option, Result, Schema, Array as Arr, String as Str } from "effect"
 import {
+	all,
 	attr,
+	change,
 	Command,
 	click,
 	expect as expectView,
+	expectAll,
 	find,
 	given,
 	inside,
+	Mount,
 	role,
 	scene,
 	selector,
+	submit,
 	tap,
 	text,
 	type,
 	withViewInputs,
 } from "foldkit/scene"
+import { AsyncData } from "foldkit"
 import { describe, expect, test } from "vitest"
+import * as Dialog from "@maple/views/ui/dialog"
+import { MountDialog } from "@maple/views/ui/dialog"
 import { toLoadFailure } from "@maple/views/data/load-failure"
 import { PageOutMessage, type PageContext } from "../../contract"
-import { statusPagesHref } from "../shared/commands"
+import { statusPageHref, statusPagesHref } from "../shared/commands"
 import { selectionOf } from "../shared/preview"
 import { ORG } from "../../kit/alert-test-rows"
 import { downMonitor, httpMonitor } from "../../kit/uptime/test-monitors"
@@ -36,16 +46,27 @@ import {
 	componentId,
 	incident,
 	incidentId,
+	updateId,
 	statusPage,
 	statusPageConfig,
 } from "../shared/test-pages"
 import { PickerMessage } from "../shared/picker"
-import { FocusEditorElement } from "./command"
+import {
+	CheckCustomDomain,
+	FocusEditorElement,
+	RemoveCustomDomain,
+	RevealOpenComponent,
+	SaveVisibility,
+	SetCustomDomain,
+} from "./command"
 import { Message } from "./message"
 import type { Model } from "./model"
 import { init, routeChanged, update } from "./update"
-import { moved } from "./update-components"
+import { groupedOrder, moved } from "./update-components"
+import { customDomainOf } from "./update-domain"
 import { canvasDocument } from "./view-canvas"
+import { maintenanceDurationMs } from "./view-incidents"
+import { type Focused, popupOwnsEscape } from "./subscription"
 import { removeComponentCopy, view as pageView } from "./view"
 
 const ADMIN = Policy.grantsOf(["org:admin"])
@@ -61,6 +82,7 @@ const PUBLIC_ID = Schema.encodeSync(StatusPagePublicId)(statusPage().id)
 
 type Fixture = Readonly<{
 	tab?: string
+	section?: string
 	page?: V2StatusPage
 	grants?: ReadonlyArray<Policy.Permission>
 	components?: ReturnType<typeof component>[]
@@ -70,14 +92,48 @@ type Fixture = Readonly<{
 	/** The config read's document; by default the page and its components. */
 	config?: StatusPageConfig
 	configFail?: boolean
+	/** The custom domain read; by default none set on a deployment that offers them. */
+	customDomain?: V2StatusPageCustomDomain
 }>
+
+/** The custom domain read as the API answers it. */
+const customDomain = (fields: Partial<V2StatusPageCustomDomain> = {}): V2StatusPageCustomDomain => ({
+	object: "status_page_custom_domain",
+	page_id: statusPage().id,
+	available: true,
+	cname_target: "status-domains.maple.dev",
+	hostname: null,
+	status: null,
+	dns_records: [],
+	last_error: null,
+	last_checked_at: null,
+	activated_at: null,
+	created_at: null,
+	...fields,
+})
+
+const pendingDomain = customDomain({
+	hostname: "status.acme.com",
+	status: "pending_dns",
+	dns_records: [
+		{ type: "CNAME", name: "status.acme.com", value: "status-domains.maple.dev", purpose: "routing" },
+		{
+			type: "TXT",
+			name: "_cf-custom-hostname.status.acme.com",
+			value: "4d0b9f6e-owner",
+			purpose: "ownership",
+		},
+	],
+	last_error: "custom hostname does not CNAME to this zone.",
+	created_at: "2026-10-01T12:00:00.000Z",
+})
 
 const loaded = (fixture: Fixture = {}): Model => {
 	const entered = init(
 		{
 			_tag: "StatusPage",
 			pageId: PUBLIC_ID,
-			search: fixture.tab === undefined ? {} : { view: fixture.tab },
+			search: { view: fixture.tab, section: fixture.section },
 		},
 		context,
 	).model
@@ -105,7 +161,11 @@ const loaded = (fixture: Fixture = {}): Model => {
 					? Result.fail(toLoadFailure(new Error("monitors unavailable")))
 					: Result.succeed([httpMonitor(), downMonitor()]),
 			}),
-			// Only the JSON tab reads the config.
+			Message.CompletedFetchCustomDomain({
+				key: entered.customDomain.key ?? "",
+				result: Result.succeed(fixture.customDomain ?? customDomain()),
+			}),
+			// Only Settings > Advanced reads the config.
 			...(entered.config.key === null
 				? []
 				: [
@@ -156,6 +216,27 @@ describe("status page editor", () => {
 		expect(names(afterIncidents.commands)).toContain("ReadStatusPageClock")
 	})
 
+	test("the preview reads monitor history even when the page lands after the components' debounce", () => {
+		const entered = init({ _tag: "StatusPage", pageId: PUBLIC_ID, search: {} }, context).model
+		const settle = (model: Model) =>
+			pageUpdate(model, Message.ElapsedPreviewDebounce({ generation: model.previewGeneration }))
+		const withComponents = pageUpdate(
+			entered,
+			Message.CompletedFetchComponents({
+				key: entered.components.key ?? "",
+				result: Result.succeed([component(1)]),
+			}),
+		).model
+		const early = settle(withComponents)
+		expect(names(early.commands)).toEqual([])
+		const withPage = pageUpdate(
+			early.model,
+			Message.CompletedFetchPage({ key: entered.page.key ?? "", result: Result.succeed(statusPage()) }),
+		)
+		expect(names(withPage.commands)).toContain("WaitStatusPageEditorPreview")
+		expect(names(settle(withPage.model).commands)).toEqual(["FetchStatusPageEditorPreview"])
+	})
+
 	test("an id that is not a page id shows not found without a read", () => {
 		const entered = init({ _tag: "StatusPage", pageId: "nope", search: {} }, context)
 		expect(names(entered.commands)).not.toContain("FetchStatusPage")
@@ -192,11 +273,27 @@ describe("read failures", () => {
 	})
 })
 
-describe("the page as the editor", () => {
-	const selected = (componentNumber: number, fixture: Fixture = {}) =>
-		pageUpdate(loaded(fixture), Message.ClickedComponent({ componentId: componentId(componentNumber) }))
-			.model
+const MONITORS = { tab: "settings", section: "monitors" } as const
 
+/** The `srcdoc` of the frame titled `title`; "" without one. */
+const srcdocOf =
+	(title: string) =>
+	(html: Parameters<ReturnType<typeof find>>[0]): string =>
+		Option.getOrElse(Option.flatMap(find(`iframe[title="${title}"]`)(html), attr("srcdoc")), () => "")
+const APPEARANCE = { tab: "settings", section: "appearance" } as const
+const ACCESS = { tab: "settings", section: "access" } as const
+const ADVANCED = { tab: "settings", section: "advanced" } as const
+
+/** Settings > Monitors with one component open. */
+const selected = (componentNumber: number, fixture: Fixture = {}) =>
+	pageUpdate(
+		loaded({ ...MONITORS, ...fixture }),
+		Message.ClickedComponent({ componentId: componentId(componentNumber) }),
+	).model
+
+const revealed = Mount.resolve(RevealOpenComponent, Message.CompletedFocus())
+
+describe("components under Settings > Monitors", () => {
 	test("moving a component down sends the whole new order once and shows it at once", () => {
 		const moving = pageUpdate(
 			loaded(),
@@ -222,46 +319,162 @@ describe("the page as the editor", () => {
 		expect(moved(rows, componentId(2), 1)).toBeNull()
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ components: rows })),
+			given(loaded({ ...MONITORS, components: rows })),
 			expectView(role("button", { name: "Move Component 1 up" })).toBeDisabled(),
 			expectView(role("button", { name: "Move Component 2 down" })).toBeDisabled(),
 			expectView(role("button", { name: "Move Component 1 down" })).not.toBeDisabled(),
 		)
 	})
 
-	test("a component picked in the On this page list opens in its place, and Back returns to the list", () => {
+	test("a component opens in its row with its fields, and a second click closes it", () => {
 		const target = component(2, { name: "API", group: "Core", manual_status: "degraded" })
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ components: [component(1), target] })),
+			given(loaded({ ...MONITORS, components: [component(1), target] })),
 			click(role("button", { name: /^API/u })),
-			Command.resolve(FocusEditorElement, Message.CompletedFocus()),
+			// Expanded in place: nothing scrolls.
+			Mount.expectNone(),
+			expectView(role("button", { name: /^API/u })).toHaveAttr("aria-expanded", "true"),
 			expectView(role("textbox", { name: "Shown as" })).toHaveValue("API"),
 			expectView(role("textbox", { name: "Group" })).toHaveValue("Core"),
-			expectView(role("navigation", { name: "On this page" })).not.toExist(),
-			click(role("button", { name: "On this page" })),
+			expectView(text("Degraded, set under Override status.")).toExist(),
+			click(role("button", { name: /^API/u })),
 			Command.resolve(FocusEditorElement, Message.CompletedFocus()),
-			expectView(role("button", { name: /^API/u })).toHaveAttr("aria-pressed", "false"),
+			expectView(role("textbox", { name: "Shown as" })).not.toExist(),
+			expectView(role("button", { name: /^API/u })).toHaveAttr("aria-expanded", "false"),
 		)
 	})
 
-	test("a click in the preview selects the component or incident it names; unknown ids do nothing", () => {
-		const model = loaded({ incidents: [incident(1)] })
+	test("groups list where their first member is, as on the public page, ungrouped ones too", () => {
+		// The page opens on an ungrouped component, so "No group" leads.
+		const rows = [
+			component(1),
+			component(2, { group: "Core" }),
+			component(3),
+			component(4, { group: "Core" }),
+		]
+		expect(Arr.map(groupedOrder(rows), (row) => row.id)).toEqual([
+			componentId(1),
+			componentId(3),
+			componentId(2),
+			componentId(4),
+		])
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded({ ...MONITORS, components: rows })),
+			expectAll(all.role("list")).toHaveCount(2),
+			tap(({ html }) =>
+				expect(
+					Option.flatMap(find('[aria-label="Components"] ul')(html), attr("aria-label")),
+				).toEqual(Option.some("No group")),
+			),
+			expectView(role("button", { name: "Move Component 1 up" })).toBeDisabled(),
+			expectView(role("button", { name: "Move Component 3 down" })).toBeDisabled(),
+			expectView(role("button", { name: "Move Component 2 up" })).toBeDisabled(),
+			expectView(role("button", { name: "Move Component 4 down" })).toBeDisabled(),
+		)
+	})
+
+	test("a move swaps a component with its neighbour in its group and leaves every other where it was", () => {
+		const rows = [
+			component(1),
+			component(2, { group: "Core" }),
+			component(3),
+			component(4, { group: "Core" }),
+		]
+		expect(
+			pageUpdate(
+				loaded({ components: rows }),
+				Message.ClickedMoveComponent({ componentId: componentId(3), offset: -1 }),
+			).commands,
+		).toMatchObject([
+			{
+				name: "ReorderStatusPageComponents",
+				args: { componentIds: [componentId(3), componentId(2), componentId(1), componentId(4)] },
+			},
+		])
+		expect(moved(rows, componentId(4), 1)).toBeNull()
+	})
+
+	test("the open component's row shows how it reads on the page, as typed", () => {
+		const editing = pageUpdate(
+			selected(2, { components: [component(1, { group: "Core" }), component(2, { group: "Core" })] }),
+			Message.ChangedComponentField({ field: "name", value: "Payments" }),
+		).model
+		scene(
+			{ update: pageUpdate, view },
+			given(editing),
+			expectView(selector('iframe[title="Component 2 as visitors see it"]')).toHaveAttr("sandbox", ""),
+			tap(({ html }) => {
+				const srcdoc = Option.getOrElse(
+					Option.flatMap(
+						find('iframe[title="Component 2 as visitors see it"]')(html),
+						attr("srcdoc"),
+					),
+					() => "",
+				)
+				expect(srcdoc).toContain("Payments")
+				expect(srcdoc).toContain("Core")
+				expect(srcdoc).not.toContain("Component 1")
+			}),
+		)
+	})
+
+	test("a click in the live page opens the component under Monitors and the incident under its tab", () => {
+		const model = loaded({ incidents: [incident(1), incident(2, { kind: "maintenance" })] })
 		const picked = pageUpdate(
 			model,
 			Message.ReceivedPreviewSelection({ kind: "component", id: componentId(3) }),
 		)
 		expect(picked.model.panel).toEqual({ _tag: "Component", componentId: componentId(3) })
 		expect(picked.model.componentForm.name).toBe("Component 3")
+		expect(picked.outMessage).toMatchObject({
+			_tag: "RequestedNavigation",
+			url: statusPageHref(statusPage().id, "settings", "monitors"),
+		})
+		// Landing on Monitors keeps the component open.
+		const landed = routeChanged(
+			picked.model,
+			{ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "settings", section: "monitors" } },
+			context,
+		)
+		expect(landed.model.panel).toEqual({ _tag: "Component", componentId: componentId(3) })
+		// Opened from the page, its row scrolls into view as it mounts.
+		// Once: the reveal's completion drops it, so a later remount of the row stays put.
+		scene(
+			{ update: pageUpdate, view },
+			given(landed.model),
+			revealed,
+			Mount.expectEnded(RevealOpenComponent),
+		)
 		const incidentPicked = pageUpdate(
 			model,
 			Message.ReceivedPreviewSelection({ kind: "incident", id: incidentId(1) }),
 		)
 		expect(incidentPicked.model.panel).toEqual({ _tag: "Incident", incidentId: incidentId(1) })
+		expect(incidentPicked.model.panelSheet.isOpen).toBe(true)
+		expect(incidentPicked.outMessage).toMatchObject({ url: statusPageHref(statusPage().id, "incidents") })
+		expect(
+			pageUpdate(model, Message.ReceivedPreviewSelection({ kind: "incident", id: incidentId(2) }))
+				.outMessage,
+		).toMatchObject({ url: statusPageHref(statusPage().id, "maintenance") })
 		expect(
 			pageUpdate(model, Message.ReceivedPreviewSelection({ kind: "component", id: "elsewhere" })).model
 				.panel,
 		).toBeNull()
+	})
+
+	test("switching to a tab that does not show the open component closes it", () => {
+		const left = routeChanged(selected(1), { _tag: "StatusPage", pageId: PUBLIC_ID, search: {} }, context)
+		expect(left.model.panel).toBeNull()
+		// A route change that skipped the field's blur still saves what was typed.
+		const typed = pageUpdate(
+			selected(1),
+			Message.ChangedComponentField({ field: "name", value: "Payments" }),
+		).model
+		const leftTyped = routeChanged(typed, { _tag: "StatusPage", pageId: PUBLIC_ID, search: {} }, context)
+		expect(leftTyped.model.panel).toBeNull()
+		expect(names(leftTyped.commands)).toContain("SaveStatusPageComponent")
 	})
 
 	test("a preview message that is not exactly a selection is ignored", () => {
@@ -276,19 +489,27 @@ describe("the page as the editor", () => {
 		expect(selectionOf("select")).toEqual(Option.none())
 	})
 
-	test("the preview outlines the selection and marks components and incidents to click", () => {
-		const model = selected(2, { incidents: [incident(1)] })
+	test("the live page is a sandboxed frame whose components and incidents can be clicked", () => {
+		const model = loaded({ incidents: [incident(1)] })
 		scene(
 			{ update: pageUpdate, view },
 			given(model),
 			expectView(selector("iframe")).toHaveAttr("sandbox", "allow-scripts"),
 		)
 		const document = canvasDocument(model, statusPage())
-		const outlined = (id: string) => new RegExp(`\\[data-component-id="${id}"\\][^{]*\\{outline:2px`, "u")
-		expect(document).toMatch(outlined(componentId(2)))
-		expect(document).not.toMatch(outlined(componentId(1)))
 		expect(document).toContain(`data-incident-id="${incidentId(1)}"`)
 		expect(document).toContain(`data-component-id="${componentId(1)}"`)
+	})
+
+	test("the preview's subscribe dialog carries the Slack command for the page's public address", () => {
+		const withDomain = { ...selected(2), publicBaseUrl: "https://status-pr-7.maple.dev" }
+		expect(canvasDocument(withDomain, statusPage())).toContain(
+			`value="/feed subscribe https://status-pr-7.maple.dev/s/acme-status/feed.rss"`,
+		)
+		// Slack fetches the feed itself: without a status domain there is no address to give it.
+		expect(canvasDocument({ ...withDomain, publicBaseUrl: "" }, statusPage())).not.toContain(
+			"/feed subscribe",
+		)
 	})
 
 	test("a field saves on blur with one PATCH of the whole component, and only when it changed", () => {
@@ -462,8 +683,12 @@ describe("the page as the editor", () => {
 				name: "AddStatusPageComponents",
 				args: { components: [{ name: monitor.name, monitor_id: monitor.id }] },
 			},
+			{ name: "TrackStatusPageEditorMonitorCreated", args: { kind: monitor.kind } },
 		])
-		const closed = pageUpdate(adding, Message.ClickedClosePanel()).model
+		const closed = pageUpdate(
+			adding,
+			Message.GotPanelSheetMessage({ message: Dialog.Message.ClickedClose() }),
+		).model
 		expect(names(pageUpdate(closed, created).commands)).not.toContain("AddStatusPageComponents")
 		// Reopened before the first monitor arrived: the new panel's picker stays its own.
 		const reopened = pageUpdate(closed, Message.ClickedAddComponent()).model
@@ -483,6 +708,7 @@ describe("the page as the editor", () => {
 		scene(
 			{ update: pageUpdate, view },
 			given({ ...adding, addPicker: { ...adding.addPicker, isCreatingMonitor: true } }),
+			mounted,
 			expectView(role("button", { name: "Add a component without a monitor" })).toBeDisabled(),
 			expectView(role("button", { name: "Add component" })).toBeDisabled(),
 		)
@@ -524,17 +750,26 @@ describe("the page as the editor", () => {
 	})
 })
 
-describe("incidents in the panel", () => {
+const steps = (model: Model, messages: ReadonlyArray<Message>, ctx: PageContext = context) =>
+	Arr.reduce(messages, model, (current, message) => update(current, message, ctx).model)
+
+const mounted = Mount.resolve(MountDialog, Dialog.Message.CompletedMountDialog())
+
+/** The reviewed message as the public page's markup renders it; the incident's sheet is a dialog too. */
+const updateBodyOf = find('[role="dialog"]:not(#status-page-panel-popup) [data-slot="update-body"]')
+const messageHtml = (html: Parameters<typeof updateBodyOf>[0]): string =>
+	Option.getOrElse(Option.flatMap(updateBodyOf(html), attr("innerHTML")), () => "")
+
+const shown = (row: ReturnType<typeof incident>) =>
+	pageUpdate(loaded({ incidents: [row] }), Message.ClickedIncident({ incidentId: row.id })).model
+
+describe("posting an incident", () => {
 	test("switching between incident and maintenance keeps what was typed", () => {
-		const typed = Arr.reduce(
-			[
-				Message.ClickedNewIncident({ kind: "incident" }),
-				Message.ChangedIncidentField({ field: "title", value: "Database upgrade" }),
-				Message.ChangedIncidentField({ field: "body", value: "Planned work." }),
-			],
-			loaded(),
-			(model, message) => pageUpdate(model, message).model,
-		)
+		const typed = steps(loaded(), [
+			Message.ClickedNewIncident({ kind: "incident" }),
+			Message.ChangedIncidentField({ field: "title", value: "Database upgrade" }),
+			Message.ChangedIncidentField({ field: "body", value: "Planned work." }),
+		])
 		const switched = pageUpdate(typed, Message.ChangedIncidentKind({ kind: "maintenance" })).model
 		expect(switched.incidentForm).toMatchObject({
 			kind: "maintenance",
@@ -546,6 +781,396 @@ describe("incidents in the panel", () => {
 		})
 	})
 
+	test("Post incident opens a dialog on its write step, with the affected components picked", () => {
+		const model = loaded({ components: [component(1), component(2, { monitor_id: downMonitor().id })] })
+		const opened = pageUpdate(model, Message.ClickedNewIncident({ kind: "incident" })).model
+		expect(opened.composeDialog.isOpen).toBe(true)
+		expect(opened.incidentForm.impact).toBe("critical")
+		scene(
+			{ update: pageUpdate, view },
+			given(opened),
+			mounted,
+			expectView(role("dialog", { name: "Post incident" })).toExist(),
+			expectView(role("listitem", { name: "Write" })).toHaveAttr("aria-current", "step"),
+			expectView(role("listitem", { name: "Review" })).not.toHaveAttr("aria-current", "step"),
+			expectView(role("textbox", { name: "Title" })).toExist(),
+			expectView(role("checkbox", { name: "Component 2" })).toBeChecked(),
+			expectView(role("checkbox", { name: "Component 1" })).not.toBeChecked(),
+		)
+	})
+
+	test("Review waits for a title and a message, and names what is missing", () => {
+		const opened = pageUpdate(loaded(), Message.ClickedNewIncident({ kind: "incident" })).model
+		expect(pageUpdate(opened, Message.SubmittedIncidentWrite()).model.composeStep).toBe("write")
+		scene(
+			{ update: pageUpdate, view },
+			given(opened),
+			mounted,
+			expectView(text("Add a title.")).toExist(),
+			expectView(role("button", { name: "Review" })).toBeDisabled(),
+			type(role("textbox", { name: "Title" }), "Elevated API errors"),
+			expectView(text("Write the first update.")).toExist(),
+			type(role("textbox", { name: "Message" }), "Looking into it."),
+			expectView(text("Nothing is public until you confirm on the next step.")).toExist(),
+			expectView(role("button", { name: "Review" })).toBeEnabled(),
+		)
+	})
+
+	const reviewing = () =>
+		steps(loaded(), [
+			Message.ClickedNewIncident({ kind: "incident" }),
+			Message.ChangedIncidentField({ field: "title", value: "Slow checkout" }),
+			Message.ChangedIncidentField({ field: "impact", value: "critical" }),
+			Message.ToggledIncidentComponent({ componentId: componentId(2) }),
+			Message.ChangedIncidentField({ field: "body", value: "**Checkout** is slow." }),
+			Message.SubmittedIncidentWrite(),
+		])
+
+	test("the review shows the post as the page renders it and what visitors see change", () => {
+		const model = reviewing()
+		expect(model.composeStep).toBe("review")
+		scene(
+			{ update: pageUpdate, view },
+			given(model),
+			mounted,
+			expectView(role("dialog", { name: "Review before publishing" })).toExist(),
+			inside(
+				role("region", { name: "On the page" }),
+				expectView(text("Slow checkout")).toExist(),
+				expectView(text("Affects Component 2 · Posted just now")).toExist(),
+			),
+			tap(({ html }) => expect(messageHtml(html)).toBe("<p><strong>Checkout</strong> is slow.</p>")),
+			inside(
+				role("region", { name: "What changes when you publish" }),
+				expectAll(all.role("listitem")).toHaveCount(2),
+				expectView(text("Page banner")).toExist(),
+				expectView(text("Component 2")).toExist(),
+				expectAll(all.text("Major outage")).toHaveCount(2),
+				expectView(text("Component 1")).not.toExist(),
+			),
+		)
+	})
+
+	test("Publish creates the incident as reviewed, then the dialog closes on the incident's panel", () => {
+		const publishing = pageUpdate(reviewing(), Message.SubmittedIncident({ isPublished: true }))
+		expect(publishing.commands).toMatchObject([
+			{
+				name: "CreateStatusPageIncident",
+				args: {
+					payload: {
+						kind: "incident",
+						title: "Slow checkout",
+						impact: "critical",
+						status: "investigating",
+						component_ids: [componentId(2)],
+						body: "**Checkout** is slow.",
+						published: true,
+					},
+				},
+			},
+		])
+		expect(
+			pageUpdate(publishing.model, Message.SubmittedIncident({ isPublished: true })).commands ?? [],
+		).toEqual([])
+		const created = pageUpdate(
+			publishing.model,
+			Message.CompletedCreateIncident({ result: Result.succeed(incident(2)) }),
+		)
+		expect(created.model.composeDialog.isOpen).toBe(false)
+		expect(created.model.panel).toEqual({ _tag: "Incident", incidentId: incidentId(2) })
+		expect(names(created.commands)).toContain("FetchStatusPageIncidents")
+		expect(created.outMessage).toMatchObject({ _tag: "RequestedToast", title: "Incident published" })
+		// With no incident list loaded to put it in, the sheet still shows the new incident.
+		const unloaded = {
+			...publishing.model,
+			incidents: { ...publishing.model.incidents, data: AsyncData.Loading() },
+		}
+		const shownAnyway = pageUpdate(
+			unloaded,
+			Message.CompletedCreateIncident({ result: Result.succeed(incident(2)) }),
+		)
+		expect(shownAnyway.model.sheetIncident?.id).toBe(incidentId(2))
+	})
+
+	test("Save as draft sends the same incident unpublished", () => {
+		expect(
+			pageUpdate(reviewing(), Message.SubmittedIncident({ isPublished: false })).commands,
+		).toMatchObject([
+			{
+				name: "CreateStatusPageIncident",
+				args: { payload: { title: "Slow checkout", published: false } },
+			},
+		])
+	})
+
+	test("Back returns to the write step with everything as typed", () => {
+		const back = pageUpdate(reviewing(), Message.ClickedIncidentBack()).model
+		expect(back.composeStep).toBe("write")
+		scene(
+			{ update: pageUpdate, view },
+			given(back),
+			mounted,
+			expectView(role("textbox", { name: "Title" })).toHaveValue("Slow checkout"),
+			expectView(role("textbox", { name: "Message" })).toHaveValue("**Checkout** is slow."),
+			expectView(role("checkbox", { name: "Component 2" })).toBeChecked(),
+		)
+	})
+
+	test("a refused create stays on the review with the reason", () => {
+		const refused = pageUpdate(
+			pageUpdate(reviewing(), Message.SubmittedIncident({ isPublished: true })).model,
+			Message.CompletedCreateIncident({
+				result: Result.fail(toLoadFailure(new Error("create refused"))),
+			}),
+		).model
+		expect(refused.composeDialog.isOpen).toBe(true)
+		scene(
+			{ update: pageUpdate, view },
+			given(refused),
+			mounted,
+			expectView(text("Couldn't open the incident")).toExist(),
+			expectView(role("button", { name: "Publish" })).toBeEnabled(),
+		)
+	})
+
+	test("the dialog cannot be dismissed while the incident is being created", () => {
+		const creating = pageUpdate(reviewing(), Message.SubmittedIncident({ isPublished: true })).model
+		const dismissed = pageUpdate(
+			creating,
+			Message.GotComposeDialogMessage({ message: Dialog.Message.PressedEscape() }),
+		).model
+		expect(dismissed.composeDialog.isOpen).toBe(true)
+	})
+
+	test("maintenance needs a window that ends after it starts, read in the viewer's zone", () => {
+		const zoned: PageContext = { ...context, timeZone: "Europe/Berlin" }
+		const filled = steps(
+			loaded(),
+			[
+				Message.ClickedNewIncident({ kind: "maintenance" }),
+				Message.ChangedIncidentField({ field: "title", value: "Database upgrade" }),
+				Message.ChangedIncidentField({ field: "body", value: "Brief read-only periods." }),
+				Message.ChangedIncidentField({ field: "scheduledStart", value: "2026-10-30T22:00" }),
+				Message.ChangedIncidentField({ field: "scheduledEnd", value: "2026-10-30T21:00" }),
+				Message.SubmittedIncidentWrite(),
+			],
+			zoned,
+		)
+		expect(filled.composeStep).toBe("write")
+		const fixed = steps(
+			filled,
+			[
+				Message.ChangedIncidentField({ field: "scheduledEnd", value: "2026-10-31T01:00" }),
+				Message.SubmittedIncidentWrite(),
+			],
+			zoned,
+		)
+		expect(update(fixed, Message.SubmittedIncident({ isPublished: true }), zoned).commands).toMatchObject(
+			[
+				{
+					name: "CreateStatusPageIncident",
+					args: {
+						payload: {
+							kind: "maintenance",
+							status: "scheduled",
+							scheduled_start: "2026-10-30T21:00:00.000Z",
+							scheduled_end: "2026-10-31T00:00:00.000Z",
+						},
+					},
+				},
+			],
+		)
+	})
+
+	test("future maintenance is scheduled, and changes nothing on the page yet", () => {
+		const model = steps(loaded(), [
+			Message.ClickedNewIncident({ kind: "maintenance" }),
+			Message.ChangedIncidentField({ field: "title", value: "Database upgrade" }),
+			Message.ChangedIncidentField({ field: "body", value: "Brief read-only periods." }),
+			Message.ToggledIncidentComponent({ componentId: componentId(1) }),
+			Message.ChangedIncidentField({ field: "scheduledStart", value: "2026-10-30T22:00" }),
+			Message.ChangedIncidentField({ field: "scheduledEnd", value: "2026-10-30T23:00" }),
+			Message.SubmittedIncidentWrite(),
+		])
+		scene(
+			{ update: pageUpdate, view },
+			given(model),
+			mounted,
+			expectView(text("Nothing on the page changes")).toExist(),
+			expectView(role("button", { name: "Schedule" })).toExist(),
+		)
+	})
+
+	test("maintenance takes its status from its window, so the dialog asks for none", () => {
+		const written = (start: string, end: string) =>
+			steps(loaded(), [
+				Message.ClickedNewIncident({ kind: "maintenance" }),
+				Message.ChangedIncidentField({ field: "title", value: "Database upgrade" }),
+				Message.ChangedIncidentField({ field: "body", value: "Read-only for a few minutes." }),
+				Message.ChangedIncidentField({ field: "scheduledStart", value: start }),
+				Message.ChangedIncidentField({ field: "scheduledEnd", value: end }),
+			])
+		scene(
+			{ update: pageUpdate, view },
+			given(written("2026-10-01T13:00", "2026-10-01T14:00")),
+			mounted,
+			expectView(role("combobox", { name: "Status" })).not.toExist(),
+		)
+		const post = (model: Model) =>
+			pageUpdate(
+				pageUpdate(model, Message.SubmittedIncidentWrite()).model,
+				Message.SubmittedIncident({ isPublished: true }),
+			).commands
+		// The clock reads 12:00.
+		expect(post(written("2026-10-01T13:00", "2026-10-01T14:00"))).toMatchObject([
+			{ name: "CreateStatusPageIncident", args: { payload: { status: "scheduled" } } },
+		])
+		expect(post(written("2026-10-01T11:00", "2026-10-01T14:00"))).toMatchObject([
+			{ name: "CreateStatusPageIncident", args: { payload: { status: "in_progress" } } },
+		])
+		const over = written("2026-10-01T10:00", "2026-10-01T11:00")
+		expect(post(over) ?? []).toEqual([])
+		scene(
+			{ update: pageUpdate, view },
+			given(over),
+			mounted,
+			expectView(text("The maintenance must end in the future.")).toExist(),
+		)
+	})
+
+	test("maintenance can stay in progress past its window: the choice, the review and the post", () => {
+		const writing = steps(loaded(), [
+			Message.ClickedNewIncident({ kind: "maintenance" }),
+			Message.ChangedIncidentField({ field: "title", value: "Index rebuild" }),
+			Message.ChangedIncidentField({ field: "body", value: "Rebuilding indexes." }),
+			Message.ChangedIncidentField({ field: "scheduledStart", value: "2026-10-30T22:00" }),
+			Message.ChangedIncidentField({ field: "scheduledEnd", value: "2026-10-30T23:00" }),
+		])
+		scene(
+			{ update: pageUpdate, view },
+			given(writing),
+			mounted,
+			expectView(role("radio", { name: "Complete automatically" })).toBeChecked(),
+			expectView(
+				role("radio", { name: "Keep it in progress until someone completes it" }),
+			).not.toBeChecked(),
+		)
+		const reviewed = steps(writing, [
+			Message.ChangedIncidentAutoComplete({ autoComplete: false }),
+			Message.SubmittedIncidentWrite(),
+		])
+		scene(
+			{ update: pageUpdate, view },
+			given(reviewed),
+			mounted,
+			expectView(
+				text(
+					"Starts Oct 30, 22:00 and ends Oct 30, 23:00 (UTC). It moves to In progress at the start on its own and stays there past the end until someone completes it.",
+				),
+			).toExist(),
+		)
+		expect(pageUpdate(reviewed, Message.SubmittedIncident({ isPublished: true })).commands).toMatchObject(
+			[{ name: "CreateStatusPageIncident", args: { payload: { auto_complete: false } } }],
+		)
+	})
+
+	test("an incident can be backdated: the review says when it started and the post carries it", () => {
+		const written = steps(loaded(), [
+			Message.ClickedNewIncident({ kind: "incident" }),
+			Message.ChangedIncidentField({ field: "title", value: "Elevated errors" }),
+			Message.ChangedIncidentField({ field: "body", value: "Looking into it." }),
+		])
+		// The clock reads 12:00: a start after it is refused before Review, as the API would.
+		const future = steps(written, [
+			Message.ChangedIncidentField({ field: "startedAt", value: "2026-10-01T12:30" }),
+			Message.SubmittedIncidentWrite(),
+		])
+		expect(future.composeStep).toBe("write")
+		scene(
+			{ update: pageUpdate, view },
+			given(future),
+			mounted,
+			expectView(text("It can't start in the future.")).toExist(),
+			expectView(role("button", { name: "Review" })).toBeDisabled(),
+		)
+		const reviewed = steps(future, [
+			Message.ChangedIncidentField({ field: "startedAt", value: "2026-10-01T09:05" }),
+			Message.SubmittedIncidentWrite(),
+		])
+		scene(
+			{ update: pageUpdate, view },
+			given(reviewed),
+			mounted,
+			inside(
+				role("region", { name: "On the page" }),
+				expectView(text(/Started Oct 1, 09:05/u)).toExist(),
+			),
+		)
+		expect(pageUpdate(reviewed, Message.SubmittedIncident({ isPublished: true })).commands).toMatchObject(
+			[
+				{
+					name: "CreateStatusPageIncident",
+					args: { payload: { started_at: "2026-10-01T09:05:00.000Z" } },
+				},
+			],
+		)
+	})
+
+	test("the maintenance review says it starts and completes on its own", () => {
+		const reviewed = steps(loaded(), [
+			Message.ClickedNewIncident({ kind: "maintenance" }),
+			Message.ChangedIncidentField({ field: "title", value: "Database upgrade" }),
+			Message.ChangedIncidentField({ field: "body", value: "Brief read-only periods." }),
+			Message.ChangedIncidentField({ field: "scheduledStart", value: "2026-10-30T22:00" }),
+			Message.ChangedIncidentField({ field: "scheduledEnd", value: "2026-10-31T01:00" }),
+			Message.SubmittedIncidentWrite(),
+		])
+		scene(
+			{ update: pageUpdate, view },
+			given(reviewed),
+			mounted,
+			inside(
+				role("region", { name: "Schedule" }),
+				expectView(
+					text(
+						"Starts Oct 30, 22:00 and ends Oct 31, 01:00 (UTC). It moves to In progress at the start and to Completed at the end on its own; subscribers see both updates.",
+					),
+				).toExist(),
+			),
+		)
+	})
+
+	test("a first update over 20,000 characters keeps Review shut and says so", () => {
+		const long = steps(loaded(), [
+			Message.ClickedNewIncident({ kind: "incident" }),
+			Message.ChangedIncidentField({ field: "title", value: "Elevated errors" }),
+			Message.ChangedIncidentField({ field: "body", value: Str.repeat(20_001)("x") }),
+		])
+		expect(pageUpdate(long, Message.SubmittedIncidentWrite()).model.composeStep).toBe("write")
+		scene(
+			{ update: pageUpdate, view },
+			given(long),
+			mounted,
+			expectAll(all.text("Keep it under 20,000 characters (20,001 now).")).toHaveCount(2),
+			expectView(role("button", { name: "Review" })).toBeDisabled(),
+		)
+	})
+
+	test("the write step lists what is missing for maintenance", () => {
+		const opened = pageUpdate(loaded(), Message.ClickedNewIncident({ kind: "maintenance" })).model
+		scene(
+			{ update: pageUpdate, view },
+			given(opened),
+			mounted,
+			type(role("textbox", { name: "Title" }), "Database upgrade"),
+			type(role("textbox", { name: "Message" }), "Brief read-only periods."),
+			expectView(text("Set when the maintenance starts and ends.")).toExist(),
+			expectView(role("button", { name: "Review" })).toBeDisabled(),
+		)
+	})
+})
+
+describe("posting an update", () => {
 	test("an open incident carries its actions, and a draft can be published", () => {
 		const model = pageUpdate(
 			loaded({
@@ -559,6 +1184,7 @@ describe("incidents in the panel", () => {
 		scene(
 			{ update: pageUpdate, view },
 			given(model),
+			mounted,
 			expectView(text("Draft, not public")).toExist(),
 			expectView(role("button", { name: "Publish" })).toExist(),
 			expectView(role("button", { name: "Resolve" })).toExist(),
@@ -568,183 +1194,232 @@ describe("incidents in the panel", () => {
 		).toMatchObject([{ name: "PublishStatusPageIncident", args: { incidentId: incidentId(1) } }])
 	})
 
-	test("resolving posts a resolved update with the closing message", () => {
-		const model = loaded({ incidents: [incident(1)] })
+	test("Post update opens a dialog with the status one step along, and Review needs a message", () => {
 		const opened = pageUpdate(
-			model,
-			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: true }),
+			loaded({ incidents: [incident(1, { status: "identified" })] }),
+			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: false }),
+		).model
+		expect(opened.updateDialog.isOpen).toBe(true)
+		expect(opened.updateForm).toMatchObject({ _tag: "Writing", form: { status: "monitoring" } })
+		expect(pageUpdate(opened, Message.SubmittedUpdateWrite()).model.updateForm._tag).toBe("Writing")
+		scene(
+			{ update: pageUpdate, view },
+			given(opened),
+			mounted,
+			mounted,
+			expectView(role("dialog", { name: "Post update" })).toExist(),
+			// The last update reads as the page renders it.
+			tap(({ html }) =>
+				expect(messageHtml(html)).toBe("<p>We are looking into elevated error rates.</p>"),
+			),
+			expectView(role("button", { name: "Monitoring" })).toHaveAttr("aria-pressed", "true"),
+			expectView(role("button", { name: "Review" })).toBeDisabled(),
+			type(role("textbox", { name: "Message" }), "A fix is rolling out."),
+			expectView(role("button", { name: "Review" })).toBeEnabled(),
 		)
-		const posting = pageUpdate(opened.model, Message.SubmittedUpdate())
+	})
+
+	const resolving = () =>
+		steps(loaded({ incidents: [incident(1, { impact: "major" })] }), [
+			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: true }),
+			Message.SubmittedUpdateWrite(),
+		])
+
+	test("resolving reviews the components going back to operational, then posts the closing message", () => {
+		const model = resolving()
+		scene(
+			{ update: pageUpdate, view },
+			given(model),
+			mounted,
+			mounted,
+			inside(role("region", { name: "On the page" }), expectView(text("Resolved")).toExist()),
+			tap(({ html }) => expect(messageHtml(html)).toBe("<p>This incident has been resolved.</p>")),
+			inside(
+				role("region", { name: "What changes" }),
+				expectAll(all.role("listitem")).toHaveCount(2),
+				expectView(text("Page banner")).toExist(),
+				expectView(text("Component 1")).toExist(),
+				expectAll(all.text("Partial outage")).toHaveCount(2),
+			),
+		)
+		const posting = pageUpdate(model, Message.SubmittedUpdate())
 		expect(posting.commands).toMatchObject([
 			{
 				name: "PostStatusPageIncidentUpdate",
 				args: {
 					incidentId: incidentId(1),
-					generation: 0,
 					payload: { status: "resolved", body: "This incident has been resolved." },
 				},
 			},
 		])
+		const posted = pageUpdate(
+			posting.model,
+			Message.CompletedPostUpdate({ result: Result.succeed(incident(1, { status: "resolved" })) }),
+		)
+		expect(posted.model.updateDialog.isOpen).toBe(false)
+		expect(posted.outMessage).toMatchObject({ _tag: "RequestedToast", title: "Incident resolved" })
 	})
 
-	test("Post update moves the status one step along and needs a message", () => {
-		const model = loaded({ incidents: [incident(1, { status: "identified" })] })
+	test("a typed time re-reads the clock, so it is checked against the time it was typed", () => {
 		const opened = pageUpdate(
-			model,
-			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: false }),
+			loaded({ incidents: [incident(1)] }),
+			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: true }),
+		).model
+		const typed = pageUpdate(
+			opened,
+			Message.ChangedUpdateField({ field: "endedAt", value: "2026-10-01T11:58" }),
 		)
-		expect(opened.model.updateForm._tag === "Editing" && opened.model.updateForm.form.status).toBe(
-			"monitoring",
-		)
-		expect(pageUpdate(opened.model, Message.SubmittedUpdate()).commands ?? []).toEqual([])
+		expect(names(typed.commands)).toEqual(["ReadStatusPageClock"])
 	})
 
-	test("Post incident opens the composer in the panel, with the affected components picked", () => {
-		const model = loaded({ components: [component(1), component(2, { monitor_id: downMonitor().id })] })
+	test("resolving can say when it ended, but not in the future", () => {
+		const opened = pageUpdate(
+			loaded({ incidents: [incident(1)] }),
+			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: true }),
+		).model
+		const late = steps(opened, [
+			Message.ChangedUpdateField({ field: "endedAt", value: "2026-10-01T12:30" }),
+			Message.SubmittedUpdateWrite(),
+		])
+		expect(late.updateForm._tag).toBe("Writing")
 		scene(
 			{ update: pageUpdate, view },
-			given(model),
-			click(role("button", { name: "Post incident" })),
-			Command.resolve(FocusEditorElement, Message.CompletedFocus()),
-			expectView(role("textbox", { name: "Title" })).toExist(),
-			expectView(role("checkbox", { name: "Component 2" })).toBeChecked(),
-			expectView(role("checkbox", { name: "Component 1" })).not.toBeChecked(),
-			expectView(role("dialog")).not.toExist(),
+			given(late),
+			mounted,
+			mounted,
+			expectView(text("It can't end in the future.")).toExist(),
+			expectView(role("button", { name: "Review" })).toBeDisabled(),
 		)
-		const opened = pageUpdate(model, Message.ClickedNewIncident({ kind: "incident" })).model
-		expect(opened.incidentForm.impact).toBe("critical")
-	})
-
-	test("an incident saved as a draft names its components and is not published", () => {
-		const opened = pageUpdate(loaded(), Message.ClickedNewIncident({ kind: "incident" })).model
-		const filled = Arr.reduce(
-			[
-				Message.ChangedIncidentField({ field: "title", value: "Slow checkout" }),
-				Message.ChangedIncidentField({ field: "impact", value: "critical" }),
-				Message.ToggledIncidentComponent({ componentId: componentId(2) }),
-				Message.ChangedIncidentField({ field: "body", value: "Checkout is slow." }),
-				Message.PickedIncidentPublished({ isPublished: false }),
-			],
-			opened,
-			(current, message) => pageUpdate(current, message).model,
-		)
-		expect(pageUpdate(filled, Message.SubmittedIncident()).commands).toMatchObject([
-			{
-				name: "CreateStatusPageIncident",
-				args: {
-					payload: {
-						kind: "incident",
-						title: "Slow checkout",
-						impact: "critical",
-						status: "investigating",
-						component_ids: [componentId(2)],
-						body: "Checkout is slow.",
-						published: false,
-					},
-				},
-			},
+		// A clock read after the typed minute lets it through.
+		const later = steps(late, [
+			Message.ReadClock({ nowMs: Date.UTC(2026, 9, 1, 12, 31) }),
+			Message.SubmittedUpdateWrite(),
 		])
+		expect(later.updateForm._tag).toBe("Reviewing")
 	})
 
-	test("maintenance needs a window that ends after it starts, read in the viewer's zone", () => {
-		const zoned: PageContext = { ...context, timeZone: "Europe/Berlin" }
-		const opened = update(loaded(), Message.ClickedNewIncident({ kind: "maintenance" }), zoned).model
-		const filled = Arr.reduce(
-			[
-				Message.ChangedIncidentField({ field: "title", value: "Database upgrade" }),
-				Message.ChangedIncidentField({ field: "body", value: "Brief read-only periods." }),
-				Message.ChangedIncidentField({ field: "scheduledStart", value: "2026-10-30T22:00" }),
-				Message.ChangedIncidentField({ field: "scheduledEnd", value: "2026-10-30T21:00" }),
-			],
-			opened,
-			(current, message) => update(current, message, zoned).model,
-		)
-		expect(update(filled, Message.SubmittedIncident(), zoned).commands ?? []).toEqual([])
-		const fixed = update(
-			filled,
-			Message.ChangedIncidentField({ field: "scheduledEnd", value: "2026-10-31T01:00" }),
-			zoned,
+	test("resolving can say when it ended, but not before the incident started", () => {
+		const opened = pageUpdate(
+			loaded({ incidents: [incident(1)] }),
+			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: true }),
 		).model
-		expect(update(fixed, Message.SubmittedIncident(), zoned).commands).toMatchObject([
+		const early = steps(opened, [
+			Message.ChangedUpdateField({ field: "endedAt", value: "2026-10-01T11:45" }),
+			Message.SubmittedUpdateWrite(),
+		])
+		expect(early.updateForm._tag).toBe("Writing")
+		scene(
+			{ update: pageUpdate, view },
+			given(early),
+			mounted,
+			mounted,
+			expectView(text("It can't end before it started.")).toExist(),
+			expectView(role("button", { name: "Review" })).toBeDisabled(),
+		)
+		const reviewed = steps(early, [
+			Message.ChangedUpdateField({ field: "endedAt", value: "2026-10-01T11:58" }),
+			Message.SubmittedUpdateWrite(),
+		])
+		expect(pageUpdate(reviewed, Message.SubmittedUpdate()).commands).toMatchObject([
 			{
-				name: "CreateStatusPageIncident",
-				args: {
-					payload: {
-						kind: "maintenance",
-						status: "scheduled",
-						scheduled_start: "2026-10-30T21:00:00.000Z",
-						scheduled_end: "2026-10-31T00:00:00.000Z",
-					},
-				},
+				name: "PostStatusPageIncidentUpdate",
+				args: { payload: { status: "resolved", resolved_at: "2026-10-01T11:58:00.000Z" } },
 			},
 		])
 	})
 
-	test("the composer lists what is missing before it can be sent", () => {
-		const opened = pageUpdate(loaded(), Message.ClickedNewIncident({ kind: "maintenance" })).model
+	test("an update that does not close the incident has no end time to set", () => {
+		const opened = pageUpdate(
+			loaded({ incidents: [incident(1)] }),
+			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: false }),
+		).model
 		scene(
 			{ update: pageUpdate, view },
 			given(opened),
-			expectView(text("Add a title.")).toExist(),
-			type(role("textbox", { name: "Title" }), "Database upgrade"),
-			type(role("textbox", { name: "Message" }), "Brief read-only periods."),
-			expectView(text("Set when the maintenance starts and ends.")).toExist(),
-			expectView(role("button", { name: "Schedule" })).toBeDisabled(),
+			mounted,
+			mounted,
+			expectView(role("textbox", { name: "Ended" })).not.toExist(),
 		)
 	})
 
-	const shown = (row: ReturnType<typeof incident>) =>
-		pageUpdate(loaded({ incidents: [row] }), Message.ClickedIncident({ incidentId: row.id })).model
-
-	test("Edit details opens the saved title, impact and components in place of the actions", () => {
+	test("Back keeps the message, and a failed post stays on the review with the reason", () => {
+		const back = pageUpdate(resolving(), Message.ClickedUpdateBack()).model
+		expect(back.updateForm).toMatchObject({
+			_tag: "Writing",
+			form: { status: "resolved", body: "This incident has been resolved." },
+		})
+		const failed = steps(back, [
+			Message.SubmittedUpdateWrite(),
+			Message.SubmittedUpdate(),
+			Message.CompletedPostUpdate({ result: Result.fail(toLoadFailure(new Error("unreachable"))) }),
+		])
+		expect(failed.updateDialog.isOpen).toBe(true)
 		scene(
 			{ update: pageUpdate, view },
-			given(shown(incident(1, { title: "Elevated errors" }))),
-			click(role("button", { name: "Edit details" })),
-			Command.resolve(FocusEditorElement, Message.CompletedFocus()),
+			given(failed),
+			mounted,
+			mounted,
+			expectView(text("Couldn't post the update")).toExist(),
+			expectView(role("button", { name: "Publish update" })).toBeEnabled(),
+		)
+	})
+
+	test("Change title, impact, times or components opens Edit details over the update, which keeps its message", () => {
+		const typed = steps(loaded({ incidents: [incident(1, { title: "Elevated errors" })] }), [
+			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: false }),
+			Message.ChangedUpdateField({ field: "body", value: "Still looking." }),
+		])
+		const editing = pageUpdate(typed, Message.ClickedEditIncident({ incidentId: incidentId(1) })).model
+		expect(editing.editIncidentDialog.isOpen).toBe(true)
+		expect(editing.updateDialog.isOpen).toBe(true)
+		expect(editing.updateForm).toMatchObject({ _tag: "Writing", form: { body: "Still looking." } })
+		scene(
+			{ update: pageUpdate, view },
+			given(typed),
+			mounted,
+			mounted,
+			expectView(role("button", { name: "Change title, impact, times or components" })).toHaveHandler(
+				"click",
+			),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(editing),
+			mounted,
+			mounted,
+			mounted,
+			expectView(role("dialog", { name: "Post update" })).toExist(),
+			expectView(role("dialog", { name: "Edit details" })).toExist(),
+			expectView(role("textbox", { name: "Title" })).toHaveValue("Elevated errors"),
+		)
+	})
+})
+
+describe("editing an incident's details", () => {
+	test("Edit details opens the saved title, impact and components in a dialog", () => {
+		const opened = pageUpdate(
+			shown(incident(1, { title: "Elevated errors" })),
+			Message.ClickedEditIncident({ incidentId: incidentId(1) }),
+		).model
+		expect(opened.editIncidentDialog.isOpen).toBe(true)
+		scene(
+			{ update: pageUpdate, view },
+			given(opened),
+			mounted,
+			mounted,
 			expectView(role("textbox", { name: "Title" })).toHaveValue("Elevated errors"),
 			expectView(role("checkbox", { name: "Component 1" })).toBeChecked(),
 			expectView(role("checkbox", { name: "Component 2" })).not.toBeChecked(),
-			expectView(role("button", { name: "Post update" })).not.toExist(),
-			click(role("button", { name: "Cancel" })),
-			expectView(role("button", { name: "Post update" })).toExist(),
-		)
-	})
-
-	test("an edit form left open does not hide the actions of an incident created after it", () => {
-		const editing = pageUpdate(
-			pageUpdate(
-				loaded({ incidents: [incident(1), incident(2)] }),
-				Message.ClickedIncident({ incidentId: incidentId(1) }),
-			).model,
-			Message.ClickedEditIncident({ incidentId: incidentId(1) }),
-		).model
-		const composing = pageUpdate(editing, Message.ClickedNewIncident({ kind: "incident" })).model
-		expect(composing.incidentEdit).toBeNull()
-		const created = pageUpdate(
-			{ ...composing, incidentEdit: editing.incidentEdit },
-			Message.CompletedCreateIncident({ result: Result.succeed(incident(2)) }),
-		).model
-		scene(
-			{ update: pageUpdate, view },
-			given(created),
-			expectView(role("button", { name: "Post update" })).toExist(),
-			expectView(role("button", { name: "Edit details" })).toExist(),
-			expectView(role("textbox", { name: "Title" })).not.toExist(),
 		)
 	})
 
 	test("saving an edit sends the trimmed title, the impact and the components once, and posts no update", () => {
-		const edited = Arr.reduce(
-			[
-				Message.ClickedEditIncident({ incidentId: incidentId(1) }),
-				Message.ChangedIncidentEditField({ field: "title", value: " Checkout errors " }),
-				Message.ChangedIncidentEditField({ field: "impact", value: "critical" }),
-				Message.ToggledIncidentEditComponent({ componentId: componentId(2) }),
-			],
-			shown(incident(1)),
-			(model, message) => pageUpdate(model, message).model,
-		)
+		const edited = steps(shown(incident(1)), [
+			Message.ClickedEditIncident({ incidentId: incidentId(1) }),
+			Message.ChangedIncidentEditField({ field: "title", value: " Checkout errors " }),
+			Message.ChangedIncidentEditField({ field: "impact", value: "critical" }),
+			Message.ToggledIncidentEditComponent({ componentId: componentId(2) }),
+		])
 		const saving = pageUpdate(edited, Message.SubmittedIncidentEdit())
 		expect(saving.commands).toMatchObject([
 			{
@@ -766,7 +1441,7 @@ describe("incidents in the panel", () => {
 				result: Result.succeed(incident(1, { title: "Checkout errors", impact: "critical" })),
 			}),
 		)
-		expect(saved.model.incidentEdit).toBeNull()
+		expect(saved.model.editIncidentDialog.isOpen).toBe(false)
 		expect(names(saved.commands)).not.toContain("PostStatusPageIncidentUpdate")
 		expect(saved.outMessage).toMatchObject({ _tag: "RequestedToast", type: "success" })
 	})
@@ -781,18 +1456,18 @@ describe("incidents in the panel", () => {
 			Message.ChangedIncidentEditField({ field: "title", value: "  " }),
 		).model
 		expect(pageUpdate(blank, Message.SubmittedIncidentEdit()).commands ?? []).toEqual([])
-		const typed = pageUpdate(
-			opened,
+		const refused = steps(opened, [
 			Message.ChangedIncidentEditField({ field: "title", value: "Checkout errors" }),
-		).model
-		const refused = pageUpdate(
-			pageUpdate(typed, Message.SubmittedIncidentEdit()).model,
+			Message.SubmittedIncidentEdit(),
 			Message.CompletedSaveIncident({ result: Result.fail(toLoadFailure(new Error("save refused"))) }),
-		).model
+		])
 		expect(refused.incidentEdit?.title).toBe("Checkout errors")
+		expect(refused.editIncidentDialog.isOpen).toBe(true)
 		scene(
 			{ update: pageUpdate, view },
 			given(refused),
+			mounted,
+			mounted,
 			expectView(text("Couldn't save the changes")).toExist(),
 			expectView(role("button", { name: "Save changes" })).toBeEnabled(),
 		)
@@ -800,12 +1475,22 @@ describe("incidents in the panel", () => {
 
 	test("maintenance has no impact to edit, so its save sends none", () => {
 		const opened = pageUpdate(
-			shown(incident(1, { kind: "maintenance", status: "scheduled", impact: "none" })),
+			shown(
+				incident(1, {
+					kind: "maintenance",
+					status: "scheduled",
+					impact: "none",
+					scheduled_start: "1970-01-01T01:10:00.000Z",
+					scheduled_end: "1970-01-01T02:10:00.000Z",
+				}),
+			),
 			Message.ClickedEditIncident({ incidentId: incidentId(1) }),
 		).model
 		scene(
 			{ update: pageUpdate, view },
 			given(opened),
+			mounted,
+			mounted,
 			expectView(role("textbox", { name: "Title" })).toExist(),
 			expectView(role("combobox", { name: "Impact" })).not.toExist(),
 		)
@@ -814,6 +1499,113 @@ describe("incidents in the panel", () => {
 		expect(sent[0]?.args?.payload).not.toHaveProperty("impact")
 	})
 
+	const maintenance = incident(1, {
+		kind: "maintenance",
+		status: "scheduled",
+		impact: "none",
+		scheduled_start: "1970-01-01T01:10:00.000Z",
+		scheduled_end: "1970-01-01T02:10:00.000Z",
+	})
+
+	test("a maintenance window is edited in the viewer's zone, sending only the bound that changed", () => {
+		const zoned: PageContext = { ...context, timeZone: "Europe/Berlin" }
+		const opened = update(
+			shown(maintenance),
+			Message.ClickedEditIncident({ incidentId: incidentId(1) }),
+			zoned,
+		).model
+		expect(opened.incidentEdit).toMatchObject({ start: "1970-01-01T02:10", end: "1970-01-01T03:10" })
+		const inverted = steps(
+			opened,
+			[Message.ChangedIncidentEditField({ field: "end", value: "1970-01-01T02:00" })],
+			zoned,
+		)
+		expect(update(inverted, Message.SubmittedIncidentEdit(), zoned).commands ?? []).toEqual([])
+		const extended = steps(
+			inverted,
+			[Message.ChangedIncidentEditField({ field: "end", value: "1970-01-01T04:00" })],
+			zoned,
+		)
+		const sent = update(extended, Message.SubmittedIncidentEdit(), zoned).commands ?? []
+		expect(sent[0]?.args?.payload).toMatchObject({ scheduled_end: "1970-01-01T03:00:00.000Z" })
+		expect(sent[0]?.args?.payload).not.toHaveProperty("scheduled_start")
+	})
+
+	test("completed maintenance offers no window to edit", () => {
+		const opened = pageUpdate(
+			shown({ ...maintenance, status: "completed", resolved_at: "1970-01-01T02:10:00.000Z" }),
+			Message.ClickedEditIncident({ incidentId: incidentId(1) }),
+		).model
+		scene(
+			{ update: pageUpdate, view },
+			given(opened),
+			mounted,
+			mounted,
+			expectView(role("textbox", { name: "Starts" })).not.toExist(),
+			expectView(role("textbox", { name: "Ends" })).not.toExist(),
+		)
+	})
+
+	test("an incident's start and end can't move into the future", () => {
+		const opened = pageUpdate(
+			shown(incident(1, { status: "resolved", resolved_at: "2026-10-01T11:55:00.000Z" })),
+			Message.ClickedEditIncident({ incidentId: incidentId(1) }),
+		).model
+		const lateEnd = pageUpdate(
+			opened,
+			Message.ChangedIncidentEditField({ field: "end", value: "2026-10-01T12:30" }),
+		).model
+		scene(
+			{ update: pageUpdate, view },
+			given(lateEnd),
+			mounted,
+			mounted,
+			expectView(text("It can't end in the future.")).toExist(),
+			expectView(role("button", { name: "Save changes" })).toBeDisabled(),
+		)
+		expect(pageUpdate(lateEnd, Message.SubmittedIncidentEdit()).commands ?? []).toEqual([])
+		const lateStart = pageUpdate(
+			opened,
+			Message.ChangedIncidentEditField({ field: "start", value: "2026-10-02T09:00" }),
+		).model
+		expect(pageUpdate(lateStart, Message.SubmittedIncidentEdit()).commands ?? []).toEqual([])
+		scene(
+			{ update: pageUpdate, view },
+			given(lateStart),
+			mounted,
+			mounted,
+			expectView(text("It can't start in the future.")).toExist(),
+		)
+	})
+
+	test("a resolved incident's start and end can be corrected, but not out of order", () => {
+		const opened = pageUpdate(
+			shown(incident(1, { status: "resolved", resolved_at: "2026-10-01T11:55:00.000Z" })),
+			Message.ClickedEditIncident({ incidentId: incidentId(1) }),
+		).model
+		const inverted = pageUpdate(
+			opened,
+			Message.ChangedIncidentEditField({ field: "start", value: "2026-10-01T11:57" }),
+		).model
+		scene(
+			{ update: pageUpdate, view },
+			given(inverted),
+			mounted,
+			mounted,
+			expectView(text("It can't end before it started.")).toExist(),
+			expectView(role("button", { name: "Save changes" })).toBeDisabled(),
+		)
+		const corrected = pageUpdate(
+			inverted,
+			Message.ChangedIncidentEditField({ field: "start", value: "2026-10-01T11:40" }),
+		).model
+		const sent = pageUpdate(corrected, Message.SubmittedIncidentEdit()).commands ?? []
+		expect(sent[0]?.args?.payload).toMatchObject({ started_at: "2026-10-01T11:40:00.000Z" })
+		expect(sent[0]?.args?.payload).not.toHaveProperty("resolved_at")
+	})
+})
+
+describe("deleting an incident", () => {
 	test("deleting an incident asks first, deletes it once and closes its panel", () => {
 		const asking = pageUpdate(
 			shown(incident(1, { status: "resolved" })),
@@ -854,109 +1646,275 @@ describe("incidents in the panel", () => {
 	})
 })
 
-describe("an update posted while the form moved on", () => {
-	const posting = () => {
-		const model = loaded({
-			incidents: [incident(1, { status: "identified" }), incident(2, { status: "identified" })],
-		})
-		const opened = pageUpdate(
-			model,
-			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: false }),
-		)
-		const typed = pageUpdate(opened.model, Message.ChangedUpdateField({ field: "body", value: "Fixed." }))
-		const posted = pageUpdate(typed.model, Message.SubmittedUpdate()).model
-		// The viewer opens the other incident's form before the post answers.
-		return pageUpdate(
-			posted,
-			Message.ClickedPostUpdate({ incidentId: incidentId(2), isResolving: false }),
-		).model
-	}
-
-	test("a success keeps the other incident's form open and still rereads", () => {
-		const moved = posting()
-		const done = pageUpdate(
-			moved,
-			Message.CompletedPostUpdate({ generation: 0, result: Result.succeed(incident(1)) }),
-		)
-		expect(done.model.updateForm).toMatchObject({ _tag: "Editing", form: { incidentId: incidentId(2) } })
-		expect(done.outMessage).toMatchObject({ _tag: "RequestedToast", type: "success" })
-		expect(done.commands ?? []).not.toEqual([])
-	})
-
-	test("a failure is a toast, not an error on the other incident's form", () => {
-		const moved = posting()
-		const failed = pageUpdate(
-			moved,
-			Message.CompletedPostUpdate({
-				generation: 0,
-				result: Result.fail(toLoadFailure(new Error("unreachable"))),
+describe("an update in flight", () => {
+	const posting = () =>
+		steps(
+			loaded({
+				incidents: [incident(1, { status: "identified" }), incident(2, { status: "identified" })],
 			}),
-		)
-		expect(failed.model.updateForm).toMatchObject({
-			_tag: "Editing",
-			form: { incidentId: incidentId(2) },
-		})
-		expect(failed.outMessage).toMatchObject({ _tag: "RequestedToast", type: "error" })
-	})
-
-	test("a reopened form for the same incident ignores the earlier post's answer", () => {
-		const model = loaded({ incidents: [incident(1, { status: "identified" })] })
-		const open = (current: Model) =>
-			pageUpdate(
-				pageUpdate(
-					current,
-					Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: false }),
-				).model,
+			[
+				Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: false }),
 				Message.ChangedUpdateField({ field: "body", value: "Fixed." }),
-			).model
-		const first = pageUpdate(open(model), Message.SubmittedUpdate()).model
-		const closed = pageUpdate(first, Message.ClickedIncident({ incidentId: incidentId(1) })).model
-		const second = pageUpdate(open(closed), Message.SubmittedUpdate()).model
-		const failed = pageUpdate(
-			second,
-			Message.CompletedPostUpdate({
-				generation: 0,
-				result: Result.fail(toLoadFailure(new Error("no"))),
-			}),
+				Message.SubmittedUpdateWrite(),
+				Message.SubmittedUpdate(),
+			],
 		)
-		expect(failed.model.updateForm).toMatchObject({ _tag: "Posting", generation: 1 })
-		expect(failed.outMessage).toMatchObject({ _tag: "RequestedToast", type: "error" })
-	})
 
-	test("edits and Cancel wait while a post is in flight, and its failure keeps the text", () => {
-		const model = loaded({ incidents: [incident(1, { status: "identified" })] })
-		const opened = pageUpdate(
-			model,
-			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: false }),
-		)
-		const typed = pageUpdate(opened.model, Message.ChangedUpdateField({ field: "body", value: "Fixed." }))
-		const posted = pageUpdate(typed.model, Message.SubmittedUpdate()).model
-		const edited = pageUpdate(posted, Message.ChangedUpdateField({ field: "body", value: "Other" })).model
-		const cancelled = pageUpdate(edited, Message.ClickedCancelUpdate()).model
-		expect(cancelled.updateForm).toMatchObject({ _tag: "Posting", form: { body: "Fixed." } })
+	test("edits, closing and another incident's Post update wait, and a failure keeps the text", () => {
+		const held = steps(posting(), [
+			Message.ChangedUpdateField({ field: "body", value: "Other" }),
+			Message.ClickedUpdateBack(),
+			Message.GotUpdateDialogMessage({ message: Dialog.Message.ClickedClose() }),
+			Message.ClickedPostUpdate({ incidentId: incidentId(2), isResolving: false }),
+		])
+		expect(held.updateDialog.isOpen).toBe(true)
+		expect(held.updateForm).toMatchObject({
+			_tag: "Posting",
+			form: { incidentId: incidentId(1), body: "Fixed." },
+		})
 		const failed = pageUpdate(
-			cancelled,
-			Message.CompletedPostUpdate({
-				generation: 0,
-				result: Result.fail(toLoadFailure(new Error("unreachable"))),
-			}),
+			held,
+			Message.CompletedPostUpdate({ result: Result.fail(toLoadFailure(new Error("unreachable"))) }),
 		).model
 		expect(failed.updateForm).toMatchObject({ _tag: "Failed", form: { body: "Fixed." } })
+	})
+
+	test("a success closes the dialog and reads the incidents again", () => {
+		const done = pageUpdate(
+			posting(),
+			Message.CompletedPostUpdate({ result: Result.succeed(incident(1)) }),
+		)
+		expect(done.model.updateDialog.isOpen).toBe(false)
+		expect(names(done.commands)).toContain("FetchStatusPageIncidents")
+		expect(done.outMessage).toMatchObject({ _tag: "RequestedToast", type: "success" })
 	})
 })
 
 describe("header", () => {
-	test("Post incident is offered on the Page tab only, where its composer opens", () => {
+	test("Incidents leads with Declare incident and Maintenance with Schedule maintenance", () => {
+		const declaring = pageUpdate(
+			loaded({ tab: "incidents" }),
+			Message.ClickedNewIncident({ kind: "incident" }),
+		)
+		expect(declaring.model.incidentForm.kind).toBe("incident")
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded()),
-			expectView(role("button", { name: "Post incident" })).toExist(),
+			given(loaded({ tab: "incidents" })),
+			expectView(role("button", { name: "Declare incident" })).toExist(),
+			expectView(role("link", { name: "Open page" })).not.toExist(),
 		)
 		scene(
 			{ update: pageUpdate, view },
+			given(loaded({ tab: "maintenance" })),
+			expectView(role("button", { name: "Schedule maintenance" })).toExist(),
+			expectView(text("No maintenance scheduled.")).toExist(),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded()),
+			expectView(role("button", { name: "Declare incident" })).not.toExist(),
+			expectView(role("link", { name: "Live page" })).toHaveAttr("aria-current", "page"),
+		)
+	})
+
+	test("the Incidents tab counts open incidents and lists them apart from resolved ones", () => {
+		const model = loaded({
+			tab: "incidents",
+			incidents: [
+				incident(1, { title: "Elevated errors" }),
+				incident(2, {
+					title: "Old outage",
+					status: "resolved",
+					resolved_at: "2026-09-30T12:00:00.000Z",
+				}),
+				incident(3, { kind: "maintenance", title: "Database upgrade" }),
+			],
+		})
+		scene(
+			{ update: pageUpdate, view },
+			given(model),
+			expectView(role("link", { name: /^Incidents\s*1$/u })).toHaveAttr("aria-current", "page"),
+			inside(role("table", { name: "Active" }), expectView(text("Elevated errors")).toExist()),
+			inside(role("table", { name: "Resolved" }), expectView(text("Old outage")).toExist()),
+			expectView(text("Database upgrade")).not.toExist(),
+			click(role("button", { name: "Elevated errors" })),
+			mounted,
+			Command.resolve(
+				Animation.WaitForPaint,
+				Animation.Message.CompletedWaitForPaint({ generation: 1 }),
+			),
+			Command.resolve(
+				Animation.WaitForAnimationSettled,
+				Animation.Message.EndedAnimation({ generation: 1 }),
+			),
+			expectView(role("dialog", { name: "Elevated errors" })).toExist(),
+			expectView(role("button", { name: "Post update" })).toExist(),
+		)
+	})
+
+	test("the Maintenance tab lists what is in progress, how each ends, and completes one over time", () => {
+		const model = loaded({
+			tab: "maintenance",
+			incidents: [
+				incident(1, {
+					kind: "maintenance",
+					title: "Index rebuild",
+					status: "in_progress",
+					impact: "none",
+					auto_complete: false,
+					scheduled_start: "2026-10-01T08:00:00.000Z",
+					scheduled_end: "2026-10-01T10:00:00.000Z",
+				}),
+				incident(2, {
+					kind: "maintenance",
+					title: "Database upgrade",
+					status: "scheduled",
+					impact: "none",
+					scheduled_start: "2026-10-03T02:00:00.000Z",
+					scheduled_end: "2026-10-03T03:00:00.000Z",
+				}),
+			],
+		})
+		scene(
+			{ update: pageUpdate, view },
+			given(model),
+			inside(
+				role("table", { name: "In progress" }),
+				expectView(text("Index rebuild")).toExist(),
+				expectView(text("You complete it")).toExist(),
+				expectView(text("2h over")).toExist(),
+			),
+			inside(
+				role("table", { name: "Upcoming" }),
+				expectView(text("Database upgrade")).toExist(),
+				expectView(text("Auto-complete")).toExist(),
+			),
+		)
+		const reopened = loaded({
+			tab: "maintenance",
+			incidents: [
+				incident(3, {
+					kind: "maintenance",
+					title: "Reopened upgrade",
+					status: "completed",
+					impact: "none",
+					resolved_at: "2026-10-01T11:00:00.000Z",
+					updates: [
+						{
+							id: updateId(3),
+							status: "completed",
+							body: "Done.",
+							source: "dashboard",
+							created_at: "2026-10-01T11:00:00.000Z",
+						},
+						{
+							id: updateId(2),
+							status: "in_progress",
+							body: "Back on it.",
+							source: "dashboard",
+							created_at: "2026-10-01T10:30:00.000Z",
+						},
+						{
+							id: updateId(1),
+							status: "completed",
+							body: "The scheduled maintenance is complete.",
+							source: "auto",
+							created_at: "2026-10-01T10:00:00.000Z",
+						},
+					],
+				}),
+			],
+		})
+		scene(
+			{ update: pageUpdate, view },
+			given(reopened),
+			inside(role("table", { name: "Completed" }), expectView(text("Manually")).toExist()),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(model),
+			inside(
+				role("table", { name: "In progress" }),
+				expectView(role("button", { name: "Complete" })).toExist(),
+			),
+		)
+		// Without the post grant the overrun still shows, with nothing to press.
+		const withoutPost = { ...model, grants: [] }
+		scene(
+			{ update: pageUpdate, view },
+			given(withoutPost),
+			inside(
+				role("table", { name: "In progress" }),
+				expectView(text("2h over")).toExist(),
+				expectView(role("button", { name: "Complete" })).not.toExist(),
+			),
+		)
+		const completing = pageUpdate(
+			model,
+			Message.ClickedPostUpdate({ incidentId: incidentId(1), isResolving: true }),
+		).model
+		expect(completing.updateDialog.isOpen).toBe(true)
+		expect(completing.updateForm).toMatchObject({ form: { status: "completed" } })
+	})
+
+	test("closing the incident's sheet closes the incident", () => {
+		const open = pageUpdate(
+			loaded({ tab: "incidents", incidents: [incident(1)] }),
+			Message.ClickedIncident({ incidentId: incidentId(1) }),
+		).model
+		expect(open.panelSheet.isOpen).toBe(true)
+		const closed = pageUpdate(
+			open,
+			Message.GotPanelSheetMessage({ message: Dialog.Message.ClickedClose() }),
+		).model
+		expect(closed.panel).toBeNull()
+		expect(closed.panelSheet.isOpen).toBe(false)
+	})
+
+	test("old Appearance and JSON links open those Settings sections", () => {
+		scene(
+			{ update: pageUpdate, view },
 			given(loaded({ tab: "appearance" })),
-			expectView(role("button", { name: "Post incident" })).not.toExist(),
+			expectView(role("link", { name: "Settings" })).toHaveAttr("aria-current", "page"),
 			expectView(role("link", { name: "Appearance" })).toHaveAttr("aria-current", "page"),
+		)
+		expect(
+			names(
+				init({ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "json" } }, context).commands,
+			),
+		).toContain("FetchStatusPageConfig")
+	})
+
+	test("Open page opens the published page in a new tab", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given({ ...loaded({ tab: "settings" }), publicBaseUrl: "https://status-pr-7.maple.dev" }),
+			expectView(role("link", { name: "Open page" })).toHaveAttr(
+				"href",
+				"https://status-pr-7.maple.dev/s/acme-status",
+			),
+			expectView(role("link", { name: "Open page" })).toHaveAttr("target", "_blank"),
+			expectView(role("link", { name: "Open page" })).toHaveAttr("rel", "noopener"),
+		)
+	})
+
+	test("Open page is disabled, with the reason, while the page has no public address", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given({
+				...loaded({ page: statusPage({ draft: true, published_at: null }) }),
+				publicBaseUrl: "https://status-pr-7.maple.dev",
+			}),
+			expectView(role("link", { name: "Open page" })).not.toExist(),
+			expectView(role("button", { name: "Open page" })).toBeDisabled(),
+			expectView(selector('[data-tooltip="Publish the page to open it"]')).toExist(),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given({ ...loaded(), publicBaseUrl: "" }),
+			expectView(role("link", { name: "Open page" })).not.toExist(),
+			expectView(role("button", { name: "Open page" })).toBeDisabled(),
+			expectView(selector('[data-tooltip="No status domain is configured yet"]')).toExist(),
 		)
 	})
 })
@@ -1026,7 +1984,7 @@ describe("live screen", () => {
 			expectView(role("button", { name: "Get break-glass token" })).toExist(),
 			expectView(role("link", { name: "Page JSON" })).toHaveAttr(
 				"href",
-				`/status-pages/${PUBLIC_ID}?view=json`,
+				`/status-pages/${PUBLIC_ID}?view=settings&section=advanced`,
 			),
 		)
 	})
@@ -1065,6 +2023,27 @@ describe("live screen", () => {
 		)
 	})
 
+	test("an internal page is live for members in Maple: no public address and no break-glass token", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given({
+				...loaded({ tab: "live", page: statusPage({ visibility: "internal" }) }),
+				publicBaseUrl: "https://status-pr-7.maple.dev",
+			}),
+			expectView(role("heading", { name: "Acme Status is live" })).toExist(),
+			expectView(text("Only members of this organization can read it, in Maple.")).toExist(),
+			expectView(text(/Visitors can read it now/u)).not.toExist(),
+			expectView(selector("#status-page-public-url")).not.toExist(),
+			expectView(role("link", { name: /\/s\/acme-status/u })).not.toExist(),
+			expectAll(all.role("link", { name: "Open page" })).toHaveCount(2),
+			expectView(role("link", { name: "Open page" })).toHaveAttr(
+				"href",
+				`/status-pages/${PUBLIC_ID}/view`,
+			),
+			expectView(role("button", { name: "Get break-glass token" })).not.toExist(),
+		)
+	})
+
 	test("an engineer edits the page but cannot issue a break-glass token", () => {
 		const engineer = {
 			...live("https://status-pr-7.maple.dev"),
@@ -1084,11 +2063,11 @@ describe("live screen", () => {
 	})
 })
 
-describe("settings and appearance views", () => {
+describe("settings", () => {
 	test("an edit raises the save bar, and a bad color blocks the save", () => {
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "appearance" })),
+			given(loaded(APPEARANCE)),
 			expectView(text("Unsaved changes")).not.toExist(),
 			type(role("textbox", { name: "Accent" }), "teal"),
 			expectView(text("Unsaved changes")).toExist(),
@@ -1097,16 +2076,21 @@ describe("settings and appearance views", () => {
 		)
 	})
 
-	test("a bad field on Settings blocks the save on Appearance too, and the bar names its tab", () => {
+	test("a bad field in Basic settings blocks the save on Appearance too, and the bar names its section", () => {
 		const edited = pageUpdate(
 			loaded({ tab: "settings" }),
 			Message.ChangedSetting({ field: "termsUrl", value: "http://acme.example/terms" }),
 		).model
 		scene(
 			{ update: pageUpdate, view },
-			given({ ...edited, search: { view: "appearance" } }),
-			expectView(text("Fix the fields marked on the Settings tab.")).toExist(),
+			given({ ...edited, search: { view: "settings", section: "appearance" } }),
+			expectView(text("Fix the fields marked in Basic settings.")).toExist(),
 			expectView(role("button", { name: "Save" })).toBeDisabled(),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given({ ...edited, search: { view: "settings", section: "access" } }),
+			expectView(text("Fix the fields marked in Basic settings.")).toExist(),
 		)
 	})
 
@@ -1178,7 +2162,7 @@ describe("settings and appearance views", () => {
 	test("Auto disables the colour overrides but not the accent", () => {
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "appearance" })),
+			given(loaded(APPEARANCE)),
 			expectView(role("textbox", { name: "Background" })).toBeDisabled(),
 			expectView(role("textbox", { name: "Text" })).toBeDisabled(),
 			expectView(role("textbox", { name: "Accent" })).toBeEnabled(),
@@ -1190,7 +2174,7 @@ describe("settings and appearance views", () => {
 	test("an unreadable text colour shows its contrast and blocks the save", () => {
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "appearance" })),
+			given(loaded(APPEARANCE)),
 			inside(role("group", { name: "Mode" }), click(role("button", { name: "Light" }))),
 			type(role("textbox", { name: "Text" }), "#757575"),
 			expectView(
@@ -1200,29 +2184,125 @@ describe("settings and appearance views", () => {
 		)
 	})
 
-	test("the preview is a sandboxed page that follows the draft accent and preview mode", () => {
-		const iframeOf = find("iframe")
-		const srcdoc = (html: Parameters<typeof iframeOf>[0]): string =>
-			Option.getOrElse(Option.flatMap(iframeOf(html), attr("srcdoc")), () => "")
+	test("the theme preview is the page's own renderer, sandboxed, following the unsaved theme", () => {
+		const theme = srcdocOf("The theme as visitors see it")
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "appearance" })),
-			// Scripts page the bars; without `allow-same-origin` the page still reaches nothing of ours.
-			expectView(selector("iframe")).toHaveAttr("sandbox", "allow-scripts"),
+			given(loaded(APPEARANCE)),
+			expectView(selector('iframe[title="The theme as visitors see it"]')).toHaveAttr("sandbox", ""),
 			tap(({ html }) => {
-				expect(srcdoc(html)).toContain("Acme Status")
-				expect(srcdoc(html)).toContain("color-scheme:light;")
+				expect(theme(html)).toContain("Acme Status")
+				expect(theme(html)).toContain("Component 1")
+				expect(theme(html)).not.toContain("Component 2")
+				expect(theme(html)).toContain("color-scheme:light;")
 			}),
-			// The preview mode is for looking only: it is not a page edit.
-			inside(role("group", { name: "Preview mode" }), click(role("button", { name: "Dark" }))),
-			tap(({ html }) => expect(srcdoc(html)).toContain("color-scheme:dark;")),
-			expectView(text("Unsaved changes")).not.toExist(),
+			inside(role("group", { name: "Mode" }), click(role("button", { name: "Dark" }))),
+			tap(({ html }) => expect(theme(html)).toContain("color-scheme:dark;")),
 			type(role("textbox", { name: "Accent" }), "#ff0066"),
-			tap(({ html }) => expect(srcdoc(html)).toContain("--link:#ff0066")),
+			tap(({ html }) => expect(theme(html)).toContain("--link:#ff0066")),
 		)
 	})
 
-	test("the preview can show a state the page is not in, and says it is an example", () => {
+	test("the branding links preview at once: the logo in the header, the favicon in the tab", () => {
+		const header = srcdocOf("The page header as visitors see it")
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded(APPEARANCE)),
+			type(role("textbox", { name: "Logo URL" }), "https://acme.example/logo.svg"),
+			type(role("textbox", { name: "Dark mode logo URL" }), "https://acme.example/logo-dark.svg"),
+			type(role("textbox", { name: "Favicon URL" }), "https://acme.example/favicon.png"),
+			tap(({ html }) => {
+				expect(header(html)).toContain(`<img src="https://acme.example/logo.svg"`)
+				expect(header(html)).toContain(`<link rel="icon" href="https://acme.example/favicon.png">`)
+			}),
+			expectView(selector('img[src="https://acme.example/favicon.png"]')).toExist(),
+			inside(role("group", { name: "Mode" }), click(role("button", { name: "Dark" }))),
+			tap(({ html }) =>
+				expect(header(html)).toContain(`<img src="https://acme.example/logo-dark.svg"`),
+			),
+		)
+	})
+
+	test("every Settings section shows the whole page beside it, as the unsaved settings render it", () => {
+		const page = srcdocOf("Globex with these settings")
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded({ tab: "settings" })),
+			type(role("textbox", { name: "Name" }), "Globex"),
+			tap(({ html }) => {
+				expect(page(html)).toContain("Globex")
+				expect(page(html)).toContain("Component 1")
+			}),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded(ADVANCED)),
+			expectView(role("region", { name: "Page preview" })).toExist(),
+		)
+	})
+
+	test("Basic settings preview the header, the tab title, the search result and the footer as typed", () => {
+		const footer = srcdocOf("The page footer as visitors see it")
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded({ tab: "settings" })),
+			type(role("textbox", { name: "Name" }), "Globex"),
+			type(role("textbox", { name: "Description" }), "Live status of Globex"),
+			expectAll(all.text("Globex status")).toHaveCount(2),
+			expectView(text("Live status of Globex")).toExist(),
+			tap(({ html }) => expect(footer(html)).toContain("Powered by")),
+			click(role("switch", { name: "Show powered by Maple" })),
+			tap(({ html }) => expect(footer(html)).not.toContain("Powered by")),
+		)
+	})
+
+	test("a password-protected page previews the password form visitors meet", () => {
+		const gate = srcdocOf("The password form visitors see first")
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded({ ...ACCESS, page: statusPage({ visibility: "password", has_password: true }) })),
+			tap(({ html }) => {
+				expect(gate(html)).toContain("This status page is password-protected")
+				expect(gate(html)).toContain("Acme Status")
+			}),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded(ACCESS)),
+			expectView(selector('iframe[title="The password form visitors see first"]')).not.toExist(),
+		)
+	})
+
+	test("the settings menu links each section and marks the open one", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded(MONITORS)),
+			inside(
+				role("navigation", { name: "Settings sections" }),
+				expectView(role("link", { name: "Monitors" })).toHaveAttr("aria-current", "page"),
+				expectView(role("link", { name: "Advanced" })).toHaveAttr(
+					"href",
+					`/status-pages/${PUBLIC_ID}?view=settings&section=advanced`,
+				),
+			),
+		)
+	})
+
+	test("a bad branding link is marked on Appearance, and the Settings save bar points there", () => {
+		const edited = pageUpdate(
+			loaded(APPEARANCE),
+			Message.ChangedSetting({ field: "faviconUrl", value: "http://acme.example/favicon.png" }),
+		).model
+		scene({ update: pageUpdate, view }, given(edited), expectView(text("Use an https URL.")).toExist())
+		scene(
+			{ update: pageUpdate, view },
+			given({ ...edited, search: { view: "settings" } }),
+			expectView(text("Fix the fields marked in Appearance.")).toExist(),
+			expectView(role("button", { name: "Save" })).toBeDisabled(),
+		)
+	})
+
+	test("the live page can show a state the page is not in, and says it is an example", () => {
 		const iframeOf = find("iframe")
 		const srcdoc = (html: Parameters<typeof iframeOf>[0]): string =>
 			Option.getOrElse(Option.flatMap(iframeOf(html), attr("srcdoc")), () => "")
@@ -1231,7 +2311,7 @@ describe("settings and appearance views", () => {
 			inside(role("group", { name: "Preview state" }), click(role("button", { name })))
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "appearance" })),
+			given(loaded()),
 			expectView(note).not.toExist(),
 			tap(({ html }) => expect(srcdoc(html)).not.toContain("Example incident")),
 			pick("Outage"),
@@ -1257,7 +2337,7 @@ describe("settings and appearance views", () => {
 			inside(role("group", { name: "Preview width" }), click(role("button", { name })))
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "appearance" })),
+			given(loaded()),
 			expectView(selector("iframe")).toHaveAttr("data-width", "desktop"),
 			pick("Mobile"),
 			expectView(selector("iframe")).toHaveAttr("data-width", "mobile"),
@@ -1271,7 +2351,7 @@ describe("settings and appearance views", () => {
 		const accent = selector('[aria-label="Accent color"]')
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "appearance" })),
+			given(loaded(APPEARANCE)),
 			// Empty field: the preset's own colour, the one the placeholder names.
 			expectView(accent).toHaveValue("#000000"),
 			type(role("textbox", { name: "Accent" }), "#FF0066"),
@@ -1285,7 +2365,7 @@ describe("settings and appearance views", () => {
 	})
 
 	test("the first break-glass token is issued at once and shown once", () => {
-		const issuing = pageUpdate(loaded({ tab: "settings" }), Message.ClickedRotateToken())
+		const issuing = pageUpdate(loaded(ADVANCED), Message.ClickedRotateToken())
 		expect(names(issuing.commands)).toEqual(["RotateStatusPageBreakGlassToken"])
 		const issued = pageUpdate(
 			issuing.model,
@@ -1311,8 +2391,71 @@ describe("settings and appearance views", () => {
 		)
 	})
 
+	test("a password is set before the page can be password-protected, and never rides a command's args", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded(ACCESS)),
+			expectView(role("radio", { name: "Password-protected" })).toBeDisabled(),
+			expectView(text("Set a password below first.")).toExist(),
+			click(role("button", { name: "Set password" })),
+			type(role("textbox", { name: "New password" }), "short"),
+			expectView(text("Use at least 8 characters")).toExist(),
+			expectView(role("button", { name: "Save password" })).toBeDisabled(),
+		)
+		const typed = pageUpdate(
+			pageUpdate(loaded(ACCESS), Message.ClickedChangePassword()).model,
+			Message.ChangedPassword({ value: "correct horse battery" }),
+		).model
+		const saving = pageUpdate(typed, Message.SubmittedPassword())
+		expect(saving.commands).toMatchObject([{ name: "SetStatusPagePassword" }])
+		expect(saving.commands?.[0]).not.toHaveProperty("args")
+		const saved = pageUpdate(
+			saving.model,
+			Message.CompletedAccessChange({
+				action: "password",
+				result: Result.succeed(statusPage({ has_password: true })),
+			}),
+		).model
+		expect(saved.passwordDraft).toBeNull()
+		scene(
+			{ update: pageUpdate, view },
+			given(saved),
+			expectView(role("radio", { name: "Password-protected" })).not.toBeDisabled(),
+			change(role("radio", { name: "Password-protected" }), "on"),
+			Command.resolve(
+				SaveVisibility,
+				Message.CompletedAccessChange({
+					action: "visibility",
+					result: Result.succeed(statusPage({ has_password: true, visibility: "password" })),
+				}),
+			),
+			// A password page keeps its password: it can be changed, not removed.
+			expectView(role("button", { name: "Change password" })).toExist(),
+			expectView(role("button", { name: "Remove password" })).not.toExist(),
+		)
+	})
+
+	test("a page with a custom domain cannot go internal, and only admins change who can view", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded({ ...ACCESS, customDomain: pendingDomain })),
+			expectView(role("radio", { name: "Internal" })).toBeDisabled(),
+			expectView(text("Remove the custom domain first.")).toExist(),
+		)
+		const engineer = loaded({ ...ACCESS, grants: Policy.grantsOf(["org:engineer"]) })
+		scene(
+			{ update: pageUpdate, view },
+			given(engineer),
+			expectView(text("Only org admins can change who can view a status page.")).toExist(),
+			expectView(role("button", { name: "Set password" })).not.toExist(),
+		)
+		expect(
+			names(pageUpdate(engineer, Message.PickedVisibility({ visibility: "internal" })).commands),
+		).toEqual([])
+	})
+
 	test("replacing or revoking an issued token asks first", () => {
-		const model = loaded({ tab: "settings", page: statusPage({ break_glass_token_suffix: "ABC123" }) })
+		const model = loaded({ ...ADVANCED, page: statusPage({ break_glass_token_suffix: "ABC123" }) })
 		const replacing = pageUpdate(model, Message.ClickedRotateToken())
 		expect(names(replacing.commands)).not.toContain("RotateStatusPageBreakGlassToken")
 		expect(replacing.model.breakGlassDialog.isOpen).toBe(true)
@@ -1341,7 +2484,162 @@ describe("settings and appearance views", () => {
 	})
 })
 
-describe("json view", () => {
+describe("custom domain", () => {
+	test("adding a domain sends the hostname as typed, normalized, then shows the DNS records to add", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded({ tab: "settings" })),
+			expectView(role("button", { name: "Add domain" })).toBeDisabled(),
+			type(role("textbox", { name: "Hostname" }), " Status.Acme.com "),
+			submit(role("form", { name: "Custom domain" })),
+			Command.expectExact(SetCustomDomain({ pageId: statusPage().id, hostname: "status.acme.com" })),
+			Command.resolve(
+				SetCustomDomain,
+				Message.CompletedSetCustomDomain({ result: Result.succeed(pendingDomain) }),
+			),
+			expectView(text("Waiting for DNS")).toExist(),
+			expectView(text("status-domains.maple.dev")).toExist(),
+			expectView(text("_cf-custom-hostname.status.acme.com")).toExist(),
+			expectView(text("custom hostname does not CNAME to this zone.")).toExist(),
+			expectView(role("button", { name: "Copy ownership TXT value" })).toExist(),
+			expectView(role("button", { name: "Check now" })).toExist(),
+		)
+	})
+
+	test("an apex, an IP or a Maple hostname is refused before it is sent", () => {
+		for (const hostname of ["acme.com", "10.0.0.1", "status.maple.dev"])
+			scene(
+				{ update: pageUpdate, view },
+				given(loaded({ tab: "settings" })),
+				type(role("textbox", { name: "Hostname" }), hostname),
+				expectView(role("button", { name: "Add domain" })).toBeDisabled(),
+				expectView(role("textbox", { name: "Hostname" })).toHaveAttr("aria-invalid", "true"),
+			)
+	})
+
+	test("Check now asks Cloudflare again and an active domain becomes the page's address", () => {
+		const checking = pageUpdate(
+			loaded({ tab: "settings", customDomain: pendingDomain }),
+			Message.ClickedCheckCustomDomain(),
+		)
+		expect(checking.commands).toMatchObject([
+			{ name: CheckCustomDomain.name, args: { pageId: statusPage().id } },
+		])
+		const active = customDomain({
+			hostname: "status.acme.com",
+			status: "active",
+			dns_records: [pendingDomain.dns_records[0]!],
+		})
+		const done = pageUpdate(
+			checking.model,
+			Message.CompletedCheckCustomDomain({ result: Result.succeed(active) }),
+		).model
+		scene(
+			{ update: pageUpdate, view },
+			given(done),
+			expectView(text("Active")).toExist(),
+			expectView(role("link", { name: "https://status.acme.com" })).toHaveAttr(
+				"href",
+				"https://status.acme.com",
+			),
+		)
+	})
+
+	test("a failed domain says what went wrong", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(
+				loaded({
+					tab: "settings",
+					customDomain: customDomain({
+						hostname: "status.acme.com",
+						status: "failed",
+						last_error: "The hostname no longer points at Maple. Check its CNAME record.",
+					}),
+				}),
+			),
+			expectView(text("Needs attention")).toExist(),
+			expectView(text("The hostname no longer points at Maple. Check its CNAME record.")).toExist(),
+		)
+	})
+
+	test("removing the domain asks first, then removes it once", () => {
+		const asking = pageUpdate(
+			loaded({ tab: "settings", customDomain: pendingDomain }),
+			Message.ClickedRemoveCustomDomain(),
+		)
+		expect(asking.model.removeCustomDomainDialog.isOpen).toBe(true)
+		expect(names(asking.commands)).not.toContain(RemoveCustomDomain.name)
+		const removing = pageUpdate(asking.model, Message.ClickedConfirmRemoveCustomDomain())
+		expect(removing.commands).toMatchObject([
+			{ name: RemoveCustomDomain.name, args: { pageId: statusPage().id } },
+		])
+		// A second confirm while the first is in flight sends nothing.
+		expect(pageUpdate(removing.model, Message.ClickedConfirmRemoveCustomDomain()).commands ?? []).toEqual(
+			[],
+		)
+		// An earlier refused hostname is not shown against the now-empty field.
+		const refused = pageUpdate(
+			{ ...removing.model, customDomainAction: "set" },
+			Message.CompletedSetCustomDomain({ result: Result.fail(toLoadFailure(new Error("taken"))) }),
+		).model
+		const removed = pageUpdate(
+			{ ...refused, customDomainAction: "remove" },
+			Message.CompletedRemoveCustomDomain({ result: Result.succeed(customDomain()) }),
+		)
+		expect(removed.model.customDomainFailure).toBeNull()
+		expect(removed.model.removeCustomDomainDialog.isOpen).toBe(false)
+		expect(removed.outMessage).toEqual(
+			PageOutMessage.RequestedToast({
+				type: "success",
+				title: "Custom domain removed",
+				description: "",
+			}),
+		)
+		expect(Option.getOrNull(customDomainOf(removed.model))?.hostname).toBeNull()
+	})
+
+	test("an internal page takes no custom domain, and has no break-glass token to issue", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded({ tab: "settings", page: statusPage({ visibility: "internal" }) })),
+			expectView(role("textbox", { name: "Hostname" })).toBeDisabled(),
+			expectView(role("button", { name: "Add domain" })).toBeDisabled(),
+			expectView(
+				text("An internal page has no public address. Make it public or password-protected first."),
+			).toExist(),
+			expectView(role("region", { name: "Break-glass token" })).not.toExist(),
+			expectView(role("button", { name: "Issue token" })).not.toExist(),
+		)
+	})
+
+	test("members see the domain and its records but no control to change them", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded({ tab: "settings", grants: MEMBER, customDomain: pendingDomain })),
+			expectView(text("_cf-custom-hostname.status.acme.com")).toExist(),
+			expectView(role("textbox", { name: "Hostname" })).toBeDisabled(),
+			expectView(role("button", { name: "Check now" })).not.toExist(),
+			expectView(role("button", { name: "Remove" })).not.toExist(),
+		)
+	})
+
+	test("a deployment without custom domains says so instead of the form", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(
+				loaded({
+					tab: "settings",
+					customDomain: customDomain({ available: false, cname_target: null }),
+				}),
+			),
+			expectView(text("Custom domains are unavailable on this Maple deployment.")).toExist(),
+			expectView(role("textbox", { name: "Hostname" })).not.toExist(),
+		)
+	})
+})
+
+describe("the JSON editor under Advanced", () => {
 	const publicComponentId = (n: number) => Schema.encodeSync(StatusPageComponentPublicId)(componentId(n))
 	/** The document the tab shows, as the user would edit it. */
 	const documentOf = (components: ReadonlyArray<number>) => ({
@@ -1352,16 +2650,16 @@ describe("json view", () => {
 	const editing = (draft: string, fixture: Fixture = {}) =>
 		Arr.reduce(
 			[Message.ClickedEditJson(), Message.ChangedJson({ value: draft })],
-			loaded({ tab: "json", ...fixture }),
+			loaded({ ...ADVANCED, ...fixture }),
 			(model, message) => pageUpdate(model, message).model,
 		)
 
 	test("shows the page as its config document, with public ids", () => {
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "json" })),
-			expectView(role("link", { name: "Page" })).toHaveAttr("href", `/status-pages/${PUBLIC_ID}`),
-			expectView(role("link", { name: "JSON" })).toHaveAttr("aria-current", "page"),
+			given(loaded(ADVANCED)),
+			expectView(role("link", { name: "Live page" })).toHaveAttr("href", `/status-pages/${PUBLIC_ID}`),
+			expectView(role("link", { name: "Advanced" })).toHaveAttr("aria-current", "page"),
 			expectView(selector("pre")).toContainText('"slug": "acme-status"'),
 			expectView(selector("pre")).toContainText(`"id": "${publicComponentId(2)}"`),
 			expectView(selector("pre")).toContainText('"auto_incidents": "draft"'),
@@ -1373,19 +2671,19 @@ describe("json view", () => {
 	test("members read the document but cannot edit it", () => {
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "json", grants: MEMBER })),
+			given(loaded({ ...ADVANCED, grants: MEMBER })),
 			expectView(selector("pre")).toContainText('"name": "Acme Status"'),
 			expectView(role("button", { name: "Edit JSON" })).not.toExist(),
 			expectView(role("textbox", { name: "Config JSON" })).not.toExist(),
 		)
-		const tried = pageUpdate(loaded({ tab: "json", grants: MEMBER }), Message.ClickedEditJson())
+		const tried = pageUpdate(loaded({ ...ADVANCED, grants: MEMBER }), Message.ClickedEditJson())
 		expect(tried.model.jsonEdit).toBeNull()
 	})
 
 	test("Edit fills the editor with the current document, and Reset brings it back", () => {
 		scene(
 			{ update: pageUpdate, view },
-			given(loaded({ tab: "json" })),
+			given(loaded(ADVANCED)),
 			click(role("button", { name: "Edit JSON" })),
 			expectView(role("textbox", { name: "Config JSON" })).toExist(),
 			expectView(text("No changes yet")).toExist(),
@@ -1510,11 +2808,14 @@ describe("json view", () => {
 	})
 
 	test("the document comes from the config read, so components past the list's first page stay", () => {
-		const entered = init({ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "json" } }, context)
+		const entered = init(
+			{ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "settings", section: "advanced" } },
+			context,
+		)
 		expect(names(entered.commands)).toContain("FetchStatusPageConfig")
 		const listed = [component(1), component(2)]
 		const config = statusPageConfig(statusPage(), [...listed, component(3), component(4)])
-		const model = loaded({ tab: "json", components: listed, config })
+		const model = loaded({ ...ADVANCED, components: listed, config })
 		scene(
 			{ update: pageUpdate, view },
 			given(model),
@@ -1539,7 +2840,7 @@ describe("json view", () => {
 
 	test("the tab shows the config read's loading and failure states", () => {
 		const entered = init(
-			{ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "json" } },
+			{ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "settings", section: "advanced" } },
 			context,
 		).model
 		const pageIn = pageUpdate(
@@ -1552,7 +2853,7 @@ describe("json view", () => {
 			expectView(selector("pre")).not.toExist(),
 			expectView(role("button", { name: "Edit JSON" })).not.toExist(),
 		)
-		const failed = loaded({ tab: "json", configFail: true })
+		const failed = loaded({ ...ADVANCED, configFail: true })
 		scene(
 			{ update: pageUpdate, view },
 			given(failed),
@@ -1561,15 +2862,15 @@ describe("json view", () => {
 		expect(names(pageUpdate(failed, Message.ClickedRetry()).commands)).toContain("FetchStatusPageConfig")
 	})
 
-	test("opening the tab re-reads the config, since other tabs write the page too", () => {
+	test("opening Advanced re-reads the config, since other sections write the page too", () => {
 		const onSettings = loaded({ tab: "settings" })
 		expect(onSettings.config.key).toBeNull()
 		const opened = routeChanged(
 			onSettings,
-			{ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "json" } },
+			{ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "settings", section: "advanced" } },
 			context,
 		)
-		expect(names(opened.commands)).toEqual(["FetchStatusPageConfig"])
+		expect(names(opened.commands)).toContain("FetchStatusPageConfig")
 	})
 
 	test("Apply sends the version the document was read with", () => {
@@ -1846,6 +3147,271 @@ describe("json view", () => {
 		const discarded = pageUpdate(dirty, Message.ClickedDiscardSettings()).model
 		expect(names(pageUpdate(discarded, Message.ClickedApplyJson()).commands)).toContain(
 			"ApplyStatusPageConfig",
+		)
+	})
+})
+
+describe("the sheet, the previews and the reads they wait on", () => {
+	test("a closing sheet keeps showing its incident until it has animated out", () => {
+		const open = pageUpdate(
+			loaded({ tab: "incidents", incidents: [incident(1, { title: "Elevated errors" })] }),
+			Message.ClickedIncident({ incidentId: incidentId(1) }),
+		).model
+		const closing = pageUpdate(
+			open,
+			Message.GotPanelSheetMessage({ message: Dialog.Message.ClickedClose() }),
+		).model
+		expect(closing.panel).toBeNull()
+		expect(closing.sheetPanel).toEqual({ _tag: "Incident", incidentId: incidentId(1) })
+	})
+
+	test("a created incident shows in its sheet at once, before the re-read lands", () => {
+		const created = pageUpdate(
+			pageUpdate(loaded({ tab: "incidents" }), Message.ClickedNewIncident({ kind: "incident" })).model,
+			Message.CompletedCreateIncident({
+				result: Result.succeed(incident(2, { title: "Slow checkout" })),
+			}),
+		).model
+		scene(
+			{ update: pageUpdate, view },
+			given(created),
+			mounted,
+			mounted,
+			expectView(role("dialog", { name: "Slow checkout" })).toExist(),
+		)
+	})
+
+	test("an incident missing from a failed read says so in its sheet, with a retry", () => {
+		const open = pageUpdate(
+			loaded({ tab: "incidents", incidents: [incident(1)] }),
+			Message.ClickedIncident({ incidentId: incidentId(1) }),
+		).model
+		const failed = {
+			...open,
+			incidents: {
+				...open.incidents,
+				data: AsyncData.Failure({ error: toLoadFailure(new Error("down")) }),
+			},
+		}
+		scene(
+			{ update: pageUpdate, view },
+			given(failed),
+			mounted,
+			expectView(text("Couldn't load the incident")).toExist(),
+		)
+		const reading = { ...open, incidents: { ...open.incidents, data: AsyncData.Loading() } }
+		scene(
+			{ update: pageUpdate, view },
+			given(reading),
+			mounted,
+			expectView(text("Couldn't load the incident")).not.toExist(),
+			inside(
+				role("dialog", { name: "Incident" }),
+				expectView(selector('[aria-busy="true"]')).toExist(),
+			),
+		)
+	})
+
+	test("the theme preview waits for the statuses' reads, and says so when they fail", () => {
+		const entered = init(
+			{ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "settings", section: "appearance" } },
+			context,
+		).model
+		const withPage = pageUpdate(
+			entered,
+			Message.CompletedFetchPage({ key: entered.page.key ?? "", result: Result.succeed(statusPage()) }),
+		).model
+		scene(
+			{ update: pageUpdate, view },
+			given(withPage),
+			expectView(selector('iframe[title="The theme as visitors see it"]')).not.toExist(),
+			expectView(selector('iframe[title="The page header as visitors see it"]')).toExist(),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded({ ...APPEARANCE, monitorsFail: true })),
+			expectView(selector('iframe[title="The theme as visitors see it"]')).not.toExist(),
+			expectView(text("No preview: the page's components didn't load.")).toExist(),
+		)
+	})
+
+	test("opening another component saves the typed edit first and keeps a save in flight", () => {
+		const typed = pageUpdate(
+			selected(1),
+			Message.ChangedComponentField({ field: "name", value: "Payments" }),
+		).model
+		const switched = pageUpdate(typed, Message.ClickedComponent({ componentId: componentId(2) }))
+		expect(switched.commands).toMatchObject([
+			{
+				name: "SaveStatusPageComponent",
+				args: { componentId: componentId(1), payload: { name: "Payments" } },
+			},
+		])
+		expect(switched.model.componentSave).toEqual({ _tag: "Saving", componentId: componentId(1) })
+		expect(switched.model.componentForm.name).toBe("Component 2")
+	})
+
+	/** Component 1's name blurred (its save in flight), then its description typed. */
+	const savingThenTyped = () =>
+		steps(selected(1), [
+			Message.ChangedComponentField({ field: "name", value: "Payments" }),
+			Message.CommittedComponent(),
+			Message.ChangedComponentField({ field: "description", value: "Card payments" }),
+		])
+
+	test("an edit typed while a save is in flight is queued when another component opens, and sent once the save lands", () => {
+		const switched = pageUpdate(
+			savingThenTyped(),
+			Message.ClickedComponent({ componentId: componentId(2) }),
+		)
+		expect(names(switched.commands)).not.toContain("SaveStatusPageComponent")
+		const landed = pageUpdate(
+			switched.model,
+			Message.CompletedSaveComponent({ result: Result.succeed(component(1, { name: "Payments" })) }),
+		)
+		expect(landed.commands).toContainEqual(
+			expect.objectContaining({
+				name: "SaveStatusPageComponent",
+				args: expect.objectContaining({
+					componentId: componentId(1),
+					payload: expect.objectContaining({ name: "Payments", description: "Card payments" }),
+				}),
+			}),
+		)
+		expect(landed.model.queuedComponentForms).toEqual([])
+	})
+
+	test("Escape queues an edit typed while a save is in flight, too", () => {
+		const escaped = pageUpdate(savingThenTyped(), Message.PressedEscape()).model
+		expect(Arr.map(escaped.queuedComponentForms, (form) => form.description)).toEqual(["Card payments"])
+	})
+
+	test("a refused save stays on its own component and its queued edit is never sent behind its back", () => {
+		const switched = pageUpdate(
+			savingThenTyped(),
+			Message.ClickedComponent({ componentId: componentId(2) }),
+		).model
+		const refused = pageUpdate(
+			switched,
+			Message.CompletedSaveComponent({ result: Result.fail(toLoadFailure(new Error("refused"))) }),
+		)
+		expect(names(refused.commands)).not.toContain("SaveStatusPageComponent")
+		expect(refused.model.queuedComponentForms).toEqual([])
+		expect(refused.model.componentSave).toMatchObject({ _tag: "Failed", componentId: componentId(1) })
+		scene(
+			{ update: pageUpdate, view },
+			given(refused.model),
+			expectView(text("Couldn't save the component")).not.toExist(),
+		)
+		// Closing the other component or opening a third sends nothing of the abandoned form.
+		expect(names(pageUpdate(refused.model, Message.PressedEscape()).commands)).not.toContain(
+			"SaveStatusPageComponent",
+		)
+		const third = pageUpdate(refused.model, Message.ClickedComponent({ componentId: componentId(3) }))
+		expect(names(third.commands)).not.toContain("SaveStatusPageComponent")
+		scene(
+			{ update: pageUpdate, view },
+			given(pageUpdate(refused.model, Message.ClickedComponent({ componentId: componentId(1) })).model),
+			expectView(text("Couldn't save the component")).toExist(),
+		)
+	})
+
+	test("opening a component after a JSON apply renamed an untouched one sends no stale PATCH", () => {
+		const opened = selected(1, { components: [component(1, { name: "API" }), component(2)] })
+		const advanced = routeChanged(
+			opened,
+			{ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "settings", section: "advanced" } },
+			context,
+		).model
+		// The apply's re-read lands the rename made in the JSON.
+		const renamed = pageUpdate(
+			advanced,
+			Message.CompletedFetchComponents({
+				key: advanced.components.key ?? "",
+				result: Result.succeed([component(1, { name: "Payments" }), component(2)]),
+			}),
+		).model
+		const back = routeChanged(
+			renamed,
+			{ _tag: "StatusPage", pageId: PUBLIC_ID, search: { view: "settings", section: "monitors" } },
+			context,
+		).model
+		expect(
+			names(pageUpdate(back, Message.ClickedComponent({ componentId: componentId(2) })).commands),
+		).not.toContain("SaveStatusPageComponent")
+	})
+
+	test("Escape closes an expanded component row, but an open popup trigger or list keeps it", () => {
+		const focused = (attributes: Readonly<Record<string, string>>, inList = false): Focused => ({
+			getAttribute: (name) => attributes[name] ?? null,
+			isInside: () => inList,
+		})
+		expect(popupOwnsEscape(focused({ "aria-expanded": "true" }))).toBe(false)
+		expect(popupOwnsEscape(focused({ "aria-expanded": "true", "aria-haspopup": "listbox" }))).toBe(true)
+		expect(popupOwnsEscape(focused({ "aria-expanded": "false", "aria-haspopup": "menu" }))).toBe(false)
+		expect(popupOwnsEscape(focused({}, true))).toBe(true)
+	})
+
+	test("a deleted incident's closing sheet keeps showing it after the re-read drops it", () => {
+		const deleting = steps(
+			pageUpdate(
+				loaded({ tab: "incidents", incidents: [incident(1)] }),
+				Message.ClickedIncident({ incidentId: incidentId(1) }),
+			).model,
+			[
+				Message.ClickedDeleteIncident({ incidentId: incidentId(1) }),
+				Message.ClickedConfirmDeleteIncident(),
+			],
+		)
+		const deleted = pageUpdate(
+			deleting,
+			Message.CompletedDeleteIncident({ result: Result.succeed(undefined) }),
+		).model
+		const reread = pageUpdate(
+			deleted,
+			Message.CompletedFetchIncidents({ key: deleted.incidents.key ?? "", result: Result.succeed([]) }),
+		).model
+		expect(reread.panel).toBeNull()
+		expect(reread.sheetIncident?.id).toBe(incidentId(1))
+	})
+
+	test("completed maintenance lasts from its first In progress update to completion, else its window", () => {
+		const done = incident(1, {
+			kind: "maintenance",
+			status: "completed",
+			scheduled_start: "2026-10-01T02:00:00.000Z",
+			scheduled_end: "2026-10-01T03:00:00.000Z",
+			started_at: "2026-10-01T02:00:00.000Z",
+			resolved_at: "2026-10-01T02:24:00.000Z",
+			updates: Arr.map(incident(1).updates, (update) => ({
+				...update,
+				status: "in_progress" as const,
+				created_at: "2026-10-01T02:05:00.000Z",
+			})),
+		})
+		expect(maintenanceDurationMs(done)).toBe(19 * 60_000)
+		expect(maintenanceDurationMs({ ...done, updates: [] })).toBe(60 * 60_000)
+	})
+
+	test("a failed custom domain read can be retried, and Access does not offer Internal until it is known", () => {
+		const failed = {
+			...loaded({ tab: "settings" }),
+			customDomain: {
+				key: "custom-domain",
+				data: AsyncData.Failure({ error: toLoadFailure(new Error("unreachable")) }),
+			},
+		}
+		scene(
+			{ update: pageUpdate, view },
+			given(failed),
+			expectView(text("Couldn't load the custom domain")).toExist(),
+			expectView(role("button", { name: "Try again" })).toExist(),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given({ ...failed, search: { view: "settings", section: "access" } }),
+			expectView(role("radio", { name: "Internal" })).toBeDisabled(),
+			expectView(text("Couldn't check for a custom domain. Try again under Basic settings.")).toExist(),
 		)
 	})
 })

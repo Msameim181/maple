@@ -41,6 +41,8 @@ import {
 	isManagedSignalType,
 	type ManagedSignalType,
 } from "@maple/domain/http"
+import { AuditDetectionFilters } from "@maple/domain/audit-trail"
+import { StoredCostBudget } from "@maple/domain/cost-budget"
 import * as PG from "@maple-dev/effect-orm/postgres"
 import { AlertRules, type AlertRuleRow } from "@maple/db/tables"
 import { DateTime, Array as Arr, Effect, Match, Result, Schema, String as Str } from "effect"
@@ -57,6 +59,8 @@ type StoredJsonColumn =
 	| "tagsJson"
 	| "destinationIdsJson"
 	| "thresholdsJson"
+	| "auditFiltersJson"
+	| "costBudgetJson"
 
 /**
  * An `alert_rules` row with its schema-typed jsonb columns read as `unknown`. The model
@@ -76,6 +80,10 @@ export const selectStoredAlertRules = () =>
 		tagsJson: PG.undecoded($.tagsJson),
 		destinationIdsJson: PG.undecoded($.destinationIdsJson),
 		thresholdsJson: PG.undecoded($.thresholdsJson),
+		// Undecoded so one detection with filters this build cannot read fails alone.
+		auditFiltersJson: PG.undecoded($.auditFiltersJson),
+		// Undecoded for the same reason: one budget this build cannot read fails alone.
+		costBudgetJson: PG.undecoded($.costBudgetJson),
 	}))
 const DestinationIdArraySchema = Schema.Array(AlertDestinationDocument.fields.id)
 const AlertGroupByFromJson = Schema.fromJsonString(AlertGroupBySchema)
@@ -105,6 +113,12 @@ export interface NormalizedRule {
 	readonly environments: ReadonlyArray<string>
 	/** Anomaly rules only: detector signals in scope; empty is every signal. */
 	readonly anomalySignals: ReadonlyArray<AnomalySignalType>
+	/** Audit detections only: which events the rule counts; empty is every event. */
+	readonly auditFilters: AuditDetectionFilters
+	/** Audit detections only: events that arrived before this do not count; null counts the whole window. */
+	readonly auditCountFrom: number | null
+	/** Cost budgets only: what the rule measures; null on every other rule. */
+	readonly costBudget: StoredCostBudget | null
 	readonly tags: ReadonlyArray<string>
 	readonly groupBy: AlertGroupBy | null
 	readonly signalType: AlertSignalType
@@ -235,13 +249,31 @@ const planGroupingTokens = (
 
 /** Why the generic rule APIs refuse a rule another resource owns. */
 export const managedRuleMessage = (signalType: ManagedSignalType): string =>
-	signalType === "uptime"
-		? "uptime rules belong to an uptime monitor; create, edit or delete the monitor instead"
-		: "slo_burn_rate rules belong to an SLO; create, edit or delete the SLO instead"
+	Match.value(signalType).pipe(
+		Match.when(
+			"uptime",
+			() => "uptime rules belong to an uptime monitor; create, edit or delete the monitor instead",
+		),
+		Match.when(
+			"slo_burn_rate",
+			() => "slo_burn_rate rules belong to an SLO; create, edit or delete the SLO instead",
+		),
+		Match.when(
+			"audit",
+			() =>
+				"audit rules belong to an audit log detection; create, edit or delete the detection in the Security hub instead",
+		),
+		Match.when(
+			"cost_budget",
+			() =>
+				"cost_budget rules belong to a cost budget; create, edit or delete the budget on the Cost page instead",
+		),
+		Match.exhaustive,
+	)
 
 /**
- * The stored plan of every queryless rule (`uptime`, `slo_burn_rate`, `anomaly`): the evaluator
- * reads the owning resource or the anomaly detector's incidents instead.
+ * The stored plan of every queryless rule (`uptime`, `slo_burn_rate`, `audit`, `cost_budget`,
+ * `anomaly`): the evaluator reads the owning resource or the anomaly detector's incidents instead.
  */
 export const MANAGED_RULE_PLAN = new CompiledAlertQueryPlan({
 	kind: "spec",
@@ -252,9 +284,13 @@ export const MANAGED_RULE_PLAN = new CompiledAlertQueryPlan({
 	noDataBehavior: "skip",
 })
 
+/** What an uptime rule observes: a down monitor, and an HTTPS certificate inside its warning window. */
+export const UPTIME_OBSERVED_VALUE = { down: 1, certificateExpiring: 0.5, healthy: 0 } as const
+
 /**
- * The `alert_rules` columns of a monitor's backing rule: down (1) breaches, one check opens
- * and one healthy check resolves. Scoped to the monitor's service so links follow it.
+ * The `alert_rules` columns of a monitor's backing rule: down (1) is critical, an expiring
+ * certificate (0.5) a warning; one check opens and one healthy check resolves. Scoped to the
+ * monitor's service so links follow it.
  */
 export const uptimeRuleFields = (monitor: {
 	readonly name: string
@@ -264,8 +300,15 @@ export const uptimeRuleFields = (monitor: {
 }) => {
 	const thresholds: AlertThresholds = [
 		{
+			severity: "warning",
+			value: UPTIME_OBSERVED_VALUE.certificateExpiring,
+			upper: null,
+			recoveryValue: null,
+			destinationIds: [...monitor.destinationIds],
+		},
+		{
 			severity: "critical",
-			value: 1,
+			value: UPTIME_OBSERVED_VALUE.down,
 			upper: null,
 			recoveryValue: null,
 			destinationIds: [...monitor.destinationIds],
@@ -285,7 +328,7 @@ export const uptimeRuleFields = (monitor: {
 		groupBy: null,
 		signalType: "uptime",
 		comparator: "gte",
-		threshold: 1,
+		threshold: UPTIME_OBSERVED_VALUE.certificateExpiring,
 		thresholdUpper: null,
 		thresholdsJson: thresholds,
 		windowMinutes: 1,
@@ -646,6 +689,18 @@ export const decodeStoredAlertRuleMetadata = (row: StoredAlertRuleRow) =>
 		),
 	})
 
+/** An audit detection's filters. A detection stored without any counts every event. */
+const decodeStoredAuditFilters = (row: StoredAlertRuleRow) =>
+	row.signalType !== "audit" || row.auditFiltersJson == null
+		? Effect.succeed<AuditDetectionFilters>({})
+		: decodeStoredRuleComponent(row.id, "audit_filters", AuditDetectionFilters, row.auditFiltersJson)
+
+/** A cost budget's amount, period and slice. Another kind of rule has none. */
+const decodeStoredCostBudget = (row: StoredAlertRuleRow) =>
+	row.signalType !== "cost_budget"
+		? Effect.succeed(null)
+		: decodeStoredRuleComponent(row.id, "cost_budget", StoredCostBudget, row.costBudgetJson)
+
 export const decodeStoredAlertRuleDestinationIds = (
 	ruleId: AlertRuleId,
 	value: unknown,
@@ -804,6 +859,8 @@ export const makeAlertRuleNormalizer = (runtime: AlertRuntimeApi) => {
 		const destinationIds = yield* decodeStoredAlertRuleDestinationIds(row.id, row.destinationIdsJson)
 		const thresholds = yield* decodeStoredAlertRuleThresholds(row, destinationIds)
 		const legacy = alertThresholdLegacyFields(thresholds)
+		const auditFilters = yield* decodeStoredAuditFilters(row)
+		const costBudget = yield* decodeStoredCostBudget(row)
 		return {
 			id: decoded.id,
 			name: row.name,
@@ -816,6 +873,9 @@ export const makeAlertRuleNormalizer = (runtime: AlertRuntimeApi) => {
 			excludeServiceNames: stored.excludeServiceNames,
 			environments: stored.environments,
 			anomalySignals: row.anomalySignalsJson ?? [],
+			auditFilters,
+			auditCountFrom: row.auditCountFrom,
+			costBudget,
 			tags: stored.tags,
 			groupBy: decoded.groupBy,
 			signalType: decoded.signalType,
@@ -1040,6 +1100,9 @@ export const makeAlertRuleNormalizer = (runtime: AlertRuntimeApi) => {
 			excludeServiceNames,
 			environments,
 			anomalySignals,
+			auditFilters: {},
+			auditCountFrom: null,
+			costBudget: null,
 			tags,
 			groupBy,
 			signalType: request.signalType,

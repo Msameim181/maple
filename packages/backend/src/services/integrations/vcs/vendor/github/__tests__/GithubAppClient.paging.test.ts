@@ -1,13 +1,14 @@
 import { assert, describe, it } from "@effect/vitest"
 import { generateKeyPairSync } from "node:crypto"
-import { ConfigProvider, Effect, Layer, Schema, String as Str } from "effect"
-import { Env } from "@maple/backend/platform/Env"
+import { ConfigProvider, Effect, Layer, Schema, Array as Arr, String as Str } from "effect"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import {
 	COMMIT_PAGES_PER_INVOCATION,
 	GithubAppClient,
 } from "@maple/backend/services/integrations/vcs/vendor/github/GithubAppClient"
 import { VcsRepositoryBlockedError, VcsRepoUnavailableError } from "@maple/domain/http"
 import { fakeGithubHttp } from "@maple/backend/services/integrations/vcs/__tests__/harness"
+import * as VendorFake from "@maple/backend/testing/vendor-fake"
 
 const privateKey = generateKeyPairSync("rsa", {
 	modulusLength: 2048,
@@ -15,7 +16,7 @@ const privateKey = generateKeyPairSync("rsa", {
 	privateKeyEncoding: { type: "pkcs8", format: "pem" },
 }).privateKey
 
-const env = Env.layer.pipe(
+const env = EnvTestLive.pipe(
 	Layer.provide(
 		ConfigProvider.layer(
 			ConfigProvider.fromUnknown({
@@ -226,13 +227,30 @@ describe("GithubAppClient repository listings", () => {
 		}).pipe(Effect.provide(layer))
 	})
 
-	it.effect("keeps an upstream 5xx a GithubAppError the provider can retry", () => {
-		const layer = clientLayer([tokenResponse(), new Response("boom", { status: 502 })], [])
+	it.effect(
+		"keeps an upstream 5xx a GithubAppError the provider can retry, after retrying the read",
+		() => {
+			const requests: Array<string> = []
+			const layer = clientLayer(
+				[
+					tokenResponse(),
+					new Response("boom", { status: 502 }),
+					new Response("boom", { status: 502 }),
+					new Response("boom", { status: 502 }),
+				],
+				requests,
+			)
 
-		return Effect.gen(function* () {
-			const client = yield* GithubAppClient
-			const error = yield* Effect.flip(client.listBranches("42", "octo", "shop"))
-			assert.strictEqual(error._tag, "@maple/backend/vcs/GithubAppError")
-		}).pipe(Effect.provide(layer))
-	})
+			return Effect.gen(function* () {
+				const client = yield* GithubAppClient
+				const error = yield* Effect.flip(
+					VendorFake.elapsing(client.listBranches("42", "octo", "shop")),
+				)
+				assert.strictEqual(error._tag, "@maple/backend/vcs/GithubAppError")
+				assert.strictEqual(error._tag === "@maple/backend/vcs/GithubAppError" && error.status, 502)
+				// A read is sent three times in all before the 5xx is surfaced.
+				assert.strictEqual(Arr.filter(requests, (url) => Str.includes("/branches")(url)).length, 3)
+			}).pipe(Effect.provide(layer))
+		},
+	)
 })

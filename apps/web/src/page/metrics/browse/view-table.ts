@@ -15,8 +15,10 @@ import {
 	tableRow,
 } from "@maple/views/ui/table"
 import { tableSkeleton } from "@maple/views/ui/table-skeleton"
+import { rowFocusAttributes } from "@maple/views/ui/row-focus"
 import { truncatedText } from "@maple/views/ui/truncated-text"
-import { emptyValue, serviceDot } from "@maple/views/ui/values"
+import { emptyValue } from "@maple/views/ui/values"
+import { serviceLabel } from "@maple/views/ui/service-label"
 import { metricTypeBadge } from "@maple/views/ui/metric-type"
 import type { MetricRow } from "../shared"
 import { Message } from "./message"
@@ -64,7 +66,7 @@ export const loadingTable = (h: H): Html =>
 		tableClassName: "table-fixed",
 	})
 
-const metricRow = (h: H, model: Model, metric: MetricRow, timeZone: string): Html =>
+const metricRow = (h: H, model: Model, metric: MetricRow, timeZone: string, isFocused: boolean): Html =>
 	tableRow(
 		h,
 		[
@@ -104,16 +106,9 @@ const metricRow = (h: H, model: Model, metric: MetricRow, timeZone: string): Htm
 								{
 									variant: "outline",
 									size: "xs",
-									mono: true,
 									className: "max-w-full",
-									attributes: [h.Title(metric.serviceName)],
 								},
-								[
-									serviceDot(h, { serviceName: metric.serviceName, size: "sm" }),
-									typography(h, { truncate: true, className: "min-w-0" }, [
-										metric.serviceName,
-									]),
-								],
+								[serviceLabel(h, { serviceName: metric.serviceName, dot: "sm" })],
 							),
 				],
 				`${MD_CELL} overflow-hidden`,
@@ -126,6 +121,7 @@ const metricRow = (h: H, model: Model, metric: MetricRow, timeZone: string): Htm
 			),
 		],
 		"hover:bg-surface-sunken active:bg-surface-sunken",
+		rowFocusAttributes(h, isFocused),
 	)
 
 /** The loaded table: rows up to `tableLimit`, dimmed while the next page loads. */
@@ -156,7 +152,9 @@ export const metricsTable = (
 						]),
 						tableBody(
 							h,
-							Arr.map(metrics, (metric) => metricRow(h, model, metric, timeZone)),
+							Arr.map(metrics, (metric, index) =>
+								metricRow(h, model, metric, timeZone, model.focusedIndex === index),
+							),
 						),
 					]),
 				],

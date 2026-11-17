@@ -197,7 +197,7 @@ SELECT
         LIMIT 2500
         FORMAT JSON
 
--- builder:anomaly:anomalyLogVolumeQuery:matchedHours  [16004c1b]
+-- builder:anomaly:anomalyLogVolumeQuery:baselineHours  [ed6267d2]
 SELECT
           logs_aggregates_hourly.ServiceName AS serviceName,
           logs_aggregates_hourly.DeploymentEnv AS deploymentEnv,
@@ -208,7 +208,7 @@ SELECT
         WHERE logs_aggregates_hourly.OrgId = 'org_sql_catalog'
           AND logs_aggregates_hourly.Hour >= '2026-01-01 10:30:00'
           AND logs_aggregates_hourly.Hour <= '2026-01-03 14:15:00'
-          AND toHour(logs_aggregates_hourly.Hour) IN (9, 10, 11)
+          AND toHour(logs_aggregates_hourly.Hour) IN (8, 9, 10, 11)
         GROUP BY serviceName, deploymentEnv, hour
         LIMIT 25000
         FORMAT JSON
@@ -228,37 +228,50 @@ SELECT
         LIMIT 200
         FORMAT JSON
 
--- builder:anomaly:anomalyTraceSignalsQuery:matchedHours  [215fec55]
+-- builder:anomaly:anomalyTraceSignalsQuery:baselineHours  [5d5ecce5]
 SELECT
-          traces_aggregates_hourly.ServiceName AS serviceName,
-          traces_aggregates_hourly.DeploymentEnv AS deploymentEnv,
-          traces_aggregates_hourly.Hour AS hour,
-          sum(WeightedCount) AS requestCount,
-          sum(WeightedErrorCount) AS errorCount,
-          arrayElement(quantilesTDigestWeightedMerge(0.95)(DurationQuantiles), 1) / 1000000 AS p95Ms
-        FROM traces_aggregates_hourly
-        WHERE traces_aggregates_hourly.OrgId = 'org_sql_catalog'
-          AND traces_aggregates_hourly.IsEntryPoint = 1
-          AND traces_aggregates_hourly.Hour >= '2026-01-01 10:30:00'
-          AND traces_aggregates_hourly.Hour <= '2026-01-03 14:15:00'
-          AND toHour(traces_aggregates_hourly.Hour) IN (9, 10, 11)
+          service_overview_hourly.ServiceName AS serviceName,
+          service_overview_hourly.DeploymentEnv AS deploymentEnv,
+          service_overview_hourly.Hour AS hour,
+          sum(service_overview_hourly.EstimatedSpanCount) AS requestCount,
+          sum(service_overview_hourly.EstimatedErrorCount) AS errorCount,
+          arrayElement(quantilesTDigestMerge(0.5, 0.95, 0.99)(DurationQuantiles), 2) / 1000000 AS p95Ms
+        FROM service_overview_hourly
+        WHERE service_overview_hourly.OrgId = 'org_sql_catalog'
+          AND service_overview_hourly.Hour >= '2026-01-01 10:30:00'
+          AND service_overview_hourly.Hour <= '2026-01-03 14:15:00'
+          AND toHour(service_overview_hourly.Hour) IN (8, 9, 10, 11)
         GROUP BY serviceName, deploymentEnv, hour
         LIMIT 25000
         FORMAT JSON
 
--- builder:anomaly:anomalyTraceSignalTimeseriesQuery:default  [a134b2f6]
+-- builder:anomaly:anomalyTraceSignalsWindowQuery:lastHour  [f1facc81]
 SELECT
-          traces_aggregates_hourly.Hour AS hour,
-          sum(WeightedCount) AS requestCount,
-          sum(WeightedErrorCount) AS errorCount,
-          arrayElement(quantilesTDigestWeightedMerge(0.95)(DurationQuantiles), 1) / 1000000 AS p95Ms
-        FROM traces_aggregates_hourly
-        WHERE traces_aggregates_hourly.OrgId = 'org_sql_catalog'
-          AND traces_aggregates_hourly.IsEntryPoint = 1
-          AND traces_aggregates_hourly.ServiceName = 'api'
-          AND traces_aggregates_hourly.DeploymentEnv = 'production'
-          AND traces_aggregates_hourly.Hour >= '2026-01-01 10:30:00'
-          AND traces_aggregates_hourly.Hour <= '2026-01-03 14:15:00'
+          service_overview_minutely.ServiceName AS serviceName,
+          service_overview_minutely.DeploymentEnv AS deploymentEnv,
+          sum(service_overview_minutely.EstimatedSpanCount) AS requestCount,
+          sum(service_overview_minutely.EstimatedErrorCount) AS errorCount,
+          arrayElement(quantilesTDigestMerge(0.5, 0.95, 0.99)(DurationQuantiles), 2) / 1000000 AS p95Ms
+        FROM service_overview_minutely
+        WHERE service_overview_minutely.OrgId = 'org_sql_catalog'
+          AND service_overview_minutely.Minute >= '2026-01-01 10:30:00'
+          AND service_overview_minutely.Minute < '2026-01-03 14:15:00'
+        GROUP BY serviceName, deploymentEnv
+        LIMIT 25000
+        FORMAT JSON
+
+-- builder:anomaly:anomalyTraceSignalTimeseriesQuery:default  [e5db4c31]
+SELECT
+          service_overview_hourly.Hour AS hour,
+          sum(service_overview_hourly.EstimatedSpanCount) AS requestCount,
+          sum(service_overview_hourly.EstimatedErrorCount) AS errorCount,
+          arrayElement(quantilesTDigestMerge(0.5, 0.95, 0.99)(DurationQuantiles), 2) / 1000000 AS p95Ms
+        FROM service_overview_hourly
+        WHERE service_overview_hourly.OrgId = 'org_sql_catalog'
+          AND service_overview_hourly.ServiceName = 'api'
+          AND service_overview_hourly.DeploymentEnv = 'production'
+          AND service_overview_hourly.Hour >= '2026-01-01 10:30:00'
+          AND service_overview_hourly.Hour <= '2026-01-03 14:15:00'
         GROUP BY hour
         ORDER BY hour ASC
         LIMIT 200
@@ -371,6 +384,98 @@ SELECT
         ORDER BY occurredAt DESC, id DESC
         LIMIT 50
         OFFSET 50
+        FORMAT JSON
+
+-- builder:audit-trail:auditTrailCountQuery:filtered  [ee015597]
+SELECT
+          uniqExact(audit_trail_events.Id) AS events
+        FROM audit_trail_events
+        WHERE audit_trail_events.OrgId = 'org_sql_catalog'
+          AND audit_trail_events.IngestedAt > '2026-01-01 10:30:00'
+          AND audit_trail_events.IngestedAt <= '2026-01-03 14:15:00'
+          AND audit_trail_events.OccurredAt >= '2026-01-01 10:30:00' - INTERVAL 604800 SECOND
+          AND audit_trail_events.Provider = 'vercel'
+          AND audit_trail_events.Category = 'membership'
+          AND audit_trail_events.Outcome = 'success'
+          AND audit_trail_events.Action = 'team.member.added'
+        FORMAT JSON
+
+-- builder:audit-trail:auditTrailEventsQuery:default  [9ab77231]
+SELECT
+          audit_trail_events.Id AS id,
+          audit_trail_events.OccurredAt AS occurredAt,
+          audit_trail_events.IngestedAt AS ingestedAt,
+          audit_trail_events.Provider AS provider,
+          audit_trail_events.Account AS account,
+          audit_trail_events.ProviderEventId AS providerEventId,
+          audit_trail_events.ActorType AS actorType,
+          audit_trail_events.ActorId AS actorId,
+          audit_trail_events.ActorName AS actorName,
+          audit_trail_events.ActorEmail AS actorEmail,
+          audit_trail_events.Action AS action,
+          audit_trail_events.Category AS category,
+          audit_trail_events.Outcome AS outcome,
+          audit_trail_events.OutcomeReason AS outcomeReason,
+          audit_trail_events.TargetType AS targetType,
+          audit_trail_events.TargetId AS targetId,
+          audit_trail_events.TargetName AS targetName,
+          audit_trail_events.OriginIp AS originIp,
+          audit_trail_events.OriginCountry AS originCountry,
+          audit_trail_events.UserAgent AS userAgent,
+          audit_trail_events.Raw AS raw
+        FROM audit_trail_events
+        WHERE audit_trail_events.OrgId = 'org_sql_catalog'
+        ORDER BY occurredAt DESC, id DESC, ingestedAt ASC
+        LIMIT 51
+        FORMAT JSON
+
+-- builder:audit-trail:auditTrailEventsQuery:filtered  [fb4fb694]
+SELECT
+          audit_trail_events.Id AS id,
+          audit_trail_events.OccurredAt AS occurredAt,
+          audit_trail_events.IngestedAt AS ingestedAt,
+          audit_trail_events.Provider AS provider,
+          audit_trail_events.Account AS account,
+          audit_trail_events.ProviderEventId AS providerEventId,
+          audit_trail_events.ActorType AS actorType,
+          audit_trail_events.ActorId AS actorId,
+          audit_trail_events.ActorName AS actorName,
+          audit_trail_events.ActorEmail AS actorEmail,
+          audit_trail_events.Action AS action,
+          audit_trail_events.Category AS category,
+          audit_trail_events.Outcome AS outcome,
+          audit_trail_events.OutcomeReason AS outcomeReason,
+          audit_trail_events.TargetType AS targetType,
+          audit_trail_events.TargetId AS targetId,
+          audit_trail_events.TargetName AS targetName,
+          audit_trail_events.OriginIp AS originIp,
+          audit_trail_events.OriginCountry AS originCountry,
+          audit_trail_events.UserAgent AS userAgent,
+          audit_trail_events.Raw AS raw
+        FROM audit_trail_events
+        WHERE audit_trail_events.OrgId = 'org_sql_catalog'
+          AND audit_trail_events.Provider = 'github'
+          AND audit_trail_events.Account = 'acme'
+          AND audit_trail_events.Category = 'membership'
+          AND audit_trail_events.Outcome = 'success'
+          AND audit_trail_events.Action = 'org.add_member'
+          AND ((audit_trail_events.ActorId = 'octocat@acme.test' OR audit_trail_events.ActorEmail = 'octocat@acme.test') OR audit_trail_events.ActorId = 'user_1')
+          AND audit_trail_events.OccurredAt >= '2026-01-01 10:30:00'
+          AND audit_trail_events.OccurredAt <= '2026-01-03 14:15:00'
+          AND (audit_trail_events.OccurredAt < '2026-01-03 14:15:00' OR (audit_trail_events.OccurredAt = '2026-01-03 14:15:00' AND audit_trail_events.Id < '0f6f2c1e7a554c0e9a3b0d2c7e5b9a11'))
+        ORDER BY occurredAt DESC, id DESC, ingestedAt ASC
+        LIMIT 51
+        FORMAT JSON
+
+-- builder:audit-trail:auditTrailSourcesQuery:default  [c248e070]
+SELECT
+          audit_trail_events.Provider AS provider,
+          uniqExact(audit_trail_events.Id) AS events,
+          toUnixTimestamp(max(audit_trail_events.OccurredAt)) AS lastOccurredAt
+        FROM audit_trail_events
+        WHERE audit_trail_events.OrgId = 'org_sql_catalog'
+          AND audit_trail_events.OccurredAt >= '2026-01-01 10:30:00'
+        GROUP BY provider
         FORMAT JSON
 
 -- builder:aws-ingest:awsIngestQuery:default  [c5891e34]
@@ -1184,6 +1289,239 @@ SELECT
           AND metrics_gauge.ResourceAttributes['k8s.pod.name'] = ''
           AND metrics_gauge.MetricName IN ('container.cpu.utilization', 'container.memory.percent')
         GROUP BY containerName, hostName) AS containers
+        FORMAT JSON
+
+-- builder:cost:costBreakdownQuery:byUsageTypeEffectiveByChange  [539cbf8f]
+SELECT
+          latest.usageType AS key,
+          ifNull(sumIf(latest.cost, latest.date >= '2026-10-01 00:00:00'), 0) AS cost,
+          ifNull(sumIf(latest.cost, NOT (latest.date >= '2026-10-01 00:00:00')), 0) AS previousCost,
+          greatest(ifNull(sumIf(latest.cost, latest.date >= '2026-10-01 00:00:00'), 0) - ifNull(sumIf(latest.cost, NOT (latest.date >= '2026-10-01 00:00:00')), 0), ifNull(sumIf(latest.cost, NOT (latest.date >= '2026-10-01 00:00:00')), 0) - ifNull(sumIf(latest.cost, latest.date >= '2026-10-01 00:00:00'), 0)) AS changeSize
+        FROM (SELECT
+          cost_daily.Date AS date,
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Provider AS provider,
+          cost_daily.AccountId AS account,
+          cost_daily.CloudService AS cloudService,
+          cost_daily.ServiceCategory AS serviceCategory,
+          cost_daily.UsageType AS usageType,
+          cost_daily.Region AS region,
+          cost_daily.ResourceId AS resource,
+          cost_daily.ServiceName AS service,
+          cost_daily.ChargeCategory AS chargeCategory,
+          cost_daily.Currency AS currency,
+          max(cost_daily.EffectiveCost) AS cost,
+          max(cost_daily.Estimated) AS estimated
+        FROM cost_daily
+        INNER JOIN (SELECT
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Date AS date,
+          max(cost_daily.IngestedAt) AS ingestedAt
+        FROM cost_daily
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-09-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+        GROUP BY sourceId, date) AS newest ON ((cost_daily.SourceId = newest.sourceId AND cost_daily.Date = newest.date) AND cost_daily.IngestedAt = newest.ingestedAt)
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-09-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+          AND cost_daily.ChargeCategory != 'none'
+          AND cost_daily.Region IN ('us-east-1', 'global')
+          AND cost_daily.Currency = 'USD'
+        GROUP BY date, sourceId, provider, account, cloudService, serviceCategory, usageType, region, resource, service, chargeCategory, currency) AS latest
+        GROUP BY key
+        ORDER BY changeSize DESC, key ASC
+        LIMIT 25
+        FORMAT JSON
+
+-- builder:cost:costCurrenciesQuery:filtered  [0cb5938a]
+SELECT
+          latest.currency AS currency,
+          max(if(latest.date >= '2026-10-01 00:00:00', 1, 0)) AS inWindow,
+          ifNull(sumIf(latest.cost, latest.date >= '2026-10-01 00:00:00'), 0) AS cost,
+          ifNull(sumIf(latest.cost, NOT (latest.date >= '2026-10-01 00:00:00')), 0) AS previousCost
+        FROM (SELECT
+          cost_daily.Date AS date,
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Provider AS provider,
+          cost_daily.AccountId AS account,
+          cost_daily.CloudService AS cloudService,
+          cost_daily.ServiceCategory AS serviceCategory,
+          cost_daily.UsageType AS usageType,
+          cost_daily.Region AS region,
+          cost_daily.ResourceId AS resource,
+          cost_daily.ServiceName AS service,
+          cost_daily.ChargeCategory AS chargeCategory,
+          cost_daily.Currency AS currency,
+          max(cost_daily.BilledCost) AS cost,
+          max(cost_daily.Estimated) AS estimated
+        FROM cost_daily
+        INNER JOIN (SELECT
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Date AS date,
+          max(cost_daily.IngestedAt) AS ingestedAt
+        FROM cost_daily
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-09-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+        GROUP BY sourceId, date) AS newest ON ((cost_daily.SourceId = newest.sourceId AND cost_daily.Date = newest.date) AND cost_daily.IngestedAt = newest.ingestedAt)
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-09-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+          AND cost_daily.ChargeCategory != 'none'
+          AND cost_daily.Region IN ('us-east-1', 'global')
+        GROUP BY date, sourceId, provider, account, cloudService, serviceCategory, usageType, region, resource, service, chargeCategory, currency) AS latest
+        GROUP BY currency
+        ORDER BY inWindow DESC, cost DESC, previousCost DESC, currency ASC
+        FORMAT JSON
+
+-- builder:cost:costSourceCoverageQuery:default  [8dac47d3]
+SELECT
+          cost_daily.SourceId AS sourceId,
+          min(cost_daily.Date) AS firstDate,
+          max(cost_daily.Date) AS lastDate,
+          max(cost_daily.IngestedAt) AS lastPulledAt
+        FROM cost_daily
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-10-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+        GROUP BY sourceId
+        ORDER BY sourceId ASC
+        FORMAT JSON
+
+-- builder:cost:costTimeseriesQuery:byCloudServiceTopKeys  [92e3d568]
+SELECT
+          latest.date AS date,
+          if(latest.cloudService IN ('Amazon Elastic Compute Cloud - Compute', 'Amazon Elastic Load Balancing'), latest.cloudService, '__other__') AS key,
+          if(latest.cloudService IN ('Amazon Elastic Compute Cloud - Compute', 'Amazon Elastic Load Balancing'), 0, 1) AS other,
+          ifNull(sum(latest.cost), 0) AS cost,
+          max(latest.estimated) AS estimated
+        FROM (SELECT
+          cost_daily.Date AS date,
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Provider AS provider,
+          cost_daily.AccountId AS account,
+          cost_daily.CloudService AS cloudService,
+          cost_daily.ServiceCategory AS serviceCategory,
+          cost_daily.UsageType AS usageType,
+          cost_daily.Region AS region,
+          cost_daily.ResourceId AS resource,
+          cost_daily.ServiceName AS service,
+          cost_daily.ChargeCategory AS chargeCategory,
+          cost_daily.Currency AS currency,
+          max(cost_daily.BilledCost) AS cost,
+          max(cost_daily.Estimated) AS estimated
+        FROM cost_daily
+        INNER JOIN (SELECT
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Date AS date,
+          max(cost_daily.IngestedAt) AS ingestedAt
+        FROM cost_daily
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-10-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+        GROUP BY sourceId, date) AS newest ON ((cost_daily.SourceId = newest.sourceId AND cost_daily.Date = newest.date) AND cost_daily.IngestedAt = newest.ingestedAt)
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-10-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+          AND cost_daily.ChargeCategory != 'none'
+          AND cost_daily.Region IN ('us-east-1', 'global')
+          AND cost_daily.Currency = 'USD'
+        GROUP BY date, sourceId, provider, account, cloudService, serviceCategory, usageType, region, resource, service, chargeCategory, currency) AS latest
+        GROUP BY date, key, other
+        ORDER BY date ASC, key ASC, other ASC
+        FORMAT JSON
+
+-- builder:cost:costTotalsQuery:filtered  [479224e0]
+SELECT
+          ifNull(sumIf(latest.cost, latest.date >= '2026-10-01 00:00:00'), 0) AS cost,
+          ifNull(sumIf(latest.cost, NOT (latest.date >= '2026-10-01 00:00:00')), 0) AS previousCost,
+          uniqIf(latest.date, (latest.date >= '2026-10-01 00:00:00' AND latest.estimated = 1)) AS estimatedDays,
+          if(anyIf(latest.currency, latest.date >= '2026-10-01 00:00:00') != '', anyIf(latest.currency, latest.date >= '2026-10-01 00:00:00'), any(latest.currency)) AS currency,
+          uniq(latest.currency) AS currencies
+        FROM (SELECT
+          cost_daily.Date AS date,
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Provider AS provider,
+          cost_daily.AccountId AS account,
+          cost_daily.CloudService AS cloudService,
+          cost_daily.ServiceCategory AS serviceCategory,
+          cost_daily.UsageType AS usageType,
+          cost_daily.Region AS region,
+          cost_daily.ResourceId AS resource,
+          cost_daily.ServiceName AS service,
+          cost_daily.ChargeCategory AS chargeCategory,
+          cost_daily.Currency AS currency,
+          max(cost_daily.BilledCost) AS cost,
+          max(cost_daily.Estimated) AS estimated
+        FROM cost_daily
+        INNER JOIN (SELECT
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Date AS date,
+          max(cost_daily.IngestedAt) AS ingestedAt
+        FROM cost_daily
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-09-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+        GROUP BY sourceId, date) AS newest ON ((cost_daily.SourceId = newest.sourceId AND cost_daily.Date = newest.date) AND cost_daily.IngestedAt = newest.ingestedAt)
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-09-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+          AND cost_daily.ChargeCategory != 'none'
+          AND cost_daily.Region IN ('us-east-1', 'global')
+        GROUP BY date, sourceId, provider, account, cloudService, serviceCategory, usageType, region, resource, service, chargeCategory, currency) AS latest
+        FORMAT JSON
+
+-- builder:cost:costTotalsQuery:inOneCurrency  [6f3d120d]
+SELECT
+          ifNull(sumIf(latest.cost, latest.date >= '2026-10-01 00:00:00'), 0) AS cost,
+          ifNull(sumIf(latest.cost, NOT (latest.date >= '2026-10-01 00:00:00')), 0) AS previousCost,
+          uniqIf(latest.date, (latest.date >= '2026-10-01 00:00:00' AND latest.estimated = 1)) AS estimatedDays,
+          if(anyIf(latest.currency, latest.date >= '2026-10-01 00:00:00') != '', anyIf(latest.currency, latest.date >= '2026-10-01 00:00:00'), any(latest.currency)) AS currency,
+          uniq(latest.currency) AS currencies
+        FROM (SELECT
+          cost_daily.Date AS date,
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Provider AS provider,
+          cost_daily.AccountId AS account,
+          cost_daily.CloudService AS cloudService,
+          cost_daily.ServiceCategory AS serviceCategory,
+          cost_daily.UsageType AS usageType,
+          cost_daily.Region AS region,
+          cost_daily.ResourceId AS resource,
+          cost_daily.ServiceName AS service,
+          cost_daily.ChargeCategory AS chargeCategory,
+          cost_daily.Currency AS currency,
+          max(cost_daily.BilledCost) AS cost,
+          max(cost_daily.Estimated) AS estimated
+        FROM cost_daily
+        INNER JOIN (SELECT
+          cost_daily.SourceId AS sourceId,
+          cost_daily.Date AS date,
+          max(cost_daily.IngestedAt) AS ingestedAt
+        FROM cost_daily
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-09-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+        GROUP BY sourceId, date) AS newest ON ((cost_daily.SourceId = newest.sourceId AND cost_daily.Date = newest.date) AND cost_daily.IngestedAt = newest.ingestedAt)
+        WHERE cost_daily.OrgId = 'org_sql_catalog'
+          AND cost_daily.Date >= '2026-09-01 00:00:00'
+          AND cost_daily.Date <= '2026-10-30 00:00:00'
+          AND cost_daily.SourceId IN ('0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11')
+          AND cost_daily.ChargeCategory != 'none'
+          AND cost_daily.Region IN ('us-east-1', 'global')
+          AND cost_daily.Currency = 'USD'
+        GROUP BY date, sourceId, provider, account, cloudService, serviceCategory, usageType, region, resource, service, chargeCategory, currency) AS latest
         FORMAT JSON
 
 -- builder:errors:errorCooccurringFingerprintsQuery:default  [e257ab78]
@@ -3953,7 +4291,7 @@ SELECT
         ORDER BY bucket ASC, groupName ASC
         FORMAT JSON
 
--- builder:product-events-paths:productEventsPathsQuery:after-person  [ca42de6b]
+-- builder:product-events-paths:productEventsPathsQuery:after-person  [387f0bb9]
 SELECT
           mapped.hop AS hop,
           mapped.fromNode AS fromNode,
@@ -3986,7 +4324,7 @@ SELECT
           toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
           e.Seq AS seq,
           e.Kind AS kind,
-          if(e.Kind = 'navigation', e.PagePath, e.EventName) AS name,
+          if((e.Kind IN ('navigation', 'screen') AND e.PagePath != ''), e.PagePath, e.EventName) AS name,
           toUInt8(e.EventName = 'signup_completed') AS isAnchor
         FROM product_events AS e
         LEFT JOIN (SELECT
@@ -4078,7 +4416,7 @@ SELECT
         ORDER BY hop ASC, count DESC, fromNode ASC, toNode ASC
         FORMAT JSON
 
--- builder:product-events-paths:productEventsPathsQuery:before-session-pages-filtered  [59eef311]
+-- builder:product-events-paths:productEventsPathsQuery:before-session-pages-filtered  [a4e7b20b]
 SELECT
           mapped.hop AS hop,
           mapped.fromNode AS fromNode,
@@ -4111,8 +4449,8 @@ SELECT
           toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
           e.Seq AS seq,
           e.Kind AS kind,
-          if(e.Kind = 'navigation', e.PagePath, e.EventName) AS name,
-          toUInt8(((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS isAnchor
+          if((e.Kind IN ('navigation', 'screen') AND e.PagePath != ''), e.PagePath, e.EventName) AS name,
+          toUInt8(((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS isAnchor
         FROM product_events AS e
         WHERE e.OrgId = 'org_sql_catalog'
           AND e.Timestamp >= '2026-01-01 10:30:00'
@@ -4198,11 +4536,11 @@ SELECT
           AND product_events.EventName = 'signup_started'
         GROUP BY sessionId)
         GROUP BY key)
-          AND ((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')
+          AND ((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')
         GROUP BY key) AS a ON r.key = a.key
         WHERE r.ts <= a.anchorTs
           AND r.ts >= a.anchorTs - 3600000
-          AND (r.isAnchor = 1 OR r.kind = 'navigation')) AS path_events
+          AND (r.isAnchor = 1 OR r.kind IN ('navigation', 'screen'))) AS path_events
         GROUP BY key) AS per_person
         WHERE anchorIdx > 0) AS sequences) AS edges
         WHERE tupleElement(edge, 1) <= 2
@@ -4253,13 +4591,13 @@ SELECT
         ORDER BY hop ASC, count DESC, fromNode ASC, toNode ASC
         FORMAT JSON
 
--- builder:product-events:productEventNamesQuery:default  [1562ead5]
+-- builder:product-events:productEventNamesQuery:default  [d05b039c]
 SELECT
           product_events.EventName AS eventName,
           product_events.Kind AS kind,
           count() AS count,
           uniqIf(product_events.SessionId, product_events.SessionId != '') AS sessions,
-          uniq(if(product_events.UserId != '', product_events.UserId, product_events.VisitorId)) AS persons
+          uniq(if(product_events.VisitorId != '', product_events.VisitorId, product_events.UserId)) AS persons
         FROM product_events
         WHERE product_events.OrgId = 'org_sql_catalog'
           AND product_events.Timestamp >= '2026-01-01 10:30:00'
@@ -4269,13 +4607,13 @@ SELECT
         LIMIT 100
         FORMAT JSON
 
--- builder:product-events:productEventNamesQuery:filtered  [d2ec0a20]
+-- builder:product-events:productEventNamesQuery:filtered  [b9a881b9]
 SELECT
           product_events.EventName AS eventName,
           product_events.Kind AS kind,
           count() AS count,
           uniqIf(product_events.SessionId, product_events.SessionId != '') AS sessions,
-          uniq(if(product_events.UserId != '', product_events.UserId, product_events.VisitorId)) AS persons
+          uniq(if(product_events.VisitorId != '', product_events.VisitorId, product_events.UserId)) AS persons
         FROM product_events
         WHERE product_events.OrgId = 'org_sql_catalog'
           AND product_events.Timestamp >= '2026-01-01 10:30:00'
@@ -4341,7 +4679,7 @@ SELECT
         LIMIT 50
         FORMAT JSON
 
--- builder:product-events:productEventsFunnelBreakdownQuery:attribute-session-step  [c28317af]
+-- builder:product-events:productEventsFunnelBreakdownQuery:attribute-session-step  [9bf9b182]
 SELECT
           groups.group AS group,
           arrayJoin([1, 2, 3, 4]) AS step,
@@ -4351,14 +4689,34 @@ SELECT
           [countIf(level >= 1), countIf(level >= 2), countIf(level >= 3), countIf(level >= 4)] AS counts,
           countIf(level >= 1) AS entered
         FROM (SELECT
+          walked.key AS key,
+          walked.level AS level,
+          group AS group
+        FROM (SELECT
+          person_events.key AS key,
+          person_events.evs AS evs,
+          arrayFill(v -> v > 0, arrayMap(x -> if(x.2 = 1, x.1, toUInt64(0)), evs)) AS a1,
+          arrayMap((x, p) -> if(x.3 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a1), toUInt64(0))) AS b2,
+          arrayFill(v -> v > 0, b2) AS a2,
+          arrayMap((x, p) -> if(x.4 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a2), toUInt64(0))) AS b3,
+          arrayFill(v -> v > 0, b3) AS a3,
+          arrayMap((x, p) -> if(x.5 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a3), toUInt64(0))) AS b4,
+          arrayFill(v -> v > 0, b4) AS a4,
+          arrayFirst(v -> v > 0, a1) AS f1,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b2), 1) AS f2,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b3), 1) AS f3,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b4), 1) AS f4,
+          toUInt8((f1 > 0) + (f2 > 0) + (f3 > 0) + (f4 > 0)) AS level,
+          greatest(f1, f2, f3, f4) AS reachedAt,
+          group AS group
+        FROM (SELECT
           funnel_events.key AS key,
-          windowFunnel(604800000)(funnel_events.ts, funnel_events.s1 = 1, funnel_events.s2 = 1, funnel_events.s3 = 1, funnel_events.s4 = 1) AS level,
-          argMinIf(funnel_events.dim, funnel_events.ts, funnel_events.dim != '') AS group
+          arraySort(x -> (x.1, 1 - x.2, 1 - x.3, 1 - x.4, 1 - x.5), groupArray(tuple(ord, s1, s2, s3, s4))) AS evs,
+          argMinIf(funnel_events.dim, funnel_events.ord, funnel_events.dim != '') AS group
         FROM (
 SELECT
           s.UserId AS key,
-          toUInt64(toUnixTimestamp64Milli(s.StartTime)) AS ts,
-          0 AS seq,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(s.StartTime)), 1048576), modulo(0, 1048576)) AS ord,
           1 AS s1,
           0 AS s2,
           0 AS s3,
@@ -4373,10 +4731,9 @@ SELECT
 UNION ALL
 SELECT
           e.UserId AS key,
-          toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
-          e.Seq AS seq,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(e.Timestamp)), 1048576), modulo(e.Seq, 1048576)) AS ord,
           0 AS s1,
-          toUInt8(((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s2,
+          toUInt8(((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s2,
           toUInt8(e.EventName = 'signup_completed') AS s3,
           toUInt8((e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup')) AS s4,
           e.Attributes['plan'] AS dim
@@ -4384,17 +4741,17 @@ SELECT
         WHERE e.OrgId = 'org_sql_catalog'
           AND e.Timestamp >= '2026-01-01 10:30:00'
           AND e.Timestamp <= '2026-01-03 14:15:00'
-          AND (((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
+          AND (((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
           AND e.UserId != ''
 ) AS funnel_events
-        GROUP BY key) AS levels
+        GROUP BY key) AS person_events) AS walked) AS levels
         GROUP BY group
         ORDER BY entered DESC, group ASC
         LIMIT 5) AS groups
         ORDER BY group ASC, step ASC
         FORMAT JSON
 
--- builder:product-events:productEventsFunnelBreakdownQuery:session-dimension  [f210b7b0]
+-- builder:product-events:productEventsFunnelBreakdownQuery:session-dimension  [210cccc5]
 SELECT
           groups.group AS group,
           arrayJoin([1, 2, 3]) AS step,
@@ -4404,14 +4761,31 @@ SELECT
           [countIf(level >= 1), countIf(level >= 2), countIf(level >= 3)] AS counts,
           countIf(level >= 1) AS entered
         FROM (SELECT
+          walked.key AS key,
+          walked.level AS level,
+          group AS group
+        FROM (SELECT
+          person_events.key AS key,
+          person_events.evs AS evs,
+          arrayFill(v -> v > 0, arrayMap(x -> if(x.2 = 1, x.1, toUInt64(0)), evs)) AS a1,
+          arrayMap((x, p) -> if(x.3 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a1), toUInt64(0))) AS b2,
+          arrayFill(v -> v > 0, b2) AS a2,
+          arrayMap((x, p) -> if(x.4 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a2), toUInt64(0))) AS b3,
+          arrayFill(v -> v > 0, b3) AS a3,
+          arrayFirst(v -> v > 0, a1) AS f1,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b2), 1) AS f2,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b3), 1) AS f3,
+          toUInt8((f1 > 0) + (f2 > 0) + (f3 > 0)) AS level,
+          greatest(f1, f2, f3) AS reachedAt,
+          group AS group
+        FROM (SELECT
           funnel_events.key AS key,
-          windowFunnel(604800000)(funnel_events.ts, funnel_events.s1 = 1, funnel_events.s2 = 1, funnel_events.s3 = 1) AS level,
-          argMinIf(funnel_events.dim, funnel_events.ts, funnel_events.dim != '') AS group
+          arraySort(x -> (x.1, 1 - x.2, 1 - x.3, 1 - x.4), groupArray(tuple(ord, s1, s2, s3))) AS evs,
+          argMinIf(funnel_events.dim, funnel_events.ord, funnel_events.dim != '') AS group
         FROM (SELECT
           multiIf(e.UserId != '', e.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), e.VisitorId) AS key,
-          toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
-          e.Seq AS seq,
-          toUInt8(((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(e.Timestamp)), 1048576), modulo(e.Seq, 1048576)) AS ord,
+          toUInt8(((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
           toUInt8(e.EventName = 'signup_completed') AS s2,
           toUInt8((e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup')) AS s3,
           coalesce(sd.Value, '') AS dim
@@ -4438,16 +4812,16 @@ SELECT
         WHERE e.OrgId = 'org_sql_catalog'
           AND e.Timestamp >= '2026-01-01 10:30:00'
           AND e.Timestamp <= '2026-01-03 14:15:00'
-          AND (((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
+          AND (((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
           AND multiIf(e.UserId != '', e.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), e.VisitorId) != '') AS funnel_events
-        GROUP BY key) AS levels
+        GROUP BY key) AS person_events) AS walked) AS levels
         GROUP BY group
         ORDER BY entered DESC, group ASC
         LIMIT 10) AS groups
         ORDER BY group ASC, step ASC
         FORMAT JSON
 
--- builder:product-events:productEventsFunnelLeaversQuery:visitor-filtered  [95bb693c]
+-- builder:product-events:productEventsFunnelLeaversQuery:visitor-filtered  [e4ee4b23]
 SELECT
           hops.step AS step,
           tupleElement(hop, 1) AS next,
@@ -4457,86 +4831,55 @@ SELECT
           arrayJoin(head) AS hop
         FROM (SELECT
           counted.step AS step,
-          arraySlice(arrayReverseSort(x -> x.2, groupArray(tuple(next, count))), 1, 6) AS head
+          arraySlice(arraySort(x -> (-toInt64(x.2), x.1), groupArray(tuple(next, count))), 1, 6) AS head
         FROM (SELECT
           nexts.step AS step,
           nexts.next AS next,
           count() AS count
         FROM (SELECT
-          e.key AS key,
+          d.key AS key,
           d.step AS step,
-          argMinIf(e.name, e.ts, e.ts > d.tLast) AS next
+          argMinIf(coalesce(e.name, ''), tuple(coalesce(e.ord, 0), coalesce(e.name, '')), coalesce(e.ord, 0) > d.lastOrd) AS next
         FROM (SELECT
-          e.VisitorId AS key,
-          toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
-          if(e.Kind = 'navigation', e.PagePath, e.EventName) AS name
-        FROM product_events AS e
-        WHERE e.OrgId = 'org_sql_catalog'
-          AND e.Timestamp >= '2026-01-01 10:30:00'
-          AND e.Timestamp <= '2026-01-03 14:15:00'
-          AND e.VisitorId != ''
-          AND e.VisitorId IN (SELECT
-          session_replays.VisitorId AS key
-        FROM session_replays
-        WHERE session_replays.OrgId = 'org_sql_catalog'
-          AND session_replays.StartTime >= '2026-01-01 10:30:00'
-          AND session_replays.StartTime <= '2026-01-03 14:15:00'
-          AND session_replays.SessionId IN (SELECT
-          product_events.SessionId AS sessionId
-        FROM product_events
-        WHERE product_events.OrgId = 'org_sql_catalog'
-          AND product_events.Timestamp >= '2026-01-01 10:30:00'
-          AND product_events.Timestamp <= '2026-01-03 14:15:00'
-          AND product_events.Kind = 'navigation'
-          AND product_events.Host = 'maple.dev'
-          AND product_events.PagePath = '/pricing'
-        GROUP BY sessionId)
-          AND session_replays.ReferrerHost = 't.co'
-          AND session_replays.Country = 'DE'
-          AND session_replays.DeviceType = 'desktop'
-          AND session_replays.BrowserName = 'Chrome'
-          AND session_replays.OsName = 'macOS'
-          AND session_replays.Language = 'en-US'
-          AND session_replays.UtmSource = 'twitter'
-          AND session_replays.UtmMedium = 'social'
-          AND session_replays.UtmCampaign = 'launch'
-          AND session_replays.VisitorIsNew = 1
-          AND session_replays.SessionId IN (SELECT
-          product_events.SessionId AS sessionId
-        FROM product_events
-        WHERE product_events.OrgId = 'org_sql_catalog'
-          AND product_events.Timestamp >= '2026-01-01 10:30:00'
-          AND product_events.Timestamp <= '2026-01-03 14:15:00'
-          AND product_events.Kind = 'custom'
-          AND product_events.EventName = 'signup_started'
-        GROUP BY sessionId)
-        GROUP BY key)) AS e
-        INNER JOIN (SELECT
           chain.key AS key,
           chain.level + 1 AS step,
-          arrayElement([t1, t2, t3], level) AS tLast
+          arrayElement([o1, o2, o3], level) AS lastOrd
         FROM (SELECT
-          chain_events.key AS key,
-          chain_events.level AS level,
-          tupleElement(arrayFirst(x -> x.3 = 1, evs), 1) AS t1,
-          tupleElement(arrayFirst(x -> t1 > 0 AND x.4 = 1 AND x.1 >= t1 AND x.1 <= t1 + 604800000, evs), 1) AS t2,
-          tupleElement(arrayFirst(x -> t2 > 0 AND x.5 = 1 AND x.1 >= t2 AND x.1 <= t1 + 604800000, evs), 1) AS t3
+          walked.key AS key,
+          walked.level AS level,
+          if(level >= 1, arrayFirstIndex(x -> x.2 = 1 AND intDiv(x.1, 1048576) + 604800000 >= intDiv(reachedAt, 1048576), evs), 0) AS i1,
+          if(i1 > 0, tupleElement(arrayElement(evs, i1), 1), toUInt64(0)) AS o1,
+          if(level >= 2, arrayFirstIndex((x, i) -> x.3 = 1 AND i > i1, evs, arrayEnumerate(evs)), 0) AS i2,
+          if(i2 > 0, tupleElement(arrayElement(evs, i2), 1), toUInt64(0)) AS o2,
+          if(level >= 3, arrayFirstIndex((x, i) -> x.4 = 1 AND i > i2, evs, arrayEnumerate(evs)), 0) AS i3,
+          if(i3 > 0, tupleElement(arrayElement(evs, i3), 1), toUInt64(0)) AS o3
+        FROM (SELECT
+          person_events.key AS key,
+          person_events.evs AS evs,
+          arrayFill(v -> v > 0, arrayMap(x -> if(x.2 = 1, x.1, toUInt64(0)), evs)) AS a1,
+          arrayMap((x, p) -> if(x.3 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a1), toUInt64(0))) AS b2,
+          arrayFill(v -> v > 0, b2) AS a2,
+          arrayMap((x, p) -> if(x.4 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a2), toUInt64(0))) AS b3,
+          arrayFill(v -> v > 0, b3) AS a3,
+          arrayFirst(v -> v > 0, a1) AS f1,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b2), 1) AS f2,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b3), 1) AS f3,
+          toUInt8((f1 > 0) + (f2 > 0) + (f3 > 0)) AS level,
+          greatest(f1, f2, f3) AS reachedAt
         FROM (SELECT
           funnel_events.key AS key,
-          windowFunnel(604800000)(funnel_events.ts, funnel_events.s1 = 1, funnel_events.s2 = 1, funnel_events.s3 = 1) AS level,
-          arraySort(x -> (x.1, x.2), groupArray(tuple(ts, seq, s1, s2, s3))) AS evs
+          arraySort(x -> (x.1, 1 - x.2, 1 - x.3, 1 - x.4), groupArray(tuple(ord, s1, s2, s3))) AS evs
         FROM (SELECT
           e.VisitorId AS key,
-          toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
-          e.Seq AS seq,
-          toUInt8(((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(e.Timestamp)), 1048576), modulo(e.Seq, 1048576)) AS ord,
+          toUInt8(((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
           toUInt8(e.EventName = 'signup_completed') AS s2,
           toUInt8((e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup')) AS s3
         FROM product_events AS e
         WHERE e.OrgId = 'org_sql_catalog'
           AND e.Timestamp >= '2026-01-01 10:30:00'
           AND e.Timestamp <= '2026-01-03 14:15:00'
-          AND (((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
+          AND (((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
           AND e.VisitorId != ''
           AND e.VisitorId IN (SELECT
           session_replays.VisitorId AS key
@@ -4574,30 +4917,89 @@ SELECT
           AND product_events.EventName = 'signup_started'
         GROUP BY sessionId)
         GROUP BY key)) AS funnel_events
-        GROUP BY key) AS chain_events) AS chain
+        GROUP BY key) AS person_events) AS walked) AS chain
         WHERE chain.level >= 1
-          AND chain.level < 3
-          AND arrayElement([t1, t2, t3], level) > 0) AS d ON e.key = d.key
+          AND chain.level < 3) AS d
+        LEFT JOIN (SELECT
+          e.VisitorId AS key,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(e.Timestamp)), 1048576), modulo(e.Seq, 1048576)) AS ord,
+          if((e.Kind IN ('navigation', 'screen') AND e.PagePath != ''), e.PagePath, e.EventName) AS name
+        FROM product_events AS e
+        WHERE e.OrgId = 'org_sql_catalog'
+          AND e.Timestamp >= '2026-01-01 10:30:00'
+          AND e.Timestamp <= '2026-01-03 14:15:00'
+          AND e.VisitorId != ''
+          AND e.VisitorId IN (SELECT
+          session_replays.VisitorId AS key
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+          AND session_replays.SessionId IN (SELECT
+          product_events.SessionId AS sessionId
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.Kind = 'navigation'
+          AND product_events.Host = 'maple.dev'
+          AND product_events.PagePath = '/pricing'
+        GROUP BY sessionId)
+          AND session_replays.ReferrerHost = 't.co'
+          AND session_replays.Country = 'DE'
+          AND session_replays.DeviceType = 'desktop'
+          AND session_replays.BrowserName = 'Chrome'
+          AND session_replays.OsName = 'macOS'
+          AND session_replays.Language = 'en-US'
+          AND session_replays.UtmSource = 'twitter'
+          AND session_replays.UtmMedium = 'social'
+          AND session_replays.UtmCampaign = 'launch'
+          AND session_replays.VisitorIsNew = 1
+          AND session_replays.SessionId IN (SELECT
+          product_events.SessionId AS sessionId
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.Kind = 'custom'
+          AND product_events.EventName = 'signup_started'
+        GROUP BY sessionId)
+        GROUP BY key)) AS e ON d.key = e.key
         GROUP BY key, step) AS nexts
         GROUP BY step, next) AS counted
         GROUP BY step) AS ranked) AS hops
         ORDER BY step ASC, count DESC, next ASC
         FORMAT JSON
 
--- builder:product-events:productEventsFunnelQuery:person  [877c57db]
+-- builder:product-events:productEventsFunnelQuery:person  [3ef2759a]
 SELECT
           arrayJoin([1, 2, 3]) AS step,
           arrayElement(totals.counts, step) AS count
         FROM (SELECT
           [countIf(level >= 1), countIf(level >= 2), countIf(level >= 3)] AS counts
         FROM (SELECT
+          walked.key AS key,
+          walked.level AS level
+        FROM (SELECT
+          person_events.key AS key,
+          person_events.evs AS evs,
+          arrayFill(v -> v > 0, arrayMap(x -> if(x.2 = 1, x.1, toUInt64(0)), evs)) AS a1,
+          arrayMap((x, p) -> if(x.3 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a1), toUInt64(0))) AS b2,
+          arrayFill(v -> v > 0, b2) AS a2,
+          arrayMap((x, p) -> if(x.4 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a2), toUInt64(0))) AS b3,
+          arrayFill(v -> v > 0, b3) AS a3,
+          arrayFirst(v -> v > 0, a1) AS f1,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b2), 1) AS f2,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b3), 1) AS f3,
+          toUInt8((f1 > 0) + (f2 > 0) + (f3 > 0)) AS level,
+          greatest(f1, f2, f3) AS reachedAt
+        FROM (SELECT
           funnel_events.key AS key,
-          windowFunnel(604800000)(funnel_events.ts, funnel_events.s1 = 1, funnel_events.s2 = 1, funnel_events.s3 = 1) AS level
+          arraySort(x -> (x.1, 1 - x.2, 1 - x.3, 1 - x.4), groupArray(tuple(ord, s1, s2, s3))) AS evs
         FROM (SELECT
           multiIf(e.UserId != '', e.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), e.VisitorId) AS key,
-          toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
-          e.Seq AS seq,
-          toUInt8(((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(e.Timestamp)), 1048576), modulo(e.Seq, 1048576)) AS ord,
+          toUInt8(((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
           toUInt8(e.EventName = 'signup_completed') AS s2,
           toUInt8((e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup')) AS s3
         FROM product_events AS e
@@ -4615,52 +5017,85 @@ SELECT
         WHERE e.OrgId = 'org_sql_catalog'
           AND e.Timestamp >= '2026-01-01 10:30:00'
           AND e.Timestamp <= '2026-01-03 14:15:00'
-          AND (((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
+          AND (((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
           AND multiIf(e.UserId != '', e.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), e.VisitorId) != '') AS funnel_events
-        GROUP BY key) AS levels) AS totals
+        GROUP BY key) AS person_events) AS walked) AS levels) AS totals
         ORDER BY step ASC
         FORMAT JSON
 
--- builder:product-events:productEventsFunnelQuery:session-key  [118d45ba]
+-- builder:product-events:productEventsFunnelQuery:session-key  [6abee1d1]
 SELECT
           arrayJoin([1, 2, 3]) AS step,
           arrayElement(totals.counts, step) AS count
         FROM (SELECT
           [countIf(level >= 1), countIf(level >= 2), countIf(level >= 3)] AS counts
         FROM (SELECT
+          walked.key AS key,
+          walked.level AS level
+        FROM (SELECT
+          person_events.key AS key,
+          person_events.evs AS evs,
+          arrayFill(v -> v > 0, arrayMap(x -> if(x.2 = 1, x.1, toUInt64(0)), evs)) AS a1,
+          arrayMap((x, p) -> if(x.3 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 1800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a1), toUInt64(0))) AS b2,
+          arrayFill(v -> v > 0, b2) AS a2,
+          arrayMap((x, p) -> if(x.4 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 1800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a2), toUInt64(0))) AS b3,
+          arrayFill(v -> v > 0, b3) AS a3,
+          arrayFirst(v -> v > 0, a1) AS f1,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b2), 1) AS f2,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b3), 1) AS f3,
+          toUInt8((f1 > 0) + (f2 > 0) + (f3 > 0)) AS level,
+          greatest(f1, f2, f3) AS reachedAt
+        FROM (SELECT
           funnel_events.key AS key,
-          windowFunnel(1800000)(funnel_events.ts, funnel_events.s1 = 1, funnel_events.s2 = 1, funnel_events.s3 = 1) AS level
+          arraySort(x -> (x.1, 1 - x.2, 1 - x.3, 1 - x.4), groupArray(tuple(ord, s1, s2, s3))) AS evs
         FROM (SELECT
           e.SessionId AS key,
-          toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
-          e.Seq AS seq,
-          toUInt8(((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(e.Timestamp)), 1048576), modulo(e.Seq, 1048576)) AS ord,
+          toUInt8(((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
           toUInt8(e.EventName = 'signup_completed') AS s2,
           toUInt8((e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup')) AS s3
         FROM product_events AS e
         WHERE e.OrgId = 'org_sql_catalog'
           AND e.Timestamp >= '2026-01-01 10:30:00'
           AND e.Timestamp <= '2026-01-03 14:15:00'
-          AND (((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
+          AND (((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
           AND e.SessionId != '') AS funnel_events
-        GROUP BY key) AS levels) AS totals
+        GROUP BY key) AS person_events) AS walked) AS levels) AS totals
         ORDER BY step ASC
         FORMAT JSON
 
--- builder:product-events:productEventsFunnelQuery:session-step-filtered  [7bae7ef8]
+-- builder:product-events:productEventsFunnelQuery:session-step-filtered  [a221d533]
 SELECT
           arrayJoin([1, 2, 3, 4]) AS step,
           arrayElement(totals.counts, step) AS count
         FROM (SELECT
           [countIf(level >= 1), countIf(level >= 2), countIf(level >= 3), countIf(level >= 4)] AS counts
         FROM (SELECT
+          walked.key AS key,
+          walked.level AS level
+        FROM (SELECT
+          person_events.key AS key,
+          person_events.evs AS evs,
+          arrayFill(v -> v > 0, arrayMap(x -> if(x.2 = 1, x.1, toUInt64(0)), evs)) AS a1,
+          arrayMap((x, p) -> if(x.3 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a1), toUInt64(0))) AS b2,
+          arrayFill(v -> v > 0, b2) AS a2,
+          arrayMap((x, p) -> if(x.4 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a2), toUInt64(0))) AS b3,
+          arrayFill(v -> v > 0, b3) AS a3,
+          arrayMap((x, p) -> if(x.5 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a3), toUInt64(0))) AS b4,
+          arrayFill(v -> v > 0, b4) AS a4,
+          arrayFirst(v -> v > 0, a1) AS f1,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b2), 1) AS f2,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b3), 1) AS f3,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b4), 1) AS f4,
+          toUInt8((f1 > 0) + (f2 > 0) + (f3 > 0) + (f4 > 0)) AS level,
+          greatest(f1, f2, f3, f4) AS reachedAt
+        FROM (SELECT
           funnel_events.key AS key,
-          windowFunnel(604800000)(funnel_events.ts, funnel_events.s1 = 1, funnel_events.s2 = 1, funnel_events.s3 = 1, funnel_events.s4 = 1) AS level
+          arraySort(x -> (x.1, 1 - x.2, 1 - x.3, 1 - x.4, 1 - x.5), groupArray(tuple(ord, s1, s2, s3, s4))) AS evs
         FROM (
 SELECT
           multiIf(s.UserId != '', s.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), s.VisitorId) AS key,
-          toUInt64(toUnixTimestamp64Milli(s.StartTime)) AS ts,
-          0 AS seq,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(s.StartTime)), 1048576), modulo(0, 1048576)) AS ord,
           1 AS s1,
           0 AS s2,
           0 AS s3,
@@ -4732,10 +5167,9 @@ SELECT
 UNION ALL
 SELECT
           multiIf(e.UserId != '', e.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), e.VisitorId) AS key,
-          toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
-          e.Seq AS seq,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(e.Timestamp)), 1048576), modulo(e.Seq, 1048576)) AS ord,
           0 AS s1,
-          toUInt8(((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s2,
+          toUInt8(((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s2,
           toUInt8(e.EventName = 'signup_completed') AS s3,
           toUInt8((e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup')) AS s4
         FROM product_events AS e
@@ -4753,7 +5187,7 @@ SELECT
         WHERE e.OrgId = 'org_sql_catalog'
           AND e.Timestamp >= '2026-01-01 10:30:00'
           AND e.Timestamp <= '2026-01-03 14:15:00'
-          AND (((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
+          AND (((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
           AND multiIf(e.UserId != '', e.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), e.VisitorId) != ''
           AND multiIf(e.UserId != '', e.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), e.VisitorId) IN (SELECT
           multiIf(s.UserId != '', s.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), s.VisitorId) AS key
@@ -4803,24 +5237,42 @@ SELECT
         GROUP BY sessionId)
         GROUP BY key)
 ) AS funnel_events
-        GROUP BY key) AS levels) AS totals
+        GROUP BY key) AS person_events) AS walked) AS levels) AS totals
         ORDER BY step ASC
         FORMAT JSON
 
--- builder:product-events:productEventsFunnelQuery:visitor-session-step  [59b281c2]
+-- builder:product-events:productEventsFunnelQuery:visitor-session-step  [81721d45]
 SELECT
           arrayJoin([1, 2, 3, 4]) AS step,
           arrayElement(totals.counts, step) AS count
         FROM (SELECT
           [countIf(level >= 1), countIf(level >= 2), countIf(level >= 3), countIf(level >= 4)] AS counts
         FROM (SELECT
+          walked.key AS key,
+          walked.level AS level
+        FROM (SELECT
+          person_events.key AS key,
+          person_events.evs AS evs,
+          arrayFill(v -> v > 0, arrayMap(x -> if(x.2 = 1, x.1, toUInt64(0)), evs)) AS a1,
+          arrayMap((x, p) -> if(x.3 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 3600000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a1), toUInt64(0))) AS b2,
+          arrayFill(v -> v > 0, b2) AS a2,
+          arrayMap((x, p) -> if(x.4 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 3600000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a2), toUInt64(0))) AS b3,
+          arrayFill(v -> v > 0, b3) AS a3,
+          arrayMap((x, p) -> if(x.5 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 3600000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a3), toUInt64(0))) AS b4,
+          arrayFill(v -> v > 0, b4) AS a4,
+          arrayFirst(v -> v > 0, a1) AS f1,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b2), 1) AS f2,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b3), 1) AS f3,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b4), 1) AS f4,
+          toUInt8((f1 > 0) + (f2 > 0) + (f3 > 0) + (f4 > 0)) AS level,
+          greatest(f1, f2, f3, f4) AS reachedAt
+        FROM (SELECT
           funnel_events.key AS key,
-          windowFunnel(3600000)(funnel_events.ts, funnel_events.s1 = 1, funnel_events.s2 = 1, funnel_events.s3 = 1, funnel_events.s4 = 1) AS level
+          arraySort(x -> (x.1, 1 - x.2, 1 - x.3, 1 - x.4, 1 - x.5), groupArray(tuple(ord, s1, s2, s3, s4))) AS evs
         FROM (
 SELECT
           s.VisitorId AS key,
-          toUInt64(toUnixTimestamp64Milli(s.StartTime)) AS ts,
-          0 AS seq,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(s.StartTime)), 1048576), modulo(0, 1048576)) AS ord,
           1 AS s1,
           0 AS s2,
           0 AS s3,
@@ -4834,46 +5286,63 @@ SELECT
 UNION ALL
 SELECT
           e.VisitorId AS key,
-          toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
-          e.Seq AS seq,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(e.Timestamp)), 1048576), modulo(e.Seq, 1048576)) AS ord,
           0 AS s1,
-          toUInt8(((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s2,
+          toUInt8(((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s2,
           toUInt8(e.EventName = 'signup_completed') AS s3,
           toUInt8((e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup')) AS s4
         FROM product_events AS e
         WHERE e.OrgId = 'org_sql_catalog'
           AND e.Timestamp >= '2026-01-01 10:30:00'
           AND e.Timestamp <= '2026-01-03 14:15:00'
-          AND (((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
+          AND (((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
           AND e.VisitorId != ''
 ) AS funnel_events
-        GROUP BY key) AS levels) AS totals
+        GROUP BY key) AS person_events) AS walked) AS levels) AS totals
         ORDER BY step ASC
         FORMAT JSON
 
--- builder:product-events:productEventsFunnelTimingQuery:person  [82b59764]
+-- builder:product-events:productEventsFunnelTimingQuery:person  [746bb43e]
 SELECT
           arrayJoin([2, 3]) AS step,
           arrayElement(totals.p50s, step) AS p50Ms,
-          arrayElement(totals.p90s, step) AS p90Ms
+          arrayElement(totals.p90s, step) AS p90Ms,
+          arrayElement(totals.start50s, step) AS sinceStartP50Ms,
+          arrayElement(totals.start90s, step) AS sinceStartP90Ms
         FROM (SELECT
-          [0, ifNotFinite(quantileIf(0.5)(toFloat64(t2 - t1), level >= 2 AND t2 > 0), 0), ifNotFinite(quantileIf(0.5)(toFloat64(t3 - t2), level >= 3 AND t3 > 0), 0)] AS p50s,
-          [0, ifNotFinite(quantileIf(0.9)(toFloat64(t2 - t1), level >= 2 AND t2 > 0), 0), ifNotFinite(quantileIf(0.9)(toFloat64(t3 - t2), level >= 3 AND t3 > 0), 0)] AS p90s
+          [0, ifNotFinite(quantileIf(0.5)(toFloat64(intDiv(o2, 1048576) - intDiv(o1, 1048576)), level >= 2), 0), ifNotFinite(quantileIf(0.5)(toFloat64(intDiv(o3, 1048576) - intDiv(o2, 1048576)), level >= 3), 0)] AS p50s,
+          [0, ifNotFinite(quantileIf(0.9)(toFloat64(intDiv(o2, 1048576) - intDiv(o1, 1048576)), level >= 2), 0), ifNotFinite(quantileIf(0.9)(toFloat64(intDiv(o3, 1048576) - intDiv(o2, 1048576)), level >= 3), 0)] AS p90s,
+          [0, ifNotFinite(quantileIf(0.5)(toFloat64(intDiv(o2, 1048576) - intDiv(o1, 1048576)), level >= 2), 0), ifNotFinite(quantileIf(0.5)(toFloat64(intDiv(o3, 1048576) - intDiv(o1, 1048576)), level >= 3), 0)] AS start50s,
+          [0, ifNotFinite(quantileIf(0.9)(toFloat64(intDiv(o2, 1048576) - intDiv(o1, 1048576)), level >= 2), 0), ifNotFinite(quantileIf(0.9)(toFloat64(intDiv(o3, 1048576) - intDiv(o1, 1048576)), level >= 3), 0)] AS start90s
         FROM (SELECT
-          chain_events.key AS key,
-          chain_events.level AS level,
-          tupleElement(arrayFirst(x -> x.3 = 1, evs), 1) AS t1,
-          tupleElement(arrayFirst(x -> t1 > 0 AND x.4 = 1 AND x.1 >= t1 AND x.1 <= t1 + 604800000, evs), 1) AS t2,
-          tupleElement(arrayFirst(x -> t2 > 0 AND x.5 = 1 AND x.1 >= t2 AND x.1 <= t1 + 604800000, evs), 1) AS t3
+          walked.key AS key,
+          walked.level AS level,
+          if(level >= 1, arrayFirstIndex(x -> x.2 = 1 AND intDiv(x.1, 1048576) + 604800000 >= intDiv(reachedAt, 1048576), evs), 0) AS i1,
+          if(i1 > 0, tupleElement(arrayElement(evs, i1), 1), toUInt64(0)) AS o1,
+          if(level >= 2, arrayFirstIndex((x, i) -> x.3 = 1 AND i > i1, evs, arrayEnumerate(evs)), 0) AS i2,
+          if(i2 > 0, tupleElement(arrayElement(evs, i2), 1), toUInt64(0)) AS o2,
+          if(level >= 3, arrayFirstIndex((x, i) -> x.4 = 1 AND i > i2, evs, arrayEnumerate(evs)), 0) AS i3,
+          if(i3 > 0, tupleElement(arrayElement(evs, i3), 1), toUInt64(0)) AS o3
+        FROM (SELECT
+          person_events.key AS key,
+          person_events.evs AS evs,
+          arrayFill(v -> v > 0, arrayMap(x -> if(x.2 = 1, x.1, toUInt64(0)), evs)) AS a1,
+          arrayMap((x, p) -> if(x.3 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a1), toUInt64(0))) AS b2,
+          arrayFill(v -> v > 0, b2) AS a2,
+          arrayMap((x, p) -> if(x.4 = 1 AND p > 0 AND intDiv(x.1, 1048576) <= intDiv(p, 1048576) + 604800000, p, toUInt64(0)), evs, arrayPushFront(arrayPopBack(a2), toUInt64(0))) AS b3,
+          arrayFill(v -> v > 0, b3) AS a3,
+          arrayFirst(v -> v > 0, a1) AS f1,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b2), 1) AS f2,
+          tupleElement(arrayFirst((x, b) -> b > 0, evs, b3), 1) AS f3,
+          toUInt8((f1 > 0) + (f2 > 0) + (f3 > 0)) AS level,
+          greatest(f1, f2, f3) AS reachedAt
         FROM (SELECT
           funnel_events.key AS key,
-          windowFunnel(604800000)(funnel_events.ts, funnel_events.s1 = 1, funnel_events.s2 = 1, funnel_events.s3 = 1) AS level,
-          arraySort(x -> (x.1, x.2), groupArray(tuple(ts, seq, s1, s2, s3))) AS evs
+          arraySort(x -> (x.1, 1 - x.2, 1 - x.3, 1 - x.4), groupArray(tuple(ord, s1, s2, s3))) AS evs
         FROM (SELECT
           multiIf(e.UserId != '', e.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), e.VisitorId) AS key,
-          toUInt64(toUnixTimestamp64Milli(e.Timestamp)) AS ts,
-          e.Seq AS seq,
-          toUInt8(((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
+          plus(multiply(toUInt64(toUnixTimestamp64Milli(e.Timestamp)), 1048576), modulo(e.Seq, 1048576)) AS ord,
+          toUInt8(((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev')) AS s1,
           toUInt8(e.EventName = 'signup_completed') AS s2,
           toUInt8((e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup')) AS s3
         FROM product_events AS e
@@ -4891,9 +5360,9 @@ SELECT
         WHERE e.OrgId = 'org_sql_catalog'
           AND e.Timestamp >= '2026-01-01 10:30:00'
           AND e.Timestamp <= '2026-01-03 14:15:00'
-          AND (((e.Kind = 'navigation' AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
+          AND (((e.Kind IN ('navigation', 'screen') AND e.PagePath = '/pricing') AND e.Host = 'maple.dev') OR e.EventName = 'signup_completed' OR (e.EventName = 'plan_started' AND e.Attributes['plan'] = 'startup'))
           AND multiIf(e.UserId != '', e.UserId, coalesce(link.UserId, '') != '', coalesce(link.UserId, ''), e.VisitorId) != '') AS funnel_events
-        GROUP BY key) AS chain_events) AS chain) AS totals
+        GROUP BY key) AS person_events) AS walked) AS chain) AS totals
         ORDER BY step ASC
         FORMAT JSON
 
@@ -4915,21 +5384,57 @@ SELECT
         LIMIT 20
         FORMAT JSON
 
--- builder:releases:releaseErrorFingerprintsQuery:default  [01c17a5e]
+-- builder:releases:commitServicesQuery:default  [813aa516]
 SELECT
-          toString(error_events_by_time.FingerprintHash) AS fingerprintHash,
-          count() AS count,
-          min(error_events_by_time.Timestamp) AS firstSeen
-        FROM error_events_by_time
-        WHERE error_events_by_time.OrgId = 'org_sql_catalog'
-          AND error_events_by_time.ServiceName = 'api'
-          AND error_events_by_time.ServiceVersion = '0af7651916cd43dd8448eb211c80319c0af76519'
-          AND error_events_by_time.Timestamp >= '2026-01-01 10:30:00'
-          AND error_events_by_time.Timestamp <= '2026-01-03 14:15:00'
-          AND error_events_by_time.DeploymentEnv IN ('production')
-        GROUP BY fingerprintHash
-        ORDER BY count DESC
-        LIMIT 50
+          service_windows.bServiceName AS serviceName
+        FROM (
+SELECT
+          toStartOfHour(service_overview_spans.Timestamp) AS bBucket,
+          service_overview_spans.ServiceName AS bServiceName,
+          service_overview_spans.ServiceNamespace AS bServiceNamespace,
+          service_overview_spans.DeploymentEnv AS bEnvironment,
+          service_overview_spans.CommitSha AS bCommitSha,
+          count() AS bSpanCount,
+          sum(service_overview_spans.SampleRate) AS bEstimatedSpanCount,
+          countIf(service_overview_spans.StatusCode = 'Error') AS bErrorCount,
+          sumIf(service_overview_spans.SampleRate, service_overview_spans.StatusCode = 'Error') AS bEstimatedErrorCount,
+          sum(toFloat64(Duration)) AS bDurationSum,
+          quantilesTDigestState(0.5, 0.95, 0.99)(Duration) AS bDurationQuantiles,
+          min(service_overview_spans.Timestamp) AS bFirstSeen,
+          countIf((service_overview_spans.StatusCode != 'Error' AND service_overview_spans.Duration < 500000000)) AS bApdexSatisfiedCount,
+          countIf(((service_overview_spans.StatusCode != 'Error' AND service_overview_spans.Duration >= 500000000) AND service_overview_spans.Duration < 2000000000)) AS bApdexToleratingCount
+        FROM service_overview_spans
+        WHERE service_overview_spans.OrgId = 'org_sql_catalog'
+          AND service_overview_spans.Timestamp >= '2026-01-01 10:30:00'
+          AND service_overview_spans.Timestamp <= '2026-01-03 14:15:00'
+          AND service_overview_spans.CommitSha IN ('abc123')
+          AND (Timestamp < if(toDateTime('2026-01-01 10:30:00') = toStartOfHour(toDateTime('2026-01-01 10:30:00')), toStartOfHour(toDateTime('2026-01-01 10:30:00')), toStartOfHour(toDateTime('2026-01-01 10:30:00')) + INTERVAL 1 HOUR) OR Timestamp >= toStartOfHour(toDateTime('2026-01-03 14:15:00')))
+        GROUP BY bBucket, bServiceName, bServiceNamespace, bEnvironment, bCommitSha
+UNION ALL
+SELECT
+          service_overview_hourly.Hour AS bBucket,
+          service_overview_hourly.ServiceName AS bServiceName,
+          service_overview_hourly.ServiceNamespace AS bServiceNamespace,
+          service_overview_hourly.DeploymentEnv AS bEnvironment,
+          service_overview_hourly.CommitSha AS bCommitSha,
+          sum(service_overview_hourly.SpanCount) AS bSpanCount,
+          sum(service_overview_hourly.EstimatedSpanCount) AS bEstimatedSpanCount,
+          sum(service_overview_hourly.ErrorCount) AS bErrorCount,
+          sum(service_overview_hourly.EstimatedErrorCount) AS bEstimatedErrorCount,
+          sum(service_overview_hourly.DurationSum) AS bDurationSum,
+          quantilesTDigestMergeState(0.5, 0.95, 0.99)(DurationQuantiles) AS bDurationQuantiles,
+          min(service_overview_hourly.FirstSeen) AS bFirstSeen,
+          sum(service_overview_hourly.ApdexSatisfiedCount) AS bApdexSatisfiedCount,
+          sum(service_overview_hourly.ApdexToleratingCount) AS bApdexToleratingCount
+        FROM service_overview_hourly
+        WHERE service_overview_hourly.OrgId = 'org_sql_catalog'
+          AND service_overview_hourly.CommitSha IN ('abc123')
+          AND service_overview_hourly.Hour >= if(toDateTime('2026-01-01 10:30:00') = toStartOfHour(toDateTime('2026-01-01 10:30:00')), toStartOfHour(toDateTime('2026-01-01 10:30:00')), toStartOfHour(toDateTime('2026-01-01 10:30:00')) + INTERVAL 1 HOUR)
+          AND service_overview_hourly.Hour < toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+        GROUP BY bBucket, bServiceName, bServiceNamespace, bEnvironment, bCommitSha
+) AS service_windows
+        GROUP BY serviceName
+        LIMIT 500
         FORMAT JSON
 
 -- builder:releases:releasesListQuery:default  [7a5933b6]
@@ -5065,12 +5570,30 @@ SELECT
         LIMIT 100
         FORMAT JSON
 
--- builder:releases:releasesTimelineQuery:hourly  [a721977f]
+-- builder:releases:releaseVerificationQuery:default  [ade9545e]
 SELECT
-          toStartOfInterval(service_windows.bBucket, INTERVAL 3600 SECOND) AS bucket,
+          deployMinutes.dServiceName AS serviceName,
+          deployMinutes.dEnvironment AS environment,
+          deployMinutes.dCommitSha AS commitSha,
+          min(deployMinutes.dFirstSeen) AS firstSeen,
+          sumIf(minutes.mSpans, minutes.mCommitSha = deployMinutes.dCommitSha AND deployMinutes.dOffset >= 0) AS afterSpans,
+          sumIf(minutes.mErrors, minutes.mCommitSha = deployMinutes.dCommitSha AND deployMinutes.dOffset >= 0) AS afterErrors,
+          ifNotFinite(arrayElement(quantilesTDigestMergeIf(0.5, 0.95, 0.99)(minutes.mQuantiles, minutes.mCommitSha = deployMinutes.dCommitSha AND deployMinutes.dOffset >= 0), 2) / 1000000, 0) AS afterP95Ms,
+          sumIf(minutes.mSpans, minutes.mCommitSha != deployMinutes.dCommitSha AND deployMinutes.dOffset < 0) AS beforeSpans,
+          sumIf(minutes.mErrors, minutes.mCommitSha != deployMinutes.dCommitSha AND deployMinutes.dOffset < 0) AS beforeErrors,
+          ifNotFinite(arrayElement(quantilesTDigestMergeIf(0.5, 0.95, 0.99)(minutes.mQuantiles, minutes.mCommitSha != deployMinutes.dCommitSha AND deployMinutes.dOffset < 0), 2) / 1000000, 0) AS beforeP95Ms
+        FROM (SELECT
+          deploys.serviceName AS dServiceName,
+          deploys.environment AS dEnvironment,
+          deploys.commitSha AS dCommitSha,
+          deploys.firstSeen AS dFirstSeen,
+          arrayJoin(range(-30, 30)) AS dOffset,
+          toStartOfMinute(firstSeen) + toIntervalMinute(dOffset) AS dBucket
+        FROM (SELECT
           service_windows.bServiceName AS serviceName,
+          service_windows.bEnvironment AS environment,
           service_windows.bCommitSha AS commitSha,
-          sum(service_windows.bSpanCount) AS count
+          min(service_windows.bFirstSeen) AS firstSeen
         FROM (
 SELECT
           toStartOfHour(service_overview_spans.Timestamp) AS bBucket,
@@ -5118,17 +5641,18 @@ SELECT
         GROUP BY bBucket, bServiceName, bServiceNamespace, bEnvironment, bCommitSha
 ) AS service_windows
         WHERE service_windows.bCommitSha NOT IN ('', 'unknown', 'N/A')
-        GROUP BY bucket, serviceName, commitSha
-        ORDER BY bucket ASC
-        LIMIT 5000
-        FORMAT JSON
-
--- builder:releases:releasesTimelineQuery:minutely  [42db38d1]
-SELECT
-          toStartOfInterval(service_windows.bBucket, INTERVAL 300 SECOND) AS bucket,
-          service_windows.bServiceName AS serviceName,
-          service_windows.bCommitSha AS commitSha,
-          sum(service_windows.bSpanCount) AS count
+        GROUP BY serviceName, environment, commitSha
+        HAVING min(service_windows.bFirstSeen) >= '2026-01-01 10:30:00'
+        ORDER BY firstSeen DESC
+        LIMIT 500) AS deploys) AS deployMinutes
+        LEFT JOIN (SELECT
+          service_windows.bBucket AS mBucket,
+          service_windows.bServiceName AS mServiceName,
+          service_windows.bEnvironment AS mEnvironment,
+          service_windows.bCommitSha AS mCommitSha,
+          service_windows.bSpanCount AS mSpans,
+          service_windows.bErrorCount AS mErrors,
+          service_windows.bDurationQuantiles AS mQuantiles
         FROM (
 SELECT
           toStartOfMinute(service_overview_spans.Timestamp) AS bBucket,
@@ -5149,7 +5673,7 @@ SELECT
         WHERE service_overview_spans.OrgId = 'org_sql_catalog'
           AND service_overview_spans.Timestamp >= '2026-01-01 10:30:00'
           AND service_overview_spans.Timestamp <= '2026-01-03 14:15:00'
-          AND service_overview_spans.DeploymentEnv IN ('production')
+          AND service_overview_spans.ServiceName = 'api'
           AND (Timestamp < if(toDateTime('2026-01-01 10:30:00') = toStartOfMinute(toDateTime('2026-01-01 10:30:00')), toStartOfMinute(toDateTime('2026-01-01 10:30:00')), toStartOfMinute(toDateTime('2026-01-01 10:30:00')) + INTERVAL 1 MINUTE) OR Timestamp >= toStartOfMinute(toDateTime('2026-01-03 14:15:00')))
         GROUP BY bBucket, bServiceName, bServiceNamespace, bEnvironment, bCommitSha
 UNION ALL
@@ -5170,32 +5694,14 @@ SELECT
           sum(service_overview_minutely.ApdexToleratingCount) AS bApdexToleratingCount
         FROM service_overview_minutely
         WHERE service_overview_minutely.OrgId = 'org_sql_catalog'
-          AND service_overview_minutely.DeploymentEnv IN ('production')
+          AND service_overview_minutely.ServiceName = 'api'
           AND service_overview_minutely.Minute >= if(toDateTime('2026-01-01 10:30:00') = toStartOfMinute(toDateTime('2026-01-01 10:30:00')), toStartOfMinute(toDateTime('2026-01-01 10:30:00')), toStartOfMinute(toDateTime('2026-01-01 10:30:00')) + INTERVAL 1 MINUTE)
           AND service_overview_minutely.Minute < toStartOfMinute(toDateTime('2026-01-03 14:15:00'))
         GROUP BY bBucket, bServiceName, bServiceNamespace, bEnvironment, bCommitSha
-) AS service_windows
-        WHERE service_windows.bCommitSha NOT IN ('', 'unknown', 'N/A')
-        GROUP BY bucket, serviceName, commitSha
-        ORDER BY bucket ASC
-        LIMIT 5000
-        FORMAT JSON
-
--- builder:releases:releasesTimelineQuery:raw  [b6bfcd22]
-SELECT
-          toStartOfInterval(service_overview_spans.Timestamp, INTERVAL 30 SECOND) AS bucket,
-          service_overview_spans.ServiceName AS serviceName,
-          service_overview_spans.CommitSha AS commitSha,
-          count() AS count
-        FROM service_overview_spans
-        WHERE service_overview_spans.OrgId = 'org_sql_catalog'
-          AND service_overview_spans.Timestamp >= '2026-01-01 10:30:00'
-          AND service_overview_spans.Timestamp <= '2026-01-03 14:15:00'
-          AND service_overview_spans.ServiceName = 'api'
-          AND service_overview_spans.CommitSha NOT IN ('', 'unknown', 'N/A')
-        GROUP BY bucket, serviceName, commitSha
-        ORDER BY bucket ASC
-        LIMIT 5000
+) AS service_windows) AS minutes ON ((deployMinutes.dServiceName = minutes.mServiceName AND deployMinutes.dEnvironment = minutes.mEnvironment) AND deployMinutes.dBucket = minutes.mBucket)
+        GROUP BY serviceName, environment, commitSha
+        ORDER BY firstSeen DESC
+        LIMIT 500
         FORMAT JSON
 
 -- builder:releases:runningCommitsQuery:default  [aa2f361b]
@@ -5465,7 +5971,7 @@ SELECT
         LIMIT 500
         FORMAT JSON
 
--- builder:search-console:searchConsoleLandingPagesQuery:default  [18eba252]
+-- builder:search-console:searchConsoleLandingPagesQuery:default  [421df049]
 SELECT
           latest.page AS page,
           ifNull(sum(latest.positionSum), 0) AS positionSum,
@@ -5502,7 +6008,7 @@ SELECT
           AND search_console_daily.Date <= '2026-10-28 00:00:00'
         GROUP BY date, page, query, country, device) AS latest
         GROUP BY page
-        ORDER BY clicks DESC, page ASC
+        ORDER BY clicks DESC, impressions DESC, page ASC
         LIMIT 100
         FORMAT JSON
 
@@ -5585,7 +6091,7 @@ SELECT
         ORDER BY date ASC
         FORMAT JSON
 
--- builder:search-console:searchConsoleTopPagesQuery:default  [18eba252]
+-- builder:search-console:searchConsoleTopPagesQuery:default  [421df049]
 SELECT
           latest.page AS page,
           ifNull(sum(latest.positionSum), 0) AS positionSum,
@@ -5622,11 +6128,11 @@ SELECT
           AND search_console_daily.Date <= '2026-10-28 00:00:00'
         GROUP BY date, page, query, country, device) AS latest
         GROUP BY page
-        ORDER BY clicks DESC, page ASC
+        ORDER BY clicks DESC, impressions DESC, page ASC
         LIMIT 50
         FORMAT JSON
 
--- builder:search-console:searchConsoleTopQueriesQuery:filtered  [45090b5d]
+-- builder:search-console:searchConsoleTopQueriesQuery:filtered  [d31810a4]
 SELECT
           latest.query AS query,
           ifNull(sum(latest.clicks), 0) AS clicks,
@@ -5664,7 +6170,7 @@ SELECT
           AND search_console_daily.Device = 'mobile'
         GROUP BY date, page, query, country, device) AS latest
         GROUP BY query
-        ORDER BY position ASC, query ASC
+        ORDER BY position ASC, impressions DESC, query ASC
         LIMIT 50
         FORMAT JSON
 
@@ -5689,12 +6195,12 @@ SELECT
         LIMIT 1000
         FORMAT JSON
 
--- builder:security-telemetry:scannerExposedQuery:default  [d1c58739]
+-- builder:security-telemetry:scannerExposedQuery:default  [77f755df]
 SELECT
           scanner_requests.ServiceName AS service,
           scanner_requests.Host AS host,
           scanner_requests.Path AS path,
-          scanner_requests.Signature AS signature,
+          if(if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))) != '', if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))), scanner_requests.Signature) AS signature,
           scanner_requests.HttpStatus AS httpStatus,
           uniq(scanner_requests.TraceId) AS requests,
           max(scanner_requests.Timestamp) AS lastSeen,
@@ -5703,19 +6209,20 @@ SELECT
         WHERE scanner_requests.OrgId = 'org_sql_catalog'
           AND scanner_requests.Timestamp >= '2026-01-01 10:30:00'
           AND scanner_requests.Timestamp <= '2026-01-03 14:15:00'
-          AND scanner_requests.Signature IN ('/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci')
-          AND (scanner_requests.HttpStatus >= 200 AND scanner_requests.HttpStatus < 300)
+          AND if(if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))) != '', if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))), scanner_requests.Signature) IN ('/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci')
+          AND ((scanner_requests.HttpStatus >= 200 AND scanner_requests.HttpStatus < 300) AND (scanner_requests.Signature = '' OR if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))) != ''))
         GROUP BY service, host, path, signature, httpStatus
         ORDER BY lastSeen DESC
         LIMIT 50
         FORMAT JSON
 
--- builder:security-telemetry:scannerSignaturesQuery:default  [60ddb44e]
+-- builder:security-telemetry:scannerSignaturesQuery:default  [489ae6cc]
 SELECT
-          scanner_requests.Signature AS signature,
+          if(if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))) != '', if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))), scanner_requests.Signature) AS signature,
           scanner_requests.ServiceName AS service,
           uniq(scanner_requests.TraceId) AS requests,
-          uniqIf(scanner_requests.TraceId, (scanner_requests.HttpStatus >= 200 AND scanner_requests.HttpStatus < 300)) AS answered,
+          uniqIf(scanner_requests.TraceId, if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))) != '') AS inPath,
+          uniqIf(scanner_requests.TraceId, ((scanner_requests.HttpStatus >= 200 AND scanner_requests.HttpStatus < 300) AND (scanner_requests.Signature = '' OR if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))) != ''))) AS answered,
           uniqIf(scanner_requests.ClientAddress, scanner_requests.ClientAddress != '') AS sources,
           max(scanner_requests.Timestamp) AS lastSeen
         FROM scanner_requests
@@ -5749,11 +6256,11 @@ SELECT
         LIMIT 20
         FORMAT JSON
 
--- builder:security-telemetry:scannerTimelineQuery:default  [6cddc38a]
+-- builder:security-telemetry:scannerTimelineQuery:default  [a51228a6]
 SELECT
           toStartOfInterval(scanner_requests.Timestamp, INTERVAL 3600 SECOND) AS bucket,
           uniq(scanner_requests.TraceId) AS requests,
-          uniqIf(scanner_requests.TraceId, (scanner_requests.HttpStatus >= 200 AND scanner_requests.HttpStatus < 300)) AS answered
+          uniqIf(scanner_requests.TraceId, ((scanner_requests.HttpStatus >= 200 AND scanner_requests.HttpStatus < 300) AND (scanner_requests.Signature = '' OR if(multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci']) > 0, arrayElement(['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', '/actuator/env', '/actuator/heapdump', '/actuator/configprops', '/actuator/gateway', '/server-status', '/server-info', 'phpinfo', '/info.php', '/_profiler', '/debug/pprof', '/telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/.env', '/.aws/', '/.ssh/', '/id_rsa', '/.npmrc', '/.htpasswd', '/.docker/config.json', '/.vscode/sftp.json', '/.s3cfg', '/wp-config.php', '/.git/', '/.svn/', '/.hg/', '/.ds_store', ' /actuator/env', ' /actuator/heapdump', ' /actuator/configprops', ' /actuator/gateway', ' /server-status', ' /server-info', 'phpinfo', '/info.php', ' /_profiler', ' /debug/pprof', ' /telescope/requests', '../', '..%2f', '%2e%2e', '..%5c', '%252e%252e', '/etc/passwd', '/proc/self/environ', 'win.ini', '/phpmyadmin', '/pma/', '/adminer', '/vendor/phpunit', 'eval-stdin.php', '/boaform', '/hnap1', '/goform/', '/cgi-bin/luci'])), arrayElement(['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/'], multiSearchFirstIndexCaseInsensitive(concat(' ', scanner_requests.Path), ['/wp-admin', '/wp-login.php', '/xmlrpc.php', '/wp-includes/', '/wp-content/plugins/']))) != ''))) AS answered
         FROM scanner_requests
         WHERE scanner_requests.OrgId = 'org_sql_catalog'
           AND scanner_requests.Timestamp >= '2026-01-01 10:30:00'
@@ -6486,7 +6993,8 @@ SELECT
         LIMIT 50
         FORMAT JSON
 
--- builder:service-infra:serviceRuntimesSQL:default  [4d718731]
+-- builder:service-infra:serviceRuntimesSQL:default  [a14d0031]
+SELECT * FROM (
 SELECT
           metrics_gauge.ServiceName AS metricServiceName,
           metrics_gauge.MetricName AS metricName,
@@ -6495,7 +7003,8 @@ SELECT
           metrics_gauge.Attributes['aws.dimension.cluster_name'] AS cluster,
           metrics_gauge.ResourceAttributes['railway.service.id'] AS railwayServiceId,
           metrics_gauge.ResourceAttributes['railway.environment.id'] AS railwayEnvironmentId,
-          max(metrics_gauge.ResourceAttributes['railway.environment.name']) AS railwayEnvironmentName
+          max(metrics_gauge.ResourceAttributes['railway.environment.name']) AS railwayEnvironmentName,
+          '' AS vercelProjectId
         FROM metrics_gauge
         WHERE metrics_gauge.OrgId = 'org_sql_catalog'
           AND metrics_gauge.TimeUnix >= '2026-01-01 10:30:00'
@@ -6503,9 +7012,29 @@ SELECT
           AND metrics_gauge.ServiceName IN ('api', 'cloudflare-worker/api', 'checkout', 'cloudflare-worker/checkout')
           AND metrics_gauge.MetricName IN ('gcp.cloud_run.container.instance.count', 'gcp.cloud_functions.instance.count', 'aws.ecs.cpu_utilization', 'aws.lambda.duration', 'railway.cpu.usage', 'cloudflare.worker.cpu_time')
         GROUP BY metricServiceName, metricName, account, region, cluster, railwayServiceId, railwayEnvironmentId
-        ORDER BY metricServiceName ASC, metricName ASC
-        LIMIT 10000
-        FORMAT JSON
+UNION ALL
+SELECT
+          traces.ServiceName AS metricServiceName,
+          'vercel.project' AS metricName,
+          '' AS account,
+          '' AS region,
+          '' AS cluster,
+          '' AS railwayServiceId,
+          '' AS railwayEnvironmentId,
+          '' AS railwayEnvironmentName,
+          multiIf(traces.ResourceAttributes['vercel.projectId'] != '', traces.ResourceAttributes['vercel.projectId'], traces.ResourceAttributes['vercel.project_id'] != '', traces.ResourceAttributes['vercel.project_id'], traces.ResourceAttributes['vercel.project.id']) AS vercelProjectId
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND traces.ServiceName IN ('api', 'checkout')
+          AND (mapContains(traces.ResourceAttributes, 'vercel.projectId') OR mapContains(traces.ResourceAttributes, 'vercel.project_id') OR mapContains(traces.ResourceAttributes, 'vercel.project.id'))
+          AND multiIf(traces.ResourceAttributes['vercel.projectId'] != '', traces.ResourceAttributes['vercel.projectId'], traces.ResourceAttributes['vercel.project_id'] != '', traces.ResourceAttributes['vercel.project_id'], traces.ResourceAttributes['vercel.project.id']) != ''
+        GROUP BY metricServiceName, vercelProjectId
+)
+ORDER BY metricServiceName ASC, metricName ASC
+LIMIT 10000
+FORMAT JSON
 
 -- builder:service-infra:serviceWorkloadsSQL:default  [e9f241ba]
 SELECT
@@ -6558,7 +7087,7 @@ SELECT
         GROUP BY hourTs
         FORMAT JSON
 
--- builder:service-map-rollup:serviceMapEdgesRollupSQL:default  [639f3369]
+-- builder:service-map-rollup:serviceMapEdgesRollupSQL:default  [aae9e2b8]
 SELECT
           p.OrgId AS OrgId,
           toStartOfHour(p.Timestamp) AS Hour,
@@ -6580,7 +7109,7 @@ SELECT
           service_map_spans.ServiceName AS ServiceName,
           service_map_spans.DeploymentEnv AS DeploymentEnv
         FROM service_map_spans
-        WHERE service_map_spans.SpanKind IN ('Client', 'Producer')
+        WHERE (service_map_spans.SpanKind IN ('Client', 'Producer') OR (service_map_spans.SpanKind = 'Server' AND service_map_spans.ServiceName IN ('vercel.edge-network')))
           AND service_map_spans.Timestamp >= toDateTime('2026-01-01 10:30:00')
           AND service_map_spans.Timestamp < toDateTime('2026-01-03 14:15:00')
           AND service_map_spans.OrgId = 'org_sql_catalog'
@@ -7343,7 +7872,7 @@ SELECT
         LIMIT 10
         FORMAT JSON
 
--- builder:service-map:serviceDependenciesForServiceQuery:default  [211f518c]
+-- builder:service-map:serviceDependenciesForServiceQuery:default  [752efbf9]
 SELECT
           edges.sourceService AS sourceService,
           edges.targetService AS targetService,
@@ -7385,7 +7914,7 @@ SELECT
           service_map_spans.ServiceName AS ServiceName,
           service_map_spans.DeploymentEnv AS DeploymentEnv
         FROM service_map_spans
-        WHERE service_map_spans.SpanKind IN ('Client', 'Producer')
+        WHERE (service_map_spans.SpanKind IN ('Client', 'Producer') OR (service_map_spans.SpanKind = 'Server' AND service_map_spans.ServiceName IN ('vercel.edge-network')))
           AND service_map_spans.Timestamp >= toDateTime('2026-01-01 10:30:00')
           AND service_map_spans.Timestamp < toDateTime('2026-01-03 14:15:00')
           AND service_map_spans.OrgId = 'org_sql_catalog'
@@ -7412,7 +7941,7 @@ SELECT
         LIMIT 200
         FORMAT JSON
 
--- builder:service-map:serviceDependenciesInvolvingServiceQuery:default  [cc329604]
+-- builder:service-map:serviceDependenciesInvolvingServiceQuery:default  [c67e0d85]
 SELECT
           edges.sourceService AS sourceService,
           edges.targetService AS targetService,
@@ -7454,7 +7983,7 @@ SELECT
           service_map_spans.ServiceName AS ServiceName,
           service_map_spans.DeploymentEnv AS DeploymentEnv
         FROM service_map_spans
-        WHERE service_map_spans.SpanKind IN ('Client', 'Producer')
+        WHERE (service_map_spans.SpanKind IN ('Client', 'Producer') OR (service_map_spans.SpanKind = 'Server' AND service_map_spans.ServiceName IN ('vercel.edge-network')))
           AND service_map_spans.Timestamp >= toDateTime('2026-01-01 10:30:00')
           AND service_map_spans.Timestamp < toDateTime('2026-01-03 14:15:00')
           AND service_map_spans.OrgId = 'org_sql_catalog'
@@ -7481,7 +8010,7 @@ SELECT
         LIMIT 200
         FORMAT JSON
 
--- builder:service-map:serviceDependenciesSQL:default  [5467ed65]
+-- builder:service-map:serviceDependenciesSQL:default  [a3800538]
 SELECT
           edges.sourceService AS sourceService,
           edges.targetService AS targetService,
@@ -7522,7 +8051,7 @@ SELECT
           service_map_spans.ServiceName AS ServiceName,
           service_map_spans.DeploymentEnv AS DeploymentEnv
         FROM service_map_spans
-        WHERE service_map_spans.SpanKind IN ('Client', 'Producer')
+        WHERE (service_map_spans.SpanKind IN ('Client', 'Producer') OR (service_map_spans.SpanKind = 'Server' AND service_map_spans.ServiceName IN ('vercel.edge-network')))
           AND service_map_spans.Timestamp >= toDateTime('2026-01-01 10:30:00')
           AND service_map_spans.Timestamp < toDateTime('2026-01-03 14:15:00')
           AND service_map_spans.OrgId = 'org_sql_catalog'
@@ -7548,7 +8077,7 @@ SELECT
         LIMIT 200
         FORMAT JSON
 
--- builder:service-map:serviceDependenciesSQL:env-scoped  [1fd187fd]
+-- builder:service-map:serviceDependenciesSQL:env-scoped  [0f1a4626]
 SELECT
           edges.sourceService AS sourceService,
           edges.targetService AS targetService,
@@ -7590,7 +8119,7 @@ SELECT
           service_map_spans.ServiceName AS ServiceName,
           service_map_spans.DeploymentEnv AS DeploymentEnv
         FROM service_map_spans
-        WHERE service_map_spans.SpanKind IN ('Client', 'Producer')
+        WHERE (service_map_spans.SpanKind IN ('Client', 'Producer') OR (service_map_spans.SpanKind = 'Server' AND service_map_spans.ServiceName IN ('vercel.edge-network')))
           AND service_map_spans.Timestamp >= toDateTime('2026-01-01 10:30:00')
           AND service_map_spans.Timestamp < toDateTime('2026-01-03 14:15:00')
           AND service_map_spans.OrgId = 'org_sql_catalog'
@@ -7759,7 +8288,7 @@ SELECT
         LIMIT 200
         FORMAT JSON
 
--- builder:service-map:serviceMapEdgeJoinQuery:rollup-hour  [639f3369]
+-- builder:service-map:serviceMapEdgeJoinQuery:rollup-hour  [aae9e2b8]
 SELECT
           p.OrgId AS OrgId,
           toStartOfHour(p.Timestamp) AS Hour,
@@ -7781,7 +8310,7 @@ SELECT
           service_map_spans.ServiceName AS ServiceName,
           service_map_spans.DeploymentEnv AS DeploymentEnv
         FROM service_map_spans
-        WHERE service_map_spans.SpanKind IN ('Client', 'Producer')
+        WHERE (service_map_spans.SpanKind IN ('Client', 'Producer') OR (service_map_spans.SpanKind = 'Server' AND service_map_spans.ServiceName IN ('vercel.edge-network')))
           AND service_map_spans.Timestamp >= toDateTime('2026-01-01 10:30:00')
           AND service_map_spans.Timestamp < toDateTime('2026-01-03 14:15:00')
           AND service_map_spans.OrgId = 'org_sql_catalog'
@@ -7801,7 +8330,7 @@ SELECT
         GROUP BY OrgId, Hour, SourceService, TargetService, DeploymentEnv
         FORMAT JSON
 
--- builder:service-map:serviceMapEdgeJoinQuery:scoped-to-service  [ebdcfe82]
+-- builder:service-map:serviceMapEdgeJoinQuery:scoped-to-service  [c274e1fd]
 SELECT
           p.OrgId AS OrgId,
           toStartOfHour(p.Timestamp) AS Hour,
@@ -7823,7 +8352,7 @@ SELECT
           service_map_spans.ServiceName AS ServiceName,
           service_map_spans.DeploymentEnv AS DeploymentEnv
         FROM service_map_spans
-        WHERE service_map_spans.SpanKind IN ('Client', 'Producer')
+        WHERE (service_map_spans.SpanKind IN ('Client', 'Producer') OR (service_map_spans.SpanKind = 'Server' AND service_map_spans.ServiceName IN ('vercel.edge-network')))
           AND service_map_spans.Timestamp >= toDateTime('2026-01-01 10:30:00')
           AND service_map_spans.Timestamp < toDateTime('2026-01-03 14:15:00')
           AND service_map_spans.OrgId = 'org_sql_catalog'
@@ -10546,6 +11075,20 @@ SELECT
         LIMIT 20
         FORMAT JSON
 
+-- builder:user-activity:userActivityIdentityQuery:default  [5c1b7e69]
+SELECT
+          argMaxIfMerge(UserName) AS name,
+          argMaxIfMerge(UserEmail) AS email,
+          toFloat64(max(user_activity_hourly.UserNameAt)) AS nameAt,
+          toFloat64(max(user_activity_hourly.UserEmailAt)) AS emailAt
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.ServiceNamespace IN ('storefront')
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.UserId = 'user_catalog'
+        FORMAT JSON
+
 -- builder:user-activity:userActivityServicesQuery:default  [eabfc3cc]
 SELECT
           user_activity_hourly.ServiceName AS serviceName,
@@ -10836,10 +11379,12 @@ SELECT
           AND product_events.UserId = 'user_42'
         FORMAT JSON
 
--- builder:users:userMcpSummaryQuery:default  [2ca96a80]
+-- builder:users:userMcpSummaryQuery:default  [e5fa1097]
 SELECT
-          anyIf(traces.SpanAttributes['user.name'], traces.SpanAttributes['user.name'] != '') AS name,
-          anyIf(traces.SpanAttributes['user.email'], traces.SpanAttributes['user.email'] != '') AS email,
+          argMax(traces.SpanAttributes['user.name'], if(traces.SpanAttributes['user.name'] != '', toFloat64(traces.Timestamp), 0)) AS name,
+          argMax(traces.SpanAttributes['user.email'], if(traces.SpanAttributes['user.email'] != '', toFloat64(traces.Timestamp), 0)) AS email,
+          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.name'] != '')) AS nameAt,
+          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.email'] != '')) AS emailAt,
           count() AS requests,
           countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call') AS calls,
           min(traces.Timestamp) AS firstSeen,
@@ -10854,10 +11399,12 @@ SELECT
           AND (if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) = 'user_42' AND (traces.SpanAttributes['user.id'] = 'user_42' OR traces.SpanAttributes['enduser.id'] = 'user_42'))
         FORMAT JSON
 
--- builder:users:userReplayProfileQuery:namespaceFiltered  [61711e1c]
+-- builder:users:userReplayProfileQuery:namespaceFiltered  [ce53b2a8]
 SELECT
           argMax(sessions.userName, if(sessions.userName != '', toFloat64(sessions.lastActivity), 0)) AS name,
           argMax(sessions.userEmail, if(sessions.userEmail != '', toFloat64(sessions.lastActivity), 0)) AS email,
+          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userName != '')) AS nameAt,
+          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userEmail != '')) AS emailAt,
           argMax(sessions.groupId, if(sessions.groupId != '', toFloat64(sessions.lastActivity), 0)) AS groupId,
           argMax(sessions.groupName, if(sessions.groupId != '', toFloat64(sessions.lastActivity), 0)) AS groupName,
           argMax(sessions.traitKeys, sessions.lastActivity) AS traitKeys,
@@ -11014,35 +11561,21 @@ SELECT
         LIMIT 50
         FORMAT JSON
 
--- builder:users:usersFacetsQuery:default  [c8c283ee]
+-- builder:users:usersFacetsQuery:default  [ff0a2c7e]
 SELECT
-          signals.namespace AS name,
-          uniqExact(signals.userId) AS count,
+          rows.namespace AS name,
+          uniq(rows.userId) AS count,
           'namespace' AS facetType
         FROM (
 SELECT
           sessions.userId AS userId,
-          argMax(sessions.userName, if(sessions.userName != '', toFloat64(sessions.lastActivity), 0)) AS name,
-          argMax(sessions.userEmail, if(sessions.userEmail != '', toFloat64(sessions.lastActivity), 0)) AS email,
-          argMax(sessions.groupId, if(sessions.groupId != '', toFloat64(sessions.lastActivity), 0)) AS groupId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
           transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
-          min(sessions.startTime) AS firstSeen,
-          max(sessions.lastActivity) AS lastSeen,
-          count() AS sessions,
-          toUInt64(sum(sessions.errors)) AS errors,
-          toUInt64(0) AS requests,
-          toUInt64(0) AS mcpSpans,
-          toUInt64(0) AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(0) AS classifiedRequests,
-          toUInt64(0) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          groupUniqArrayIf(20)(sessions.groupId, sessions.groupId != '') AS groupIds,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userName != '')) AS nameAt,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userEmail != '')) AS emailAt,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.groupId != '')) AS groupAt
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
         FROM (SELECT
           session_replays.SessionId AS sessionId,
           argMax(session_replays.UserId, session_replays.Version) AS userId,
@@ -11059,61 +11592,31 @@ SELECT
           AND session_replays.StartTime <= '2026-01-03 14:15:00'
         GROUP BY sessionId) AS sessions
         WHERE sessions.userId != ''
-        GROUP BY userId, namespace
 UNION ALL
 SELECT
           product_events.UserId AS userId,
           '' AS name,
           '' AS email,
-          argMax(product_events.GroupId, if(product_events.GroupId != '', toFloat64(product_events.Timestamp), 0)) AS groupId,
           transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
-          min(product_events.Timestamp) AS firstSeen,
-          max(product_events.Timestamp) AS lastSeen,
+          product_events.Timestamp AS at,
           toUInt64(0) AS sessions,
           toUInt64(0) AS errors,
-          toUInt64(0) AS requests,
-          toUInt64(0) AS mcpSpans,
-          count() AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(0) AS classifiedRequests,
-          toUInt64(0) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          groupUniqArrayIf(20)(product_events.GroupId, product_events.GroupId != '') AS groupIds,
-          toFloat64(0) AS nameAt,
-          toFloat64(0) AS emailAt,
-          toFloat64(maxIf(toFloat64(product_events.Timestamp), product_events.GroupId != '')) AS groupAt
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
         FROM product_events
         WHERE product_events.OrgId = 'org_sql_catalog'
           AND product_events.Timestamp >= '2026-01-01 10:30:00'
           AND product_events.Timestamp <= '2026-01-03 14:15:00'
           AND product_events.UserId != ''
-        GROUP BY userId, namespace
 UNION ALL
 SELECT
           if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) AS userId,
-          argMax(traces.SpanAttributes['user.name'], if(traces.SpanAttributes['user.name'] != '', toFloat64(traces.Timestamp), 0)) AS name,
-          argMax(traces.SpanAttributes['user.email'], if(traces.SpanAttributes['user.email'] != '', toFloat64(traces.Timestamp), 0)) AS email,
-          '' AS groupId,
+          traces.SpanAttributes['user.name'] AS name,
+          traces.SpanAttributes['user.email'] AS email,
           traces.ResourceAttributes['service.namespace'] AS namespace,
-          min(traces.Timestamp) AS firstSeen,
-          max(traces.Timestamp) AS lastSeen,
+          traces.Timestamp AS at,
           toUInt64(0) AS sessions,
           toUInt64(0) AS errors,
-          countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call') AS requests,
-          count() AS mcpSpans,
-          toUInt64(0) AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call')) AS classifiedRequests,
-          toUInt64(countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call')) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          CAST([], 'Array(String)') AS groupIds,
-          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.name'] != '')) AS nameAt,
-          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.email'] != '')) AS emailAt,
-          toFloat64(0) AS groupAt
+          CAST([], 'Array(String)') AS groupIds
         FROM traces
         WHERE traces.OrgId = 'org_sql_catalog'
           AND traces.Timestamp >= '2026-01-01 10:30:00'
@@ -11122,41 +11625,26 @@ SELECT
           AND traces.ServiceName IN ('maple-ai')
           AND traces.SpanAttributes['mcp.method.name'] != ''
           AND if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) != ''
-        GROUP BY userId, namespace
-) AS signals
-        WHERE signals.namespace != ''
+) AS rows
+        WHERE rows.namespace != ''
         GROUP BY name
         ORDER BY count DESC
         LIMIT 50
 UNION ALL
 SELECT
-          arrayJoin(signals.groupIds) AS name,
-          uniqExact(signals.userId) AS count,
+          arrayJoin(rows.groupIds) AS name,
+          uniq(rows.userId) AS count,
           'group' AS facetType
         FROM (
 SELECT
           sessions.userId AS userId,
-          argMax(sessions.userName, if(sessions.userName != '', toFloat64(sessions.lastActivity), 0)) AS name,
-          argMax(sessions.userEmail, if(sessions.userEmail != '', toFloat64(sessions.lastActivity), 0)) AS email,
-          argMax(sessions.groupId, if(sessions.groupId != '', toFloat64(sessions.lastActivity), 0)) AS groupId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
           transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
-          min(sessions.startTime) AS firstSeen,
-          max(sessions.lastActivity) AS lastSeen,
-          count() AS sessions,
-          toUInt64(sum(sessions.errors)) AS errors,
-          toUInt64(0) AS requests,
-          toUInt64(0) AS mcpSpans,
-          toUInt64(0) AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(0) AS classifiedRequests,
-          toUInt64(0) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          groupUniqArrayIf(20)(sessions.groupId, sessions.groupId != '') AS groupIds,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userName != '')) AS nameAt,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userEmail != '')) AS emailAt,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.groupId != '')) AS groupAt
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
         FROM (SELECT
           session_replays.SessionId AS sessionId,
           argMax(session_replays.UserId, session_replays.Version) AS userId,
@@ -11174,31 +11662,16 @@ SELECT
           AND session_replays.ServiceName IN ('storefront-web')
         GROUP BY sessionId) AS sessions
         WHERE sessions.userId != ''
-        GROUP BY userId, namespace
 UNION ALL
 SELECT
           product_events.UserId AS userId,
           '' AS name,
           '' AS email,
-          argMax(product_events.GroupId, if(product_events.GroupId != '', toFloat64(product_events.Timestamp), 0)) AS groupId,
           transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
-          min(product_events.Timestamp) AS firstSeen,
-          max(product_events.Timestamp) AS lastSeen,
+          product_events.Timestamp AS at,
           toUInt64(0) AS sessions,
           toUInt64(0) AS errors,
-          toUInt64(0) AS requests,
-          toUInt64(0) AS mcpSpans,
-          count() AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(0) AS classifiedRequests,
-          toUInt64(0) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          groupUniqArrayIf(20)(product_events.GroupId, product_events.GroupId != '') AS groupIds,
-          toFloat64(0) AS nameAt,
-          toFloat64(0) AS emailAt,
-          toFloat64(maxIf(toFloat64(product_events.Timestamp), product_events.GroupId != '')) AS groupAt
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
         FROM product_events
         WHERE product_events.OrgId = 'org_sql_catalog'
           AND product_events.Timestamp >= '2026-01-01 10:30:00'
@@ -11213,76 +11686,27 @@ SELECT
           AND ifNull(session_replays.LastActivityAt, session_replays.StartTime) >= '2026-01-01 10:30:00'
           AND session_replays.ServiceName IN ('storefront-web')
         GROUP BY sessionId)))
-        GROUP BY userId, namespace
-UNION ALL
-SELECT
-          if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) AS userId,
-          argMax(traces.SpanAttributes['user.name'], if(traces.SpanAttributes['user.name'] != '', toFloat64(traces.Timestamp), 0)) AS name,
-          argMax(traces.SpanAttributes['user.email'], if(traces.SpanAttributes['user.email'] != '', toFloat64(traces.Timestamp), 0)) AS email,
-          '' AS groupId,
-          traces.ResourceAttributes['service.namespace'] AS namespace,
-          min(traces.Timestamp) AS firstSeen,
-          max(traces.Timestamp) AS lastSeen,
-          toUInt64(0) AS sessions,
-          toUInt64(0) AS errors,
-          countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call') AS requests,
-          count() AS mcpSpans,
-          toUInt64(0) AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call')) AS classifiedRequests,
-          toUInt64(countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call')) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          CAST([], 'Array(String)') AS groupIds,
-          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.name'] != '')) AS nameAt,
-          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.email'] != '')) AS emailAt,
-          toFloat64(0) AS groupAt
-        FROM traces
-        WHERE traces.OrgId = 'org_sql_catalog'
-          AND traces.Timestamp >= '2026-01-01 10:30:00'
-          AND traces.Timestamp <= '2026-01-03 14:15:00'
-          AND traces.SpanKind = 'Server'
-          AND traces.ServiceName IN ('maple-ai')
-          AND traces.SpanAttributes['mcp.method.name'] != ''
-          AND if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) != ''
-          AND traces.ResourceAttributes['service.namespace'] IN ('storefront')
-        GROUP BY userId, namespace
-) AS signals
+) AS rows
         GROUP BY name
         ORDER BY count DESC
         LIMIT 50
 FORMAT JSON
 
--- builder:users:usersFacetsQuery:pinned  [e2850b12]
+-- builder:users:usersFacetsQuery:pinned  [68d54a68]
 SELECT
-          arrayJoin(signals.groupIds) AS name,
-          uniqExact(signals.userId) AS count,
+          arrayJoin(rows.groupIds) AS name,
+          uniq(rows.userId) AS count,
           'group' AS facetType
         FROM (
 SELECT
           sessions.userId AS userId,
-          argMax(sessions.userName, if(sessions.userName != '', toFloat64(sessions.lastActivity), 0)) AS name,
-          argMax(sessions.userEmail, if(sessions.userEmail != '', toFloat64(sessions.lastActivity), 0)) AS email,
-          argMax(sessions.groupId, if(sessions.groupId != '', toFloat64(sessions.lastActivity), 0)) AS groupId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
           transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
-          min(sessions.startTime) AS firstSeen,
-          max(sessions.lastActivity) AS lastSeen,
-          count() AS sessions,
-          toUInt64(sum(sessions.errors)) AS errors,
-          toUInt64(0) AS requests,
-          toUInt64(0) AS mcpSpans,
-          toUInt64(0) AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(0) AS classifiedRequests,
-          toUInt64(0) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          groupUniqArrayIf(20)(sessions.groupId, sessions.groupId != '') AS groupIds,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userName != '')) AS nameAt,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userEmail != '')) AS emailAt,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.groupId != '')) AS groupAt
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
         FROM (SELECT
           session_replays.SessionId AS sessionId,
           argMax(session_replays.UserId, session_replays.Version) AS userId,
@@ -11300,31 +11724,16 @@ SELECT
           AND session_replays.ServiceName IN ('storefront-web')
         GROUP BY sessionId) AS sessions
         WHERE sessions.userId != ''
-        GROUP BY userId, namespace
 UNION ALL
 SELECT
           product_events.UserId AS userId,
           '' AS name,
           '' AS email,
-          argMax(product_events.GroupId, if(product_events.GroupId != '', toFloat64(product_events.Timestamp), 0)) AS groupId,
           transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
-          min(product_events.Timestamp) AS firstSeen,
-          max(product_events.Timestamp) AS lastSeen,
+          product_events.Timestamp AS at,
           toUInt64(0) AS sessions,
           toUInt64(0) AS errors,
-          toUInt64(0) AS requests,
-          toUInt64(0) AS mcpSpans,
-          count() AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(0) AS classifiedRequests,
-          toUInt64(0) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          groupUniqArrayIf(20)(product_events.GroupId, product_events.GroupId != '') AS groupIds,
-          toFloat64(0) AS nameAt,
-          toFloat64(0) AS emailAt,
-          toFloat64(maxIf(toFloat64(product_events.Timestamp), product_events.GroupId != '')) AS groupAt
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
         FROM product_events
         WHERE product_events.OrgId = 'org_sql_catalog'
           AND product_events.Timestamp >= '2026-01-01 10:30:00'
@@ -11339,42 +11748,7 @@ SELECT
           AND ifNull(session_replays.LastActivityAt, session_replays.StartTime) >= '2026-01-01 10:30:00'
           AND session_replays.ServiceName IN ('storefront-web')
         GROUP BY sessionId)))
-        GROUP BY userId, namespace
-UNION ALL
-SELECT
-          if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) AS userId,
-          argMax(traces.SpanAttributes['user.name'], if(traces.SpanAttributes['user.name'] != '', toFloat64(traces.Timestamp), 0)) AS name,
-          argMax(traces.SpanAttributes['user.email'], if(traces.SpanAttributes['user.email'] != '', toFloat64(traces.Timestamp), 0)) AS email,
-          '' AS groupId,
-          traces.ResourceAttributes['service.namespace'] AS namespace,
-          min(traces.Timestamp) AS firstSeen,
-          max(traces.Timestamp) AS lastSeen,
-          toUInt64(0) AS sessions,
-          toUInt64(0) AS errors,
-          countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call') AS requests,
-          count() AS mcpSpans,
-          toUInt64(0) AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call')) AS classifiedRequests,
-          toUInt64(countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call')) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          CAST([], 'Array(String)') AS groupIds,
-          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.name'] != '')) AS nameAt,
-          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.email'] != '')) AS emailAt,
-          toFloat64(0) AS groupAt
-        FROM traces
-        WHERE traces.OrgId = 'org_sql_catalog'
-          AND traces.Timestamp >= '2026-01-01 10:30:00'
-          AND traces.Timestamp <= '2026-01-03 14:15:00'
-          AND traces.SpanKind = 'Server'
-          AND traces.ServiceName IN ('maple-ai')
-          AND traces.SpanAttributes['mcp.method.name'] != ''
-          AND if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) != ''
-          AND traces.ResourceAttributes['service.namespace'] IN ('storefront')
-        GROUP BY userId, namespace
-) AS signals
+) AS rows
         GROUP BY name
         ORDER BY count DESC
         LIMIT 50
@@ -11675,6 +12049,320 @@ SELECT
         LIMIT 200
         FORMAT JSON
 
+-- builder:users:usersListQuery:matchingBound  [ae8e2e08]
+SELECT
+          signals.userId AS userId,
+          argMax(signals.name, signals.nameAt) AS name,
+          argMax(signals.email, signals.emailAt) AS email,
+          argMax(signals.groupId, signals.groupAt) AS groupId,
+          arraySort(arrayDistinct(groupArrayArray(signals.groupIds))) AS groupIds,
+          arraySort(groupUniqArrayIf(20)(signals.namespace, signals.namespace != '')) AS namespaces,
+          min(signals.firstSeen) AS firstSeen,
+          max(signals.lastSeen) AS lastSeen,
+          toString(max(signals.lastSeen)) AS lastSeenKey,
+          sum(signals.sessions) AS sessions,
+          sum(signals.errors) AS errors,
+          sum(signals.requests) AS requests,
+          sum(signals.mcpSpans) AS mcpSpans,
+          sum(signals.events) AS events,
+          sum(signals.spans) AS spans,
+          sum(signals.logLines) AS logLines,
+          sum(signals.classifiedRequests) AS classifiedRequests,
+          sum(signals.mcpRequests) AS mcpRequests,
+          sum(signals.webRequests) AS webRequests,
+          sum(signals.mobileRequests) AS mobileRequests
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          argMax(sessions.userName, if(sessions.userName != '', toFloat64(sessions.lastActivity), 0)) AS name,
+          argMax(sessions.userEmail, if(sessions.userEmail != '', toFloat64(sessions.lastActivity), 0)) AS email,
+          argMax(sessions.groupId, if(sessions.groupId != '', toFloat64(sessions.lastActivity), 0)) AS groupId,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          min(sessions.startTime) AS firstSeen,
+          max(sessions.lastActivity) AS lastSeen,
+          count() AS sessions,
+          toUInt64(sum(sessions.errors)) AS errors,
+          toUInt64(0) AS requests,
+          toUInt64(0) AS mcpSpans,
+          toUInt64(0) AS events,
+          toUInt64(0) AS spans,
+          toUInt64(0) AS logLines,
+          toUInt64(0) AS classifiedRequests,
+          toUInt64(0) AS mcpRequests,
+          toUInt64(0) AS webRequests,
+          toUInt64(0) AS mobileRequests,
+          groupUniqArrayIf(20)(sessions.groupId, sessions.groupId != '') AS groupIds,
+          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userName != '')) AS nameAt,
+          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userEmail != '')) AS emailAt,
+          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.groupId != '')) AS groupAt
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+          AND sessions.userId IN (SELECT
+          rows.userId AS userId
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          product_events.Timestamp AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(user_activity_hourly.LastSeen, 9) AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(user_activity_hourly.FailedRequestCount) AS errors,
+          CAST([], 'Array(String)') AS groupIds
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.UserId != ''
+) AS rows
+        WHERE rows.errors > 0
+        GROUP BY userId)
+        GROUP BY userId, namespace
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          argMax(product_events.GroupId, if(product_events.GroupId != '', toFloat64(product_events.Timestamp), 0)) AS groupId,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          min(product_events.Timestamp) AS firstSeen,
+          max(product_events.Timestamp) AS lastSeen,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          toUInt64(0) AS requests,
+          toUInt64(0) AS mcpSpans,
+          count() AS events,
+          toUInt64(0) AS spans,
+          toUInt64(0) AS logLines,
+          toUInt64(0) AS classifiedRequests,
+          toUInt64(0) AS mcpRequests,
+          toUInt64(0) AS webRequests,
+          toUInt64(0) AS mobileRequests,
+          groupUniqArrayIf(20)(product_events.GroupId, product_events.GroupId != '') AS groupIds,
+          toFloat64(0) AS nameAt,
+          toFloat64(0) AS emailAt,
+          toFloat64(maxIf(toFloat64(product_events.Timestamp), product_events.GroupId != '')) AS groupAt
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+          AND product_events.UserId IN (SELECT
+          rows.userId AS userId
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          product_events.Timestamp AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(user_activity_hourly.LastSeen, 9) AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(user_activity_hourly.FailedRequestCount) AS errors,
+          CAST([], 'Array(String)') AS groupIds
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.UserId != ''
+) AS rows
+        WHERE rows.errors > 0
+        GROUP BY userId)
+        GROUP BY userId, namespace
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          '' AS groupId,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(min(user_activity_hourly.FirstSeen), 9) AS firstSeen,
+          toDateTime64(max(user_activity_hourly.LastSeen), 9) AS lastSeen,
+          toUInt64(0) AS sessions,
+          toUInt64(sum(user_activity_hourly.FailedRequestCount)) AS errors,
+          toUInt64(sum(user_activity_hourly.RequestCount)) AS requests,
+          toUInt64(sumIf(user_activity_hourly.SpanCount, user_activity_hourly.ServiceName IN ('maple-ai'))) AS mcpSpans,
+          toUInt64(0) AS events,
+          toUInt64(sum(user_activity_hourly.SpanCount)) AS spans,
+          toUInt64(sum(user_activity_hourly.LogCount)) AS logLines,
+          toUInt64(0) AS classifiedRequests,
+          toUInt64(0) AS mcpRequests,
+          toUInt64(0) AS webRequests,
+          toUInt64(0) AS mobileRequests,
+          CAST([], 'Array(String)') AS groupIds,
+          toFloat64(0) AS nameAt,
+          toFloat64(0) AS emailAt,
+          toFloat64(0) AS groupAt
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.UserId != ''
+          AND user_activity_hourly.UserId IN (SELECT
+          rows.userId AS userId
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          product_events.Timestamp AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(user_activity_hourly.LastSeen, 9) AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(user_activity_hourly.FailedRequestCount) AS errors,
+          CAST([], 'Array(String)') AS groupIds
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.UserId != ''
+) AS rows
+        WHERE rows.errors > 0
+        GROUP BY userId)
+        GROUP BY userId, namespace
+) AS signals
+        GROUP BY userId
+        HAVING sum(signals.errors) > 0
+          AND sum(signals.sessions) > 0
+        ORDER BY lastSeen DESC, userId ASC
+        LIMIT 201
+        FORMAT JSON
+
 -- builder:users:usersListQuery:namespaceFiltered  [5a3cb3cf]
 SELECT
           signals.userId AS userId,
@@ -11820,6 +12508,327 @@ SELECT
           AND (positionCaseInsensitiveUTF8(signals.userId, 'ada') > 0 OR positionCaseInsensitiveUTF8(argMax(signals.name, signals.nameAt), 'ada') > 0 OR positionCaseInsensitiveUTF8(argMax(signals.email, signals.emailAt), 'ada') > 0)
         ORDER BY lastSeen DESC, userId ASC
         LIMIT 200
+        FORMAT JSON
+
+-- builder:users:usersListQuery:recentFloorBound  [e9e96e2e]
+SELECT
+          signals.userId AS userId,
+          argMax(signals.name, signals.nameAt) AS name,
+          argMax(signals.email, signals.emailAt) AS email,
+          argMax(signals.groupId, signals.groupAt) AS groupId,
+          arraySort(arrayDistinct(groupArrayArray(signals.groupIds))) AS groupIds,
+          arraySort(groupUniqArrayIf(20)(signals.namespace, signals.namespace != '')) AS namespaces,
+          min(signals.firstSeen) AS firstSeen,
+          max(signals.lastSeen) AS lastSeen,
+          toString(max(signals.lastSeen)) AS lastSeenKey,
+          sum(signals.sessions) AS sessions,
+          sum(signals.errors) AS errors,
+          sum(signals.requests) AS requests,
+          sum(signals.mcpSpans) AS mcpSpans,
+          sum(signals.events) AS events,
+          sum(signals.spans) AS spans,
+          sum(signals.logLines) AS logLines,
+          sum(signals.classifiedRequests) AS classifiedRequests,
+          sum(signals.mcpRequests) AS mcpRequests,
+          sum(signals.webRequests) AS webRequests,
+          sum(signals.mobileRequests) AS mobileRequests
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          argMax(sessions.userName, if(sessions.userName != '', toFloat64(sessions.lastActivity), 0)) AS name,
+          argMax(sessions.userEmail, if(sessions.userEmail != '', toFloat64(sessions.lastActivity), 0)) AS email,
+          argMax(sessions.groupId, if(sessions.groupId != '', toFloat64(sessions.lastActivity), 0)) AS groupId,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          min(sessions.startTime) AS firstSeen,
+          max(sessions.lastActivity) AS lastSeen,
+          count() AS sessions,
+          toUInt64(sum(sessions.errors)) AS errors,
+          toUInt64(0) AS requests,
+          toUInt64(0) AS mcpSpans,
+          toUInt64(0) AS events,
+          toUInt64(0) AS spans,
+          toUInt64(0) AS logLines,
+          toUInt64(0) AS classifiedRequests,
+          toUInt64(0) AS mcpRequests,
+          toUInt64(0) AS webRequests,
+          toUInt64(0) AS mobileRequests,
+          groupUniqArrayIf(20)(sessions.groupId, sessions.groupId != '') AS groupIds,
+          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userName != '')) AS nameAt,
+          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userEmail != '')) AS emailAt,
+          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.groupId != '')) AS groupAt
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+          AND sessions.userId IN (SELECT
+          rows.userId AS userId
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+          AND sessions.lastActivity > '2026-01-01 23:40:00.000000000'
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          product_events.Timestamp AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+          AND product_events.Timestamp > '2026-01-01 23:40:00.000000000'
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(user_activity_hourly.LastSeen, 9) AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(user_activity_hourly.FailedRequestCount) AS errors,
+          CAST([], 'Array(String)') AS groupIds
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime64('2026-01-01 23:40:00.000000000', 9))
+          AND user_activity_hourly.UserId != ''
+          AND toDateTime64(user_activity_hourly.LastSeen, 9) > '2026-01-01 23:40:00.000000000'
+) AS rows
+        GROUP BY userId)
+        GROUP BY userId, namespace
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          argMax(product_events.GroupId, if(product_events.GroupId != '', toFloat64(product_events.Timestamp), 0)) AS groupId,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          min(product_events.Timestamp) AS firstSeen,
+          max(product_events.Timestamp) AS lastSeen,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          toUInt64(0) AS requests,
+          toUInt64(0) AS mcpSpans,
+          count() AS events,
+          toUInt64(0) AS spans,
+          toUInt64(0) AS logLines,
+          toUInt64(0) AS classifiedRequests,
+          toUInt64(0) AS mcpRequests,
+          toUInt64(0) AS webRequests,
+          toUInt64(0) AS mobileRequests,
+          groupUniqArrayIf(20)(product_events.GroupId, product_events.GroupId != '') AS groupIds,
+          toFloat64(0) AS nameAt,
+          toFloat64(0) AS emailAt,
+          toFloat64(maxIf(toFloat64(product_events.Timestamp), product_events.GroupId != '')) AS groupAt
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+          AND product_events.UserId IN (SELECT
+          rows.userId AS userId
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+          AND sessions.lastActivity > '2026-01-01 23:40:00.000000000'
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          product_events.Timestamp AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+          AND product_events.Timestamp > '2026-01-01 23:40:00.000000000'
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(user_activity_hourly.LastSeen, 9) AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(user_activity_hourly.FailedRequestCount) AS errors,
+          CAST([], 'Array(String)') AS groupIds
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime64('2026-01-01 23:40:00.000000000', 9))
+          AND user_activity_hourly.UserId != ''
+          AND toDateTime64(user_activity_hourly.LastSeen, 9) > '2026-01-01 23:40:00.000000000'
+) AS rows
+        GROUP BY userId)
+        GROUP BY userId, namespace
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          '' AS groupId,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(min(user_activity_hourly.FirstSeen), 9) AS firstSeen,
+          toDateTime64(max(user_activity_hourly.LastSeen), 9) AS lastSeen,
+          toUInt64(0) AS sessions,
+          toUInt64(sum(user_activity_hourly.FailedRequestCount)) AS errors,
+          toUInt64(sum(user_activity_hourly.RequestCount)) AS requests,
+          toUInt64(sumIf(user_activity_hourly.SpanCount, user_activity_hourly.ServiceName IN ('maple-ai'))) AS mcpSpans,
+          toUInt64(0) AS events,
+          toUInt64(sum(user_activity_hourly.SpanCount)) AS spans,
+          toUInt64(sum(user_activity_hourly.LogCount)) AS logLines,
+          toUInt64(0) AS classifiedRequests,
+          toUInt64(0) AS mcpRequests,
+          toUInt64(0) AS webRequests,
+          toUInt64(0) AS mobileRequests,
+          CAST([], 'Array(String)') AS groupIds,
+          toFloat64(0) AS nameAt,
+          toFloat64(0) AS emailAt,
+          toFloat64(0) AS groupAt
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.UserId != ''
+          AND user_activity_hourly.UserId IN (SELECT
+          rows.userId AS userId
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+          AND sessions.lastActivity > '2026-01-01 23:40:00.000000000'
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          product_events.Timestamp AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+          AND product_events.Timestamp > '2026-01-01 23:40:00.000000000'
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(user_activity_hourly.LastSeen, 9) AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(user_activity_hourly.FailedRequestCount) AS errors,
+          CAST([], 'Array(String)') AS groupIds
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime64('2026-01-01 23:40:00.000000000', 9))
+          AND user_activity_hourly.UserId != ''
+          AND toDateTime64(user_activity_hourly.LastSeen, 9) > '2026-01-01 23:40:00.000000000'
+) AS rows
+        GROUP BY userId)
+        GROUP BY userId, namespace
+) AS signals
+        GROUP BY userId
+        ORDER BY lastSeen DESC, userId ASC
+        LIMIT 201
         FORMAT JSON
 
 -- builder:users:usersListQuery:requestChannels  [9ff369d6]
@@ -12083,6 +13092,69 @@ SELECT
         LIMIT 200
         FORMAT JSON
 
+-- builder:users:usersMatchingCountQuery:default  [38c777b9]
+SELECT
+          uniq(rows.userId) AS users
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          product_events.Timestamp AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(user_activity_hourly.LastSeen, 9) AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(user_activity_hourly.FailedRequestCount) AS errors,
+          CAST([], 'Array(String)') AS groupIds
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.UserId != ''
+) AS rows
+        WHERE rows.errors > 0
+        FORMAT JSON
+
 -- builder:users:usersMcpNameSearchQuery:default  [a73a3eb1]
 SELECT
           if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) AS userId
@@ -12117,6 +13189,74 @@ SELECT
           AND (mapContains(traces.SpanAttributes, 'user.name') OR mapContains(traces.SpanAttributes, 'user.email'))
         GROUP BY userId
         LIMIT 2
+        FORMAT JSON
+
+-- builder:users:usersRecentFloorQuery:default  [0de89ebc]
+SELECT
+          toString(min(recent.at)) AS floor,
+          toString(addNanoseconds(min(recent.at), 1)) AS resume,
+          count() AS rows
+        FROM (SELECT
+          rows.at AS at
+        FROM (
+SELECT
+          sessions.userId AS userId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
+          transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
+        FROM (SELECT
+          session_replays.SessionId AS sessionId,
+          argMax(session_replays.UserId, session_replays.Version) AS userId,
+          argMax(session_replays.UserName, session_replays.Version) AS userName,
+          argMax(session_replays.UserEmail, session_replays.Version) AS userEmail,
+          argMax(session_replays.GroupId, session_replays.Version) AS groupId,
+          any(session_replays.ServiceName) AS serviceName,
+          max(session_replays.ErrorCount) AS errors,
+          min(session_replays.StartTime) AS startTime,
+          max(ifNull(session_replays.LastActivityAt, session_replays.StartTime)) AS lastActivity
+        FROM session_replays
+        WHERE session_replays.OrgId = 'org_sql_catalog'
+          AND session_replays.StartTime >= '2026-01-01 10:30:00'
+          AND session_replays.StartTime <= '2026-01-03 14:15:00'
+        GROUP BY sessionId) AS sessions
+        WHERE sessions.userId != ''
+UNION ALL
+SELECT
+          product_events.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
+          product_events.Timestamp AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(0) AS errors,
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
+        FROM product_events
+        WHERE product_events.OrgId = 'org_sql_catalog'
+          AND product_events.Timestamp >= '2026-01-01 10:30:00'
+          AND product_events.Timestamp <= '2026-01-03 14:15:00'
+          AND product_events.UserId != ''
+UNION ALL
+SELECT
+          user_activity_hourly.UserId AS userId,
+          '' AS name,
+          '' AS email,
+          user_activity_hourly.ServiceNamespace AS namespace,
+          toDateTime64(user_activity_hourly.LastSeen, 9) AS at,
+          toUInt64(0) AS sessions,
+          toUInt64(user_activity_hourly.FailedRequestCount) AS errors,
+          CAST([], 'Array(String)') AS groupIds
+        FROM user_activity_hourly
+        WHERE user_activity_hourly.OrgId = 'org_sql_catalog'
+          AND user_activity_hourly.Hour >= toStartOfHour(toDateTime('2026-01-01 10:30:00'))
+          AND user_activity_hourly.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+          AND user_activity_hourly.UserId != ''
+) AS rows
+        ORDER BY at DESC
+        LIMIT 20000) AS recent
         FORMAT JSON
 
 -- builder:users:usersServiceNamespacesQuery:default  [7caa4563]
@@ -12175,41 +13315,22 @@ SELECT
         LIMIT 2000
         FORMAT JSON
 
--- builder:users:usersSummaryQuery:default  [48c9b564]
+-- builder:users:usersSummaryQuery:default  [70c1cbaa]
 SELECT
-          count() AS identified,
-          countIf(users.lastSeen >= '2026-01-01 10:30:00') AS activeToday,
-          countIf(users.errors > 0) AS withErrors,
-          countIf(users.sessions > 0) AS withReplay
-        FROM (SELECT
-          signals.userId AS userId,
-          max(signals.lastSeen) AS lastSeen,
-          sum(signals.sessions) AS sessions,
-          sum(signals.errors) AS errors
+          uniq(rows.userId) AS identified,
+          uniqIf(rows.userId, rows.at >= '2026-01-01 10:30:00') AS activeToday,
+          uniqIf(rows.userId, rows.errors > 0) AS withErrors,
+          uniqIf(rows.userId, rows.sessions > 0) AS withReplay
         FROM (
 SELECT
           sessions.userId AS userId,
-          argMax(sessions.userName, if(sessions.userName != '', toFloat64(sessions.lastActivity), 0)) AS name,
-          argMax(sessions.userEmail, if(sessions.userEmail != '', toFloat64(sessions.lastActivity), 0)) AS email,
-          argMax(sessions.groupId, if(sessions.groupId != '', toFloat64(sessions.lastActivity), 0)) AS groupId,
+          sessions.userName AS name,
+          sessions.userEmail AS email,
           transform(sessions.serviceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
-          min(sessions.startTime) AS firstSeen,
-          max(sessions.lastActivity) AS lastSeen,
-          count() AS sessions,
-          toUInt64(sum(sessions.errors)) AS errors,
-          toUInt64(0) AS requests,
-          toUInt64(0) AS mcpSpans,
-          toUInt64(0) AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(0) AS classifiedRequests,
-          toUInt64(0) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          groupUniqArrayIf(20)(sessions.groupId, sessions.groupId != '') AS groupIds,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userName != '')) AS nameAt,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.userEmail != '')) AS emailAt,
-          toFloat64(maxIf(toFloat64(sessions.lastActivity), sessions.groupId != '')) AS groupAt
+          sessions.lastActivity AS at,
+          toUInt64(1) AS sessions,
+          toUInt64(sessions.errors) AS errors,
+          if(notEmpty(sessions.groupId), [sessions.groupId], CAST([], 'Array(String)')) AS groupIds
         FROM (SELECT
           session_replays.SessionId AS sessionId,
           argMax(session_replays.UserId, session_replays.Version) AS userId,
@@ -12226,61 +13347,31 @@ SELECT
           AND session_replays.StartTime <= '2026-01-03 14:15:00'
         GROUP BY sessionId) AS sessions
         WHERE sessions.userId != ''
-        GROUP BY userId, namespace
 UNION ALL
 SELECT
           product_events.UserId AS userId,
           '' AS name,
           '' AS email,
-          argMax(product_events.GroupId, if(product_events.GroupId != '', toFloat64(product_events.Timestamp), 0)) AS groupId,
           transform(product_events.ServiceName, ['storefront-web', 'maple-ai'], ['storefront', 'platform'], '') AS namespace,
-          min(product_events.Timestamp) AS firstSeen,
-          max(product_events.Timestamp) AS lastSeen,
+          product_events.Timestamp AS at,
           toUInt64(0) AS sessions,
           toUInt64(0) AS errors,
-          toUInt64(0) AS requests,
-          toUInt64(0) AS mcpSpans,
-          count() AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(0) AS classifiedRequests,
-          toUInt64(0) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          groupUniqArrayIf(20)(product_events.GroupId, product_events.GroupId != '') AS groupIds,
-          toFloat64(0) AS nameAt,
-          toFloat64(0) AS emailAt,
-          toFloat64(maxIf(toFloat64(product_events.Timestamp), product_events.GroupId != '')) AS groupAt
+          if(notEmpty(product_events.GroupId), [product_events.GroupId], CAST([], 'Array(String)')) AS groupIds
         FROM product_events
         WHERE product_events.OrgId = 'org_sql_catalog'
           AND product_events.Timestamp >= '2026-01-01 10:30:00'
           AND product_events.Timestamp <= '2026-01-03 14:15:00'
           AND product_events.UserId != ''
-        GROUP BY userId, namespace
 UNION ALL
 SELECT
           if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) AS userId,
-          argMax(traces.SpanAttributes['user.name'], if(traces.SpanAttributes['user.name'] != '', toFloat64(traces.Timestamp), 0)) AS name,
-          argMax(traces.SpanAttributes['user.email'], if(traces.SpanAttributes['user.email'] != '', toFloat64(traces.Timestamp), 0)) AS email,
-          '' AS groupId,
+          traces.SpanAttributes['user.name'] AS name,
+          traces.SpanAttributes['user.email'] AS email,
           traces.ResourceAttributes['service.namespace'] AS namespace,
-          min(traces.Timestamp) AS firstSeen,
-          max(traces.Timestamp) AS lastSeen,
+          traces.Timestamp AS at,
           toUInt64(0) AS sessions,
           toUInt64(0) AS errors,
-          countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call') AS requests,
-          count() AS mcpSpans,
-          toUInt64(0) AS events,
-          toUInt64(0) AS spans,
-          toUInt64(0) AS logLines,
-          toUInt64(countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call')) AS classifiedRequests,
-          toUInt64(countIf(traces.SpanAttributes['mcp.method.name'] = 'tools/call')) AS mcpRequests,
-          toUInt64(0) AS webRequests,
-          toUInt64(0) AS mobileRequests,
-          CAST([], 'Array(String)') AS groupIds,
-          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.name'] != '')) AS nameAt,
-          toFloat64(maxIf(toFloat64(traces.Timestamp), traces.SpanAttributes['user.email'] != '')) AS emailAt,
-          toFloat64(0) AS groupAt
+          CAST([], 'Array(String)') AS groupIds
         FROM traces
         WHERE traces.OrgId = 'org_sql_catalog'
           AND traces.Timestamp >= '2026-01-01 10:30:00'
@@ -12289,9 +13380,7 @@ SELECT
           AND traces.ServiceName IN ('maple-ai')
           AND traces.SpanAttributes['mcp.method.name'] != ''
           AND if(traces.SpanAttributes['user.id'] != '', traces.SpanAttributes['user.id'], traces.SpanAttributes['enduser.id']) != ''
-        GROUP BY userId, namespace
-) AS signals
-        GROUP BY userId) AS users
+) AS rows
         FORMAT JSON
 
 -- builder:users:userVisitorIdsQuery:default  [4df66218]
@@ -15848,6 +16937,104 @@ SELECT
         LIMIT 25
         FORMAT JSON
 
+-- pipe:list_traces:ok-only:baseline  [8c2aa4dd]
+SELECT
+          traces.TraceId AS traceId,
+          traces.Timestamp AS startTime,
+          traces.Timestamp AS endTime,
+          intDiv(traces.Duration, 1000) AS durationMicros,
+          toUInt64(1) AS spanCount,
+          [traces.ServiceName] AS services,
+          traces.SpanId AS rootSpanId,
+          traces.SpanName AS rootSpanName,
+          traces.SpanKind AS rootSpanKind,
+          traces.StatusCode AS rootSpanStatusCode,
+          traces.StatusMessage AS rootSpanStatusMessage,
+          if(traces.SpanAttributes['http.method'] != '', traces.SpanAttributes['http.method'], traces.SpanAttributes['http.request.method']) AS rootHttpMethod,
+          traces.SpanAttributes['http.route'] AS rootHttpRoute,
+          if(traces.SpanAttributes['http.status_code'] != '', traces.SpanAttributes['http.status_code'], traces.SpanAttributes['http.response.status_code']) AS rootHttpStatusCode,
+          toJSONString(map('http.method', SpanAttributes['http.method'], 'http.request.method', SpanAttributes['http.request.method'], 'http.route', SpanAttributes['http.route'], 'http.target', SpanAttributes['http.target'], 'http.status_code', SpanAttributes['http.status_code'], 'http.response.status_code', SpanAttributes['http.response.status_code'], 'http.url', SpanAttributes['http.url'], 'url.full', SpanAttributes['url.full'], 'url.path', SpanAttributes['url.path'], 'server.address', SpanAttributes['server.address'], 'net.peer.name', SpanAttributes['net.peer.name'], 'screen.name', SpanAttributes['screen.name'])) AS rootSpanAttributes,
+          coalesce(nullIf(traces.ResourceAttributes['deployment.environment.name'], ''), traces.ResourceAttributes['deployment.environment']) AS rootDeploymentEnv,
+          traces.ResourceAttributes['service.version'] AS rootServiceVersion,
+          if(traces.StatusCode = 'Error', 1, 0) AS hasError
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND (traces.SpanKind IN ('Server', 'Consumer') OR traces.ParentSpanId = '')
+          AND traces.StatusCode != 'Error'
+          AND traces.Timestamp >= (SELECT min(ts) FROM (SELECT
+          traces.Timestamp AS ts
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND (traces.SpanKind IN ('Server', 'Consumer') OR traces.ParentSpanId = '')
+          AND traces.StatusCode != 'Error'
+        ORDER BY ts DESC
+        LIMIT 100))
+        ORDER BY startTime DESC
+        LIMIT 100
+        FORMAT JSON
+
+-- pipe:list_traces:trace-id:baseline  [18275485]
+SELECT
+          traces.TraceId AS traceId,
+          traces.Timestamp AS startTime,
+          traces.Timestamp AS endTime,
+          intDiv(traces.Duration, 1000) AS durationMicros,
+          toUInt64(1) AS spanCount,
+          [traces.ServiceName] AS services,
+          traces.SpanId AS rootSpanId,
+          traces.SpanName AS rootSpanName,
+          traces.SpanKind AS rootSpanKind,
+          traces.StatusCode AS rootSpanStatusCode,
+          traces.StatusMessage AS rootSpanStatusMessage,
+          if(traces.SpanAttributes['http.method'] != '', traces.SpanAttributes['http.method'], traces.SpanAttributes['http.request.method']) AS rootHttpMethod,
+          traces.SpanAttributes['http.route'] AS rootHttpRoute,
+          if(traces.SpanAttributes['http.status_code'] != '', traces.SpanAttributes['http.status_code'], traces.SpanAttributes['http.response.status_code']) AS rootHttpStatusCode,
+          toJSONString(map('http.method', SpanAttributes['http.method'], 'http.request.method', SpanAttributes['http.request.method'], 'http.route', SpanAttributes['http.route'], 'http.target', SpanAttributes['http.target'], 'http.status_code', SpanAttributes['http.status_code'], 'http.response.status_code', SpanAttributes['http.response.status_code'], 'http.url', SpanAttributes['http.url'], 'url.full', SpanAttributes['url.full'], 'url.path', SpanAttributes['url.path'], 'server.address', SpanAttributes['server.address'], 'net.peer.name', SpanAttributes['net.peer.name'], 'screen.name', SpanAttributes['screen.name'])) AS rootSpanAttributes,
+          coalesce(nullIf(traces.ResourceAttributes['deployment.environment.name'], ''), traces.ResourceAttributes['deployment.environment']) AS rootDeploymentEnv,
+          traces.ResourceAttributes['service.version'] AS rootServiceVersion,
+          if(traces.StatusCode = 'Error', 1, 0) AS hasError
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND (traces.SpanKind IN ('Server', 'Consumer') OR traces.ParentSpanId = '')
+          AND traces.TraceId = '0af7651916cd43dd8448eb211c80319c'
+          AND (traces.ServiceName, toStartOfFiveMinutes(traces.Timestamp), traces.TraceId) IN (SELECT
+          trace_index.ServiceName AS ServiceName,
+          trace_index.Bucket AS Bucket,
+          trace_index.TraceId AS TraceId
+        FROM trace_index
+        WHERE trace_index.OrgId = 'org_sql_catalog'
+          AND trace_index.TraceId = '0af7651916cd43dd8448eb211c80319c'
+          AND trace_index.Bucket >= toStartOfFiveMinutes(toDateTime64('2026-01-01 10:30:00', 9))
+          AND trace_index.Bucket <= toDateTime64('2026-01-03 14:15:00', 9))
+          AND traces.Timestamp >= (SELECT min(ts) FROM (SELECT
+          traces.Timestamp AS ts
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND (traces.SpanKind IN ('Server', 'Consumer') OR traces.ParentSpanId = '')
+          AND traces.TraceId = '0af7651916cd43dd8448eb211c80319c'
+          AND (traces.ServiceName, toStartOfFiveMinutes(traces.Timestamp), traces.TraceId) IN (SELECT
+          trace_index.ServiceName AS ServiceName,
+          trace_index.Bucket AS Bucket,
+          trace_index.TraceId AS TraceId
+        FROM trace_index
+        WHERE trace_index.OrgId = 'org_sql_catalog'
+          AND trace_index.TraceId = '0af7651916cd43dd8448eb211c80319c'
+          AND trace_index.Bucket >= toStartOfFiveMinutes(toDateTime64('2026-01-01 10:30:00', 9))
+          AND trace_index.Bucket <= toDateTime64('2026-01-03 14:15:00', 9))
+        ORDER BY ts DESC
+        LIMIT 100))
+        ORDER BY startTime DESC
+        LIMIT 100
+        FORMAT JSON
+
 -- pipe:logs_count:default:baseline  [fa7ccb7f]
 SELECT
           sum(counts.total) AS total
@@ -16585,7 +17772,7 @@ SELECT
         ORDER BY bucket ASC
         FORMAT JSON
 
--- pipe:service_dependencies:default:baseline  [1fd187fd]
+-- pipe:service_dependencies:default:baseline  [0f1a4626]
 SELECT
           edges.sourceService AS sourceService,
           edges.targetService AS targetService,
@@ -16627,7 +17814,7 @@ SELECT
           service_map_spans.ServiceName AS ServiceName,
           service_map_spans.DeploymentEnv AS DeploymentEnv
         FROM service_map_spans
-        WHERE service_map_spans.SpanKind IN ('Client', 'Producer')
+        WHERE (service_map_spans.SpanKind IN ('Client', 'Producer') OR (service_map_spans.SpanKind = 'Server' AND service_map_spans.ServiceName IN ('vercel.edge-network')))
           AND service_map_spans.Timestamp >= toDateTime('2026-01-01 10:30:00')
           AND service_map_spans.Timestamp < toDateTime('2026-01-03 14:15:00')
           AND service_map_spans.OrgId = 'org_sql_catalog'
@@ -17726,6 +18913,38 @@ SELECT
         WHERE traces.OrgId = 'org_sql_catalog'
           AND traces.Timestamp >= '2026-01-01 10:30:00'
           AND traces.Timestamp <= '2026-01-03 14:15:00'
+        ORDER BY ts DESC
+        LIMIT 20))
+        ORDER BY timestamp DESC
+        LIMIT 20
+        FORMAT JSON
+
+-- pipe:span_search:ok-only:baseline  [2113e854]
+SELECT
+          traces.TraceId AS traceId,
+          traces.SpanId AS spanId,
+          traces.SpanName AS spanName,
+          traces.ServiceName AS serviceName,
+          traces.Duration / 1000000 AS durationMs,
+          traces.StatusCode AS statusCode,
+          traces.StatusMessage AS statusMessage,
+          traces.SpanAttributes AS spanAttributes,
+          traces.ResourceAttributes AS resourceAttributes,
+          traces.Timestamp AS timestamp
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND (traces.SpanName IN ('GET /v1/x', 'GET', 'http.server GET') AND (traces.SpanName = 'GET /v1/x' OR if(((traces.SpanName LIKE 'http.server %' OR traces.SpanName IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS')) AND (traces.SpanAttributes['http.route'] != '' OR traces.SpanAttributes['url.path'] != '')), concat(if(traces.SpanName LIKE 'http.server %', replaceOne(traces.SpanName, 'http.server ', ''), traces.SpanName), ' ', if(traces.SpanAttributes['http.route'] != '', traces.SpanAttributes['http.route'], traces.SpanAttributes['url.path'])), traces.SpanName) = 'GET /v1/x'))
+          AND traces.StatusCode != 'Error'
+          AND traces.Timestamp >= (SELECT min(ts) FROM (SELECT
+          traces.Timestamp AS ts
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND (traces.SpanName IN ('GET /v1/x', 'GET', 'http.server GET') AND (traces.SpanName = 'GET /v1/x' OR if(((traces.SpanName LIKE 'http.server %' OR traces.SpanName IN ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS')) AND (traces.SpanAttributes['http.route'] != '' OR traces.SpanAttributes['url.path'] != '')), concat(if(traces.SpanName LIKE 'http.server %', replaceOne(traces.SpanName, 'http.server ', ''), traces.SpanName), ' ', if(traces.SpanAttributes['http.route'] != '', traces.SpanAttributes['http.route'], traces.SpanAttributes['url.path'])), traces.SpanName) = 'GET /v1/x'))
+          AND traces.StatusCode != 'Error'
         ORDER BY ts DESC
         LIMIT 20))
         ORDER BY timestamp DESC
@@ -19575,7 +20794,7 @@ SELECT
         ORDER BY bucket ASC, groupName ASC
         FORMAT JSON
 
--- spec:metrics-breakdown:baseline  [8d3f329e]
+-- spec:metrics-breakdown:baseline  [5a3c67e4]
 SELECT
           bucket AS bucket,
           groupName AS groupName,
@@ -19597,21 +20816,93 @@ SELECT
           seriesCount AS seriesCount,
           max(value) OVER (PARTITION BY groupName) AS __series_peak
         FROM (SELECT
-          toDateTime('2026-01-01 10:30:00') AS bucket,
+          merged.bucket AS bucket,
+          merged.groupName AS groupName,
+          ifNull(ifNotFinite(merged.total / merged.observations, 0), 0) AS value,
+          toUInt64(merged.observations) AS dataPointCount,
+          merged.seriesCount AS seriesCount
+        FROM (WITH hist_samples AS (
+SELECT
+          metrics_histogram.TimeUnix AS TimeUnix,
           metrics_histogram.ServiceName AS groupName,
-          ifNull(ifNotFinite(sum(metrics_histogram.Sum) / sum(metrics_histogram.Count), 0), 0) AS value,
-          sum(metrics_histogram.Count) AS dataPointCount,
-          uniqExact(cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes))) AS seriesCount
+          cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) AS series,
+          metrics_histogram.AggregationTemporality AS temporality,
+          metrics_histogram.StartTimeUnix AS startTime,
+          lagInFrame(metrics_histogram.StartTimeUnix, 1, metrics_histogram.StartTimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevStart,
+          lagInFrame(metrics_histogram.TimeUnix, 1, metrics_histogram.TimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevTime,
+          if(((count() OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) = 1 AND metrics_histogram.StartTimeUnix >= '2026-01-01 10:30:00' - INTERVAL 600 SECOND) AND metrics_histogram.StartTimeUnix < metrics_histogram.TimeUnix), 1, 0) AS fresh,
+          metrics_histogram.Count AS sCount,
+          lagInFrame(metrics_histogram.Count, 1, metrics_histogram.Count) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevCount,
+          metrics_histogram.Sum AS sSum,
+          lagInFrame(metrics_histogram.Sum, 1, metrics_histogram.Sum) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevSum,
+          metrics_histogram.Min AS sMin,
+          metrics_histogram.Max AS sMax
         FROM metrics_histogram
         WHERE metrics_histogram.MetricName = 'http.server.request.duration'
           AND metrics_histogram.OrgId = 'org_sql_catalog'
-          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00'
+          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00' - INTERVAL 600 SECOND
           AND metrics_histogram.TimeUnix <= '2026-01-03 14:15:00'
           AND metrics_histogram.TimeUnix < '2026-01-03 14:15:00'
           AND metrics_histogram.ServiceName = 'api'
-        GROUP BY bucket, groupName) AS __series_base) AS __series_peaks) AS __series_ranked
+          AND bitAnd(Flags, 1) = 0
+)
+SELECT
+          toDateTime('2026-01-01 10:30:00') AS bucket,
+          hist_samples.groupName AS groupName,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount))) AS observations,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), sSum, sSum - prevSum)) AS total,
+          min(hist_samples.sMin) AS minValue,
+          max(hist_samples.sMax) AS maxValue,
+          count() AS samples,
+          uniqExact(hist_samples.series) AS seriesCount
+        FROM hist_samples
+        WHERE hist_samples.TimeUnix >= '2026-01-01 10:30:00'
+        GROUP BY bucket, groupName) AS merged
+        WHERE merged.observations > 0) AS __series_base) AS __series_peaks) AS __series_ranked
         WHERE __series_rank <= 11
         ORDER BY bucket ASC, groupName ASC
+        FORMAT JSON
+
+-- spec:metrics-sparklines-histogram:baseline  [54ca853a]
+SELECT
+          merged.bucket AS bucket,
+          merged.metricName AS metricName,
+          ifNull(ifNotFinite(merged.total / merged.observations, 0), 0) AS avgValue,
+          merged.total AS sumValue,
+          toUInt64(merged.observations) AS dataPointCount
+        FROM (WITH hist_samples AS (
+SELECT
+          metrics_histogram.TimeUnix AS TimeUnix,
+          metrics_histogram.MetricName AS groupName,
+          cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) AS series,
+          metrics_histogram.AggregationTemporality AS temporality,
+          metrics_histogram.StartTimeUnix AS startTime,
+          lagInFrame(metrics_histogram.StartTimeUnix, 1, metrics_histogram.StartTimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevStart,
+          lagInFrame(metrics_histogram.TimeUnix, 1, metrics_histogram.TimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevTime,
+          if(((count() OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) = 1 AND metrics_histogram.StartTimeUnix >= '2026-01-01 10:30:00' - INTERVAL 3600 SECOND) AND metrics_histogram.StartTimeUnix < metrics_histogram.TimeUnix), 1, 0) AS fresh,
+          metrics_histogram.Count AS sCount,
+          lagInFrame(metrics_histogram.Count, 1, metrics_histogram.Count) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevCount,
+          metrics_histogram.Sum AS sSum,
+          lagInFrame(metrics_histogram.Sum, 1, metrics_histogram.Sum) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevSum,
+          metrics_histogram.Min AS sMin,
+          metrics_histogram.Max AS sMax
+        FROM metrics_histogram
+        WHERE metrics_histogram.MetricName IN ('http.server.request.duration')
+          AND metrics_histogram.OrgId = 'org_sql_catalog'
+          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00' - INTERVAL 3600 SECOND
+          AND metrics_histogram.TimeUnix <= '2026-01-03 14:15:00'
+          AND bitAnd(Flags, 1) = 0
+)
+SELECT
+          toStartOfInterval(hist_samples.TimeUnix, INTERVAL 3600 SECOND) AS bucket,
+          hist_samples.groupName AS metricName,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount))) AS observations,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), sSum, sSum - prevSum)) AS total
+        FROM hist_samples
+        WHERE hist_samples.TimeUnix >= '2026-01-01 10:30:00'
+        GROUP BY bucket, metricName) AS merged
+        WHERE merged.observations > 0
+        ORDER BY bucket ASC
         FORMAT JSON
 
 -- spec:metrics-sparklines:baseline  [f220d493]
@@ -19630,54 +20921,345 @@ SELECT
         ORDER BY bucket ASC
         FORMAT JSON
 
--- spec:metrics-timeseries-grouped-by-attribute:baseline  [09da1919]
+-- spec:metrics-timeseries-exponential-histogram-percentile:baseline  [5d168162]
 SELECT
-          toStartOfInterval(metrics_histogram.TimeUnix, INTERVAL 300 SECOND) AS bucket,
+          estimated.bucket AS bucket,
+          estimated.groupName AS groupName,
+          least(greatest(estimated.estimate, ifNull(estimated.bMin, estimated.estimate)), ifNull(estimated.bMax, estimated.estimate)) AS value,
+          toUInt64(estimated.observations) AS dataPointCount,
+          estimated.seriesCount AS seriesCount
+        FROM (SELECT
+          walk.bucket AS bucket,
+          walk.groupName AS groupName,
+          walk.observations AS observations,
+          walk.seriesCount AS seriesCount,
+          walk.bMin AS bMin,
+          walk.bMax AS bMax,
+          multiIf(bTotal <= 0 OR arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)) = 0, nan, wSigns[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)] = 0, toFloat64(0), wSigns[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)] > 0, exp2((wKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)] + if(wCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)] > 0, ((0.95 * bTotal) - (arrayCumSum(wCounts)[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)] - wCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)])) / wCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)], 0)) * exp2(-bLow)), -exp2((wKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)] + 1 - if(wCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)] > 0, ((0.95 * bTotal) - (arrayCumSum(wCounts)[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)] - wCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)])) / wCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(wCounts)), 1)], 0)) * exp2(-bLow))) AS estimate
+        FROM (SELECT
+          merged.bucket AS bucket,
+          merged.groupName AS groupName,
+          merged.observations AS observations,
+          merged.seriesCount AS seriesCount,
+          merged.bMin AS bMin,
+          merged.bMax AS bMax,
+          merged.bLow AS bLow,
+          merged.bTotal AS bTotal,
+          arrayConcat(arrayReverse(negCounts), [bZero], posCounts) AS wCounts,
+          arrayConcat(arrayReverse(negKeys), [toInt64(0)], posKeys) AS wKeys,
+          arrayConcat(arrayWithConstant(length(negKeys), toInt32(-1)), [toInt32(0)], arrayWithConstant(length(posKeys), toInt32(1))) AS wSigns
+        FROM (SELECT
+          rescaled.bucket AS bucket,
+          rescaled.groupName AS groupName,
+          sum(rescaled.gObservations) AS observations,
+          length(groupUniqArrayArray(gSeries)) AS seriesCount,
+          if(sum(gUncovered) = 0, min(gMin), NULL) AS bMin,
+          if(sum(gUncovered) = 0, max(gMax), NULL) AS bMax,
+          any(rescaled.lowScale) AS bLow,
+          sum(rescaled.gZero) AS bZero,
+          sum(arraySum(gPosCounts) + arraySum(gNegCounts) + gZero) AS bTotal,
+          tupleElement(sumMap(arrayMap(k -> bitShiftRight(k, least(greatest(bScale - lowScale, 0), 62)), gPosKeys), gPosCounts), 1) AS posKeys,
+          tupleElement(sumMap(arrayMap(k -> bitShiftRight(k, least(greatest(bScale - lowScale, 0), 62)), gPosKeys), gPosCounts), 2) AS posCounts,
+          tupleElement(sumMap(arrayMap(k -> bitShiftRight(k, least(greatest(bScale - lowScale, 0), 62)), gNegKeys), gNegCounts), 1) AS negKeys,
+          tupleElement(sumMap(arrayMap(k -> bitShiftRight(k, least(greatest(bScale - lowScale, 0), 62)), gNegKeys), gNegCounts), 2) AS negCounts
+        FROM (SELECT
+          by_scale.bucket AS bucket,
+          by_scale.groupName AS groupName,
+          by_scale.bScale AS bScale,
+          by_scale.gObservations AS gObservations,
+          by_scale.gSeries AS gSeries,
+          by_scale.gUncovered AS gUncovered,
+          by_scale.gMin AS gMin,
+          by_scale.gMax AS gMax,
+          by_scale.gZero AS gZero,
+          by_scale.gPosKeys AS gPosKeys,
+          by_scale.gPosCounts AS gPosCounts,
+          by_scale.gNegKeys AS gNegKeys,
+          by_scale.gNegCounts AS gNegCounts,
+          minIf(bScale, arraySum(gPosCounts) + arraySum(gNegCounts) > 0) OVER (PARTITION BY bucket, groupName) AS lowScale
+        FROM (SELECT
+          toStartOfInterval(exp_increases.TimeUnix, INTERVAL 300 SECOND) AS bucket,
+          exp_increases.groupName AS groupName,
+          exp_increases.bScale AS bScale,
+          sum(exp_increases.sObservations) AS gObservations,
+          groupUniqArray(exp_increases.series) AS gSeries,
+          countIf((isNull(sMin) OR isNull(sMax)) AND sObservations > 0) AS gUncovered,
+          min(exp_increases.sMin) AS gMin,
+          max(exp_increases.sMax) AS gMax,
+          sum(exp_increases.zeroInc) AS gZero,
+          tupleElement(sumMap(range(posOff, posOff + toInt64(length(posInc))), posInc), 1) AS gPosKeys,
+          tupleElement(sumMap(range(posOff, posOff + toInt64(length(posInc))), posInc), 2) AS gPosCounts,
+          tupleElement(sumMap(range(negOff, negOff + toInt64(length(negInc))), negInc), 1) AS gNegKeys,
+          tupleElement(sumMap(range(negOff, negOff + toInt64(length(negInc))), negInc), 2) AS gNegCounts
+        FROM (WITH hist_samples AS (
+SELECT
+          metrics_exponential_histogram.TimeUnix AS TimeUnix,
+          metrics_exponential_histogram.ServiceName AS groupName,
+          cityHash64(metrics_exponential_histogram.ServiceName, mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes), mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) AS series,
+          metrics_exponential_histogram.AggregationTemporality AS temporality,
+          metrics_exponential_histogram.StartTimeUnix AS startTime,
+          lagInFrame(metrics_exponential_histogram.StartTimeUnix, 1, metrics_exponential_histogram.StartTimeUnix) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevStart,
+          lagInFrame(metrics_exponential_histogram.TimeUnix, 1, metrics_exponential_histogram.TimeUnix) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevTime,
+          if(((count() OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) = 1 AND metrics_exponential_histogram.StartTimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND) AND metrics_exponential_histogram.StartTimeUnix < metrics_exponential_histogram.TimeUnix), 1, 0) AS fresh,
+          metrics_exponential_histogram.Count AS sCount,
+          lagInFrame(metrics_exponential_histogram.Count, 1, metrics_exponential_histogram.Count) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevCount,
+          metrics_exponential_histogram.Sum AS sSum,
+          lagInFrame(metrics_exponential_histogram.Sum, 1, metrics_exponential_histogram.Sum) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevSum,
+          metrics_exponential_histogram.Min AS sMin,
+          metrics_exponential_histogram.Max AS sMax,
+          Scale AS scale,
+          lagInFrame(Scale, 1, Scale) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevScale,
+          ZeroCount AS zeroCount,
+          lagInFrame(ZeroCount, 1, ZeroCount) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevZero,
+          PositiveOffset AS posOffset,
+          lagInFrame(PositiveOffset, 1, PositiveOffset) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevPosOffset,
+          PositiveBucketCounts AS pos,
+          lagInFrame(PositiveBucketCounts, 1, PositiveBucketCounts) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevPos,
+          NegativeOffset AS negOffset,
+          lagInFrame(NegativeOffset, 1, NegativeOffset) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevNegOffset,
+          NegativeBucketCounts AS neg,
+          lagInFrame(NegativeBucketCounts, 1, NegativeBucketCounts) OVER (PARTITION BY metrics_exponential_histogram.ServiceName, metrics_exponential_histogram.MetricName, metrics_exponential_histogram.ScopeName, metrics_exponential_histogram.ScopeVersion, cityHash64(mapKeys(metrics_exponential_histogram.Attributes), mapValues(metrics_exponential_histogram.Attributes)), cityHash64(mapKeys(metrics_exponential_histogram.ResourceAttributes), mapValues(metrics_exponential_histogram.ResourceAttributes)) ORDER BY metrics_exponential_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevNeg
+        FROM metrics_exponential_histogram
+        WHERE metrics_exponential_histogram.MetricName = 'db.client.operation.duration'
+          AND metrics_exponential_histogram.OrgId = 'org_sql_catalog'
+          AND metrics_exponential_histogram.TimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND
+          AND metrics_exponential_histogram.TimeUnix <= '2026-01-03 14:15:00'
+          AND bitAnd(Flags, 1) = 0
+)
+SELECT
+          hist_samples.TimeUnix AS TimeUnix,
+          hist_samples.groupName AS groupName,
+          hist_samples.series AS series,
+          hist_samples.sMin AS sMin,
+          hist_samples.sMax AS sMax,
+          if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount)) AS sObservations,
+          (temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)) AS whole,
+          if(whole OR (empty(prevPos) AND empty(prevNeg)), scale, least(scale, prevScale)) AS bScale,
+          least(greatest(scale - bScale, 0), 62) AS curShift,
+          least(greatest(prevScale - bScale, 0), 62) AS prevShift,
+          if(whole, toFloat64(zeroCount), greatest(toFloat64(zeroCount) - toFloat64(prevZero), 0)) AS zeroInc,
+          if(curShift = 0, arrayMap(c -> toFloat64(c), pos), arrayPopFront(arrayDifference(arrayPushFront(arrayFilter((c, i, r) -> r = 1 OR bitAnd(toInt64(posOffset) + i, bitShiftLeft(toInt64(1), curShift) - 1) = 0, arrayCumSum(arrayMap(c -> toFloat64(c), pos)), arrayEnumerate(pos), arrayReverse(arrayEnumerate(pos))), toFloat64(0))))) AS posCur,
+          bitShiftRight(toInt64(posOffset), curShift) AS posCurOff,
+          if(whole, emptyArrayFloat64(), if(prevShift = 0, arrayMap(c -> toFloat64(c), prevPos), arrayPopFront(arrayDifference(arrayPushFront(arrayFilter((c, i, r) -> r = 1 OR bitAnd(toInt64(prevPosOffset) + i, bitShiftLeft(toInt64(1), prevShift) - 1) = 0, arrayCumSum(arrayMap(c -> toFloat64(c), prevPos)), arrayEnumerate(prevPos), arrayReverse(arrayEnumerate(prevPos))), toFloat64(0)))))) AS posPrev,
+          bitShiftRight(toInt64(prevPosOffset), prevShift) AS posPrevOff,
+          least(posCurOff, posPrevOff) AS posLow,
+          greatest(posCurOff + toInt64(length(posCur)), posPrevOff + toInt64(length(posPrev))) - posLow AS posSpan,
+          multiIf(empty(posPrev), posCur, empty(posCur) OR posSpan > 8192, emptyArrayFloat64(), arrayMap((c, p) -> greatest(c - p, 0), arrayResize(arrayConcat(arrayWithConstant(least(posCurOff - posLow, 8192), toFloat64(0)), posCur), least(posSpan, 8192)), arrayResize(arrayConcat(arrayWithConstant(least(posPrevOff - posLow, 8192), toFloat64(0)), posPrev), least(posSpan, 8192)))) AS posInc,
+          if(empty(posPrev), posCurOff, posLow) AS posOff,
+          if(curShift = 0, arrayMap(c -> toFloat64(c), neg), arrayPopFront(arrayDifference(arrayPushFront(arrayFilter((c, i, r) -> r = 1 OR bitAnd(toInt64(negOffset) + i, bitShiftLeft(toInt64(1), curShift) - 1) = 0, arrayCumSum(arrayMap(c -> toFloat64(c), neg)), arrayEnumerate(neg), arrayReverse(arrayEnumerate(neg))), toFloat64(0))))) AS negCur,
+          bitShiftRight(toInt64(negOffset), curShift) AS negCurOff,
+          if(whole, emptyArrayFloat64(), if(prevShift = 0, arrayMap(c -> toFloat64(c), prevNeg), arrayPopFront(arrayDifference(arrayPushFront(arrayFilter((c, i, r) -> r = 1 OR bitAnd(toInt64(prevNegOffset) + i, bitShiftLeft(toInt64(1), prevShift) - 1) = 0, arrayCumSum(arrayMap(c -> toFloat64(c), prevNeg)), arrayEnumerate(prevNeg), arrayReverse(arrayEnumerate(prevNeg))), toFloat64(0)))))) AS negPrev,
+          bitShiftRight(toInt64(prevNegOffset), prevShift) AS negPrevOff,
+          least(negCurOff, negPrevOff) AS negLow,
+          greatest(negCurOff + toInt64(length(negCur)), negPrevOff + toInt64(length(negPrev))) - negLow AS negSpan,
+          multiIf(empty(negPrev), negCur, empty(negCur) OR negSpan > 8192, emptyArrayFloat64(), arrayMap((c, p) -> greatest(c - p, 0), arrayResize(arrayConcat(arrayWithConstant(least(negCurOff - negLow, 8192), toFloat64(0)), negCur), least(negSpan, 8192)), arrayResize(arrayConcat(arrayWithConstant(least(negPrevOff - negLow, 8192), toFloat64(0)), negPrev), least(negSpan, 8192)))) AS negInc,
+          if(empty(negPrev), negCurOff, negLow) AS negOff
+        FROM hist_samples
+        WHERE hist_samples.TimeUnix >= '2026-01-01 10:30:00') AS exp_increases
+        GROUP BY bucket, groupName, bScale) AS by_scale) AS rescaled
+        GROUP BY bucket, groupName) AS merged) AS walk) AS estimated
+        WHERE isFinite(estimate)
+        ORDER BY bucket ASC
+        FORMAT JSON
+
+-- spec:metrics-timeseries-grouped-by-attribute:baseline  [8802e9ee]
+SELECT
+          merged.bucket AS bucket,
+          merged.groupName AS groupName,
+          merged.total AS value,
+          merged.samples AS dataPointCount,
+          merged.seriesCount AS seriesCount
+        FROM (WITH hist_samples AS (
+SELECT
+          metrics_histogram.TimeUnix AS TimeUnix,
           metrics_histogram.Attributes['http.route'] AS groupName,
-          sum(metrics_histogram.Sum) AS value,
-          sum(metrics_histogram.Count) AS dataPointCount,
-          uniqExact(cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes))) AS seriesCount
+          cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) AS series,
+          metrics_histogram.AggregationTemporality AS temporality,
+          metrics_histogram.StartTimeUnix AS startTime,
+          lagInFrame(metrics_histogram.StartTimeUnix, 1, metrics_histogram.StartTimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevStart,
+          lagInFrame(metrics_histogram.TimeUnix, 1, metrics_histogram.TimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevTime,
+          if(((count() OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) = 1 AND metrics_histogram.StartTimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND) AND metrics_histogram.StartTimeUnix < metrics_histogram.TimeUnix), 1, 0) AS fresh,
+          metrics_histogram.Count AS sCount,
+          lagInFrame(metrics_histogram.Count, 1, metrics_histogram.Count) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevCount,
+          metrics_histogram.Sum AS sSum,
+          lagInFrame(metrics_histogram.Sum, 1, metrics_histogram.Sum) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevSum,
+          metrics_histogram.Min AS sMin,
+          metrics_histogram.Max AS sMax
         FROM metrics_histogram
         WHERE metrics_histogram.MetricName = 'http.server.request.duration'
           AND metrics_histogram.OrgId = 'org_sql_catalog'
-          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00'
+          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND
           AND metrics_histogram.TimeUnix <= '2026-01-03 14:15:00'
           AND metrics_histogram.ServiceName = 'api'
-        GROUP BY bucket, groupName
+          AND bitAnd(Flags, 1) = 0
+)
+SELECT
+          toStartOfInterval(hist_samples.TimeUnix, INTERVAL 300 SECOND) AS bucket,
+          hist_samples.groupName AS groupName,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount))) AS observations,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), sSum, sSum - prevSum)) AS total,
+          min(hist_samples.sMin) AS minValue,
+          max(hist_samples.sMax) AS maxValue,
+          count() AS samples,
+          uniqExact(hist_samples.series) AS seriesCount
+        FROM hist_samples
+        WHERE hist_samples.TimeUnix >= '2026-01-01 10:30:00'
+        GROUP BY bucket, groupName) AS merged
         ORDER BY bucket ASC
         FORMAT JSON
 
--- spec:metrics-timeseries-grouped-by-resource:baseline  [71f914a2]
+-- spec:metrics-timeseries-grouped-by-resource:baseline  [fa5f4d94]
 SELECT
-          toStartOfInterval(metrics_histogram.TimeUnix, INTERVAL 300 SECOND) AS bucket,
+          merged.bucket AS bucket,
+          merged.groupName AS groupName,
+          ifNull(ifNotFinite(merged.total / merged.observations, 0), 0) AS value,
+          toUInt64(merged.observations) AS dataPointCount,
+          merged.seriesCount AS seriesCount
+        FROM (WITH hist_samples AS (
+SELECT
+          metrics_histogram.TimeUnix AS TimeUnix,
           metrics_histogram.ResourceAttributes['host.name'] AS groupName,
-          ifNull(ifNotFinite(sum(metrics_histogram.Sum) / sum(metrics_histogram.Count), 0), 0) AS value,
-          sum(metrics_histogram.Count) AS dataPointCount,
-          uniqExact(cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes))) AS seriesCount
+          cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) AS series,
+          metrics_histogram.AggregationTemporality AS temporality,
+          metrics_histogram.StartTimeUnix AS startTime,
+          lagInFrame(metrics_histogram.StartTimeUnix, 1, metrics_histogram.StartTimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevStart,
+          lagInFrame(metrics_histogram.TimeUnix, 1, metrics_histogram.TimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevTime,
+          if(((count() OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) = 1 AND metrics_histogram.StartTimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND) AND metrics_histogram.StartTimeUnix < metrics_histogram.TimeUnix), 1, 0) AS fresh,
+          metrics_histogram.Count AS sCount,
+          lagInFrame(metrics_histogram.Count, 1, metrics_histogram.Count) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevCount,
+          metrics_histogram.Sum AS sSum,
+          lagInFrame(metrics_histogram.Sum, 1, metrics_histogram.Sum) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevSum,
+          metrics_histogram.Min AS sMin,
+          metrics_histogram.Max AS sMax
         FROM metrics_histogram
         WHERE metrics_histogram.MetricName = 'http.server.request.duration'
           AND metrics_histogram.OrgId = 'org_sql_catalog'
-          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00'
+          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND
           AND metrics_histogram.TimeUnix <= '2026-01-03 14:15:00'
           AND metrics_histogram.ServiceName = 'api'
-        GROUP BY bucket, groupName
+          AND bitAnd(Flags, 1) = 0
+)
+SELECT
+          toStartOfInterval(hist_samples.TimeUnix, INTERVAL 300 SECOND) AS bucket,
+          hist_samples.groupName AS groupName,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount))) AS observations,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), sSum, sSum - prevSum)) AS total,
+          min(hist_samples.sMin) AS minValue,
+          max(hist_samples.sMax) AS maxValue,
+          count() AS samples,
+          uniqExact(hist_samples.series) AS seriesCount
+        FROM hist_samples
+        WHERE hist_samples.TimeUnix >= '2026-01-01 10:30:00'
+        GROUP BY bucket, groupName) AS merged
+        WHERE merged.observations > 0
         ORDER BY bucket ASC
         FORMAT JSON
 
--- spec:metrics-timeseries-grouped-by-several-keys:baseline  [72ed34b2]
+-- spec:metrics-timeseries-grouped-by-several-keys:baseline  [2c948f08]
 SELECT
-          toStartOfInterval(metrics_histogram.TimeUnix, INTERVAL 300 SECOND) AS bucket,
+          merged.bucket AS bucket,
+          merged.groupName AS groupName,
+          ifNull(ifNotFinite(merged.total / merged.observations, 0), 0) AS value,
+          toUInt64(merged.observations) AS dataPointCount,
+          merged.seriesCount AS seriesCount
+        FROM (WITH hist_samples AS (
+SELECT
+          metrics_histogram.TimeUnix AS TimeUnix,
           arrayStringConcat(arrayFilter(x -> x != '', [metrics_histogram.ResourceAttributes['k8s.namespace.name'], metrics_histogram.Attributes['job'], metrics_histogram.Attributes['http.route']]), ' · ') AS groupName,
-          ifNull(ifNotFinite(sum(metrics_histogram.Sum) / sum(metrics_histogram.Count), 0), 0) AS value,
-          sum(metrics_histogram.Count) AS dataPointCount,
-          uniqExact(cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes))) AS seriesCount
+          cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) AS series,
+          metrics_histogram.AggregationTemporality AS temporality,
+          metrics_histogram.StartTimeUnix AS startTime,
+          lagInFrame(metrics_histogram.StartTimeUnix, 1, metrics_histogram.StartTimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevStart,
+          lagInFrame(metrics_histogram.TimeUnix, 1, metrics_histogram.TimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevTime,
+          if(((count() OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) = 1 AND metrics_histogram.StartTimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND) AND metrics_histogram.StartTimeUnix < metrics_histogram.TimeUnix), 1, 0) AS fresh,
+          metrics_histogram.Count AS sCount,
+          lagInFrame(metrics_histogram.Count, 1, metrics_histogram.Count) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevCount,
+          metrics_histogram.Sum AS sSum,
+          lagInFrame(metrics_histogram.Sum, 1, metrics_histogram.Sum) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevSum,
+          metrics_histogram.Min AS sMin,
+          metrics_histogram.Max AS sMax
         FROM metrics_histogram
         WHERE metrics_histogram.MetricName = 'http.server.request.duration'
           AND metrics_histogram.OrgId = 'org_sql_catalog'
-          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00'
+          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND
           AND metrics_histogram.TimeUnix <= '2026-01-03 14:15:00'
           AND metrics_histogram.ServiceName = 'api'
-        GROUP BY bucket, groupName
+          AND bitAnd(Flags, 1) = 0
+)
+SELECT
+          toStartOfInterval(hist_samples.TimeUnix, INTERVAL 300 SECOND) AS bucket,
+          hist_samples.groupName AS groupName,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount))) AS observations,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), sSum, sSum - prevSum)) AS total,
+          min(hist_samples.sMin) AS minValue,
+          max(hist_samples.sMax) AS maxValue,
+          count() AS samples,
+          uniqExact(hist_samples.series) AS seriesCount
+        FROM hist_samples
+        WHERE hist_samples.TimeUnix >= '2026-01-01 10:30:00'
+        GROUP BY bucket, groupName) AS merged
+        WHERE merged.observations > 0
+        ORDER BY bucket ASC
+        FORMAT JSON
+
+-- spec:metrics-timeseries-histogram-percentile:baseline  [61ad23f3]
+SELECT
+          estimated.bucket AS bucket,
+          estimated.groupName AS groupName,
+          least(greatest(estimated.estimate, ifNull(estimated.bMin, estimated.estimate)), ifNull(estimated.bMax, estimated.estimate)) AS value,
+          toUInt64(estimated.observations) AS dataPointCount,
+          estimated.seriesCount AS seriesCount
+        FROM (SELECT
+          merged.bucket AS bucket,
+          merged.groupName AS groupName,
+          merged.observations AS observations,
+          merged.seriesCount AS seriesCount,
+          merged.bMin AS bMin,
+          merged.bMax AS bMax,
+          multiIf(bTotal <= 0 OR arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)) = 0, nan, isInfinite(bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)]), if(empty(bBounds), nan, if(empty(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)), if(bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] > 0, 0, bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)]), arrayMax(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds))) + (greatest(ifNull(bMax, if(empty(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)), if(bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] > 0, 0, bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)]), arrayMax(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)))), if(empty(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)), if(bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] > 0, 0, bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)]), arrayMax(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)))) - if(empty(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)), if(bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] > 0, 0, bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)]), arrayMax(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)))) * if(bCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] > 0, ((0.95 * bTotal) - (arrayCumSum(bCounts)[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] - bCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)])) / bCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], 0)), if(empty(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)), if(bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] > 0, 0, bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)]), arrayMax(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds))) + (bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] - if(empty(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)), if(bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] > 0, 0, bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)]), arrayMax(arrayFilter(b -> b < bKeys[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], bBounds)))) * if(bCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] > 0, ((0.95 * bTotal) - (arrayCumSum(bCounts)[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)] - bCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)])) / bCounts[greatest(arrayFirstIndex(c -> c >= (0.95 * bTotal), arrayCumSum(bCounts)), 1)], 0)) AS estimate
+        FROM (WITH hist_samples AS (
+SELECT
+          metrics_histogram.TimeUnix AS TimeUnix,
+          metrics_histogram.ServiceName AS groupName,
+          cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) AS series,
+          metrics_histogram.AggregationTemporality AS temporality,
+          metrics_histogram.StartTimeUnix AS startTime,
+          lagInFrame(metrics_histogram.StartTimeUnix, 1, metrics_histogram.StartTimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevStart,
+          lagInFrame(metrics_histogram.TimeUnix, 1, metrics_histogram.TimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevTime,
+          if(((count() OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) = 1 AND metrics_histogram.StartTimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND) AND metrics_histogram.StartTimeUnix < metrics_histogram.TimeUnix), 1, 0) AS fresh,
+          metrics_histogram.Count AS sCount,
+          lagInFrame(metrics_histogram.Count, 1, metrics_histogram.Count) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevCount,
+          metrics_histogram.Sum AS sSum,
+          lagInFrame(metrics_histogram.Sum, 1, metrics_histogram.Sum) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevSum,
+          metrics_histogram.Min AS sMin,
+          metrics_histogram.Max AS sMax,
+          metrics_histogram.BucketCounts AS buckets,
+          lagInFrame(metrics_histogram.BucketCounts, 1, metrics_histogram.BucketCounts) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevBuckets,
+          metrics_histogram.ExplicitBounds AS bounds,
+          lagInFrame(metrics_histogram.ExplicitBounds, 1, metrics_histogram.ExplicitBounds) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevBounds
+        FROM metrics_histogram
+        WHERE metrics_histogram.MetricName = 'http.server.request.duration'
+          AND metrics_histogram.OrgId = 'org_sql_catalog'
+          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00' - INTERVAL 300 SECOND
+          AND metrics_histogram.TimeUnix <= '2026-01-03 14:15:00'
+          AND metrics_histogram.ServiceName = 'api'
+          AND bitAnd(Flags, 1) = 0
+)
+SELECT
+          toStartOfInterval(hist_samples.TimeUnix, INTERVAL 300 SECOND) AS bucket,
+          hist_samples.groupName AS groupName,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount))) AS observations,
+          uniqExact(hist_samples.series) AS seriesCount,
+          tupleElement(sumMap(if(length(buckets) = length(bounds) + 1, arrayPushBack(bounds, inf), emptyArrayFloat64()), if(length(buckets) = length(bounds) + 1, multiIf((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), arrayMap(c -> toFloat64(c), buckets), bounds != prevBounds, arrayMap(c -> toFloat64(0), buckets), arrayMap((c, p) -> greatest(toFloat64(c) - toFloat64(p), 0), buckets, arrayResize(prevBuckets, length(buckets)))), emptyArrayFloat64())), 1) AS bKeys,
+          tupleElement(sumMap(if(length(buckets) = length(bounds) + 1, arrayPushBack(bounds, inf), emptyArrayFloat64()), if(length(buckets) = length(bounds) + 1, multiIf((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), arrayMap(c -> toFloat64(c), buckets), bounds != prevBounds, arrayMap(c -> toFloat64(0), buckets), arrayMap((c, p) -> greatest(toFloat64(c) - toFloat64(p), 0), buckets, arrayResize(prevBuckets, length(buckets)))), emptyArrayFloat64())), 2) AS bCounts,
+          sum(arraySum(if(length(buckets) = length(bounds) + 1, multiIf((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), arrayMap(c -> toFloat64(c), buckets), bounds != prevBounds, arrayMap(c -> toFloat64(0), buckets), arrayMap((c, p) -> greatest(toFloat64(c) - toFloat64(p), 0), buckets, arrayResize(prevBuckets, length(buckets)))), emptyArrayFloat64()))) AS bTotal,
+          arraySort(groupUniqArrayArray(if(arraySum(if(length(buckets) = length(bounds) + 1, multiIf((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), arrayMap(c -> toFloat64(c), buckets), bounds != prevBounds, arrayMap(c -> toFloat64(0), buckets), arrayMap((c, p) -> greatest(toFloat64(c) - toFloat64(p), 0), buckets, arrayResize(prevBuckets, length(buckets)))), emptyArrayFloat64())) > 0, bounds, emptyArrayFloat64()))) AS bBounds,
+          if(countIf((isNull(sMin) OR isNull(sMax)) AND if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount)) > 0) = 0, min(sMin), NULL) AS bMin,
+          if(countIf((isNull(sMin) OR isNull(sMax)) AND if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount)) > 0) = 0, max(sMax), NULL) AS bMax
+        FROM hist_samples
+        WHERE hist_samples.TimeUnix >= '2026-01-01 10:30:00'
+        GROUP BY bucket, groupName) AS merged) AS estimated
+        WHERE isFinite(estimate)
         ORDER BY bucket ASC
         FORMAT JSON
 
@@ -19745,20 +21327,50 @@ SELECT
         ORDER BY bucket ASC
         FORMAT JSON
 
--- spec:metrics-timeseries:baseline  [797e943f]
+-- spec:metrics-timeseries:baseline  [41591e93]
 SELECT
-          toStartOfInterval(metrics_histogram.TimeUnix, INTERVAL 3600 SECOND) AS bucket,
+          merged.bucket AS bucket,
+          merged.groupName AS groupName,
+          ifNull(ifNotFinite(merged.total / merged.observations, 0), 0) AS value,
+          toUInt64(merged.observations) AS dataPointCount,
+          merged.seriesCount AS seriesCount
+        FROM (WITH hist_samples AS (
+SELECT
+          metrics_histogram.TimeUnix AS TimeUnix,
           '' AS groupName,
-          ifNull(ifNotFinite(sum(metrics_histogram.Sum) / sum(metrics_histogram.Count), 0), 0) AS value,
-          sum(metrics_histogram.Count) AS dataPointCount,
-          uniqExact(cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes))) AS seriesCount
+          cityHash64(metrics_histogram.ServiceName, mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes), mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) AS series,
+          metrics_histogram.AggregationTemporality AS temporality,
+          metrics_histogram.StartTimeUnix AS startTime,
+          lagInFrame(metrics_histogram.StartTimeUnix, 1, metrics_histogram.StartTimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevStart,
+          lagInFrame(metrics_histogram.TimeUnix, 1, metrics_histogram.TimeUnix) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevTime,
+          if(((count() OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) = 1 AND metrics_histogram.StartTimeUnix >= '2026-01-01 10:30:00' - INTERVAL 3600 SECOND) AND metrics_histogram.StartTimeUnix < metrics_histogram.TimeUnix), 1, 0) AS fresh,
+          metrics_histogram.Count AS sCount,
+          lagInFrame(metrics_histogram.Count, 1, metrics_histogram.Count) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevCount,
+          metrics_histogram.Sum AS sSum,
+          lagInFrame(metrics_histogram.Sum, 1, metrics_histogram.Sum) OVER (PARTITION BY metrics_histogram.ServiceName, metrics_histogram.MetricName, metrics_histogram.ScopeName, metrics_histogram.ScopeVersion, cityHash64(mapKeys(metrics_histogram.Attributes), mapValues(metrics_histogram.Attributes)), cityHash64(mapKeys(metrics_histogram.ResourceAttributes), mapValues(metrics_histogram.ResourceAttributes)) ORDER BY metrics_histogram.TimeUnix ASC ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS prevSum,
+          metrics_histogram.Min AS sMin,
+          metrics_histogram.Max AS sMax
         FROM metrics_histogram
         WHERE metrics_histogram.MetricName = 'http.server.request.duration'
           AND metrics_histogram.OrgId = 'org_sql_catalog'
-          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00'
+          AND metrics_histogram.TimeUnix >= '2026-01-01 10:30:00' - INTERVAL 3600 SECOND
           AND metrics_histogram.TimeUnix <= '2026-01-03 14:15:00'
           AND metrics_histogram.ServiceName = 'api'
-        GROUP BY bucket, groupName
+          AND bitAnd(Flags, 1) = 0
+)
+SELECT
+          toStartOfInterval(hist_samples.TimeUnix, INTERVAL 3600 SECOND) AS bucket,
+          hist_samples.groupName AS groupName,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), toFloat64(sCount), toFloat64(sCount) - toFloat64(prevCount))) AS observations,
+          sum(if((temporality = 1 OR fresh = 1 OR sCount < prevCount OR (startTime >= prevTime AND startTime > prevStart AND startTime < TimeUnix)), sSum, sSum - prevSum)) AS total,
+          min(hist_samples.sMin) AS minValue,
+          max(hist_samples.sMax) AS maxValue,
+          count() AS samples,
+          uniqExact(hist_samples.series) AS seriesCount
+        FROM hist_samples
+        WHERE hist_samples.TimeUnix >= '2026-01-01 10:30:00'
+        GROUP BY bucket, groupName) AS merged
+        WHERE merged.observations > 0
         ORDER BY bucket ASC
         FORMAT JSON
 

@@ -3,24 +3,24 @@ import { countLabel } from "@maple/ui/lib/format"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { button } from "@maple/views/ui/button"
 import {
+	connectionTabItem,
 	type CheckRow,
 	flowColumns,
 	flowRail,
 	foundChips,
 	liveChecklist,
-	savedBanner,
 	statusRow,
 	stepCard,
 } from "../../../kit/connect-flow"
 import { relativeTime } from "../../../kit/relative-time"
 import { catalogEntry } from "../../../integrations/catalog"
-import { fold } from "../../../integrations/derive"
+import { fold } from "../../../integrations/overview"
 import type { FlowStage } from "../../../integrations/flow"
 import { railwayReach } from "./flow-railway"
 import { Message } from "../../../integrations/message"
 import type { Model } from "../../../integrations/model"
-import { unsyncedEnvironments } from "./railway"
-import { railwayTokenForm } from "./view-railway-token"
+import { RailwayMessage, unsyncedEnvironments } from "./railway"
+import { railwayTokenForm, toHub } from "./view-railway-token"
 import { Array as Arr, Record as Rec, Option } from "effect"
 
 // Railway in the connect flow: paste a token, then watch the first sync land.
@@ -69,7 +69,7 @@ const showsUpRail = (h: H): Html =>
 				title: "Next to your traces",
 				detail: "Matched on the Railway service name",
 			},
-			{ icon: "GearIcon", title: "Source page", detail: "Sync now, Update credential, Disconnect" },
+			connectionTabItem("Sync now, Update credential, Disconnect"),
 		],
 		timeNote: "First live sample within 5 minutes",
 		docs: DOCS_HREF === undefined ? null : { label: "Docs", href: DOCS_HREF },
@@ -128,7 +128,7 @@ const connectStep = (h: H, model: Model): Html => {
 								variant: "outline",
 								size: "sm",
 								className: "w-fit",
-								attributes: [h.OnClick(Message.ClickedRailwayRotate())],
+								attributes: [h.OnClick(toHub(RailwayMessage.ClickedRotate()))],
 							},
 							["Use a different token"],
 						),
@@ -235,12 +235,8 @@ const liveStep = (h: H, model: Model, timeZone: string): Html => {
 	return flowColumns(
 		h,
 		[
-			savedBanner(
-				h,
-				"Saved as a source. Safe to leave; syncing keeps running.",
-				"Nothing to apply in Railway",
-			),
 			liveChecklist(h, {
+				saved: "Saved as a source. Safe to leave; syncing keeps running.",
 				rows:
 					status === null || !status.connected
 						? [{ state: "waiting", title: "Waiting for Railway's status" }]

@@ -37,12 +37,14 @@ import { hstack, vstack } from "@maple/views/ui/stack"
 import { typography } from "@maple/views/ui/typography"
 import { timestamp } from "@maple/views/ui/timestamp"
 import { Array as Arr, String as Str } from "effect"
+import { isClerkAuthEnabled } from "../../../platform/auth-mode"
 
 type H = HtmlBuilder<Message>
 type Inputs = Readonly<{ nowMs: number; timeZone: string; isKnownMember: boolean }>
 
+// The self-hosted directory has no analyst role yet, so only Clerk offers it.
 const ROLE_ENTRIES: ReadonlyArray<SelectView.SelectEntry> = Arr.map(
-	Policy.assignableRoles,
+	Arr.filter(Policy.assignableRoles, (entry) => isClerkAuthEnabled || entry.role !== "analyst"),
 	(entry): SelectView.SelectEntry => ({
 		_tag: "Item",
 		item: { value: entry.clerkKey, label: entry.label },
@@ -215,40 +217,48 @@ const memberRows = (h: H, model: Model, member: MemberRow, inputs: Inputs): Read
 				tableCell(
 					h,
 					[
-						hstack(h, { gap: "4", align: "center", justify: "between", className: "pl-9" }, [
-							h.p(
-								[h.Class("flex items-center gap-2 text-xs text-foreground")],
-								[
-									icon(h, "CircleInfoIcon", {
-										className: "size-3.5 shrink-0 text-primary",
-									}),
-									prompt.question,
-								],
-							),
-							hstack(h, { gap: "1.5", className: "shrink-0" }, [
-								button(
-									h,
-									{
-										variant: "ghost",
-										size: "sm",
-										isDisabled: pending._tag === "Saving",
-										attributes: [h.OnClick(Message.ClickedCancelRole())],
-									},
-									["Cancel"],
+						hstack(
+							h,
+							{ gap: "4", align: "center", justify: "between", wrap: true, className: "pl-9" },
+							[
+								h.p(
+									[
+										h.Class(
+											"flex min-w-0 flex-1 basis-64 items-start gap-2 text-xs text-foreground",
+										),
+									],
+									[
+										icon(h, "CircleInfoIcon", {
+											className: "mt-0.5 size-3.5 shrink-0 text-primary",
+										}),
+										prompt.question,
+									],
 								),
-								button(
-									h,
-									{
-										size: "sm",
-										isLoading: pending._tag === "Saving",
-										attributes: [h.OnClick(Message.ClickedConfirmRole())],
-									},
-									[prompt.confirmLabel],
-								),
-							]),
-						]),
+								hstack(h, { gap: "1.5", className: "ml-auto shrink-0" }, [
+									button(
+										h,
+										{
+											variant: "ghost",
+											size: "sm",
+											isDisabled: pending._tag === "Saving",
+											attributes: [h.OnClick(Message.ClickedCancelRole())],
+										},
+										["Cancel"],
+									),
+									button(
+										h,
+										{
+											size: "sm",
+											isLoading: pending._tag === "Saving",
+											attributes: [h.OnClick(Message.ClickedConfirmRole())],
+										},
+										[prompt.confirmLabel],
+									),
+								]),
+							],
+						),
 					],
-					undefined,
+					"whitespace-normal leading-normal",
 					[h.Colspan(columnCount)],
 				),
 			],

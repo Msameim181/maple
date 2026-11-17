@@ -109,6 +109,8 @@ describe("MapleApiV2 OpenAPI", () => {
 			"DELETE /v2/status_pages/{id}",
 			"DELETE /v2/status_pages/{id}/break_glass",
 			"DELETE /v2/status_pages/{id}/components/{component_id}",
+			"DELETE /v2/status_pages/{id}/custom_domain",
+			"DELETE /v2/status_pages/{id}/password",
 			"DELETE /v2/uptime_monitors/{id}",
 			"DELETE /v2/widget_credentials/{installation_id}",
 			"GET /v2/agent_feedback",
@@ -211,6 +213,8 @@ describe("MapleApiV2 OpenAPI", () => {
 			"GET /v2/status_pages/{id}",
 			"GET /v2/status_pages/{id}/components",
 			"GET /v2/status_pages/{id}/config",
+			"GET /v2/status_pages/{id}/custom_domain",
+			"GET /v2/status_pages/{id}/view",
 			"GET /v2/support/slack_channel",
 			"GET /v2/traces/{trace_id}",
 			"GET /v2/traces/{trace_id}/spans/{span_id}",
@@ -236,6 +240,7 @@ describe("MapleApiV2 OpenAPI", () => {
 			"PATCH /v2/integrations/aws/connections/{id}",
 			"PATCH /v2/integrations/chat_workspaces/{id}",
 			"PATCH /v2/integrations/gcp/connectors/{id}",
+			"PATCH /v2/integrations/planetscale",
 			"PATCH /v2/scrape_targets/{id}",
 			"PATCH /v2/slos/{id}",
 			"PATCH /v2/sources/{id}",
@@ -328,6 +333,7 @@ describe("MapleApiV2 OpenAPI", () => {
 			"POST /v2/status_pages/preview",
 			"POST /v2/status_pages/{id}/components",
 			"POST /v2/status_pages/{id}/components/reorder",
+			"POST /v2/status_pages/{id}/custom_domain/check",
 			"POST /v2/status_pages/{id}/publish",
 			"POST /v2/status_pages/{id}/rotate_break_glass",
 			"POST /v2/support/slack_channel/invite",
@@ -344,6 +350,8 @@ describe("MapleApiV2 OpenAPI", () => {
 			"PUT /v2/mobile_devices/{token}",
 			"PUT /v2/mobile_devices/{token}/live_activities/{incident_id}",
 			"PUT /v2/status_pages/{id}/config",
+			"PUT /v2/status_pages/{id}/custom_domain",
+			"PUT /v2/status_pages/{id}/password",
 			"PUT /v2/widget_credentials/{installation_id}",
 		])
 	})
@@ -559,6 +567,13 @@ describe("MapleApiV2 OpenAPI", () => {
 		).not.toThrow()
 		expect(mutation.properties.txid.$ref).toBe("#/components/schemas/_maple_PostgresTransactionId")
 		expect(operation("post", "/v2/alerts/destinations").responses["200"]).toBeDefined()
+	})
+
+	it("publishes a chat workspace's switches as always sent, and optional on update", () => {
+		const switches = ["alerts_enabled", "direct_messages_enabled", "assistant_enabled"]
+		expect(schemas["ChatWorkspace"].required).toEqual(expect.arrayContaining(switches))
+		const update: ReadonlyArray<string> = schemas["ChatWorkspaceUpdateParams"].required ?? []
+		expect(Arr.intersection(update, switches)).toEqual([])
 	})
 
 	it("gives every error response an exhaustive literal-tag union", () => {

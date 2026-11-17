@@ -1,6 +1,7 @@
 import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { Schema, String as Str } from "effect"
 import { AWS_INFRA_KIND_IDS } from "../aws-infra"
+import { CostCurrency, CostDimension, CostFilters, CostMetric, CostProvider } from "../cost"
 import { GCP_INFRA_SERVICE_IDS, GCP_INFRA_SOURCE_IDS } from "../gcp-infra"
 import { ADVISORY_SEVERITIES } from "../runtime-advisories"
 import { ATTACK_STAGES } from "../security-telemetry"
@@ -9,6 +10,7 @@ import { MAX_RAW_SQL_LENGTH } from "../raw-sql"
 import { RawSqlDisplayType } from "@maple/widgets"
 import {
 	CommitSha,
+	CostSourceId,
 	DeploymentEnvironment,
 	FingerprintHash,
 	SearchConsoleSiteUrl,
@@ -31,6 +33,7 @@ import {
 } from "../query-engine"
 import { AuditedRead } from "./audit-log"
 import { SessionAuthorization } from "./current-tenant"
+import { DependencyScanForbiddenError } from "./dependency-scan"
 import { HttpTaggedError } from "./error-policy"
 import { warehouseHttpErrors } from "./warehouse"
 import {
@@ -42,6 +45,7 @@ import {
 	PathsInclude,
 } from "@maple/query-model"
 import { WireRow } from "../wire"
+import { AnalystAccess } from "./analyst-access"
 
 /**
  * A timeseries bucket width.
@@ -732,6 +736,378 @@ export class AwsInfraTimeseriesResponse extends Schema.Class<AwsInfraTimeseriesR
 	),
 }) {}
 
+// Vercel infrastructure page (/infra/vercel): log drain records, deployment traces and AI Gateway traces.
+const VercelProjectId = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))
+
+export class VercelInfraProjectsRequest extends Schema.Class<VercelInfraProjectsRequest>(
+	"VercelInfraProjectsRequest",
+)({
+	startTime: TinybirdDateTime,
+	endTime: TinybirdDateTime,
+}) {}
+
+export const VercelInfraProject = Schema.Struct({
+	projectId: Schema.String,
+	projectName: Schema.String,
+	serviceName: Schema.String,
+	requests: Schema.Number,
+	requests4xx: Schema.Number,
+	requests5xx: Schema.Number,
+	cacheHits: Schema.Number,
+	cacheLookups: Schema.Number,
+	errorLogs: Schema.Number,
+	/** ISO-8601. */
+	lastSeen: Schema.String,
+	/** Request latency at Vercel's edge, from the trace drain; null when the project sends no traces. */
+	p50DurationMs: Schema.NullOr(Schema.Number),
+	p95DurationMs: Schema.NullOr(Schema.Number),
+	/** Function invocations and the cold starts among them, from the trace drain's platform spans. */
+	invocations: Schema.Number,
+	coldStarts: Schema.Number,
+})
+export type VercelInfraProject = typeof VercelInfraProject.Type
+
+export class VercelInfraProjectsResponse extends Schema.Class<VercelInfraProjectsResponse>(
+	"VercelInfraProjectsResponse",
+)({
+	projects: Schema.Array(VercelInfraProject),
+}) {}
+
+/** The log attribute a project's request breakdown groups by. */
+export const VercelInfraBreakdownDimension = Schema.Literals([
+	"path",
+	"host",
+	"region",
+	"source",
+	"cache",
+	"waf",
+	"status",
+])
+export type VercelInfraBreakdownDimension = typeof VercelInfraBreakdownDimension.Type
+
+export class VercelInfraTimeseriesRequest extends Schema.Class<VercelInfraTimeseriesRequest>(
+	"VercelInfraTimeseriesRequest",
+)({
+	startTime: TinybirdDateTime,
+	endTime: TinybirdDateTime,
+	bucketSeconds: BucketSeconds,
+	/** Every project when absent. */
+	projectId: Schema.optionalKey(VercelProjectId),
+	/** Narrows the requests to one breakdown value: the dimension, then `filterValue`. */
+	filterBy: Schema.optionalKey(VercelInfraBreakdownDimension),
+	filterValue: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2048))),
+}) {}
+
+export const VercelInfraRequestBucket = Schema.Struct({
+	/** ISO-8601 bucket start. */
+	bucket: Schema.String,
+	requests: Schema.Number,
+	requests2xx: Schema.Number,
+	requests3xx: Schema.Number,
+	requests4xx: Schema.Number,
+	requests5xx: Schema.Number,
+	cacheHits: Schema.Number,
+	/** Requests Vercel reported a cache status for: the hit-rate denominator. */
+	cacheLookups: Schema.Number,
+	errorLogs: Schema.Number,
+})
+export type VercelInfraRequestBucket = typeof VercelInfraRequestBucket.Type
+
+export class VercelInfraRequestTimeseriesResponse extends Schema.Class<VercelInfraRequestTimeseriesResponse>(
+	"VercelInfraRequestTimeseriesResponse",
+)({
+	buckets: Schema.Array(VercelInfraRequestBucket),
+}) {}
+
+/** Edge latency and function activity per bucket, from the trace drain. */
+export const VercelInfraLatencyBucket = Schema.Struct({
+	/** ISO-8601 bucket start. */
+	bucket: Schema.String,
+	/** Request latency at Vercel's edge; null in a bucket without edge spans. */
+	edgeP50Ms: Schema.NullOr(Schema.Number),
+	edgeP95Ms: Schema.NullOr(Schema.Number),
+	invocations: Schema.Number,
+	coldStarts: Schema.Number,
+	/** `Invoke Function` duration; null in a bucket without invocations. */
+	invokeP50Ms: Schema.NullOr(Schema.Number),
+	invokeP95Ms: Schema.NullOr(Schema.Number),
+})
+export type VercelInfraLatencyBucket = typeof VercelInfraLatencyBucket.Type
+
+export class VercelInfraLatencyTimeseriesResponse extends Schema.Class<VercelInfraLatencyTimeseriesResponse>(
+	"VercelInfraLatencyTimeseriesResponse",
+)({
+	buckets: Schema.Array(VercelInfraLatencyBucket),
+}) {}
+
+/** Narrows a breakdown to failing requests. */
+export const VercelInfraBreakdownStatus = Schema.Literals(["all", "4xx", "5xx"])
+export type VercelInfraBreakdownStatus = typeof VercelInfraBreakdownStatus.Type
+
+export class VercelInfraBreakdownRequest extends Schema.Class<VercelInfraBreakdownRequest>(
+	"VercelInfraBreakdownRequest",
+)({
+	startTime: TinybirdDateTime,
+	endTime: TinybirdDateTime,
+	projectId: VercelProjectId,
+	dimension: VercelInfraBreakdownDimension,
+	/** Every request when absent. */
+	status: Schema.optionalKey(VercelInfraBreakdownStatus),
+	/** Narrows the requests to one breakdown value: the dimension, then `filterValue`. */
+	filterBy: Schema.optionalKey(VercelInfraBreakdownDimension),
+	filterValue: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2048))),
+}) {}
+
+export const VercelInfraBreakdownRow = Schema.Struct({
+	/** The attribute's value; empty when Vercel reported none. */
+	key: Schema.String,
+	requests: Schema.Number,
+	requests4xx: Schema.Number,
+	requests5xx: Schema.Number,
+	cacheHits: Schema.Number,
+	cacheLookups: Schema.Number,
+	/** Response body bytes. */
+	bytes: Schema.Number,
+})
+export type VercelInfraBreakdownRow = typeof VercelInfraBreakdownRow.Type
+
+export class VercelInfraBreakdownResponse extends Schema.Class<VercelInfraBreakdownResponse>(
+	"VercelInfraBreakdownResponse",
+)({
+	rows: Schema.Array(VercelInfraBreakdownRow),
+}) {}
+
+export class VercelInfraProjectDetailRequest extends Schema.Class<VercelInfraProjectDetailRequest>(
+	"VercelInfraProjectDetailRequest",
+)({
+	startTime: TinybirdDateTime,
+	endTime: TinybirdDateTime,
+	projectId: VercelProjectId,
+}) {}
+
+export const VercelInfraPath = Schema.Struct({
+	path: Schema.String,
+	requests: Schema.Number,
+	requests4xx: Schema.Number,
+	requests5xx: Schema.Number,
+	cacheHits: Schema.Number,
+	/** Requests Vercel reported a cache status for: the hit-rate denominator. */
+	cacheLookups: Schema.Number,
+})
+export type VercelInfraPath = typeof VercelInfraPath.Type
+
+/** One error message template on a Vercel project, from its newest error logs. */
+export const VercelInfraErrorMessage = Schema.Struct({
+	/** The message with its variable parts as `<*>` (or `<uuid>`, `<ip>`...). */
+	pattern: Schema.String,
+	/** The newest line in the pattern, in full (up to 2000 characters). */
+	sample: Schema.String,
+	occurrences: Schema.Number,
+	source: Schema.String,
+	/** ISO-8601, of the newest line. */
+	lastSeen: Schema.String,
+	/** The newest line's trace, when it carried one. */
+	traceId: Schema.NullOr(Schema.String),
+	spanId: Schema.NullOr(Schema.String),
+	/** The pattern's longest literal part, for a logs body search; null when none is distinctive. */
+	search: Schema.NullOr(Schema.String),
+})
+export type VercelInfraErrorMessage = typeof VercelInfraErrorMessage.Type
+
+export class VercelInfraProjectDetailResponse extends Schema.Class<VercelInfraProjectDetailResponse>(
+	"VercelInfraProjectDetailResponse",
+)({
+	paths: Schema.Array(VercelInfraPath),
+	errors: Schema.Array(VercelInfraErrorMessage),
+	/** Error logs the patterns were clustered from: the window's newest, up to the sample cap. */
+	errorLogsSampled: Schema.Number,
+	/** True when the window had more error logs than the sample holds. */
+	errorLogsCapped: Schema.Boolean,
+}) {}
+
+const VercelAiGatewayUsageFields = {
+	requests: Schema.Number,
+	costUsd: Schema.Number,
+	inputTokens: Schema.Number,
+	outputTokens: Schema.Number,
+	errors: Schema.Number,
+}
+
+export const VercelAiGatewaySummary = Schema.Struct({
+	...VercelAiGatewayUsageFields,
+	p50DurationMs: Schema.NullOr(Schema.Number),
+	p95DurationMs: Schema.NullOr(Schema.Number),
+})
+export type VercelAiGatewaySummary = typeof VercelAiGatewaySummary.Type
+
+export const VercelAiGatewayModel = Schema.Struct({
+	model: Schema.String,
+	provider: Schema.String,
+	...VercelAiGatewayUsageFields,
+	p95DurationMs: Schema.NullOr(Schema.Number),
+})
+export type VercelAiGatewayModel = typeof VercelAiGatewayModel.Type
+
+export const VercelAiGatewayProject = Schema.Struct({
+	/** Empty for requests made outside a Vercel project. */
+	projectId: Schema.String,
+	...VercelAiGatewayUsageFields,
+})
+export type VercelAiGatewayProject = typeof VercelAiGatewayProject.Type
+
+export const VercelAiGatewayBucket = Schema.Struct({
+	/** ISO-8601 bucket start. */
+	bucket: Schema.String,
+	...VercelAiGatewayUsageFields,
+})
+export type VercelAiGatewayBucket = typeof VercelAiGatewayBucket.Type
+
+export class VercelAiGatewayResponse extends Schema.Class<VercelAiGatewayResponse>("VercelAiGatewayResponse")(
+	{
+		summary: VercelAiGatewaySummary,
+		models: Schema.Array(VercelAiGatewayModel),
+		/** Empty when the request named a project. */
+		projects: Schema.Array(VercelAiGatewayProject),
+		timeseries: Schema.Array(VercelAiGatewayBucket),
+	},
+) {}
+
+/** A window, for every project or one. */
+/**
+ * What a Real users read is narrowed to: a route or device type for Speed Insights, a page,
+ * referrer or country for Web Analytics. Each read ignores the other's dimensions.
+ */
+export const VercelRealUsersDimension = Schema.Literals(["route", "device", "page", "referrer", "country"])
+export type VercelRealUsersDimension = typeof VercelRealUsersDimension.Type
+
+export class VercelInfraWindowRequest extends Schema.Class<VercelInfraWindowRequest>(
+	"VercelInfraWindowRequest",
+)({
+	startTime: TinybirdDateTime,
+	endTime: TinybirdDateTime,
+	/** Every project when absent. */
+	projectId: Schema.optionalKey(VercelProjectId),
+	filterBy: Schema.optionalKey(VercelRealUsersDimension),
+	filterValue: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(2048))),
+}) {}
+
+/** One route of a project: the function behind it, from the trace drain's platform spans. */
+export const VercelInfraFunction = Schema.Struct({
+	/** The edge request's `http.route`; empty when Vercel reported none. */
+	route: Schema.String,
+	invocations: Schema.Number,
+	coldStarts: Schema.Number,
+	p95DurationMs: Schema.Number,
+	/** Start VM, Spawn Node.js and Init User Code of one cold start, summed; null without cold starts. */
+	initP50Ms: Schema.NullOr(Schema.Number),
+	initP95Ms: Schema.NullOr(Schema.Number),
+})
+export type VercelInfraFunction = typeof VercelInfraFunction.Type
+
+export class VercelInfraFunctionsResponse extends Schema.Class<VercelInfraFunctionsResponse>(
+	"VercelInfraFunctionsResponse",
+)({
+	functions: Schema.Array(VercelInfraFunction),
+}) {}
+
+/** One project's functions over time, for every route or one. */
+export class VercelInfraFunctionTimeseriesRequest extends Schema.Class<VercelInfraFunctionTimeseriesRequest>(
+	"VercelInfraFunctionTimeseriesRequest",
+)({
+	startTime: TinybirdDateTime,
+	endTime: TinybirdDateTime,
+	bucketSeconds: BucketSeconds,
+	projectId: VercelProjectId,
+	/** The edge request's `http.route`; every route when absent. */
+	route: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(1024))),
+	/** Only invocations that called this host; every invocation when absent. */
+	host: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(1024))),
+}) {}
+
+export const VercelInfraFunctionBucket = Schema.Struct({
+	/** ISO-8601 bucket start. */
+	bucket: Schema.String,
+	invocations: Schema.Number,
+	coldStarts: Schema.Number,
+	p50DurationMs: Schema.Number,
+	p95DurationMs: Schema.Number,
+	/** Cold-start init time; 0 in a bucket without a cold start. */
+	initP50Ms: Schema.Number,
+	initP95Ms: Schema.Number,
+})
+export type VercelInfraFunctionBucket = typeof VercelInfraFunctionBucket.Type
+
+export class VercelInfraFunctionTimeseriesResponse extends Schema.Class<VercelInfraFunctionTimeseriesResponse>(
+	"VercelInfraFunctionTimeseriesResponse",
+)({
+	buckets: Schema.Array(VercelInfraFunctionBucket),
+}) {}
+
+/** One host a project's functions called. */
+export const VercelInfraDependency = Schema.Struct({
+	host: Schema.String,
+	calls: Schema.Number,
+	/** Calls that failed: an error status, a 5xx, or no response. */
+	errors: Schema.Number,
+	p50DurationMs: Schema.Number,
+	p95DurationMs: Schema.Number,
+})
+export type VercelInfraDependency = typeof VercelInfraDependency.Type
+
+export class VercelInfraDependenciesResponse extends Schema.Class<VercelInfraDependenciesResponse>(
+	"VercelInfraDependenciesResponse",
+)({
+	dependencies: Schema.Array(VercelInfraDependency),
+}) {}
+
+export const VercelWebVital = Schema.Literals(["LCP", "INP", "CLS", "FCP", "TTFB"])
+export type VercelWebVital = typeof VercelWebVital.Type
+
+/** The 75th percentile of one Web Vital over a group; milliseconds, or a score for CLS. */
+export const VercelSpeedInsightsReading = Schema.Struct({
+	/** The route or device type; empty in `metrics`. */
+	key: Schema.String,
+	metric: Schema.String,
+	p75: Schema.Number,
+	samples: Schema.Number,
+})
+export type VercelSpeedInsightsReading = typeof VercelSpeedInsightsReading.Type
+
+export class VercelSpeedInsightsResponse extends Schema.Class<VercelSpeedInsightsResponse>(
+	"VercelSpeedInsightsResponse",
+)({
+	metrics: Schema.Array(VercelSpeedInsightsReading),
+	/** By route and by device type; empty when the request named no project. */
+	routes: Schema.Array(VercelSpeedInsightsReading),
+	devices: Schema.Array(VercelSpeedInsightsReading),
+}) {}
+
+export const VercelWebAnalyticsSummary = Schema.Struct({
+	pageViews: Schema.Number,
+	/** Distinct device ids among page views; Vercel rotates them daily. */
+	uniqueDevices: Schema.Number,
+	customEvents: Schema.Number,
+})
+export type VercelWebAnalyticsSummary = typeof VercelWebAnalyticsSummary.Type
+
+/** One value of a breakdown: page views, or occurrences for a custom event. */
+export const VercelWebAnalyticsTop = Schema.Struct({
+	value: Schema.String,
+	count: Schema.Number,
+	devices: Schema.Number,
+})
+export type VercelWebAnalyticsTop = typeof VercelWebAnalyticsTop.Type
+
+export class VercelWebAnalyticsResponse extends Schema.Class<VercelWebAnalyticsResponse>(
+	"VercelWebAnalyticsResponse",
+)({
+	summary: VercelWebAnalyticsSummary,
+	pages: Schema.Array(VercelWebAnalyticsTop),
+	referrers: Schema.Array(VercelWebAnalyticsTop),
+	countries: Schema.Array(VercelWebAnalyticsTop),
+	events: Schema.Array(VercelWebAnalyticsTop),
+}) {}
+
 // Google Cloud infrastructure page (/infra/gcp): `gcp.*` metrics from the Google Cloud poller.
 const GcpInfraService = Schema.Literals(GCP_INFRA_SERVICE_IDS)
 
@@ -1232,13 +1608,50 @@ const ReleaseRow = Schema.Struct({
 })
 export type ReleaseRow = Schema.Schema.Type<typeof ReleaseRow>
 
-const ReleaseTimelinePoint = Schema.Struct({
-	bucket: Schema.String,
+/**
+ * One deploy's first minutes against the same minutes just before it on the
+ * same environment. `before*` is every other version in that span.
+ */
+const DeployVerificationRow = Schema.Struct({
 	serviceName: ServiceName,
+	environment: Schema.String,
 	commitSha: CommitSha,
-	count: Schema.Number,
+	firstSeen: Schema.String,
+	afterSpans: Schema.Number,
+	afterErrors: Schema.Number,
+	afterP95Ms: Schema.Number,
+	beforeSpans: Schema.Number,
+	beforeErrors: Schema.Number,
+	beforeP95Ms: Schema.Number,
 })
-export type ReleaseTimelinePoint = Schema.Schema.Type<typeof ReleaseTimelinePoint>
+export type DeployVerificationRow = Schema.Schema.Type<typeof DeployVerificationRow>
+
+/** One service's deploys in the window, or with `commitSha` one commit across the services it reached. */
+export class ServiceDeploysRequest extends Schema.Class<ServiceDeploysRequest>("ServiceDeploysRequest")(
+	Schema.Struct({
+		serviceName: Schema.optional(ServiceName),
+		commitSha: Schema.optional(CommitSha),
+		startTime: TinybirdDateTime,
+		endTime: TinybirdDateTime,
+		environments: OptionalDeploymentEnvs,
+	}).check(
+		// Neither would read every service's minutes across the org.
+		Schema.makeFilter(
+			(request: { readonly serviceName?: string; readonly commitSha?: string }) =>
+				request.serviceName !== undefined ||
+				request.commitSha !== undefined ||
+				"a serviceName or a commitSha is required",
+			{ identifier: "ServiceDeploysScoped" },
+		),
+	),
+) {}
+
+export class ServiceDeploysResponse extends Schema.Class<ServiceDeploysResponse>("ServiceDeploysResponse")({
+	/** Versions first seen inside the window, newest first. */
+	deploys: Schema.Array(DeployVerificationRow),
+	/** The width of each side of a verification, in seconds. */
+	verifyWindowSeconds: Schema.Number,
+}) {}
 
 export class ReleasesListRequest extends Schema.Class<ReleasesListRequest>("ReleasesListRequest")({
 	startTime: TinybirdDateTime,
@@ -1247,15 +1660,11 @@ export class ReleasesListRequest extends Schema.Class<ReleasesListRequest>("Rele
 	namespaces: OptionalServiceNamespaces,
 	services: OptionalServiceNames,
 	excludedEnvironments: OptionalDeploymentEnvs,
-	// Bucket for the swimlane timeline. Whole minutes at least: the rollup tiers
-	// cannot place a row inside a minute, and the list is org-wide.
-	bucketSeconds: BucketSeconds,
 }) {}
 
 export class ReleasesListResponse extends Schema.Class<ReleasesListResponse>("ReleasesListResponse")({
 	/** One row per (service, environment, commit), newest first. */
 	releases: Schema.Array(ReleaseRow),
-	timeline: Schema.Array(ReleaseTimelinePoint),
 	/** True when the row cap cut older releases off the end. */
 	truncated: Schema.Boolean,
 }) {}
@@ -1318,36 +1727,6 @@ export type UptimeCheck = Schema.Schema.Type<typeof UptimeCheck>
 export class UptimeChecksResponse extends Schema.Class<UptimeChecksResponse>("UptimeChecksResponse")({
 	/** Newest first. */
 	checks: Schema.Array(UptimeCheck),
-}) {}
-
-export class ReleaseDetailRequest extends Schema.Class<ReleaseDetailRequest>("ReleaseDetailRequest")({
-	serviceName: ServiceName,
-	commitSha: CommitSha,
-	startTime: TinybirdDateTime,
-	endTime: TinybirdDateTime,
-	environments: OptionalDeploymentEnvs,
-	// Pre-built all-metrics timeseries for this version and for every other
-	// version of the service, forwarded verbatim to `queryEngine.execute` like
-	// the service-detail bundle does.
-	timeseries: QueryEngineExecuteRequest,
-	baselineTimeseries: QueryEngineExecuteRequest,
-	bucketSeconds: BucketSeconds,
-}) {}
-
-export class ReleaseDetailResponse extends Schema.Class<ReleaseDetailResponse>("ReleaseDetailResponse")({
-	/** Every version of this service in the window, this one included. */
-	versions: Schema.Array(ReleaseRow),
-	timeline: Schema.Array(ReleaseTimelinePoint),
-	timeseries: QueryEngineExecuteResponse,
-	baselineTimeseries: QueryEngineExecuteResponse,
-	/** Error fingerprints whose occurrences carried this version as `service.version`. */
-	errorFingerprints: Schema.Array(
-		Schema.Struct({
-			fingerprintHash: FingerprintHash,
-			count: Schema.Number,
-			firstSeen: Schema.String,
-		}),
-	),
 }) {}
 
 export class ServiceDependenciesBundleRequest extends Schema.Class<ServiceDependenciesBundleRequest>(
@@ -1433,6 +1812,7 @@ const ServicePlatformLiteral = Schema.Literals([
 	"kubernetes",
 	"cloudflare",
 	"gcp",
+	"vercel",
 	"lambda",
 	"web",
 	"unknown",
@@ -1511,6 +1891,7 @@ export const ServiceRuntimeRow = Schema.Struct({
 	railwayServiceId: Schema.String,
 	railwayEnvironmentId: Schema.String,
 	railwayEnvironmentName: Schema.String,
+	vercelProjectId: Schema.String,
 })
 export type ServiceRuntimeRow = typeof ServiceRuntimeRow.Type
 
@@ -1519,6 +1900,86 @@ export class ServiceRuntimesResponse extends Schema.Class<ServiceRuntimesRespons
 		data: Schema.Array(ServiceRuntimeRow),
 	},
 ) {}
+
+/** Span ids one profile read may name: the span panel cuts a deeper subtree off at the same count. */
+export const PROFILE_SPAN_IDS_MAX = 500
+
+/** A span and the spans under it: a sample belongs to the innermost span that was running. */
+export const ProfileSpanIds = Schema.Array(SpanId).check(
+	Schema.isMinLength(1),
+	Schema.isMaxLength(PROFILE_SPAN_IDS_MAX),
+)
+
+/** A sample type as a producer names it (`cpu`, `alloc_space`, ...). */
+export const ProfileSampleType = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))
+
+/** `nanoseconds` | `bytes` | `count`, or `""`: ingest stores a profile that names no unit that way. */
+export const ProfileSampleUnit = Schema.String.check(Schema.isMaxLength(128))
+
+/**
+ * What a profile read covers: a service's window (`serviceName`, one environment at most), or the
+ * samples linked to spans of one trace (`traceId` with `spanIds`). A read names at least one.
+ */
+const profileScopeFields = {
+	startTime: TinybirdDateTime,
+	endTime: TinybirdDateTime,
+	serviceName: Schema.optionalKey(ServiceName),
+	deploymentEnv: Schema.optionalKey(DeploymentEnvironment),
+	traceId: Schema.optionalKey(TraceId),
+	spanIds: Schema.optionalKey(ProfileSpanIds),
+}
+
+export class ProfileSampleTypesRequest extends Schema.Class<ProfileSampleTypesRequest>(
+	"ProfileSampleTypesRequest",
+)(profileScopeFields) {}
+
+/** One sample type in scope, in one unit, with what it summed to. */
+export const ProfileSampleTypeRow = Schema.Struct({
+	sampleType: Schema.String,
+	/** `nanoseconds` | `bytes` | `count`. */
+	sampleUnit: Schema.String,
+	value: Schema.Number,
+	samples: Schema.Number,
+	profiles: Schema.Number,
+	/** The summed length of the profiled windows: CPU time over it is average cores. */
+	durationNano: Schema.Number,
+})
+export type ProfileSampleTypeRow = typeof ProfileSampleTypeRow.Type
+
+export class ProfileSampleTypesResponse extends Schema.Class<ProfileSampleTypesResponse>(
+	"ProfileSampleTypesResponse",
+)({
+	/** Heaviest first; empty for a scope without profiles. */
+	data: Schema.Array(ProfileSampleTypeRow),
+}) {}
+
+export class ProfileStacksRequest extends Schema.Class<ProfileStacksRequest>("ProfileStacksRequest")({
+	...profileScopeFields,
+	sampleType: ProfileSampleType,
+	/** The unit of the sample-type row being read: one type's values only add up within a unit. */
+	sampleUnit: ProfileSampleUnit,
+}) {}
+
+/** One distinct call stack, frames root first, with the value it summed to in scope. */
+export const ProfileStackRow = Schema.Struct({
+	frames: Schema.Array(Schema.String),
+	/** `""` where the producer had no file. */
+	files: Schema.Array(Schema.String),
+	/** 0 where unknown. */
+	lines: Schema.Array(Schema.Number),
+	value: Schema.Number,
+})
+export type ProfileStackRow = typeof ProfileStackRow.Type
+
+export class ProfileStacksResponse extends Schema.Class<ProfileStacksResponse>("ProfileStacksResponse")({
+	/** The heaviest stacks, up to the read's cap. */
+	stacks: Schema.Array(ProfileStackRow),
+	/** Every stack in scope, including those the cap cut off. */
+	totalValue: Schema.Number,
+	totalStacks: Schema.Number,
+	/** True when `stacks` is fewer than `totalStacks`. */
+	truncated: Schema.Boolean,
+}) {}
 
 export class ServiceMapBundleRequest extends Schema.Class<ServiceMapBundleRequest>("ServiceMapBundleRequest")(
 	{
@@ -2686,6 +3147,205 @@ export class SearchConsoleLandingPagesResponse extends Schema.Class<SearchConsol
 	data: Schema.Array(SearchConsoleLandingPage),
 }) {}
 
+// Cloud cost: provider spend synced into the ingest-pinned `cost_daily`, read per whole UTC day.
+// Every endpoint answers `CloudCostDisabledError` for an org outside the `cloudCost` rollout.
+
+/** The org is not in the `cloudCost` rollout. */
+export class CloudCostDisabledError extends HttpTaggedError<CloudCostDisabledError>()(
+	"@maple/http/errors/CloudCostDisabledError",
+	{ message: Schema.String },
+	{
+		status: 403,
+		code: "cloud_cost_disabled",
+		title: "Cloud cost is not enabled",
+		retry: "never",
+		recovery: "contact_support",
+		exposure: "public_message",
+	},
+) {}
+
+/** The application database could not be read for the org's cost sources. */
+export class CloudCostPersistenceError extends HttpTaggedError<CloudCostPersistenceError>()(
+	"@maple/http/errors/CloudCostPersistenceError",
+	{ message: Schema.String, cause: Schema.optionalKey(Schema.String) },
+	{
+		status: 503,
+		code: "cloud_cost_persistence_unavailable",
+		title: "Cloud cost is temporarily unavailable",
+		message: "Cloud cost is temporarily unavailable. Retry in a few seconds.",
+		retry: "backoff",
+		recovery: "retry",
+		exposure: "redacted",
+	},
+) {}
+
+/** The widest window a cost read takes: a little past what `cost_daily` keeps. */
+export const COST_MAX_WINDOW_DAYS = 800
+
+/** The years a cost window may name: day arithmetic past 9999 leaves the four-digit year. */
+const COST_WINDOW_MIN_YEAR = 2000
+const COST_WINDOW_MAX_YEAR = 2100
+
+/**
+ * A window bound that names a real instant. The pattern alone lets `2026-13-01` through, which
+ * cannot be floored to a day, and `2026-02-30`, which reads another day than the one asked for.
+ */
+const CostWindowDateTime = TinybirdDateTime.check(
+	Schema.makeFilter((value: string) => {
+		const instant = `${Str.slice(0, 10)(value)}T${Str.slice(11, 19)(value)}`
+		const date = new Date(`${instant}Z`)
+		return (
+			(Number.isFinite(date.getTime()) && Str.startsWith(instant)(date.toISOString())) ||
+			"Expected a real calendar date and time"
+		)
+	}),
+	Schema.makeFilter((value: string) => {
+		const year = Number(Str.slice(0, 4)(value))
+		return (
+			(year >= COST_WINDOW_MIN_YEAR && year <= COST_WINDOW_MAX_YEAR) ||
+			`Expected a year from ${COST_WINDOW_MIN_YEAR} to ${COST_WINDOW_MAX_YEAR}`
+		)
+	}),
+)
+
+/** The window is floored to whole UTC days, both ends inclusive. */
+const CostWindowFields = {
+	startTime: CostWindowDateTime,
+	endTime: CostWindowDateTime,
+	/** Defaults to `billed`. */
+	metric: Schema.optionalKey(CostMetric),
+	filters: Schema.optionalKey(CostFilters),
+	/**
+	 * The one currency to read: nothing converts, so no read adds two together. Without it, the
+	 * currency with the most cost in the window.
+	 */
+	currency: Schema.optionalKey(CostCurrency),
+} as const
+
+export class CostTotalsRequest extends Schema.Class<CostTotalsRequest>("CostTotalsRequest")(
+	CostWindowFields,
+) {}
+
+export class CostTotalsResponse extends Schema.Class<CostTotalsResponse>("CostTotalsResponse")({
+	cost: Schema.Number,
+	/** The equal-length run of days just before the window. */
+	previousCost: Schema.Number,
+	/** Days of the window the provider has not finalized yet. */
+	estimatedDays: Schema.Number,
+	/** The currency every figure is in; "" when the window and the period before have no cost. */
+	currency: Schema.String,
+	/** Every currency the window and the period before are billed in, `currency` first. */
+	currencies: Schema.Array(Schema.String),
+	/** Days in the window. */
+	days: Schema.Number,
+}) {}
+
+/** Series a split timeseries names when the request sets no limit. */
+export const COST_TIMESERIES_DEFAULT_LIMIT = 8
+
+const CostSeriesLimit = Schema.Number.check(
+	Schema.isInt(),
+	Schema.isGreaterThanOrEqualTo(1),
+	Schema.isLessThanOrEqualTo(20),
+)
+
+export class CostTimeseriesRequest extends Schema.Class<CostTimeseriesRequest>("CostTimeseriesRequest")({
+	...CostWindowFields,
+	/** Splits each day by this dimension; without it there is one series with key "". */
+	groupBy: Schema.optionalKey(CostDimension),
+	/** With `groupBy`: the top keys by cost that get their own series; the rest fold into one. */
+	limit: Schema.optionalKey(CostSeriesLimit),
+}) {}
+
+export const CostSeries = Schema.Struct({
+	key: Schema.String,
+	/** The series every key outside the top ones folds into; always last. */
+	other: Schema.Boolean,
+	total: Schema.Number,
+	/** One value per entry of `days`, 0 for a day without cost. */
+	points: Schema.Array(Schema.Number),
+})
+export type CostSeries = typeof CostSeries.Type
+
+export class CostTimeseriesResponse extends Schema.Class<CostTimeseriesResponse>("CostTimeseriesResponse")({
+	/** The currency every point is in; "" when the window and the period before have no cost. */
+	currency: Schema.String,
+	/** Every day of the window as `YYYY-MM-DD`, ascending. */
+	days: Schema.Array(Schema.String),
+	/** By `total`, largest first. */
+	series: Schema.Array(CostSeries),
+	/** The first day the provider may still restate, or null when every day is final. */
+	estimatedFrom: Schema.NullOr(Schema.String),
+}) {}
+
+export const CostBreakdownSortBy = Schema.Literals(["cost", "change"])
+export type CostBreakdownSortBy = typeof CostBreakdownSortBy.Type
+
+/** Rows a breakdown returns when the request names no limit. */
+export const COST_BREAKDOWN_DEFAULT_LIMIT = 50
+
+const CostBreakdownLimit = Schema.Number.check(
+	Schema.isInt(),
+	Schema.isGreaterThanOrEqualTo(1),
+	Schema.isLessThanOrEqualTo(200),
+)
+
+export class CostBreakdownRequest extends Schema.Class<CostBreakdownRequest>("CostBreakdownRequest")({
+	...CostWindowFields,
+	groupBy: CostDimension,
+	/** `cost` (the default): largest first. `change`: largest move against the period before. */
+	sortBy: Schema.optionalKey(CostBreakdownSortBy),
+	limit: Schema.optionalKey(CostBreakdownLimit),
+}) {}
+
+export const CostBreakdownRow = Schema.Struct({
+	key: Schema.String,
+	cost: Schema.Number,
+	previousCost: Schema.Number,
+})
+export type CostBreakdownRow = typeof CostBreakdownRow.Type
+
+export class CostBreakdownResponse extends Schema.Class<CostBreakdownResponse>("CostBreakdownResponse")({
+	/** The currency every row is in; "" when the window and the period before have no cost. */
+	currency: Schema.String,
+	rows: Schema.Array(CostBreakdownRow),
+}) {}
+
+/**
+ * `paused`: the connection no longer supplies cost; its history stays. `held`: nothing failed, but
+ * the sync is waiting (request budget spent, or the org is outside the rollout); `lastError` says
+ * which. `pending`: never pulled. `syncing`: still backfilling history. `error`: the last sync failed.
+ */
+export const CostSourceStatus = Schema.Literals(["paused", "held", "pending", "syncing", "ok", "error"])
+export type CostSourceStatus = typeof CostSourceStatus.Type
+
+export const CostSourceSummary = Schema.Struct({
+	id: CostSourceId,
+	provider: CostProvider,
+	/** The id of the provider's connection the source reads through, which its row actions name. */
+	connectionRef: Schema.String,
+	accountId: Schema.String,
+	/** How a reader knows the account, where its id is not it: a Vercel team's slug beside its team id. */
+	accountName: Schema.optionalKey(Schema.String),
+	status: CostSourceStatus,
+	/** The newest and oldest UTC day pulled, `YYYY-MM-DD`; null before the first pull. */
+	watermarkDate: Schema.NullOr(Schema.String),
+	backfillDate: Schema.NullOr(Schema.String),
+	/** The backfill reached the oldest day the sync keeps. */
+	historyComplete: Schema.Boolean,
+	/** Epoch ms. */
+	lastSyncedAt: Schema.NullOr(Schema.Number),
+	lastError: Schema.NullOr(Schema.String),
+	lastErrorReason: Schema.NullOr(Schema.String),
+	/** Billable provider API requests made for the source this UTC month. */
+	requestsThisMonth: Schema.Number,
+})
+export type CostSourceSummary = typeof CostSourceSummary.Type
+
+export class CostSourcesResponse extends Schema.Class<CostSourcesResponse>("CostSourcesResponse")({
+	sources: Schema.Array(CostSourceSummary),
+}) {}
+
 // Security Center telemetry: scanner probes from `scanner_requests`, runtime versions from
 // `service_runtimes_hourly` with the endoflife.date release cycles they are judged against.
 
@@ -2707,6 +3367,8 @@ export class SecurityExposureResponse extends Schema.Class<SecurityExposureRespo
 				signature: Schema.String,
 				service: Schema.String,
 				requests: Schema.Number,
+				/** Requests whose path holds the token; the rest probed only in the query. */
+				inPath: Schema.Number,
 				answered: Schema.Number,
 				sources: Schema.Number,
 				lastSeen: Schema.String,
@@ -2871,8 +3533,19 @@ export class ProductEventsFunnelTimingRequest extends Schema.Class<ProductEvents
 export class ProductEventsFunnelTimingResponse extends Schema.Class<ProductEventsFunnelTimingResponse>(
 	"ProductEventsFunnelTimingResponse",
 )({
-	/** One row per step 2..N: milliseconds from the previous step, over persons who reached this one. */
-	data: Schema.Array(Schema.Struct({ step: Schema.Number, p50Ms: Schema.Number, p90Ms: Schema.Number })),
+	/**
+	 * One row per step 2..N, over persons who reached it: milliseconds from the previous step, and
+	 * (`sinceStart*`) from step 1.
+	 */
+	data: Schema.Array(
+		Schema.Struct({
+			step: Schema.Number,
+			p50Ms: Schema.Number,
+			p90Ms: Schema.Number,
+			sinceStartP50Ms: Schema.Number,
+			sinceStartP90Ms: Schema.Number,
+		}),
+	),
 }) {}
 
 export class ProductEventsFunnelLeaversRequest extends Schema.Class<ProductEventsFunnelLeaversRequest>(
@@ -3519,6 +4192,18 @@ const queryEngineEndpointErrors = [
 	...warehouseHttpErrors,
 ] as const
 
+// The Security Center's telemetry tabs are for engineers and admins, like its findings.
+const securityEndpointErrors = [...queryEngineEndpointErrors, DependencyScanForbiddenError] as const
+
+/** What any read of the org's cost can answer with. */
+export const costEndpointErrors = [
+	CloudCostDisabledError,
+	CloudCostPersistenceError,
+	// A window wider than `COST_MAX_WINDOW_DAYS`.
+	QueryEngineValidationError,
+	...queryEngineEndpointErrors,
+] as const
+
 const validatedQueryEndpointErrors = [
 	QueryEngineValidationError,
 	QueryEngineExecutionError,
@@ -3727,6 +4412,83 @@ export class QueryEngineApiGroup extends HttpApiGroup.make("queryEngine")
 		}),
 	)
 	.add(
+		HttpApiEndpoint.post("vercelInfraProjects", "/vercel-infra-projects", {
+			payload: VercelInfraProjectsRequest,
+			success: VercelInfraProjectsResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelInfraRequestTimeseries", "/vercel-infra-request-timeseries", {
+			payload: VercelInfraTimeseriesRequest,
+			success: VercelInfraRequestTimeseriesResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelInfraLatencyTimeseries", "/vercel-infra-latency-timeseries", {
+			payload: VercelInfraTimeseriesRequest,
+			success: VercelInfraLatencyTimeseriesResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelInfraBreakdown", "/vercel-infra-breakdown", {
+			payload: VercelInfraBreakdownRequest,
+			success: VercelInfraBreakdownResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelInfraProjectDetail", "/vercel-infra-project-detail", {
+			payload: VercelInfraProjectDetailRequest,
+			success: VercelInfraProjectDetailResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelAiGateway", "/vercel-ai-gateway", {
+			payload: VercelInfraTimeseriesRequest,
+			success: VercelAiGatewayResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelInfraFunctions", "/vercel-infra-functions", {
+			payload: VercelInfraProjectDetailRequest,
+			success: VercelInfraFunctionsResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelInfraFunctionTimeseries", "/vercel-infra-function-timeseries", {
+			payload: VercelInfraFunctionTimeseriesRequest,
+			success: VercelInfraFunctionTimeseriesResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelInfraDependencies", "/vercel-infra-dependencies", {
+			payload: VercelInfraProjectDetailRequest,
+			success: VercelInfraDependenciesResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelSpeedInsights", "/vercel-speed-insights", {
+			payload: VercelInfraWindowRequest,
+			success: VercelSpeedInsightsResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("vercelWebAnalytics", "/vercel-web-analytics", {
+			payload: VercelInfraWindowRequest,
+			success: VercelWebAnalyticsResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
 		HttpApiEndpoint.post("gcpInfraPresence", "/gcp-infra-presence", {
 			payload: GcpInfraPresenceRequest,
 			success: GcpInfraPresenceResponse,
@@ -3854,6 +4616,13 @@ export class QueryEngineApiGroup extends HttpApiGroup.make("queryEngine")
 		}),
 	)
 	.add(
+		HttpApiEndpoint.post("serviceDeploys", "/service-deploys", {
+			payload: ServiceDeploysRequest,
+			success: ServiceDeploysResponse,
+			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
 		HttpApiEndpoint.post("releasesList", "/releases", {
 			payload: ReleasesListRequest,
 			success: ReleasesListResponse,
@@ -3872,14 +4641,6 @@ export class QueryEngineApiGroup extends HttpApiGroup.make("queryEngine")
 			payload: UptimeChecksRequest,
 			success: UptimeChecksResponse,
 			error: queryEngineEndpointErrors,
-		}),
-	)
-	.add(
-		HttpApiEndpoint.post("releaseDetail", "/release-detail", {
-			payload: ReleaseDetailRequest,
-			success: ReleaseDetailResponse,
-			// Embeds `execute` sub-queries, so it can also surface QueryEngineValidationError.
-			error: validatedQueryEndpointErrors,
 		}),
 	)
 	.add(
@@ -3915,6 +4676,20 @@ export class QueryEngineApiGroup extends HttpApiGroup.make("queryEngine")
 			payload: ServiceRuntimesRequest,
 			success: ServiceRuntimesResponse,
 			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("profileSampleTypes", "/profile-sample-types", {
+			payload: ProfileSampleTypesRequest,
+			success: ProfileSampleTypesResponse,
+			error: validatedQueryEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("profileStacks", "/profile-stacks", {
+			payload: ProfileStacksRequest,
+			success: ProfileStacksResponse,
+			error: validatedQueryEndpointErrors,
 		}),
 	)
 	.add(
@@ -4254,17 +5029,44 @@ export class QueryEngineApiGroup extends HttpApiGroup.make("queryEngine")
 		}),
 	)
 	.add(
+		HttpApiEndpoint.post("costTotals", "/cost-totals", {
+			payload: CostTotalsRequest,
+			success: CostTotalsResponse,
+			error: costEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("costTimeseries", "/cost-timeseries", {
+			payload: CostTimeseriesRequest,
+			success: CostTimeseriesResponse,
+			error: costEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("costBreakdown", "/cost-breakdown", {
+			payload: CostBreakdownRequest,
+			success: CostBreakdownResponse,
+			error: costEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.get("costSources", "/cost-sources", {
+			success: CostSourcesResponse,
+			error: [CloudCostDisabledError, CloudCostPersistenceError] as const,
+		}),
+	)
+	.add(
 		HttpApiEndpoint.post("securityExposure", "/security-exposure", {
 			payload: SecurityExposureRequest,
 			success: SecurityExposureResponse,
-			error: queryEngineEndpointErrors,
+			error: securityEndpointErrors,
 		}),
 	)
 	.add(
 		HttpApiEndpoint.post("securityRuntimes", "/security-runtimes", {
 			payload: SecurityRuntimesRequest,
 			success: SecurityRuntimesResponse,
-			error: queryEngineEndpointErrors,
+			error: securityEndpointErrors,
 		}),
 	)
 	.add(
@@ -4339,5 +5141,7 @@ export class QueryEngineApiGroup extends HttpApiGroup.make("queryEngine")
 	)
 	.prefix("/internal/query-engine")
 	.middleware(SessionAuthorization)
+	// Every endpoint here only reads, so an analyst may call it.
+	.annotate(AnalystAccess, "read")
 	// Every endpoint here reads telemetry for the dashboard.
 	.annotate(AuditedRead, "telemetry.read") {}

@@ -1,6 +1,7 @@
 import { Clock, Context, Effect, Layer, Option, Redacted, Schema, Record as Rec, String as Str } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http"
 import { Env } from "@maple/backend/platform/Env"
+import { ProductEventsIngestKey } from "@maple/infra/secrets"
 
 /**
  * Server-side product events for Maple's own funnel (`signup_completed`,
@@ -38,6 +39,8 @@ export type ProductEventName =
 	| "plan_started"
 	| "plan_changed"
 	| "plan_cancelled"
+	| "member_joined"
+	| "member_removed"
 
 export interface ProductEventInput {
 	readonly name: ProductEventName
@@ -156,9 +159,13 @@ export const makeProductEvents = (options: {
 		)
 
 	const track = Effect.fn("ProductEvents.track")(function* (event: ProductEventInput) {
+		// `maple.product_events.*`, not `maple.product_event.*`: a span carrying
+		// `maple.product_event.name` is itself projected into `product_events`
+		// (`Source='trace'`, see `product-event-attributes.ts`), which duplicated
+		// every server event as an unidentified trace row.
 		yield* Effect.annotateCurrentSpan({
-			"maple.product_event.name": event.name,
-			"maple.product_event.enabled": ingestKey !== undefined,
+			"maple.product_events.event": event.name,
+			"maple.product_events.enabled": ingestKey !== undefined,
 		})
 		if (ingestKey === undefined) {
 			yield* Effect.logDebug("Product event dropped: no ingest key configured").pipe(
@@ -183,7 +190,7 @@ export const makeProductEvents = (options: {
 			Effect.catchCause((cause) =>
 				Effect.logDebug("Product event dropped").pipe(
 					Effect.annotateLogs({ event: event.name, cause: String(cause) }),
-					Effect.tap(() => Effect.annotateCurrentSpan({ "maple.product_event.dropped": true })),
+					Effect.tap(() => Effect.annotateCurrentSpan({ "maple.product_events.dropped": true })),
 				),
 			),
 		)
@@ -197,9 +204,10 @@ export class ProductEventsService extends Context.Service<ProductEventsService, 
 	{
 		make: Effect.gen(function* () {
 			const env = yield* Env
+			const productEventsKey = yield* ProductEventsIngestKey
 			const httpClient = yield* HttpClient.HttpClient
 			const ingestKey = Option.getOrUndefined(
-				Option.orElse(env.MAPLE_PRODUCT_EVENTS_INGEST_KEY, () => env.MAPLE_INGEST_KEY),
+				Option.orElse(productEventsKey, () => env.MAPLE_INGEST_KEY),
 			)
 			const endpoint = Option.getOrElse(env.MAPLE_ENDPOINT, () => env.MAPLE_INGEST_PUBLIC_URL)
 			return makeProductEvents({

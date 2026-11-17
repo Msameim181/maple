@@ -10,6 +10,7 @@ vi.hoisted(() => {
 })
 import { Message } from "./message"
 import { ClerkPhase, type Model, Session } from "./model"
+import * as PageHold from "./page/page-hold"
 import { initCustomer } from "./page/onboarding/plan-gate"
 import * as Preload from "./page/preload"
 import * as SignIn from "./page/sign-in"
@@ -17,7 +18,7 @@ import type { ClerkSnapshot } from "./platform/clerk"
 import { AppRoute } from "./route"
 import * as Shell from "./shell"
 import * as Toast from "@maple/views/ui/toast"
-import { planGateOf, update } from "./update"
+import { pageContextOf, planGateOf, update } from "./update"
 import * as TooltipHost from "@maple/views/ui/tooltip-host"
 
 const orgId = Schema.decodeSync(OrgId)("org_acme")
@@ -35,6 +36,7 @@ const base = (knownToRenderApp: Record<string, boolean>): Model => ({
 	page: null,
 	pageInstances: 0,
 	parkedPages: [],
+	pageHold: PageHold.Model.None(),
 	onboarding: null,
 	clerkSnapshot: null,
 	customer: initCustomer(),
@@ -57,13 +59,16 @@ const snapshot: ClerkSnapshot = {
 		isRegionOpen: false,
 		flags: {
 			aiAutoTriage: false,
+			cloudCost: false,
+			cloudSecurity: false,
 			dataSources: false,
-			releases: false,
+			productAnalytics: false,
+			profiling: false,
 			securityAudit: false,
-			statusPages: false,
 		},
 	}),
 	memberships: [],
+	maybeRole: Option.none(),
 	maybePendingTask: Option.none(),
 }
 
@@ -110,26 +115,64 @@ describe("plan gate splash on a slow customer read", () => {
 	})
 })
 
-describe("statusPages rollout", () => {
-	const withFlag = (statusPages: boolean): ClerkSnapshot => ({
+describe("status pages", () => {
+	test("an org in no rollout gets the list", () => {
+		const atStatusPages: Model = { ...base({ [orgId]: true }), route: AppRoute.StatusPages() }
+		const loaded = update(atStatusPages, Message.CompletedLoadClerk({ snapshot }))
+		expect(loaded.model.page).not.toBeNull()
+		expect(namesOf(loaded)).not.toContain("ReplaceUrl")
+	})
+})
+
+describe("productAnalytics rollout", () => {
+	const withFlag = (productAnalytics: boolean): ClerkSnapshot => ({
 		...snapshot,
 		maybeOrganization: Option.map(snapshot.maybeOrganization, (organization) => ({
 			...organization,
-			flags: { ...organization.flags, statusPages },
+			flags: { ...organization.flags, productAnalytics },
 		})),
 	})
-	const atStatusPages = (): Model => ({ ...base({ [orgId]: true }), route: AppRoute.StatusPages() })
+	const atProductAnalytics = (): Model => ({
+		...base({ [orgId]: true }),
+		route: AppRoute.ProductAnalytics({ search: {} }),
+	})
+	const linksOf = (model: Model) =>
+		Option.map(pageContextOf(model), (context) => context.hasProductAnalytics)
 
-	test("an org outside the rollout is sent home without the status pages list mounting", () => {
-		const loaded = update(atStatusPages(), Message.CompletedLoadClerk({ snapshot: withFlag(false) }))
+	test("an org outside the rollout is sent home, and its pages are told not to link there", () => {
+		const loaded = update(atProductAnalytics(), Message.CompletedLoadClerk({ snapshot: withFlag(false) }))
 		expect(loaded.model.page).toBeNull()
 		expect(namesOf(loaded)).toContain("ReplaceUrl")
-		expect(namesOf(loaded)).not.toContain("FetchStatusPages")
+		expect(linksOf(loaded.model)).toEqual(Option.some(false))
 	})
 
-	test("an org in the rollout gets the list", () => {
-		const loaded = update(atStatusPages(), Message.CompletedLoadClerk({ snapshot: withFlag(true) }))
+	test("an org in the rollout gets the page, and its pages may link there", () => {
+		const loaded = update(atProductAnalytics(), Message.CompletedLoadClerk({ snapshot: withFlag(true) }))
 		expect(loaded.model.page).not.toBeNull()
 		expect(namesOf(loaded)).not.toContain("ReplaceUrl")
+		expect(linksOf(loaded.model)).toEqual(Option.some(true))
+	})
+})
+
+describe("profiling rollout", () => {
+	const withFlag = (profiling: boolean): ClerkSnapshot => ({
+		...snapshot,
+		maybeOrganization: Option.map(snapshot.maybeOrganization, (organization) => ({
+			...organization,
+			flags: { ...organization.flags, profiling },
+		})),
+	})
+	const atService = (): Model => ({
+		...base({ [orgId]: true }),
+		route: AppRoute.Service({ serviceName: "checkout-api", search: { tab: "profiles" } }),
+	})
+	const profilingOf = (flag: boolean) => {
+		const loaded = update(atService(), Message.CompletedLoadClerk({ snapshot: withFlag(flag) }))
+		return Option.map(pageContextOf(loaded.model), (context) => context.hasProfiling)
+	}
+
+	test("a service page is told whether its org is in the rollout", () => {
+		expect(profilingOf(false)).toEqual(Option.some(false))
+		expect(profilingOf(true)).toEqual(Option.some(true))
 	})
 })

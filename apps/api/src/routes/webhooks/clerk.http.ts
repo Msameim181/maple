@@ -1,26 +1,34 @@
 import { OrgId, RoleName, UserId } from "@maple/domain/http"
 import { Effect, Layer, Option, Schema } from "effect"
 import { HttpRouter, type HttpServerRequest } from "effect/http"
-import { Env } from "@maple/backend/platform/Env"
+import { DEFAULT_MAPLE_REGION } from "@maple/domain/organization-regions"
+import { ClerkWebhookSecret } from "@maple/infra/secrets"
 import { MembershipRevocationService } from "@maple/backend/services/auth/MembershipRevocationService"
+import { OrganizationRegionService } from "@maple/backend/services/org/OrganizationRegionService"
 import {
 	CLERK_MEMBERSHIP_EVENTS,
 	decodeClerkEnvelope,
 	decodeClerkOrganizationMembership,
 	decodeClerkUserCreated,
+	decodeClerkDirectoryGroup,
 	decodeClerkUserDeleted,
+	decodeClerkUserUpdated,
+	isClerkDirectoryGroupEvent,
 	isClerkMembershipEvent,
+	membershipProductEvent,
 	signupCompletedEvent,
 	type ClerkMembershipEventType,
 } from "@maple/backend/services/product-events/clerk-events"
 import { ProductEventsService } from "@maple/backend/services/product-events/ProductEventsService"
 import { AuditLogService } from "@maple/backend/services/audit/AuditLogService"
+import { EnterpriseSsoService } from "@maple/backend/services/org/enterprise-sso/EnterpriseSsoService"
 import { receiveSvixWebhook, webhookText } from "./svix-receiver"
 
 /**
  * Clerk webhook receiver. Three jobs:
  *
- * - `user.created` → `signup_completed` product event.
+ * - `user.created` → `signup_completed` product event; membership created /
+ *   deleted → `member_joined` / `member_removed`.
  * - membership lifecycle → an org audit entry (`member.added` / `role_changed`
  *   / `removed`). Membership is the one org change the web app makes in Clerk
  *   rather than through Maple's API, so this receiver is the only writer of
@@ -31,8 +39,19 @@ import { receiveSvixWebhook, webhookText } from "./svix-receiver"
  *   without it the membership cache and every user-bound credential keep
  *   answering yes indefinitely.
  *
+ * - SCIM: `directoryGroup.*` keeps the org's IdP groups for the role mapping picker (home region
+ *   only), and `user.updated` with `deprovisioned` runs the user sweep in every region. A member
+ *   whose membership predates directory sync keeps it after deactivation, so this is what ends
+ *   their keys.
+ *
  * Public route; authenticity is the Svix signature (`CLERK_WEBHOOK_SECRET`).
  * Any other event type is acknowledged with 200 so Clerk does not retry it.
+ *
+ * One Clerk instance serves every region, so each region's API registers its
+ * own endpoint (and secret) and receives every event. Every region runs the
+ * revocation sweep, because a credential is honoured by the instance that
+ * minted it; only the organization's home region writes the audit entry and
+ * the product event, and `user.created` is counted by the default region.
  */
 const ROUTE = "/webhooks/clerk"
 
@@ -41,10 +60,12 @@ const decodeUserId = Schema.decodeUnknownOption(UserId)
 const decodeRole = Schema.decodeUnknownOption(RoleName)
 
 const handler = Effect.gen(function* () {
-	const env = yield* Env
+	const webhookSecret = yield* ClerkWebhookSecret
 	const productEvents = yield* ProductEventsService
 	const revocation = yield* MembershipRevocationService
 	const audit = yield* AuditLogService
+	const regions = yield* OrganizationRegionService
+	const sso = yield* EnterpriseSsoService
 
 	/**
 	 * A revocation that only half-ran is the state this whole handler exists to
@@ -73,6 +94,7 @@ const handler = Effect.gen(function* () {
 	const handleMembership = Effect.fn("ClerkWebhook.membership")(function* (
 		data: unknown,
 		event: ClerkMembershipEventType,
+		timestamp: number | undefined,
 	) {
 		const payload = yield* decodeClerkOrganizationMembership(data).pipe(Effect.option)
 		if (Option.isNone(payload)) {
@@ -91,27 +113,54 @@ const handler = Effect.gen(function* () {
 			})
 			return webhookText("Unrecognized membership identifiers", 400)
 		}
-		// Clerk's payload names the member, never the admin who acted, so
-		// attributing this to a user would be a guess. `system` says truthfully
-		// that Maple learned of the change rather than made it. Recorded before
-		// the sweep: a revocation that fails and retries must not lose the entry.
-		yield* audit.record({
-			orgId: orgId.value,
-			actor: { type: "system" },
-			source: "system",
-			action: `member.${CLERK_MEMBERSHIP_EVENTS[event]}`,
-			affectedUserId: userId.value,
-			...(payload.value.role !== undefined ? { metadata: { role: payload.value.role } } : undefined),
+		const home = yield* regions.servedHere(orgId.value)
+		yield* Effect.annotateCurrentSpan({ "maple.webhook.org_home": home })
+		// Recording is the home region's alone; the sweep below is every region's. An API key is
+		// honoured by the instance that minted it, and an organization that chose its region after
+		// sign-up may still have keys on the default one.
+		const recorded = home === "here"
+		// Recording on a guess would put the entry in the wrong region, or in two: Svix redelivers.
+		const regionUnknown = Effect.gen(function* () {
+			yield* Effect.annotateCurrentSpan({
+				"http.response.status_code": 503,
+				"maple.webhook.outcome": "region_unknown",
+			})
+			return webhookText("Could not tell which region the organization lives in", 503)
 		})
+		if (recorded) {
+			// Clerk's payload names the member, never the admin who acted, so
+			// attributing this to a user would be a guess. `system` says truthfully
+			// that Maple learned of the change rather than made it. Recorded before
+			// the sweep: a revocation that fails and retries must not lose the entry.
+			yield* audit.record({
+				orgId: orgId.value,
+				actor: { type: "system" },
+				source: "system",
+				action: `member.${CLERK_MEMBERSHIP_EVENTS[event]}`,
+				affectedUserId: userId.value,
+				...(payload.value.role !== undefined
+					? { metadata: { role: payload.value.role } }
+					: undefined),
+			})
+		}
+		const productEvent = recorded ? membershipProductEvent(event, payload.value, timestamp) : undefined
 		if (event === "organizationMembership.created") {
+			if (home === "unknown") return yield* regionUnknown
+			if (productEvent !== undefined) yield* productEvents.track(productEvent)
 			yield* Effect.annotateCurrentSpan({
 				"http.response.status_code": 200,
-				"maple.webhook.outcome": "handled",
+				"maple.webhook.outcome": recorded ? "handled" : "not_home_region",
 			})
 			return webhookText("ok", 200)
 		}
 		if (event === "organizationMembership.deleted") {
-			return yield* revoke(revocation.revokeMembership(orgId.value, userId.value))
+			const response = yield* revoke(revocation.revokeMembership(orgId.value, userId.value))
+			// Swept first, so an unanswered lookup never leaves credentials standing while it retries.
+			if (home === "unknown" && response.status === 200) return yield* regionUnknown
+			// Only once the sweep succeeded: a 500 is retried by Clerk and would emit it twice.
+			if (response.status === 200 && productEvent !== undefined)
+				yield* productEvents.track(productEvent)
+			return response
 		}
 
 		// A role change is not just a cache eviction: CLI/MCP/device keys pin the
@@ -126,9 +175,11 @@ const handler = Effect.gen(function* () {
 				Effect.annotateLogs({ orgId: orgId.value, userId: userId.value }),
 			)
 			yield* Effect.annotateCurrentSpan({ "maple.webhook.role_missing": true })
-			return yield* revoke(revocation.invalidateMembership(userId.value))
+			const evicted = yield* revoke(revocation.invalidateMembership(userId.value))
+			return home === "unknown" && evicted.status === 200 ? yield* regionUnknown : evicted
 		}
-		return yield* revoke(revocation.demoteMembership(orgId.value, userId.value, [role.value]))
+		const demoted = yield* revoke(revocation.demoteMembership(orgId.value, userId.value, [role.value]))
+		return home === "unknown" && demoted.status === 200 ? yield* regionUnknown : demoted
 	})
 
 	return Effect.fn("ClerkWebhook.receive")(function* (req: HttpServerRequest.HttpServerRequest) {
@@ -136,7 +187,7 @@ const handler = Effect.gen(function* () {
 
 		const received = yield* receiveSvixWebhook({
 			provider: "clerk",
-			secret: env.CLERK_WEBHOOK_SECRET,
+			secret: webhookSecret,
 			request: req,
 		})
 		if (received._tag === "rejected") return received.response
@@ -153,7 +204,64 @@ const handler = Effect.gen(function* () {
 		yield* Effect.annotateCurrentSpan({ "maple.webhook.event": envelope.value.type })
 
 		if (isClerkMembershipEvent(envelope.value.type)) {
-			return yield* handleMembership(envelope.value.data, envelope.value.type)
+			return yield* handleMembership(envelope.value.data, envelope.value.type, envelope.value.timestamp)
+		}
+		if (isClerkDirectoryGroupEvent(envelope.value.type)) {
+			const group = yield* decodeClerkDirectoryGroup(envelope.value.data).pipe(Effect.option)
+			if (Option.isNone(group)) {
+				yield* Effect.annotateCurrentSpan({
+					"http.response.status_code": 400,
+					"maple.webhook.outcome": "parse_rejected",
+				})
+				return webhookText("Unrecognized directory group payload", 400)
+			}
+			const outcome = yield* sso
+				.applyDirectoryGroup({
+					directoryId: group.value.directory_id,
+					groupId: group.value.id,
+					displayName: group.value.display_name,
+					updatedAt: group.value.updated_at,
+					deleted: envelope.value.type === "directoryGroup.deleted",
+				})
+				.pipe(Effect.option)
+			if (Option.isNone(outcome)) {
+				yield* Effect.annotateCurrentSpan({
+					"http.response.status_code": 500,
+					"maple.webhook.outcome": "directory_group_failed",
+				})
+				return webhookText("Directory group could not be saved", 500)
+			}
+			yield* Effect.annotateCurrentSpan({
+				"http.response.status_code": 200,
+				"maple.webhook.outcome": outcome.value === "applied" ? "handled" : "not_home_region",
+			})
+			return webhookText("ok", 200)
+		}
+		if (envelope.value.type === "user.updated") {
+			const user = yield* decodeClerkUserUpdated(envelope.value.data).pipe(Effect.option)
+			const userId = Option.flatMap(user, (u) =>
+				u.deprovisioned === true ? decodeUserId(u.id) : Option.none(),
+			)
+			if (Option.isSome(userId)) {
+				// Clerk sets this only once every directory managing the user has deprovisioned them,
+				// and then the user cannot sign in anywhere, so every org's credentials go too.
+				yield* Effect.annotateCurrentSpan({ "maple.webhook.deprovisioned": true })
+				// Deliveries are unordered: an old one after a reactivation must not take new keys away.
+				const stillDeprovisioned = yield* sso.confirmDeprovisioned(userId.value)
+				if (!stillDeprovisioned) {
+					yield* Effect.annotateCurrentSpan({
+						"http.response.status_code": 200,
+						"maple.webhook.outcome": "stale_deprovision",
+					})
+					return webhookText("ok", 200)
+				}
+				return yield* revoke(revocation.revokeUser(userId.value))
+			}
+			yield* Effect.annotateCurrentSpan({
+				"http.response.status_code": 200,
+				"maple.webhook.outcome": "ignored",
+			})
+			return webhookText("ok", 200)
 		}
 		if (envelope.value.type === "user.deleted") {
 			const payload = yield* decodeClerkUserDeleted(envelope.value.data).pipe(Effect.option)
@@ -181,7 +289,10 @@ const handler = Effect.gen(function* () {
 			return yield* revoke(revocation.revokeUser(userId.value))
 		}
 
-		if (envelope.value.type === "user.created") {
+		// A signup has no home region, so one region counts it.
+		if (envelope.value.type === "user.created" && regions.region !== DEFAULT_MAPLE_REGION) {
+			yield* Effect.annotateCurrentSpan({ "maple.webhook.outcome": "other_region" })
+		} else if (envelope.value.type === "user.created") {
 			const user = yield* decodeClerkUserCreated(envelope.value.data).pipe(
 				Effect.tapError((error) =>
 					Effect.logInfo("Clerk user.created payload failed to decode").pipe(

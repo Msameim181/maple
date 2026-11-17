@@ -8,7 +8,7 @@ import type { IntegrationFlags } from "../data/infra-surfaces"
 import type { Resources } from "../platform/resources"
 import type { AppRoute, RouteTag } from "../route"
 import type { BreadcrumbEntry } from "../shell"
-import type { NavSurface } from "../shell/nav"
+import type { NavAudience, NavSurface } from "../shell/nav"
 import type { PageSourceRef } from "../shell/source-link"
 import { ToastType } from "@maple/views/ui/toast"
 
@@ -22,6 +22,12 @@ export interface PageContext {
 	readonly timeZone: string
 	/** The infra surfaces as the shell reads them; absent off the shell (a public page). */
 	readonly infra?: ShellInfraSurfaces
+	/** Who the shell is drawn for, from the same Clerk role; absent means an operator. */
+	readonly audience?: NavAudience
+	/** The org is in the `productAnalytics` rollout, so pages may link to it; absent means it is not. */
+	readonly hasProductAnalytics?: boolean
+	/** The org is in the `profiling` rollout, so a service page shows its Profiles tab; absent means it is not. */
+	readonly hasProfiling?: boolean
 }
 
 /** The sidebar's last-hour presence probe (`null` until it answers) and the integration statuses. */

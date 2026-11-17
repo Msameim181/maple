@@ -2,7 +2,7 @@
 
 ## Overview
 
-The homepage is a Persuade surface for engineers evaluating open-source observability. Its signature is monumental typography above an Rome-inspired, amber dithered temple and aqueduct. This direction applies to the homepage, pricing page, feature-page illustrations, and their locale variants; other marketing pages and the application retain their existing design.
+The homepage is a Persuade surface for engineers evaluating open-source observability. Its signature is monumental typography above an Rome-inspired, amber dithered temple and aqueduct. This direction applies to the homepage, pricing page, feature-page illustrations, their locale variants, and the docs home; other marketing pages, the docs reading pages and the application retain their existing design.
 
 ## Colors
 
@@ -28,6 +28,8 @@ Original shared rounded buttons, sharp frames, thin shared border rules. Dither 
 
 Existing navigation, authentication-aware CTAs, carousel, walkthrough, calculator, pricing and FAQs retain their behavior. Buttons have visible hover and keyboard focus. The hero image is eager; lower imagery is lazy. The page is usable without animation and respects reduced motion.
 
+A capture in a narrow column is a crop, not the whole screen scaled down: `MediaFrame` takes `crop` (top-left corner and zoom), the right and bottom edges fade out, and the lightbox still opens the full capture. The signals strip and the platform sheet use it. Pick a window that starts on a layout edge and holds nothing you would not print at full size. Section ledes are 15px (16px from `md`), row titles 15px, row copy and links 14px.
+
 ## Do's and Don'ts
 
 Keep localized content and real commercial facts. Use the generated monument at hero scale. Do not tint screenshots, invent metrics, replace working controls with decorative labels, or change the product theme.
@@ -49,6 +51,10 @@ Pricing carries the shared orange-and-charcoal palette, Geist typography, sharp 
 Each `/features/*` page has its own Roman engraving in the hero, shared across English, Japanese and Korean. Match the balanced hero's amber-on-charcoal palette and medium-fine dithering. Choose a subject that relates to the feature: aqueduct channels for tracing, an archive for logs, a water clock for metrics, a connected city for services, a cracked keystone for errors, a watchtower for alerts, a theater for session replay, a scholar's instrument for MCP, and an organized harbor for Kubernetes.
 
 The illustration occupies the right background and fades behind the copy; on smaller screens its opacity drops to keep the full-width text readable. Preserve all localized copy, breadcrumbs, CTAs, real screenshots and interactive demos. Illustration paths belong to the feature registry; generated WebP assets and prompts live in `public/art/features/`. Use-case and comparison heroes retain their existing layout.
+
+## Documentation home
+
+`/docs` carries the direction into the docs chrome (header, section strip and sidebar stay as they are). The title is set in the heavy display face over the Roman archive from `features/log-management.webp`, the same engraving as the docs social card, placed top right and faded behind the copy; below `lg` it drops to a faint backdrop. "Start here" is a framed strip under the lede, like the pricing rate card. Sections use an eyebrow, a heavy heading and sharp hairline frames; cells have no radius and hover to `--card`. The catch-all "Any OTLP exporter" row spans the language grid so no slot is left empty. Article pages are a reading surface and keep their own type scale. The docs 404 uses the same title weight and sharp list frame.
 
 ## Social previews
 

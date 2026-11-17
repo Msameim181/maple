@@ -9,35 +9,40 @@ import {
 	gcpScopeLabel,
 	gcpWorstState,
 } from "../infra-integrations/gcp/connector-state"
-import { DateTime, Option, Array as Arr } from "effect"
+import { Option, Array as Arr } from "effect"
 import { AsyncData } from "foldkit"
-import {
-	metricsAuthOf,
-	metricsLastCollectedAt,
-	metricsLastError,
-} from "../infra-integrations/planetscale/setup-steps"
-import type { Keyed } from "@maple/views/data/keyed"
-import { chatIntegrationId, type IntegrationId } from "./catalog"
+import type { IntegrationId } from "./catalog"
 import { hasBringYourOwnCloudAddOn } from "../kit/billing/plan-gating"
 import type { Visibility } from "../settings/nav"
 import type { Model, Statuses } from "./model"
+import { scrapeOverview, scrapeStatus } from "./scrape-overview"
+import { providerModuleOf } from "./provider-modules"
+import {
+	attentionOr,
+	type CardStatus,
+	CONNECT,
+	fold,
+	type IntegrationOverview,
+	isoMs,
+	type LastSync,
+	lastSyncOf,
+	maxMs,
+	NOT_CONNECTED,
+	SET_UP,
+	unavailableOverview,
+	unavailableStatus,
+} from "./overview"
 
-/** Success (also while revalidating), initial (`null`), else the failure value. */
-export const fold = <A, E, R>(slot: Keyed<A, E>, onSuccess: (data: A) => R, onFailure: () => R): R | null =>
-	AsyncData.match(slot.data, {
-		onIdle: () => null,
-		onLoading: () => null,
-		onRefreshing: onSuccess,
-		onSuccess,
-		onFailure: () => onFailure(),
-		onStale: () => onFailure(),
-	})
-
-/** `Date.parse` of an ISO timestamp (lint-banned), `null` when absent or unparseable. */
-export const isoMs = (iso: string | null | undefined): number | null =>
-	iso === null || iso === undefined
-		? null
-		: Option.getOrNull(Option.map(DateTime.make(iso), DateTime.toEpochMillis))
+export {
+	type AvailableOverview,
+	type CardStatus,
+	type ConnectedOverview,
+	fold,
+	type IntegrationOverview,
+	isoMs,
+	type LastSync,
+	type UnavailableOverview,
+} from "./overview"
 
 /** Where a connection's metric stream stands, as the source's health reads it. */
 export const awsStreamOf = (connection: V2AwsConnection, nowMs: number): AwsStreamState =>
@@ -103,44 +108,6 @@ export const AWS_CONDITION_LABEL = {
 	receiving: "Receiving metrics",
 } satisfies Record<AwsConnectionCondition, string>
 
-export interface CardStatus {
-	readonly label: string
-	readonly variant: "ok" | "warn" | "crit" | "outline"
-}
-
-const NOT_CONNECTED: CardStatus = { label: "Not connected", variant: "outline" }
-const NOT_CONFIGURED: CardStatus = { label: "Not configured", variant: "outline" }
-/** The status read failed: a warning, not the neutral look of a quiet connection. */
-const STATUS_UNAVAILABLE: CardStatus = { label: "Couldn't check status", variant: "warn" }
-
-/** The newest data or sync, read as `{verb} {relative time}`: `synced 3m ago`. */
-export type LastSync = Readonly<{ verb: string; at: number }>
-
-export interface ConnectedOverview {
-	readonly kind: "connected"
-	readonly health: "healthy" | "attention" | "pending"
-	readonly stateLabel: string
-	readonly context: string | null
-	readonly stat: string | null
-	readonly lastSync: LastSync | null
-	readonly issue: string | null
-}
-export interface AvailableOverview {
-	readonly kind: "available"
-	readonly cta: "Connect" | "Set up"
-}
-export interface UnavailableOverview {
-	readonly kind: "unavailable"
-	/** `failed`: the status read failed. `not-configured`: this deployment has no setup for it. */
-	readonly reason: "failed" | "not-configured"
-}
-export type IntegrationOverview = ConnectedOverview | AvailableOverview | UnavailableOverview | null
-
-const CONNECT: AvailableOverview = { kind: "available", cta: "Connect" }
-const SET_UP: AvailableOverview = { kind: "available", cta: "Set up" }
-const UNAVAILABLE: UnavailableOverview = { kind: "unavailable", reason: "failed" }
-const UNCONFIGURED: UnavailableOverview = { kind: "unavailable", reason: "not-configured" }
-
 export const HEALTH_TONE = {
 	healthy: "ok",
 	attention: "warn",
@@ -148,60 +115,9 @@ export const HEALTH_TONE = {
 	unavailable: "warn",
 } as const
 
-const lastSyncOf = (ms: number | null, verb = "synced"): LastSync | null =>
-	ms === null ? null : { verb, at: ms }
-
 /** `synced 3m ago`: a last sync as plain text, for places that cannot hold a timestamp. */
 export const lastSyncText = (lastSync: LastSync, nowMs: number): string =>
 	`${lastSync.verb} ${formatRelativeTime(lastSync.at, nowMs)}`
-
-const maxMs = (values: ReadonlyArray<number | null | undefined>): number | null =>
-	Arr.reduce<(typeof values)[number], number | null>(values, null, (acc, v) =>
-		v !== null && v !== undefined && (acc === null || v > acc) ? v : acc,
-	)
-
-const unavailableStatus = () => STATUS_UNAVAILABLE
-
-const scrapeStatus = (statuses: Statuses, targetType: "prometheus" | "planetscale") =>
-	fold(
-		statuses.scrapeTargets,
-		(data): CardStatus => {
-			const targets = Arr.filter(data, (target) => target.target_type === targetType)
-			if (targets.length === 0) return NOT_CONNECTED
-			const failing = Arr.some(targets, (target) => target.enabled && target.last_scrape_error !== null)
-			const enabled = Arr.filter(targets, (target) => target.enabled).length
-			const noun = targetType === "planetscale" ? "org" : "target"
-			return {
-				label: `${countLabel(targets.length, noun)} · ${enabled} enabled`,
-				variant: failing ? "warn" : "ok",
-			}
-		},
-		unavailableStatus,
-	)
-
-const chatStatus = (statuses: Statuses, id: IntegrationId) =>
-	fold(
-		statuses.chat,
-		(response): CardStatus => {
-			const connector = Arr.findFirst(response.data, (entry) => chatIntegrationId(entry.id) === id)
-			const workspaces = Option.match(connector, {
-				onNone: () => [],
-				onSome: (found) => found.workspaces,
-			})
-			if (workspaces.length === 0)
-				return Option.exists(connector, (found) => found.available === false)
-					? NOT_CONFIGURED
-					: NOT_CONNECTED
-			return {
-				label:
-					workspaces.length === 1
-						? (workspaces[0]?.name ?? "Connected")
-						: `${workspaces.length} workspaces`,
-				variant: "ok",
-			}
-		},
-		unavailableStatus,
-	)
 
 const githubStatus = (statuses: Statuses) =>
 	fold(
@@ -216,11 +132,10 @@ const githubStatus = (statuses: Statuses) =>
 		unavailableStatus,
 	)
 
-const connectedOrNot = (connected: boolean): CardStatus =>
-	connected ? { label: "Connected", variant: "ok" } : NOT_CONNECTED
-
 /** The header badge per integration; `null` while loading. */
 export const cardStatusOf = (statuses: Statuses, id: IntegrationId, nowMs: number): CardStatus | null => {
+	const provider = providerModuleOf(id)
+	if (provider !== undefined) return provider.cardStatus(statuses, { id, nowMs })
 	switch (id) {
 		case "gcp":
 			return fold(
@@ -246,99 +161,16 @@ export const cardStatusOf = (statuses: Statuses, id: IntegrationId, nowMs: numbe
 				},
 				unavailableStatus,
 			)
-		case "railway":
-			return fold(
-				statuses.railway,
-				(status): CardStatus =>
-					!status.connected
-						? NOT_CONNECTED
-						: status.authFailed
-							? { label: "Token rejected", variant: "crit" }
-							: { label: countLabel(status.environments.length, "environment"), variant: "ok" },
-				unavailableStatus,
-			)
-		case "supabase":
-			return fold(
-				statuses.supabase,
-				(status): CardStatus =>
-					!status.configured
-						? NOT_CONFIGURED
-						: !status.connected
-							? NOT_CONNECTED
-							: status.revoked
-								? { label: "Access revoked", variant: "crit" }
-								: { label: status.organization?.name ?? "Connected", variant: "ok" },
-				unavailableStatus,
-			)
-		case "cloudflare":
-			return fold(statuses.cloudflare, (status) => connectedOrNot(status.connected), unavailableStatus)
 		case "prometheus":
 			return scrapeStatus(statuses, "prometheus")
-		case "planetscale":
-			return fold(
-				statuses.planetscale,
-				(status): CardStatus | null =>
-					status.connected
-						? {
-								label: status.organization ?? "Connected",
-								variant: metricsLastError(status) !== null ? "warn" : "ok",
-							}
-						: scrapeStatus(statuses, "planetscale"),
-				unavailableStatus,
-			)
 		case "warpstream":
 			return { label: "Via Prometheus", variant: "outline" }
-		case "linear":
-			return fold(
-				statuses.linear,
-				(status): CardStatus =>
-					status.revoked
-						? { label: "Revoked", variant: "warn" }
-						: status.connected
-							? {
-									label:
-										status.workspaceName === null || status.workspaceName === ""
-											? "Connected"
-											: status.workspaceName,
-									variant: "ok",
-								}
-							: NOT_CONNECTED,
-				unavailableStatus,
-			)
 		case "github":
 			return githubStatus(statuses)
-		case "google-search-console":
-			return fold(
-				statuses.searchConsole,
-				(status): CardStatus =>
-					status.revoked
-						? { label: "Revoked", variant: "warn" }
-						: !status.connected
-							? status.configured
-								? NOT_CONNECTED
-								: NOT_CONFIGURED
-							: {
-									label: countLabel(
-										Arr.filter(status.sites, (site) => site.enabled).length,
-										"property",
-										"properties",
-									),
-									variant: "ok",
-								},
-				unavailableStatus,
-			)
 		default:
-			return chatStatus(statuses, id)
+			return null
 	}
 }
-
-const unavailableOverview = (): IntegrationOverview => UNAVAILABLE
-
-const attentionOr = (issue: string | null) =>
-	({
-		health: issue !== null ? "attention" : "healthy",
-		stateLabel: issue !== null ? "Needs attention" : "Healthy",
-	}) as const
 
 const gcpOverview = (statuses: Statuses, nowMs: number) =>
 	fold(
@@ -439,214 +271,6 @@ const awsOverview = (statuses: Statuses, nowMs: number) =>
 		unavailableOverview,
 	)
 
-const railwayOverview = (statuses: Statuses) =>
-	fold(
-		statuses.railway,
-		(status): IntegrationOverview => {
-			if (!status.connected) return CONNECT
-			const failing = Arr.filter(
-				status.environments,
-				(environment) => environment.lastError != null,
-			).length
-			const issue = status.authFailed
-				? "Token rejected"
-				: failing > 0
-					? `${countLabel(failing, "environment")} failing`
-					: null
-			return {
-				kind: "connected",
-				...attentionOr(issue),
-				context: status.workspaceNames,
-				stat: `${countLabel(status.environments.length, "environment")} polled`,
-				lastSync: lastSyncOf(status.lastSyncedAt ?? null),
-				issue,
-			}
-		},
-		unavailableOverview,
-	)
-
-const supabaseOverview = (statuses: Statuses) =>
-	fold(
-		statuses.supabase,
-		(status): IntegrationOverview => {
-			if (!status.configured) return UNCONFIGURED
-			if (!status.connected) return CONNECT
-			const issue = status.revoked
-				? "Reconnect to resume"
-				: status.lastDiscoveryError !== null
-					? "Project discovery failing"
-					: null
-			const collecting = Arr.filter(status.projects, (project) => project.metricsEnabled).length
-			return {
-				kind: "connected",
-				...attentionOr(issue),
-				context: status.organization?.name ?? null,
-				stat: `${countLabel(status.projects.length, "project")} · ${collecting} collecting metrics`,
-				lastSync: lastSyncOf(status.lastDiscoveryAt),
-				issue,
-			}
-		},
-		unavailableOverview,
-	)
-
-const cloudflareOverview = (statuses: Statuses) =>
-	fold(
-		statuses.cloudflare,
-		(status): IntegrationOverview => {
-			if (!status.connected) return CONNECT
-			const zones = status.zones
-			const enabledZones = Arr.filter(zones, (zone) => zone.enabled).length
-			const erroringZones = Arr.filter(zones, (zone) => zone.enabled && zone.lastError != null).length
-			const workersFailing = status.workers?.enabled === true && status.workers.lastError != null
-			const issue = !status.analyticsCapable
-				? "Update access"
-				: erroringZones > 0
-					? `${countLabel(erroringZones, "zone")} erroring`
-					: workersFailing
-						? "Workers sync failing"
-						: null
-			const statParts = [
-				...(zones.length > 0
-					? [`${enabledZones} of ${countLabel(zones.length, "zone")} streaming`]
-					: []),
-				...(status.workers?.enabled === true ? ["Workers"] : []),
-			]
-			return {
-				kind: "connected",
-				...attentionOr(issue),
-				context: status.accountName,
-				stat: statParts.length > 0 ? Arr.join(statParts, " · ") : null,
-				lastSync: lastSyncOf(
-					maxMs([...Arr.map(zones, (zone) => zone.lastSyncedAt), status.workers?.lastSyncedAt]),
-				),
-				issue,
-			}
-		},
-		unavailableOverview,
-	)
-
-const scrapeOverview = (statuses: Statuses, targetType: "prometheus" | "planetscale") =>
-	fold(
-		statuses.scrapeTargets,
-		(data): IntegrationOverview => {
-			const targets = Arr.filter(data, (target) => target.target_type === targetType)
-			if (targets.length === 0) return targetType === "prometheus" ? SET_UP : CONNECT
-			const enabled = Arr.filter(targets, (target) => target.enabled).length
-			const failing = Arr.filter(
-				targets,
-				(target) => target.enabled && target.last_scrape_error !== null,
-			).length
-			const noun = targetType === "planetscale" ? "org" : "target"
-			return {
-				kind: "connected",
-				health: failing > 0 ? "attention" : "healthy",
-				stateLabel: failing > 0 ? "Needs attention" : "Healthy",
-				context: countLabel(targets.length, `scrape ${noun}`),
-				stat: `${enabled} of ${targets.length} enabled`,
-				lastSync: lastSyncOf(maxMs(Arr.map(targets, (t) => isoMs(t.last_scrape_at))), "scraped"),
-				issue: failing > 0 ? `${countLabel(failing, noun)} failing` : null,
-			}
-		},
-		unavailableOverview,
-	)
-
-const planetscaleOverview = (statuses: Statuses) => {
-	const dbCount = fold(
-		statuses.planetscaleDatabases,
-		(response): number | null => response.databases.length,
-		() => null,
-	)
-	return fold(
-		statuses.planetscale,
-		(status): IntegrationOverview => {
-			if (!status.connected) return scrapeOverview(statuses, "planetscale")
-			const issue = status.pending_org_selection
-				? "Finish org selection"
-				: metricsLastError(status) !== null
-					? metricsAuthOf(status) === "api"
-						? "Metrics polling failing"
-						: "Scrape failing"
-					: status.last_inventory_error != null
-						? "Inventory failing"
-						: null
-			return {
-				kind: "connected",
-				...attentionOr(issue),
-				context: status.organization,
-				stat:
-					dbCount !== null && dbCount > 0
-						? `${countLabel(dbCount, "database")} tracked`
-						: metricsAuthOf(status) === "api" || status.scrape_target?.enabled === true
-							? "Branch metrics on"
-							: null,
-				lastSync: lastSyncOf(
-					maxMs(Arr.map([metricsLastCollectedAt(status), status.last_inventory_at], isoMs)),
-				),
-				issue,
-			}
-		},
-		unavailableOverview,
-	)
-}
-
-const linearOverview = (statuses: Statuses) =>
-	fold(
-		statuses.linear,
-		(status): IntegrationOverview =>
-			status.revoked
-				? {
-						kind: "connected",
-						health: "attention",
-						stateLabel: "Revoked",
-						context: status.workspaceName,
-						stat: null,
-						lastSync: null,
-						issue: "Reconnect Linear",
-					}
-				: status.connected
-					? {
-							kind: "connected",
-							health: "healthy",
-							stateLabel: "Healthy",
-							context: status.workspaceName,
-							stat: "Incident issues ready",
-							lastSync: null,
-							issue: null,
-						}
-					: CONNECT,
-		unavailableOverview,
-	)
-
-const searchConsoleOverview = (statuses: Statuses) =>
-	fold(
-		statuses.searchConsole,
-		(status): IntegrationOverview => {
-			if (!status.connected) return status.configured ? CONNECT : UNCONFIGURED
-			const enabled = Arr.filter(status.sites, (site) => site.enabled)
-			const failing = Arr.filter(enabled, (site) => site.lastError !== null).length
-			const issue = status.revoked
-				? "Reconnect Google"
-				: enabled.length === 0
-					? "Choose properties"
-					: failing > 0
-						? `${countLabel(failing, "property", "properties")} failing`
-						: null
-			return {
-				kind: "connected",
-				...attentionOr(issue),
-				...(status.revoked ? { stateLabel: "Revoked" } : undefined),
-				context: status.accountEmail,
-				stat:
-					enabled.length > 0
-						? `${countLabel(enabled.length, "property", "properties")} selected`
-						: null,
-				lastSync: lastSyncOf(maxMs(Arr.map(enabled, (site) => site.lastSyncedAt))),
-				issue,
-			}
-		},
-		unavailableOverview,
-	)
-
 const githubOverview = (statuses: Statuses) =>
 	fold(
 		statuses.github,
@@ -686,61 +310,23 @@ const githubOverview = (statuses: Statuses) =>
 		unavailableOverview,
 	)
 
-const chatOverview = (statuses: Statuses, id: IntegrationId) =>
-	fold(
-		statuses.chat,
-		(response): IntegrationOverview => {
-			const workspaces = Arr.findFirst(
-				response.data,
-				(entry) => chatIntegrationId(entry.id) === id,
-			).pipe(
-				Option.flatMapNullishOr((found) => found.workspaces),
-				Option.getOrElse(() => []),
-			)
-			if (workspaces.length === 0) return CONNECT
-			return {
-				kind: "connected",
-				health: "healthy",
-				stateLabel: "Healthy",
-				context:
-					workspaces.length === 1
-						? (workspaces[0]?.name ?? null)
-						: countLabel(workspaces.length, "workspace"),
-				stat: "Alerts & agent ready",
-				lastSync: null,
-				issue: null,
-			}
-		},
-		unavailableOverview,
-	)
-
 /** One integration's overview; `null` while its status loads. */
 export const overviewOf = (statuses: Statuses, nowMs: number, id: IntegrationId): IntegrationOverview => {
+	const provider = providerModuleOf(id)
+	if (provider !== undefined) return provider.overview(statuses, { id, nowMs })
 	switch (id) {
 		case "gcp":
 			return gcpOverview(statuses, nowMs)
 		case "aws":
 			return awsOverview(statuses, nowMs)
-		case "railway":
-			return railwayOverview(statuses)
-		case "supabase":
-			return supabaseOverview(statuses)
-		case "cloudflare":
-			return cloudflareOverview(statuses)
 		case "prometheus":
 			return scrapeOverview(statuses, "prometheus")
-		case "planetscale":
-			return planetscaleOverview(statuses)
 		case "warpstream":
 			return SET_UP
-		case "linear":
-			return linearOverview(statuses)
 		case "github":
 			return githubOverview(statuses)
-		case "google-search-console":
-			return searchConsoleOverview(statuses)
 		default:
-			return chatOverview(statuses, id)
+			return null
 	}
 }
 

@@ -9,7 +9,7 @@ import { FetchHttpClient, HttpRouter } from "effect/http"
 import { parseSecretKeyring, sealSecret } from "@maple/backend/platform/SecretBox"
 import { planetScaleDatabaseWebhookSecretSlot } from "@maple/backend/platform/secret-slots"
 import { Database } from "@maple/backend/platform/DatabaseLive"
-import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import {
 	cleanupTestDbs,
 	createTestDb,
@@ -60,7 +60,7 @@ const makeRouterLayer = (
 		Layer.provide(FetchHttpClient.layer),
 		Layer.provide(testDb.layer),
 		Layer.provide(Layer.succeed(PlanetScaleWebhookQueue, { send: (prepared) => send(prepared.body) })),
-		Layer.provide(Env.layer),
+		Layer.provide(EnvTestLive),
 		Layer.provide(makeConfig()),
 	)
 
@@ -152,6 +152,26 @@ describe("PlanetScaleWebhookRouter", () => {
 					),
 				)
 				assert.strictEqual(rejected.status, 401)
+
+				// An unsigned delivery is refused whatever it carries, and an oversized one is never parsed.
+				const unsigned = yield* Effect.promise(() =>
+					handler(
+						new Request(`http://api.localhost${WEBHOOK_PATH}`, { method: "POST", body: BODY }),
+						handlerContext,
+					),
+				)
+				assert.strictEqual(unsigned.status, 401)
+				const oversized = yield* Effect.promise(() =>
+					handler(
+						new Request(`http://api.localhost${WEBHOOK_PATH}`, {
+							method: "POST",
+							headers: { "x-planetscale-signature": "invalid" },
+							body: Str.repeat(1024 * 1024 + 1)("x"),
+						}),
+						handlerContext,
+					),
+				)
+				assert.strictEqual(oversized.status, 413)
 
 				// A database Maple registered no webhook on has no secret a signature could match.
 				const otherDatabase = JSON.stringify({
@@ -359,6 +379,48 @@ describe("PlanetScaleWebhookRouter", () => {
 				})
 				assert.strictEqual(unknown.status, 200)
 				assert.strictEqual(jobs.length, 2)
+			}).pipe(Effect.ensuring(Effect.promise(dispose)))
+		}).pipe(Effect.provide(testDb.layer))
+	})
+
+	it.effect("acknowledges and drops a verified delivery while events are switched off", () => {
+		const testDb = createTestDb(trackedDbs)
+		const jobs: PlanetScaleWebhookJob[] = []
+		return Effect.gen(function* () {
+			const database = yield* Database
+			yield* seedConnection(testDb)
+			yield* database.execute((db) =>
+				db.run(
+					PG.update(PlanetscaleConnections)
+						.set({ eventsEnabled: false })
+						.where(($) => [$.id.eq(CONNECTION_ID)]),
+				),
+			)
+			const body = JSON.stringify({
+				timestamp: 1_698_252_879,
+				event: "branch.anomaly",
+				organization: "acme",
+				database: "shop",
+			})
+			const signature = createHmac("sha256", SECRET).update(body, "utf8").digest("hex")
+			const { handler, dispose } = HttpRouter.toWebHandler(
+				makeRouterLayer(testDb, (job) => Effect.sync(() => jobs.push(job))),
+				{ disableLogger: true },
+			)
+
+			yield* Effect.gen(function* () {
+				const response = yield* Effect.promise(() =>
+					handler(
+						new Request(`http://api.localhost${WEBHOOK_PATH}`, {
+							method: "POST",
+							headers: { "x-planetscale-signature": signature },
+							body,
+						}),
+						Context.make(Database, database),
+					),
+				)
+				assert.strictEqual(response.status, 200)
+				assert.strictEqual(jobs.length, 0)
 			}).pipe(Effect.ensuring(Effect.promise(dispose)))
 		}).pipe(Effect.provide(testDb.layer))
 	})

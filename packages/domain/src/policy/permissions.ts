@@ -11,6 +11,15 @@ export const permissions = {
 	// The public ingest key ships in browser bundles, so every member may read it to set up an app.
 	"ingest_keys:view_public": { min: "member", action: "view the public ingest key" },
 
+	// Running the product day to day: members and above. Analysts read it and build dashboards, which
+	// every role may. The API refuses an analyst the rest in one place (`AnalystAccess`); these name
+	// it for the dashboard.
+	"error_issues:triage": { min: "member", action: "triage error issues" },
+	"incidents:respond": { min: "member", action: "acknowledge and resolve incidents" },
+	"investigations:run": { min: "member", action: "start investigations" },
+	"status_page_incidents:post": { min: "member", action: "post status page incidents and updates" },
+	"recommendations:triage": { min: "member", action: "dismiss and reopen recommendations" },
+
 	// Technical setup: engineers and above.
 	"integrations:manage": { min: "engineer", action: "manage integrations" },
 	"code_review:configure": { min: "engineer", action: "change code review settings" },
@@ -25,7 +34,7 @@ export const permissions = {
 	"anomalies:configure": { min: "engineer", action: "manage anomaly detector settings" },
 	"error_policy:manage": { min: "engineer", action: "manage error notifications and escalation" },
 	"ai_triage:configure": { min: "engineer", action: "manage AI triage settings" },
-	"security:manage": { min: "engineer", action: "read and triage security findings" },
+	"security:manage": { min: "engineer", action: "open the Security Center and triage its findings" },
 
 	// The organization, money and credentials: admins only.
 	"organization:manage": { min: "admin", action: "change the organization's settings" },
@@ -34,11 +43,13 @@ export const permissions = {
 	"api_keys:manage": { min: "admin", action: "manage API keys" },
 	"ingest_keys:roll": { min: "admin", action: "roll ingest keys" },
 	"status_pages:break_glass": { min: "admin", action: "manage status page break-glass tokens" },
+	"status_pages:access": { min: "admin", action: "change who can view status pages" },
 	"warehouse:manage": { min: "admin", action: "manage the data warehouse" },
 	"data_sources:manage": { min: "admin", action: "connect and manage data sources" },
 	"security_audit:run": { min: "admin", action: "configure and run code security audits" },
 	"audit_log:read": { min: "admin", action: "read the audit log" },
 	"llm_keys:manage": { min: "admin", action: "manage the organization's model provider keys" },
+	"sso:manage": { min: "admin", action: "manage single sign-on and SCIM provisioning" },
 	"mcp_connections:view_all": { min: "admin", action: "see every member's MCP connections" },
 } as const satisfies Record<string, { readonly min: Role; readonly action: string }>
 

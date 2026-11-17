@@ -1,9 +1,20 @@
 import { OrgId } from "@maple/domain"
 import { Option, Result, Schema, Array as Arr } from "effect"
 import { AsyncData } from "foldkit"
-import { expect as expectView, given, label, Mount, role, scene, text, withViewInputs } from "foldkit/scene"
+import {
+	all,
+	expect as expectView,
+	expectAll,
+	given,
+	label,
+	Mount,
+	role,
+	scene,
+	text,
+	withViewInputs,
+} from "foldkit/scene"
 import { describe, expect, test } from "vitest"
-import { LinkedCursorMessage, MountLinkedCursor } from "@maple/views/charts/linked-cursor"
+import { LinkedCursorMessage, MountLinkedZoom } from "@maple/views/charts/linked-cursor"
 import { ResolveThemeColors, ThemeMessage } from "@maple/views/charts/theme-colors"
 import { toLoadFailure } from "@maple/views/data/load-failure"
 import { PageOutMessage, type PageContext } from "../contract"
@@ -79,7 +90,7 @@ const withPresence = (model: Model, traces: Presence, logs: Presence = traces): 
 
 const themeResolved = () =>
 	Mount.resolve(ResolveThemeColors, ThemeMessage.ResolvedThemeColors({ colors: {} }))
-const cursorMounted = () => Mount.resolve(MountLinkedCursor, LinkedCursorMessage.CompletedMountLinkedCursor())
+const cursorMounted = () => Mount.resolve(MountLinkedZoom, LinkedCursorMessage.CompletedMountLinkedCursor())
 
 describe("overview", () => {
 	test("entry reads the clock and hint; downstream queries wait for facets", () => {
@@ -242,9 +253,59 @@ describe("overview", () => {
 			given(failed),
 			Mount.resolveAll(
 				[ResolveThemeColors, ThemeMessage.ResolvedThemeColors({ colors: {} })],
-				[MountLinkedCursor, LinkedCursorMessage.CompletedMountLinkedCursor()],
+				[MountLinkedZoom, LinkedCursorMessage.CompletedMountLinkedCursor()],
 			),
 			expectView(text("Firing now:")).toBeAbsent(),
+		)
+	})
+
+	test("health computed without alert status says so, and says nothing once alerts are known", () => {
+		const facets = withFacets(entered().model, ["production"]).model
+		const steps: ReadonlyArray<Message> = [
+			Message.CompletedFetchSnapshot({
+				key: facets.snapshot.key ?? "",
+				result: Result.succeed([snapshotRow("checkout")]),
+			}),
+			Message.CompletedFetchAnomalies({ key: facets.anomalies.key ?? "", result: Result.succeed([]) }),
+			Message.FailedLoadIncidents({ orgId }),
+		]
+		const mounts = Mount.resolveAll(
+			[ResolveThemeColors, ThemeMessage.ResolvedThemeColors({ colors: {} })],
+			[MountLinkedZoom, LinkedCursorMessage.CompletedMountLinkedCursor()],
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(Arr.reduce(steps, facets, (model, message) => pageUpdate(model, message).model)),
+			mounts,
+			expectView(text("Couldn't load alert status")).toExist(),
+			// The notice, and the services list's caption further down.
+			expectAll(all.text("Service health leaves out firing alerts.")).toHaveCount(2),
+			expectView(text("Status reflects active alerts and baseline anomalies.")).toBeAbsent(),
+		)
+		const withoutAnomalies: ReadonlyArray<Message> = [
+			Message.CompletedFetchSnapshot({
+				key: facets.snapshot.key ?? "",
+				result: Result.succeed([snapshotRow("checkout")]),
+			}),
+			Message.CompletedFetchAnomalies({
+				key: facets.anomalies.key ?? "",
+				result: Result.fail(toLoadFailure("boom")),
+			}),
+			Message.UpdatedIncidents({ orgId, incidents: [] }),
+		]
+		scene(
+			{ update: pageUpdate, view },
+			given(Arr.reduce(withoutAnomalies, facets, (model, message) => pageUpdate(model, message).model)),
+			mounts,
+			expectView(text("Couldn't load anomalies")).toExist(),
+			expectView(text("Couldn't load alert status")).toBeAbsent(),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded([snapshotRow("checkout")])),
+			mounts,
+			expectView(text("Couldn't load alert status")).toBeAbsent(),
+			expectView(text("Status reflects active alerts and baseline anomalies.")).toExist(),
 		)
 	})
 
@@ -441,5 +502,23 @@ describe("overview", () => {
 			Message.CompletedReloadSpin({ version: reloaded.model.refreshVersion }),
 		)
 		expect(settled.model.isReloading).toBe(false)
+	})
+})
+
+describe("chart zoom", () => {
+	test("a drag across an Overview chart opens that span as the window", () => {
+		const zoomed = pageUpdate(
+			loaded([snapshotRow("checkout")]),
+			Message.SelectedChartRange({
+				startMs: Date.parse("2026-10-01T09:00:00Z"),
+				endMs: Date.parse("2026-10-01T09:45:00Z"),
+			}),
+		)
+		expect(zoomed.outMessage).toEqual(
+			PageOutMessage.RequestedNavigation({
+				url: "/?startTime=2026-10-01+09%3A00%3A00&endTime=2026-10-01+09%3A45%3A00",
+				isReplace: false,
+			}),
+		)
 	})
 })

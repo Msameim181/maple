@@ -573,6 +573,104 @@ describe("bundled migrations", () => {
 		expect(deliveries.rows).toEqual([{ id: "delivery_webhook" }])
 	}, 30_000)
 
+	it("moves a live GCP refusal hold out of the lease and keeps the poll order", async () => {
+		const pg = new PGlite()
+		await pg.exec(readMigrationSqlBefore("gcp_metrics_hold"))
+		await pg.query(
+			`INSERT INTO sources (id, org_id, name, platform, kind, created_at, updated_at)
+			VALUES ('src_g', 'org_1', 'GCP', 'gcp', 'pull', now(), now())`,
+		)
+		// The old column held three things: a refusal hold, a live tick's lease, and a stale cursor.
+		const connector = (id: string, leaseSql: string) =>
+			pg.query(
+				`INSERT INTO gcp_connectors (id, org_id, source_id, scope_type, scope_id, project_id, secret_ciphertext,
+					secret_iv, secret_tag, secret_hash, created_by, created_at, updated_at, metrics_lease_until)
+				VALUES ($1, 'org_1', 'src_g', 'project', $1, $1, 'x', 'x', 'x', $1, 'user_1', now(), now(), ${leaseSql})`,
+				[id],
+			)
+		await connector("held", "now() + interval '30 minutes'")
+		await connector("ticking", "now() + interval '2 minutes'")
+		await connector("polled", "now() - interval '1 hour'")
+
+		await pg.exec(readMigrationSql("gcp_metrics_hold"))
+
+		const rows = await pg.query<{
+			id: string
+			lease: boolean
+			hold_minutes: number | null
+			polled_minutes: number | null
+		}>(
+			`SELECT id, metrics_lease_until IS NOT NULL AS lease,
+				round(extract(epoch FROM metrics_hold_until - now()) / 60)::int AS hold_minutes,
+				round(extract(epoch FROM metrics_polled_at - now()) / 60)::int AS polled_minutes
+			FROM gcp_connectors ORDER BY id`,
+		)
+		expect(rows.rows).toEqual([
+			// The hold survives the deploy; its cursor is now.
+			{ id: "held", lease: false, hold_minutes: 30, polled_minutes: 0 },
+			{ id: "polled", lease: false, hold_minutes: null, polled_minutes: -64 },
+			// A live tick keeps its lease and is not held.
+			{ id: "ticking", lease: true, hold_minutes: null, polled_minutes: -2 },
+		])
+		await pg.close()
+	}, 30_000)
+
+	it("moves live Vercel and Supabase-logs holds out of the lease and leaves live leases", async () => {
+		const pg = new PGlite()
+		await pg.exec(readMigrationSqlBefore("poller_hold_vercel_supabase"))
+		await pg.query(
+			`INSERT INTO sources (id, org_id, name, platform, kind, created_at, updated_at) VALUES
+				('src_v1', 'org_1', 'Vercel', 'vercel', 'pull', now(), now()),
+				('src_v2', 'org_2', 'Vercel', 'vercel', 'pull', now(), now()),
+				('src_s', 'org_1', 'Supabase', 'supabase', 'pull', now(), now())`,
+		)
+		// A 15 minute lease is a rate-limit hold; a 2 minute one is a tick still running.
+		const vercel = (id: string, org: string, source: string, leaseSql: string) =>
+			pg.query(
+				`INSERT INTO vercel_connections (id, org_id, source_id, team_id, team_slug, team_name, token_ciphertext,
+					token_iv, token_tag, connected_by_user_id, project_scope, created_at, updated_at, lease_until)
+				VALUES ($1, $2, $3, $1, $1, $1, 'x', 'x', 'x', 'user_1', 'all', now(), now(), ${leaseSql})`,
+				[id, org, source],
+			)
+		await vercel("v_held", "org_1", "src_v1", "now() + interval '15 minutes'")
+		await vercel("v_ticking", "org_2", "src_v2", "now() + interval '2 minutes'")
+		await pg.query(
+			`INSERT INTO supabase_connections (id, org_id, source_id, supabase_organization_id,
+				supabase_organization_slug, supabase_organization_name, connected_by_user_id, created_at, updated_at)
+			VALUES ('sc1', 'org_1', 'src_s', 'so1', 'acme', 'Acme', 'user_1', now(), now())`,
+		)
+		const project = (id: string, leaseSql: string) =>
+			pg.query(
+				`INSERT INTO supabase_projects (id, org_id, connection_id, project_ref, name, region, status,
+					last_seen_at, created_at, updated_at, logs_lease_until)
+				VALUES ($1, 'org_1', 'sc1', $1, $1, 'eu-central-1', 'ACTIVE_HEALTHY', now(), now(), now(), ${leaseSql})`,
+				[id],
+			)
+		await project("p_held", "now() + interval '60 minutes'")
+		await project("p_ticking", "now() + interval '2 minutes'")
+
+		await pg.exec(readMigrationSql("poller_hold_vercel_supabase"))
+
+		const minutes = (column: string) => `round(extract(epoch FROM ${column} - now()) / 60)::int`
+		const vercelRows = await pg.query(
+			`SELECT id, ${minutes("lease_until")} AS lease, ${minutes("hold_until")} AS hold
+			FROM vercel_connections ORDER BY id`,
+		)
+		expect(vercelRows.rows).toEqual([
+			{ id: "v_held", lease: null, hold: 15 },
+			{ id: "v_ticking", lease: 2, hold: null },
+		])
+		const projectRows = await pg.query(
+			`SELECT id, ${minutes("logs_lease_until")} AS lease, ${minutes("logs_hold_until")} AS hold
+			FROM supabase_projects ORDER BY id`,
+		)
+		expect(projectRows.rows).toEqual([
+			{ id: "p_held", lease: null, hold: 60 },
+			{ id: "p_ticking", lease: 2, hold: null },
+		])
+		await pg.close()
+	}, 30_000)
+
 	it("links every integration row to the source it sends as", async () => {
 		const pg = new PGlite()
 		await pg.exec(readMigrationSqlBefore("source_ownership"))
@@ -770,6 +868,46 @@ describe("bundled migrations", () => {
 			"SELECT column_name FROM information_schema.columns WHERE table_name = 'sources' AND column_name IN ('is_default', 'integration_id')",
 		)
 		expect(columns.rows).toEqual([])
+		await pg.close()
+	}, 30_000)
+
+	it("gives uptime rules a warning tier with the critical tier's destinations, once", async () => {
+		const pg = new PGlite()
+		await pg.exec(readMigrationSqlBefore("uptime_certificate_warning_tier"))
+		const rule = (id: string, signalType: string, thresholds: unknown) =>
+			pg.query(
+				`INSERT INTO alert_rules (
+					id, org_id, name, severity, signal_type, comparator, threshold, window_minutes,
+					destination_ids_json, thresholds_json, query_spec_json, reducer, no_data_behavior,
+					created_at, updated_at, created_by, updated_by
+				) VALUES ($1, 'org_1', $1, 'critical', $2, 'gte', 1, 1, '["dest_a"]', $3, '{}', 'identity', 'skip',
+					now(), now(), 'user_1', 'user_1')`,
+				[id, signalType, thresholds === null ? null : JSON.stringify(thresholds)],
+			)
+		const critical = {
+			severity: "critical",
+			value: 1,
+			upper: null,
+			recoveryValue: null,
+			destinationIds: ["dest_a"],
+		}
+		await rule("uptime_tiered", "uptime", [critical])
+		await rule("uptime_legacy", "uptime", null)
+		await rule("error_rate", "error_rate", [critical])
+
+		const sql = readMigrationSql("uptime_certificate_warning_tier")
+		await pg.exec(sql)
+		await pg.exec(sql)
+
+		const rows = await pg.query<{ id: string; threshold: number; thresholds_json: unknown }>(
+			"SELECT id, threshold, thresholds_json FROM alert_rules ORDER BY id",
+		)
+		const warning = { ...critical, severity: "warning", value: 0.5 }
+		expect(rows.rows).toEqual([
+			{ id: "error_rate", threshold: 1, thresholds_json: [critical] },
+			{ id: "uptime_legacy", threshold: 0.5, thresholds_json: [warning, critical] },
+			{ id: "uptime_tiered", threshold: 0.5, thresholds_json: [warning, critical] },
+		])
 		await pg.close()
 	}, 30_000)
 })

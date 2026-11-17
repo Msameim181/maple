@@ -10,6 +10,7 @@ import {
 	AwsConnections,
 	ChatWorkspaces,
 	CliDeviceAuthorizations,
+	CostConnections,
 	DashboardShares,
 	DirectorySessions,
 	ExternalDataSources,
@@ -17,12 +18,14 @@ import {
 	OAuthConnections,
 	OrgClickHouseSettings,
 	OrgIngestKeys,
+	OpenRouterCostConnections,
 	OrgOpenRouterKeys,
 	PlanetscaleConnections,
 	PlanetscaleDatabases,
 	RailwayConnections,
 	ScrapeTargets,
 	UptimeMonitors,
+	VercelConnections,
 } from "@maple/db/tables"
 import { Array as Arr, Effect, Schema } from "effect"
 import type { EncryptedValue } from "@maple/backend/platform/Crypto"
@@ -277,6 +280,22 @@ export const RESEAL_TARGETS = {
 		keys: One,
 		ref: org,
 	}),
+	openRouterCostKeySlot: tripleTarget({
+		slot: slots.openRouterCostKeySlot,
+		table: OpenRouterCostConnections,
+		columns: { ciphertext: "keyCiphertext", iv: "keyIv", tag: "keyTag" },
+		identity: ["orgId"],
+		keys: One,
+		ref: org,
+	}),
+	costConnectionSecretSlot: tripleTarget({
+		slot: slots.costConnectionSecretSlot,
+		table: CostConnections,
+		columns: { ciphertext: "secretCiphertext", iv: "secretIv", tag: "secretTag" },
+		identity: ["orgId", "provider"],
+		keys: Two,
+		ref: ([orgId, provider]) => ({ orgId, provider }),
+	}),
 	planetScaleWebhookSecretSlot: tripleTarget({
 		slot: slots.planetScaleWebhookSecretSlot,
 		table: PlanetscaleConnections,
@@ -320,5 +339,13 @@ export const RESEAL_TARGETS = {
 		identity: ["orgId", "id"],
 		keys: Two,
 		ref: orgRow,
+	}),
+	vercelTokenSlot: tripleTarget({
+		slot: slots.vercelTokenSlot,
+		table: VercelConnections,
+		columns: { ciphertext: "tokenCiphertext", iv: "tokenIv", tag: "tokenTag" },
+		identity: ["orgId"],
+		keys: One,
+		ref: org,
 	}),
 } satisfies Record<keyof typeof slots, ResealTarget>

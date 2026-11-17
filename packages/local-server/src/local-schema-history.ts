@@ -52,6 +52,12 @@ import schemaV51Sql from "./schema/history/local-schema-v51.sql" with { type: "t
 import schemaV52Sql from "./schema/history/local-schema-v52.sql" with { type: "text" }
 import schemaV53Sql from "./schema/history/local-schema-v53.sql" with { type: "text" }
 import schemaV54Sql from "./schema/history/local-schema-v54.sql" with { type: "text" }
+import schemaV55Sql from "./schema/history/local-schema-v55.sql" with { type: "text" }
+import schemaV56Sql from "./schema/history/local-schema-v56.sql" with { type: "text" }
+import schemaV57Sql from "./schema/history/local-schema-v57.sql" with { type: "text" }
+import schemaV58Sql from "./schema/history/local-schema-v58.sql" with { type: "text" }
+import schemaV59Sql from "./schema/history/local-schema-v59.sql" with { type: "text" }
+import schemaV60Sql from "./schema/history/local-schema-v60.sql" with { type: "text" }
 import { Array as Arr } from "effect"
 import { buildLocalSchemaManifest, type LocalSchemaManifest } from "./schema-manifest"
 import { LEGACY_LOCAL_SCHEMA, LEGACY_LOCAL_SCHEMA_VERSION, type LocalSchemaIdentity } from "./schema-identity"
@@ -120,6 +126,12 @@ const SNAPSHOT_SQL: ReadonlyArray<string> = [
 	schemaV52Sql,
 	schemaV53Sql,
 	schemaV54Sql,
+	schemaV55Sql,
+	schemaV56Sql,
+	schemaV57Sql,
+	schemaV58Sql,
+	schemaV59Sql,
+	schemaV60Sql,
 ]
 
 export interface LocalSchemaSnapshot {

@@ -8,6 +8,7 @@ import type { Html, HtmlBuilder } from "foldkit/html"
 import { ResolveThemeColors } from "@maple/views/charts/theme-colors"
 import { isSameFailure } from "@maple/views/data/load-failure"
 import { errorState } from "@maple/views/ui/error-state"
+import { listFooter } from "@maple/views/ui/list-footer"
 import { activeFilterChips } from "@maple/views/ui/filters/active-filter-chips"
 import type * as LogsStream from "@maple/views/ui/logs/logs-stream"
 import * as LogsStreamView from "@maple/views/ui/logs/logs-stream-view"
@@ -17,6 +18,7 @@ import { advancedFilterButton, appliedWhereClause } from "../../kit/advanced-fil
 import { dashboardPage } from "../../kit/dashboard-page"
 import { advancedFilterDialog } from "./view-advanced"
 import { searchPreset, timeControls } from "../../kit/time-controls"
+import * as SavedViews from "../../kit/saved-views"
 import * as TimeRangePicker from "../../kit/time-range-picker"
 import * as LogDetail from "@maple/views/logs/log-sheet"
 import * as InfraCorrelation from "../../kit/infra-correlation"
@@ -26,6 +28,7 @@ import { chipId, isInspectingOf, logFilterChips } from "./derive"
 import { Message } from "./message"
 import type { Model } from "./model"
 import { DEFAULT_PRESET, footerText } from "./update"
+import { viewsExplorer } from "./saved-views"
 import { filtersRail } from "./view-filters"
 import { emptyState, isNeverReceived } from "./view-empty"
 import { toolbar } from "./view-toolbar"
@@ -100,6 +103,18 @@ const streamArea = (
 					selectedIndex: model.selectedIndex ?? undefined,
 				},
 			}),
+			// A later page failed: said under the count, with the retry.
+			...(model.pagination.isFailed
+				? [
+						listFooter(h, {
+							isFailed: true,
+							onLoadMore: Message.ClickedRetryNextPage(),
+							align: "start",
+							className: "shrink-0 py-0",
+							children: [h.span([], ["Couldn't load more logs"])],
+						}),
+					]
+				: []),
 		],
 	)
 
@@ -175,6 +190,12 @@ const headerActions = (h: HtmlBuilder<Message>, model: Model): Html => {
 			}),
 	})
 	return hstack(h, { gap: "2", wrap: true }, [
+		SavedViews.control(h, {
+			slotId: "logs-saved-views",
+			model: model.savedViews,
+			explorer: viewsExplorer([model.search]),
+			toMessage: (message) => Message.GotSavedViewsMessage({ message }),
+		}),
 		advancedFilterButton(h, {
 			isActive: (model.search.whereClause ?? "") !== "",
 			onClick: Message.ClickedAdvancedFilter(),

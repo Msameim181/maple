@@ -55,6 +55,10 @@ export const AlertSignalType = Schema.Literals([
 	"slo_burn_rate",
 	/** Pages on the anomaly detector's open incidents in the rule's scope; it has no query. */
 	"anomaly",
+	/** The hidden rule behind an audit log detection; managed only through the Security hub. */
+	"audit",
+	/** The hidden rule behind a cost budget; managed only through the Cost page's budgets. */
+	"cost_budget",
 ]).annotate({
 	identifier: "@maple/AlertSignalType",
 	title: "Alert Signal Type",
@@ -65,6 +69,8 @@ export type AlertSignalType = Schema.Schema.Type<typeof AlertSignalType>
 export const MANAGED_SIGNAL_TYPES = [
 	"uptime",
 	"slo_burn_rate",
+	"audit",
+	"cost_budget",
 ] as const satisfies ReadonlyArray<AlertSignalType>
 export type ManagedSignalType = (typeof MANAGED_SIGNAL_TYPES)[number]
 export const isManagedSignalType = (signalType: string): signalType is ManagedSignalType =>
@@ -1359,6 +1365,8 @@ export class AlertRuleStoredConfigInvalidError extends HttpTaggedError<AlertRule
 			"notification_template",
 			"query_builder_draft",
 			"thresholds",
+			"audit_filters",
+			"cost_budget",
 		]),
 		cause: Schema.Defect(),
 	},

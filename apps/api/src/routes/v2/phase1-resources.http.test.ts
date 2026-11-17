@@ -252,6 +252,7 @@ const settingsFixture = new AnomalyDetectorSettingsDocument({
 	enabled: true,
 	sensitivity: "normal",
 	mutedSignals: [],
+	includedEnvironments: [],
 	updatedAt: decodeIso("2026-07-15T09:12:00.000Z"),
 	updatedBy: null,
 })
@@ -726,13 +727,16 @@ const makeHarness = (
 		}
 	}
 
-	const bootstrapKey = (scopes?: ReadonlyArray<string>) =>
+	const bootstrapKey = (scopes?: ReadonlyArray<string>, roles?: ReadonlyArray<string>) =>
 		runtime.runPromise(
 			Effect.gen(function* () {
 				const service = yield* ApiKeysService
 				return yield* service.create(ORG, USER, {
 					name: "phase1-test",
 					scopes,
+					...(roles === undefined
+						? undefined
+						: { metadataJson: { source: "maple_cli", roles, deviceName: "laptop" } }),
 				})
 			}),
 		)
@@ -896,6 +900,24 @@ describe("v2 error_issues over HTTP", () => {
 			{ action: "release", actorId: actorFixture.id, opts: { transitionTo: "in_review" } },
 		])
 		expect(harness.ensuredUsers()).toHaveLength(4)
+		await harness.dispose()
+	})
+
+	it("lets an analyst read an issue and refuses to let them triage it", async () => {
+		const harness = makeHarness()
+		const key = await harness.bootstrapKey(undefined, ["org:analyst"])
+
+		const read = await harness.request("GET", `/v2/error_issues/${ISS_ID}`, { token: key.secret })
+		expect(read.status).toBe(200)
+
+		const refused = await harness.request("POST", `/v2/error_issues/${ISS_ID}/transitions`, {
+			token: key.secret,
+			body: { to_state: "todo", expected_state: "triage" },
+		})
+		expect(refused.status).toBe(403)
+		expect(refused.body.error.code).toBe("insufficient_permissions")
+		expect(refused.body.error.message).toContain("Analysts can read Maple")
+		expect(harness.issueActions()).toEqual([])
 		await harness.dispose()
 	})
 
@@ -1222,6 +1244,7 @@ describe("v2 anomalies over HTTP", () => {
 		expect(settings.body.object).toBe("anomaly_settings")
 		expect(settings.body.enabled).toBe(true)
 		expect(settings.body.muted_signals).toEqual([])
+		expect(settings.body.included_environments).toEqual([])
 		await harness.dispose()
 	})
 
@@ -2019,6 +2042,8 @@ describe("v2 users wire mapping over HTTP", () => {
 			{
 				name: "Ada Replay",
 				email: "ada.replay@acme.test",
+				nameAt: 1_762_000_000,
+				emailAt: 1_762_000_000,
 				groupId: "grp_replay",
 				groupName: "Replay Group",
 				sessions: 29,
@@ -2046,6 +2071,8 @@ describe("v2 users wire mapping over HTTP", () => {
 				calls: 59,
 				name: "",
 				email: "",
+				nameAt: 0,
+				emailAt: 0,
 				firstSeen: "2026-11-01 04:00:00",
 				lastSeen: "2026-11-01 12:00:00",
 			},

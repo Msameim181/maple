@@ -304,6 +304,9 @@ const userActivityFixtures: ReadonlyArray<BuilderFixture> = [
 	userActivityFixture("userActivityServicesQuery", () =>
 		CH.compileUnsafe(CH.userActivityServicesQuery(USER_SCOPE), window),
 	),
+	userActivityFixture("userActivityIdentityQuery", () =>
+		CH.compileUnsafe(CH.userActivityIdentityQuery(USER_SCOPE), window),
+	),
 	userActivityFixture("userActivityTotalsQuery", () =>
 		CH.compileUnsafe(CH.userActivityTotalsQuery({ userIds: ["user_a", "user_b"] }), window),
 	),
@@ -713,20 +716,25 @@ const alertingFixtures: ReadonlyArray<BuilderFixture> = [
 			}),
 	},
 
-	// backend AnomalyDetectionService, detector baselines on matched hours.
+	// backend AnomalyDetectionService, detector baselines on the hours its windows straddle.
 	{
 		module: "anomaly",
 		name: "anomalyTraceSignalsQuery",
-		label: "matchedHours",
-		compile: () =>
-			CH.compileUnsafe(CH.anomalyTraceSignalsQuery({ hoursOfDay: CH.matchedHoursOfDay(10) }), window),
+		label: "baselineHours",
+		compile: () => CH.compileUnsafe(CH.anomalyTraceSignalsQuery({ hoursOfDay: [8, 9, 10, 11] }), window),
+	},
+	// AnomalyDetectionService, the rolling 60-minute current window.
+	{
+		module: "anomaly",
+		name: "anomalyTraceSignalsWindowQuery",
+		label: "lastHour",
+		compile: () => CH.compileUnsafe(CH.anomalyTraceSignalsWindowQuery(), window),
 	},
 	{
 		module: "anomaly",
 		name: "anomalyLogVolumeQuery",
-		label: "matchedHours",
-		compile: () =>
-			CH.compileUnsafe(CH.anomalyLogVolumeQuery({ hoursOfDay: CH.matchedHoursOfDay(10) }), window),
+		label: "baselineHours",
+		compile: () => CH.compileUnsafe(CH.anomalyLogVolumeQuery({ hoursOfDay: [8, 9, 10, 11] }), window),
 	},
 	// AnomalyDetectionService, error-spike current and baseline windows.
 	{
@@ -1240,7 +1248,80 @@ const searchConsoleFixtures: ReadonlyArray<BuilderFixture> = [
 	},
 ]
 
+const costWindow = {
+	orgId: ORG_ID,
+	previousStartDate: "2026-09-01 00:00:00",
+	startDate: "2026-10-01 00:00:00",
+	endDate: "2026-10-30 00:00:00",
+}
+
+const costFilters = {
+	sourceIds: ["0f6f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11"],
+	values: { region: ["us-east-1", "global"] },
+}
+
+/** What the page reads: the same filters, in the one currency it picked. */
+const costRead = { ...costFilters, currency: "USD" }
+
+const costFixtures: ReadonlyArray<BuilderFixture> = [
+	{
+		module: "cost",
+		name: "costCurrenciesQuery",
+		label: "filtered",
+		compile: () => CH.compileUnsafe(CH.costCurrenciesQuery(costFilters), costWindow),
+	},
+	{
+		module: "cost",
+		name: "costTotalsQuery",
+		label: "filtered",
+		compile: () => CH.compileUnsafe(CH.costTotalsQuery(costFilters), costWindow),
+	},
+	{
+		module: "cost",
+		name: "costTotalsQuery",
+		label: "inOneCurrency",
+		compile: () => CH.compileUnsafe(CH.costTotalsQuery(costRead), costWindow),
+	},
+	{
+		module: "cost",
+		name: "costTimeseriesQuery",
+		label: "byCloudServiceTopKeys",
+		compile: () =>
+			CH.compileUnsafe(
+				CH.costTimeseriesQuery({
+					...costRead,
+					dimension: "cloud_service",
+					keys: ["Amazon Elastic Compute Cloud - Compute", "Amazon Elastic Load Balancing"],
+				}),
+				costWindow,
+			),
+	},
+	{
+		module: "cost",
+		name: "costBreakdownQuery",
+		label: "byUsageTypeEffectiveByChange",
+		compile: () =>
+			CH.compileUnsafe(
+				CH.costBreakdownQuery({
+					...costRead,
+					dimension: "usage_type",
+					metric: "effective",
+					sortBy: "change",
+					limit: 25,
+				}),
+				costWindow,
+			),
+	},
+	{
+		module: "cost",
+		name: "costSourceCoverageQuery",
+		label: "default",
+		compile: () => CH.compileUnsafe(CH.costSourceCoverageQuery(costFilters), costWindow),
+	},
+]
+
 export const builderFixtures: ReadonlyArray<BuilderFixture> = [
+	...costFixtures,
 	...searchConsoleFixtures,
 	...productEventsFixtures,
 	...productEventsExploreFixtures,
@@ -1385,6 +1466,75 @@ export const builderFixtures: ReadonlyArray<BuilderFixture> = [
 					until: END_TIME,
 				},
 			),
+	},
+	// Audit trail listing (packages/backend/src/services/audit-trail/AuditTrailService.ts `list`).
+	{
+		module: "audit-trail",
+		name: "auditTrailEventsQuery",
+		label: "default",
+		compile: () => CH.compileUnsafe(CH.auditTrailEventsQuery({ limit: 51 }), { orgId: ORG_ID }),
+	},
+	{
+		// Every optional filter bound at once, with the keyset cursor.
+		module: "audit-trail",
+		name: "auditTrailEventsQuery",
+		label: "filtered",
+		compile: () =>
+			CH.compileUnsafe(
+				CH.auditTrailEventsQuery({
+					provider: true,
+					account: true,
+					category: true,
+					outcome: true,
+					action: true,
+					actor: true,
+					actorAlias: true,
+					since: true,
+					until: true,
+					before: true,
+					limit: 51,
+				}),
+				{
+					orgId: ORG_ID,
+					provider: "github",
+					account: "acme",
+					category: "membership",
+					outcome: "success",
+					action: "org.add_member",
+					actor: "octocat@acme.test",
+					actorAlias: "user_1",
+					since: START_TIME,
+					until: END_TIME,
+					beforeOccurredAt: END_TIME,
+					beforeId: "0f6f2c1e7a554c0e9a3b0d2c7e5b9a11",
+				},
+			),
+	},
+	// Audit detection count (AuditTrailService.ts `count`), every optional filter bound.
+	{
+		module: "audit-trail",
+		name: "auditTrailCountQuery",
+		label: "filtered",
+		compile: () =>
+			CH.compileUnsafe(
+				CH.auditTrailCountQuery({ provider: true, category: true, outcome: true, action: true }),
+				{
+					orgId: ORG_ID,
+					provider: "vercel",
+					category: "membership",
+					outcome: "success",
+					action: "team.member.added",
+					start: START_TIME,
+					end: END_TIME,
+				},
+			),
+	},
+	// Audit log sources (AuditTrailService.ts `providerStats`): events per platform in the window.
+	{
+		module: "audit-trail",
+		name: "auditTrailSourcesQuery",
+		label: "default",
+		compile: () => CH.compileUnsafe(CH.auditTrailSourcesQuery(), { orgId: ORG_ID, since: START_TIME }),
 	},
 	// Cancellation evidence (CancellationTelemetryEvidence.read).
 	{
@@ -2044,9 +2194,8 @@ export const builderFixtures: ReadonlyArray<BuilderFixture> = [
 			),
 	},
 
-	// Releases page — routes/internal/query-engine.http.ts `releasesList` and
-	// `releaseDetail`. Same splice as the services list, grouped one level
-	// finer (per commit), plus the error-events bridge keyed on the version.
+	// routes/internal/query-engine.http.ts `releasesList`. Same splice as the
+	// services list, grouped one level finer (per commit).
 	{
 		module: "releases",
 		name: "releasesListQuery",
@@ -2067,52 +2216,30 @@ export const builderFixtures: ReadonlyArray<BuilderFixture> = [
 				window,
 			),
 	},
+	// The services one commit reached: bounds a commit's deploy verification read.
+	{
+		module: "releases",
+		name: "commitServicesQuery",
+		label: "default",
+		compile: () => CH.compileUnsafe(CH.commitServicesQuery("abc123"), window),
+	},
+	// Deploy verification: each deploy's first half hour against the half hour before it.
+	{
+		module: "releases",
+		name: "releaseVerificationQuery",
+		label: "default",
+		compile: () =>
+			CH.compileUnsafe(CH.releaseVerificationQuery({ serviceName: "api" }), {
+				...window,
+				deploysFrom: START_TIME,
+			}),
+	},
 	// Dependency scanner: which commit each service runs, ranked by traffic.
 	{
 		module: "releases",
 		name: "runningCommitsQuery",
 		label: "default",
 		compile: () => CH.compileUnsafe(CH.runningCommitsQuery(), window),
-	},
-	{
-		module: "releases",
-		name: "releasesTimelineQuery",
-		label: "minutely",
-		compile: () =>
-			CH.compileUnsafe(CH.releasesTimelineQuery({ environments: ["production"], bucketSeconds: 300 }), {
-				...window,
-				bucketSeconds: 300,
-			}),
-	},
-	{
-		module: "releases",
-		name: "releasesTimelineQuery",
-		label: "hourly",
-		compile: () =>
-			CH.compileUnsafe(CH.releasesTimelineQuery({ serviceName: "api", bucketSeconds: 3600 }), {
-				...window,
-				bucketSeconds: 3600,
-			}),
-	},
-	{
-		module: "releases",
-		name: "releasesTimelineQuery",
-		label: "raw",
-		compile: () =>
-			CH.compileUnsafe(CH.releasesTimelineQuery({ serviceName: "api", bucketSeconds: 30 }), {
-				...window,
-				bucketSeconds: 30,
-			}),
-	},
-	{
-		module: "releases",
-		name: "releaseErrorFingerprintsQuery",
-		label: "default",
-		compile: () =>
-			CH.compileUnsafe(
-				CH.releaseErrorFingerprintsQuery({ serviceName: "api", environments: ["production"] }),
-				{ ...window, serviceVersion: "0af7651916cd43dd8448eb211c80319c0af76519" },
-			),
 	},
 
 	// MCP `service_deployments`, `route_usage` and `ingest_freshness`.
@@ -2459,6 +2586,53 @@ export const builderFixtures: ReadonlyArray<BuilderFixture> = [
 		compile: () =>
 			CH.compileUnsafe(
 				CH.usersListQuery({ ...USERS_SCOPE, activityRollup: true, requestChannels: true }),
+				window,
+			),
+	},
+	{
+		module: "users",
+		name: "usersListQuery",
+		label: "recentFloorBound",
+		compile: () =>
+			CH.compileUnsafe(
+				CH.usersListQuery({ ...USERS_SCOPE, activityRollup: true }, {}, 201, {
+					since: "2026-01-01 23:40:00.000000000",
+				}),
+				window,
+			),
+	},
+	{
+		module: "users",
+		name: "usersListQuery",
+		label: "matchingBound",
+		compile: () =>
+			CH.compileUnsafe(
+				CH.usersListQuery(
+					{ ...USERS_SCOPE, activityRollup: true },
+					{ hasErrors: true, hasReplay: true },
+					201,
+					{ matching: true },
+				),
+				window,
+			),
+	},
+	{
+		module: "users",
+		name: "usersRecentFloorQuery",
+		label: "default",
+		compile: () =>
+			CH.compileUnsafe(
+				CH.usersRecentFloorQuery({ ...USERS_SCOPE, activityRollup: true }, {}, 20_000),
+				window,
+			),
+	},
+	{
+		module: "users",
+		name: "usersMatchingCountQuery",
+		label: "default",
+		compile: () =>
+			CH.compileUnsafe(
+				CH.usersMatchingCountQuery({ ...USERS_SCOPE, activityRollup: true }, { hasErrors: true }),
 				window,
 			),
 	},

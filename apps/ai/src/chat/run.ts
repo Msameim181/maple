@@ -34,7 +34,7 @@ import { agentSessionSpanAttributes, type ResolvedModel } from "../platform/Llm"
 import { withRunSessionAttributes } from "../platform/genai-spans"
 import { summarizeCause } from "@maple/backend/platform/describe-cause"
 import { type AgentDefinition, agentForSession, chatAgent } from "./agents"
-import { profileForTurn } from "./profiles"
+import { profileForRoles, profileForTurn } from "./profiles"
 import { MUTATING_TOOL_NAMES } from "./permissions"
 import {
 	makeTextSanitizer,
@@ -46,6 +46,7 @@ import {
 import { buildReviewFanout } from "./review/fanout"
 import { buildCodeMode, CODE_MODE_GUIDANCE, CODE_MODE_TOOLS } from "./code-mode"
 import { buildChatToolkit, type SessionRepositoryScope } from "./maple-toolkit"
+import { reportedCost } from "../platform/reported-cost"
 import { accumulateUsage, type RunUsage } from "./usage"
 import type { MakeCompletion } from "./completion"
 import type { TenantContext } from "@maple/domain/http"
@@ -164,7 +165,7 @@ export const runChatTurn = (input: ChatRunInput) =>
 
 const runChatTurnFrom = (input: ChatRunInput, startedAt: number) => {
 	const agent = input.agent ?? agentForSession(input.sessionId)
-	const profile = profileForTurn(agent, input.origin)
+	const profile = profileForRoles(profileForTurn(agent, input.origin), input.tenant.roles)
 	const sessionAttributes = agentSessionSpanAttributes(input.model.tags)
 	const completion = input.completion?.({
 		turnId: input.messageId,
@@ -332,6 +333,8 @@ const runChatTurnFrom = (input: ChatRunInput, startedAt: number) => {
 		// reports token usage as it accrues — the event stream carries none — and `submit_diagnosis`
 		// reads the running total mid-run, so a hook that merely observes is what fills it.
 		budget,
+		// Each call's cost as OpenRouter billed it, which is what the turn's AI credits charge.
+		estimateCostMicrousd: reportedCost,
 	}).pipe(
 		// An abort clears the claim; the run notices at the next event rather than only after the
 		// in-flight model call drains.

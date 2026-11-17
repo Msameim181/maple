@@ -90,6 +90,8 @@ const PURGE_ORDER: ReadonlyArray<TableName> = [
 	"StatusPageIncidentUpdates",
 	"StatusPageIncidents",
 	"StatusPageComponents",
+	// Its Cloudflare hostname and route were queued for removal with the pages above.
+	"StatusPageCustomDomains",
 	"StatusPages",
 	// A surviving monitor keeps Maple probing the org's endpoints, and its heartbeat token
 	// keeps accepting pings. The state rows also go with the monitor by foreign key.
@@ -114,6 +116,11 @@ const PURGE_ORDER: ReadonlyArray<TableName> = [
 	"GcpConnectors",
 	// Also removed with its connector, by the foreign key.
 	"GcpResources",
+	// Before the connections they point at: a surviving row would keep the cost sync pulling.
+	"CostSources",
+	// Also removed with their connection, by the foreign key.
+	"CloudSecurityFindings",
+	"CloudSecurityServiceStates",
 	// A surviving row would keep Maple signing tokens for, and assuming, the customer's role.
 	"AwsConnections",
 	"ErrorIssueEvents",
@@ -158,12 +165,24 @@ const PURGE_ORDER: ReadonlyArray<TableName> = [
 	// The encrypted Railway token would keep the poller reading an account for a deleted org.
 	"RailwayConnections",
 	"RailwayEnvironments",
+	// The encrypted Vercel token, and the team inventory read with it.
+	"VercelConnections",
+	"VercelProjects",
+	"VercelDeployments",
 	// The Supabase grant itself is in oauth_connections; these hold the org binding and projects.
 	"SupabaseProjectInsights",
 	"SupabaseProjects",
 	"SupabaseConnections",
 	// The org's own OpenRouter key: a recreated org with the same id must not inherit it.
 	"OrgOpenRouterKeys",
+	// Enterprise SSO domains, connection ids and SCIM groups; the Clerk side goes with the Clerk org.
+	"OrgSsoDomains",
+	"OrgSsoConnections",
+	"OrgDirectoryGroups",
+	// A surviving key would keep Maple reading the deleted org's OpenRouter spend.
+	"OpenRouterCostConnections",
+	// The same for every provider read with a pasted credential.
+	"CostConnections",
 	// A deleted member org stops being billed to anyone. A billing org with members is refused.
 	"OrgBillingLinks",
 	// Drop rules and the hash salt: a recreated org must not silently lose data to old rules.
@@ -213,6 +232,7 @@ export const UNPURGED_ORG_SCOPED_TABLES = [
 	"AnomalyDetectorStates",
 	"AnomalyIncidents",
 	"CloudflareAnalyticsState",
+	"CloudflareFeatureSettings",
 	"CloudflareHyperdriveConfigs",
 	"CloudflareZoneSettings",
 	"ErrorFingerprintCandidates",
@@ -222,6 +242,7 @@ export const UNPURGED_ORG_SCOPED_TABLES = [
 	"Investigations",
 	"IssueEscalationPolicies",
 	"IssueEscalations",
+	"LinearFeatureSettings",
 	"OrgClickHouseSchemaApplyRuns",
 	"OrgIngestAttributeMappings",
 	"OrgIngestSamplingPolicies",

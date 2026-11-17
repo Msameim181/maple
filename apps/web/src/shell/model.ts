@@ -2,6 +2,7 @@ import { InfraSurfaceLiteral } from "@maple/domain/http"
 import { V2Source } from "@maple/domain/http/v2"
 import type { BillingCustomer } from "@maple/domain/http"
 import type { ClerkOrganization, ClerkUser } from "../platform/clerk"
+import * as Policy from "@maple/domain/policy"
 import { Option, Schema } from "effect"
 import { AsyncData } from "foldkit"
 import { PopupPosition } from "@maple/views/ui/anchor"
@@ -16,7 +17,7 @@ import * as Palette from "./palette/model"
 import { Platform } from "./palette/shortcuts"
 import { Menu, Theme } from "./message"
 import { DirectoryViewer } from "../data/directory-me"
-import { NavSurface } from "./nav"
+import { type NavAudience, NavSurface } from "./nav"
 import { OnCallSnapshot } from "./oncall"
 import {
 	type InfraSurfaces,
@@ -43,6 +44,7 @@ const IntegrationFlag = Schema.NullOr(Schema.Boolean)
 export const Integrations = Schema.Struct({
 	cloudflare: IntegrationFlag,
 	railway: IntegrationFlag,
+	vercel: IntegrationFlag,
 	planetscale: IntegrationFlag,
 	gcp: IntegrationFlag,
 	supabase: IntegrationFlag,
@@ -133,7 +135,15 @@ export type ShellClerk = Readonly<{
 	maybeOrganization: Option.Option<ClerkOrganization>
 	memberships: ReadonlyArray<ClerkOrganization>
 	customer: BillingCustomer | undefined
+	/** The viewer's role in the active org (`org:admin`), once Clerk has read their membership. */
+	maybeRole: Option.Option<string>
 }>
+
+/** Who the shell is drawn for; self-hosted has no Clerk role, so it is never an analyst. */
+export const shellAudience = (clerk: ShellClerk | null): NavAudience =>
+	clerk !== null && Option.exists(clerk.maybeRole, (role) => Policy.isAnalyst([role]))
+		? "analyst"
+		: "operator"
 
 /** A rail item's tooltip: right of the item, centred. */
 export const initRailTooltip = (): Tooltip.Model =>

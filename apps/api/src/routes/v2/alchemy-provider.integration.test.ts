@@ -33,7 +33,7 @@ import { make as makeMapleApi, MapleApi } from "../../../../../packages/alchemy-
 import { MapleEnvironment } from "../../../../../packages/alchemy-maple/src/MapleEnvironment.ts"
 import { CacheBackendLive } from "@maple/backend/platform/CacheBackendLive"
 import { EmailService } from "@maple/backend/platform/EmailService"
-import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import { cleanupTestDbs, createTestDb, type TestDb } from "@maple/backend/testing/test-pglite"
 
 import { WarehouseQueryService } from "@maple/backend/services/warehouse/WarehouseQueryService"
@@ -47,6 +47,8 @@ import { AlertRuntime, AlertsService } from "@maple/backend/services/alerts/Aler
 import { UptimeAlertSource } from "@maple/backend/services/uptime/UptimeAlertSource"
 import { AnomalyAlertSource } from "@maple/backend/services/alerts/anomaly/AnomalyAlertSource"
 import { SloAlertSource } from "@maple/backend/services/slos/SloAlertSource"
+import { AuditTrailService } from "@maple/backend/services/audit-trail/AuditTrailService"
+import { CostBudgetSource } from "@maple/backend/services/cost/CostBudgetSource"
 import { AlertDestinationsService } from "@maple/backend/services/alerts/AlertDestinationsService"
 import { AlertReadModelsService } from "@maple/backend/services/alerts/AlertReadModelsService"
 import { AlertRulesService } from "@maple/backend/services/alerts/AlertRulesService"
@@ -106,7 +108,7 @@ const session = noopSession
 const makeHarness = () => {
 	const testDb = createTestDb(createdDbs)
 	const configLive = testConfig()
-	const envLive = Env.layer.pipe(Layer.provide(configLive))
+	const envLive = EnvTestLive.pipe(Layer.provide(configLive))
 	const warehouseLive = Layer.succeed(WarehouseQueryService, warehouseStub)
 	const edgeCacheLive = EdgeCacheService.layer.pipe(Layer.provide(CacheBackendLive))
 	const bucketCacheLive = BucketCacheService.layer.pipe(Layer.provide(edgeCacheLive))
@@ -205,6 +207,10 @@ const makeHarness = () => {
 				Layer.effect(SloAlertSource, SloAlertSource.make).pipe(
 					Layer.provide(Layer.effect(SloReadService, SloReadService.make)),
 					Layer.provide(Layer.mergeAll(testDb.layer, warehouseLive)),
+				),
+				Layer.effect(AuditTrailService, AuditTrailService.make).pipe(Layer.provide(warehouseLive)),
+				Layer.effect(CostBudgetSource, CostBudgetSource.make).pipe(
+					Layer.provide(Layer.mergeAll(testDb.layer, warehouseLive, queryEngineLive)),
 				),
 			),
 		),

@@ -1,4 +1,5 @@
 import { defineMaterializedView, node } from "@maple-dev/effect-orm/tinybird"
+import { AWS_METRIC_PREFIX } from "../aws-infra"
 import {
 	chPattern,
 	chRedactChain,
@@ -63,6 +64,7 @@ import {
 	tracesAggregatesHourly,
 	logsAggregatesHourly,
 	metricCatalog,
+	awsMetricsHourly,
 	spanMetricsCallsHourly,
 	serviceOperationsMinutely,
 	serviceOperationsHourly,
@@ -133,10 +135,18 @@ import {
 } from "./gen-ai-columns"
 import { NORMALIZED_SPAN_NAME_SQL } from "./span-display-name"
 import {
+	LOG_USER_EMAIL_AT_SQL,
+	LOG_USER_EMAIL_STATE_SQL,
+	LOG_USER_NAME_AT_SQL,
 	LOG_USER_ID_SQL,
+	LOG_USER_NAME_STATE_SQL,
 	MOBILE_REQUEST_SQL,
 	SERVICE_NAMESPACE_SQL,
+	SPAN_USER_EMAIL_AT_SQL,
+	SPAN_USER_EMAIL_STATE_SQL,
+	SPAN_USER_NAME_AT_SQL,
 	SPAN_USER_ID_SQL,
+	SPAN_USER_NAME_STATE_SQL,
 	WEB_REQUEST_SQL,
 } from "./user-activity-sql"
 import { Array as Arr } from "effect"
@@ -164,7 +174,9 @@ export const serviceUsageLogsMv = defineMaterializedView("service_usage_logs_mv"
           0 AS HistogramMetricCount,
           0 AS HistogramMetricSizeBytes,
           0 AS ExpHistogramMetricCount,
-          0 AS ExpHistogramMetricSizeBytes
+          0 AS ExpHistogramMetricSizeBytes,
+          0 AS ProfileRowCount,
+          0 AS ProfileSizeBytes
         FROM logs
         GROUP BY OrgId, ServiceName, Hour
       `,
@@ -194,7 +206,9 @@ export const serviceUsageTracesMv = defineMaterializedView("service_usage_traces
           0 AS HistogramMetricCount,
           0 AS HistogramMetricSizeBytes,
           0 AS ExpHistogramMetricCount,
-          0 AS ExpHistogramMetricSizeBytes
+          0 AS ExpHistogramMetricSizeBytes,
+          0 AS ProfileRowCount,
+          0 AS ProfileSizeBytes
         FROM traces
         GROUP BY OrgId, ServiceName, Hour
       `,
@@ -224,7 +238,9 @@ export const serviceUsageMetricsSumMv = defineMaterializedView("service_usage_me
           0 AS HistogramMetricCount,
           0 AS HistogramMetricSizeBytes,
           0 AS ExpHistogramMetricCount,
-          0 AS ExpHistogramMetricSizeBytes
+          0 AS ExpHistogramMetricSizeBytes,
+          0 AS ProfileRowCount,
+          0 AS ProfileSizeBytes
         FROM metrics_sum
         GROUP BY OrgId, ServiceName, Hour
       `,
@@ -254,7 +270,9 @@ export const serviceUsageMetricsGaugeMv = defineMaterializedView("service_usage_
           0 AS HistogramMetricCount,
           0 AS HistogramMetricSizeBytes,
           0 AS ExpHistogramMetricCount,
-          0 AS ExpHistogramMetricSizeBytes
+          0 AS ExpHistogramMetricSizeBytes,
+          0 AS ProfileRowCount,
+          0 AS ProfileSizeBytes
         FROM metrics_gauge
         GROUP BY OrgId, ServiceName, Hour
       `,
@@ -284,7 +302,9 @@ export const serviceUsageMetricsHistogramMv = defineMaterializedView("service_us
           count() AS HistogramMetricCount,
           count() * 250 AS HistogramMetricSizeBytes,
           0 AS ExpHistogramMetricCount,
-          0 AS ExpHistogramMetricSizeBytes
+          0 AS ExpHistogramMetricSizeBytes,
+          0 AS ProfileRowCount,
+          0 AS ProfileSizeBytes
         FROM metrics_histogram
         GROUP BY OrgId, ServiceName, Hour
       `,
@@ -317,7 +337,9 @@ export const serviceUsageMetricsExpHistogramMv = defineMaterializedView(
           0 AS HistogramMetricCount,
           0 AS HistogramMetricSizeBytes,
           count() AS ExpHistogramMetricCount,
-          count() * 300 AS ExpHistogramMetricSizeBytes
+          count() * 300 AS ExpHistogramMetricSizeBytes,
+          0 AS ProfileRowCount,
+          0 AS ProfileSizeBytes
         FROM metrics_exponential_histogram
         GROUP BY OrgId, ServiceName, Hour
       `,
@@ -325,6 +347,41 @@ export const serviceUsageMetricsExpHistogramMv = defineMaterializedView(
 		],
 	},
 )
+
+// One profiles row is one call stack. Like logs (body + 200), the estimate is the variable part,
+// 16 bytes per frame reference, plus 200 for the value, attributes and links. The billing chart
+// rescales it to the metered total, so only the daily shape matters.
+export const serviceUsageProfilesMv = defineMaterializedView("service_usage_profiles_mv", {
+	description: "Materialized view to aggregate continuous profiling usage statistics per service per hour",
+	datasource: serviceUsage,
+	nodes: [
+		node({
+			name: "service_usage_profiles_mv_node",
+			sql: `
+        SELECT
+          OrgId,
+          ServiceName,
+          toStartOfHour(toDateTime(Timestamp)) AS Hour,
+          0 AS LogCount,
+          0 AS LogSizeBytes,
+          0 AS TraceCount,
+          0 AS TraceSizeBytes,
+          0 AS SumMetricCount,
+          0 AS SumMetricSizeBytes,
+          0 AS GaugeMetricCount,
+          0 AS GaugeMetricSizeBytes,
+          0 AS HistogramMetricCount,
+          0 AS HistogramMetricSizeBytes,
+          0 AS ExpHistogramMetricCount,
+          0 AS ExpHistogramMetricSizeBytes,
+          count() AS ProfileRowCount,
+          sum(length(Frames) * 16 + 200) AS ProfileSizeBytes
+        FROM profiles
+        GROUP BY OrgId, ServiceName, Hour
+      `,
+		}),
+	],
+})
 
 /**
  * One `source_usage_hourly` row per (org, source, hour) from a signal table.
@@ -1472,7 +1529,7 @@ export const serviceRuntimesHourlyMv = defineMaterializedView("service_runtimes_
 // Read by `userActivitySlicesQuery`, `userActivitySummaryQuery` and `userActivityTotalsQuery`.
 export const userActivityHourlyTracesMv = defineMaterializedView("user_activity_hourly_traces_mv", {
 	description:
-		"Rolls up spans that carry user.id (else enduser.id) hourly per user, service and service.namespace: spans, requests, errors, traces, sessions, request latency, top routes and web/mobile requests.",
+		"Rolls up spans that carry user.id (else enduser.id) hourly per user, service and service.namespace: spans, requests, errors, traces, sessions, request latency, top routes, web/mobile requests and the latest user.name and user.email.",
 	datasource: userActivityHourly,
 	// A 90-day rollup over 30-day `traces`/`logs`: a rebuild would drop days 31-90.
 	deploymentMethod: "alter",
@@ -1501,7 +1558,11 @@ export const userActivityHourlyTracesMv = defineMaterializedView("user_activity_
           max(toDateTime(Timestamp)) AS LastSeen,
           countIf(IsEntryPoint = 1) AS ClassifiedRequestCount,
           countIf(IsEntryPoint = 1 AND ${WEB_REQUEST_SQL}) AS WebRequestCount,
-          countIf(IsEntryPoint = 1 AND ${MOBILE_REQUEST_SQL}) AS MobileRequestCount
+          countIf(IsEntryPoint = 1 AND ${MOBILE_REQUEST_SQL}) AS MobileRequestCount,
+          ${SPAN_USER_NAME_STATE_SQL} AS UserName,
+          ${SPAN_USER_EMAIL_STATE_SQL} AS UserEmail,
+          ${SPAN_USER_NAME_AT_SQL} AS UserNameAt,
+          ${SPAN_USER_EMAIL_AT_SQL} AS UserEmailAt
         FROM traces
         WHERE ${SPAN_USER_ID_SQL} != ''
         GROUP BY OrgId, ServiceNamespace, UserId, Hour, ServiceName
@@ -1512,7 +1573,7 @@ export const userActivityHourlyTracesMv = defineMaterializedView("user_activity_
 
 export const userActivityHourlyLogsMv = defineMaterializedView("user_activity_hourly_logs_mv", {
 	description:
-		"Rolls up logs that carry user.id (else enduser.id) hourly per user, service and service.namespace: log, warning and error log counts and sessions.",
+		"Rolls up logs that carry user.id (else enduser.id) hourly per user, service and service.namespace: log, warning and error log counts, sessions and the latest user.name and user.email.",
 	datasource: userActivityHourly,
 	// A 90-day rollup over 30-day `traces`/`logs`: a rebuild would drop days 31-90.
 	deploymentMethod: "alter",
@@ -1541,7 +1602,11 @@ export const userActivityHourlyLogsMv = defineMaterializedView("user_activity_ho
           max(TimestampTime) AS LastSeen,
           toUInt64(0) AS ClassifiedRequestCount,
           toUInt64(0) AS WebRequestCount,
-          toUInt64(0) AS MobileRequestCount
+          toUInt64(0) AS MobileRequestCount,
+          ${LOG_USER_NAME_STATE_SQL} AS UserName,
+          ${LOG_USER_EMAIL_STATE_SQL} AS UserEmail,
+          ${LOG_USER_NAME_AT_SQL} AS UserNameAt,
+          ${LOG_USER_EMAIL_AT_SQL} AS UserEmailAt
         FROM logs
         WHERE ${LOG_USER_ID_SQL} != ''
         GROUP BY OrgId, ServiceNamespace, UserId, Hour, ServiceName
@@ -1876,6 +1941,46 @@ export const metricCatalogGaugeMv = defineMaterializedView("metric_catalog_gauge
       `,
 		}),
 	],
+})
+
+// One row per AWS series and hour, in `aws_metrics_hourly`'s column order. The filter is the
+// prefix every `AWS_INFRA_KINDS` metric carries, so no AWS infra read misses its rollup.
+// Read by `awsInfraMetricsSQL`.
+const awsMetricsHourlySql = (metricType: "sum" | "gauge") => `
+        SELECT
+          OrgId,
+          '${metricType}' AS MetricType,
+          MetricName,
+          toStartOfHour(toDateTime(TimeUnix)) AS Hour,
+          ServiceName,
+          Attributes,
+          ResourceAttributes['cloud.region'] AS CloudRegion,
+          ResourceAttributes['cloud.account.id'] AS CloudAccountId,
+          sum(Value) AS Total,
+          count() AS Samples,
+          max(Value) AS Peak,
+          max(toDateTime(TimeUnix)) AS LastSeen
+        FROM metrics_${metricType}
+        WHERE startsWith(MetricName, '${AWS_METRIC_PREFIX}')
+        GROUP BY OrgId, MetricType, MetricName, Hour, ServiceName, Attributes, CloudRegion, CloudAccountId
+      `
+
+export const awsMetricsHourlySumMv = defineMaterializedView("aws_metrics_hourly_sum_mv", {
+	description:
+		"Rolls up the AWS metric stream's aws.* sum points hourly per series into aws_metrics_hourly.",
+	datasource: awsMetricsHourly,
+	// Tinybird refuses `alter` on a view's first deploy. Once it exists, set `deploymentMethod: "alter"`
+	// before changing it: the target is backfilled by hand (`BACKFILL skip`), so a rebuild empties it.
+	nodes: [node({ name: "aws_metrics_hourly_sum_mv_node", sql: awsMetricsHourlySql("sum") })],
+})
+
+export const awsMetricsHourlyGaugeMv = defineMaterializedView("aws_metrics_hourly_gauge_mv", {
+	description:
+		"Rolls up the AWS metric stream's aws.* gauge points hourly per series into aws_metrics_hourly.",
+	datasource: awsMetricsHourly,
+	// Tinybird refuses `alter` on a view's first deploy. Once it exists, set `deploymentMethod: "alter"`
+	// before changing it: the target is backfilled by hand (`BACKFILL skip`), so a rebuild empties it.
+	nodes: [node({ name: "aws_metrics_hourly_gauge_mv_node", sql: awsMetricsHourlySql("gauge") })],
 })
 
 export const metricCatalogHistogramMv = defineMaterializedView("metric_catalog_histogram_mv", {

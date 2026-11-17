@@ -109,6 +109,8 @@ const layerFor = (
 		readonly busy?: boolean
 		readonly withWorkerEnv?: boolean
 		readonly threads?: ReadonlyArray<PullRequestReviewThread>
+		/** Runs while the threads are read, to land a concurrent write mid-sync. */
+		readonly duringThreadRead?: { current: Effect.Effect<void> }
 		readonly resolvedThreads?: Array<string>
 		/** Present: pushes are debounced through this queue, which records what it was sent. */
 		readonly queued?: Array<{ readonly job: VcsSyncJob; readonly delaySeconds: number | undefined }>
@@ -159,7 +161,10 @@ const layerFor = (
 				? Effect.die("GitHub is down")
 				: Effect.succeed(options.prFiles ?? []),
 		fetchPullRequestContext: unused,
-		fetchReviewThreads: () => Effect.succeed(options.threads ?? []),
+		fetchReviewThreads: () =>
+			Effect.suspend(() => options.duringThreadRead?.current ?? Effect.void).pipe(
+				Effect.as(options.threads ?? []),
+			),
 		resolveReviewThread: (_installation, _repo, input) =>
 			Effect.sync(() => {
 				options.resolvedThreads?.push(`${input.threadId}:${input.reply}`)
@@ -451,6 +456,29 @@ describe("PrReviewService.onPullRequestEvent", () => {
 				`${Str.slice(0, 7)(HEAD)}:neutral`,
 			])
 		}).pipe(Effect.provide(layerFor(testDb, { checks })))
+	})
+
+	it.effect("adds each turn's cost to the review, a failed one included", () => {
+		const testDb = createTestDb(trackedDbs)
+		return Effect.gen(function* () {
+			yield* seed(true)
+			const reviews = yield* PrReviewService
+			const outcome = yield* reviews.onPullRequestEvent(orgId, job())
+			const reviewId = outcome.reviewId!
+			yield* reviews.addCost(orgId, reviewId, 1_200)
+			yield* reviews.failReview(orgId, reviewId, "no review")
+			yield* reviews.addCost(orgId, reviewId, 300)
+			// Another org cannot add to it.
+			yield* reviews.addCost(asOrgId("org_someone_else"), reviewId, 9_999)
+			const rows = yield* (yield* Database).execute((db) =>
+				db.run(
+					PG.from(PrReviews)
+						.select(($) => ({ cost: $.costMicrousd }))
+						.where(($) => [$.id.eq(reviewId)]),
+				),
+			)
+			assert.deepEqual(rows, [{ cost: 1_500 }])
+		}).pipe(Effect.provide(layerFor(testDb, {})))
 	})
 
 	it.effect("says so when the turn ends without a review", () => {
@@ -1246,6 +1274,80 @@ describe("PrReviewService.submitReview", () => {
 			)
 		}).pipe(Effect.provide(layerFor(testDb, { published, begun, threads, resolvedThreads, hidden })))
 	})
+
+	it.effect(
+		"settles a finding a person answered, but never over a fix a review confirmed meanwhile",
+		() => {
+			const testDb = createTestDb(trackedDbs)
+			const duringThreadRead = { current: Effect.void }
+			const threads: ReadonlyArray<PullRequestReviewThread> = [
+				{
+					id: "T1",
+					isResolved: false,
+					comments: [
+						{ commentId: "c-0", author: "maple[bot]", body: "F1", thumbsUp: 0, thumbsDown: 0 },
+						{ commentId: "c-8", author: "octocat", body: "Done.", thumbsUp: 0, thumbsDown: 0 },
+					],
+				},
+				{
+					id: "T2",
+					isResolved: false,
+					comments: [
+						{ commentId: "c-1", author: "maple[bot]", body: "F2", thumbsUp: 0, thumbsDown: 0 },
+						{ commentId: "c-9", author: "octocat", body: "Done.", thumbsUp: 0, thumbsDown: 0 },
+					],
+				},
+			]
+			const finding = (path: string, title: string) =>
+				new PrReviewFinding({
+					path,
+					line: 10,
+					category: "correctness",
+					severity: "warn",
+					title,
+					body: "b",
+				})
+			const stored = Effect.gen(function* () {
+				const database = yield* Database
+				return yield* database.execute((db) =>
+					db.run(
+						PG.from(PrReviewFindings)
+							.select("handle", "status", "resolvedSha")
+							.orderBy(["handle", "asc"]),
+					),
+				)
+			})
+			return Effect.gen(function* () {
+				yield* seed(true)
+				const reviews = yield* PrReviewService
+				const database = yield* Database
+				const first = yield* reviews.onPullRequestEvent(orgId, job())
+				yield* reviews.submitReview(
+					orgId,
+					first.reviewId!,
+					new SubmitPrReviewRequest({
+						report: report([finding("a.ts", "off by one"), finding("b.ts", "unchecked null")]),
+					}),
+				)
+				// A review confirms the fix while this push's sync is still reading the threads.
+				duringThreadRead.current = database
+					.execute((db) =>
+						db.run(
+							PG.update(PrReviewFindings)
+								.set({ status: "resolved", resolvedSha: HEAD_2 })
+								.where(($) => [$.handle.eq("F1")]),
+						),
+					)
+					.pipe(Effect.asVoid, Effect.orDie)
+				yield* reviews.onPullRequestEvent(orgId, job({ action: "synchronize", headSha: HEAD_4 }))
+				// F2's "Done." resolves it with no head; F1 keeps the head the review confirmed.
+				assert.deepEqual(yield* stored, [
+					{ handle: "F1", status: "resolved", resolvedSha: HEAD_2 },
+					{ handle: "F2", status: "resolved", resolvedSha: null },
+				])
+			}).pipe(Effect.provide(layerFor(testDb, { threads, duringThreadRead })))
+		},
+	)
 
 	it.effect("drops a submission for a review that was superseded while it ran", () => {
 		const testDb = createTestDb(trackedDbs)
@@ -2487,6 +2589,7 @@ describe("PrReviewService privacy scan", () => {
 							severity: "critical",
 							title: "`password` from the login form is logged in clear",
 							body: "Every failed login writes the submitted password to the log.",
+							source: 'apps/api/src/auth.ts:3 `logger.warn("bad login", { password })`',
 						}),
 					]),
 				}),
@@ -2512,6 +2615,161 @@ describe("PrReviewService privacy scan", () => {
 				"security · PII-01",
 			)
 		}).pipe(Effect.provide(layerFor(testDb, { published, prFiles: [leaky] })))
+	})
+})
+
+describe("PrReviewService credential findings and replies", () => {
+	const credential = (line: number, title: string) =>
+		new PrReviewFinding({
+			path: "apps/api/src/auth.ts",
+			line,
+			category: "security",
+			checkId: "PII-01",
+			severity: "critical",
+			title,
+			body: "Anyone who can read the telemetry can read it.",
+		})
+
+	it.effect(
+		"files name-only credential criticals as warnings, so they no longer hold confidence at 2",
+		() => {
+			const testDb = createTestDb(trackedDbs)
+			const published: Array<PullRequestReviewPublication> = []
+			return Effect.gen(function* () {
+				yield* seed(true)
+				const reviews = yield* PrReviewService
+				const started = yield* reviews.onPullRequestEvent(orgId, job())
+				// The reported pair: a boolean log field and an enum span attribute, no source for either.
+				yield* reviews.submitReview(
+					orgId,
+					started.reviewId!,
+					new SubmitPrReviewRequest({
+						report: report([
+							credential(10, "Credential `obj.legacyApiKey` written to logs"),
+							credential(20, "Cookie state `auth.cookie_refused` recorded on the span"),
+						]),
+					}),
+				)
+				const stored = Option.getOrThrow(yield* reviews.getReview(orgId, started.reviewId!))
+				assert.deepEqual(
+					Arr.map(stored.report?.findings ?? [], (finding) => finding.severity),
+					["warn", "warn"],
+				)
+				assert.equal(stored.report?.confidence, 4)
+				assert.match(published[0].title, /^Confidence 4\/10/)
+			}).pipe(Effect.provide(layerFor(testDb, { published })))
+		},
+	)
+
+	it.effect("keeps an unsourced critical where the scan recognized the value on its line", () => {
+		const testDb = createTestDb(trackedDbs)
+		const leaky: PullRequestFile = {
+			path: "apps/api/src/auth.ts",
+			previousPath: null,
+			status: "modified",
+			additions: 2,
+			deletions: 0,
+			patch: Arr.join(
+				[
+					"@@ -1,1 +1,3 @@",
+					" export const login = () => {",
+					'+\tlogger.info("key", { key: "sk_live_0123456789abcdefghij" })',
+					'+\tlogger.info("backup", { key: "sk_live_9876543210zyxwvutsrq" })',
+				],
+				"\n",
+			),
+		}
+		return Effect.gen(function* () {
+			yield* seed(true)
+			const reviews = yield* PrReviewService
+			const started = yield* reviews.onPullRequestEvent(orgId, job())
+			// The scan groups both values into one finding anchored on line 2; line 3 is still evidenced.
+			yield* reviews.submitReview(
+				orgId,
+				started.reviewId!,
+				new SubmitPrReviewRequest({
+					report: report([
+						credential(2, "Live `key` written to the log"),
+						credential(3, "Backup `secret` written to the log"),
+					]),
+				}),
+			)
+			const stored = Option.getOrThrow(yield* reviews.getReview(orgId, started.reviewId!))
+			assert.deepEqual(
+				Arr.map(stored.report?.findings ?? [], (finding) => [finding.line, finding.severity]),
+				[
+					[2, "critical"],
+					[3, "critical"],
+				],
+			)
+		}).pipe(Effect.provide(layerFor(testDb, { prFiles: [leaky] })))
+	})
+
+	it.effect("passes a person's reply to the next review, whose dismissal stops a reworded re-raise", () => {
+		const testDb = createTestDb(trackedDbs)
+		const published: Array<PullRequestReviewPublication> = []
+		const begun: Array<Begun> = []
+		const reply = "It's a boolean flag, it only says whether the legacy header was present."
+		const threads: ReadonlyArray<PullRequestReviewThread> = [
+			{
+				id: "T1",
+				isResolved: false,
+				comments: [
+					{ commentId: "c-0", author: "maple[bot]", body: "F1", thumbsUp: 0, thumbsDown: 0 },
+					{ commentId: "c-5", author: "octocat", body: reply, thumbsUp: 0, thumbsDown: 0 },
+				],
+			},
+		]
+		const statuses = Effect.gen(function* () {
+			const database = yield* Database
+			return yield* database.execute((db) =>
+				db.run(PG.from(PrReviewFindings).select("handle", "status").orderBy(["handle", "asc"])),
+			)
+		})
+		return Effect.gen(function* () {
+			yield* seed(true)
+			const reviews = yield* PrReviewService
+			const first = yield* reviews.onPullRequestEvent(orgId, job())
+			yield* reviews.submitReview(
+				orgId,
+				first.reviewId!,
+				new SubmitPrReviewRequest({
+					report: report([credential(10, "Credential `obj.legacyApiKey` written to logs")]),
+				}),
+			)
+
+			const second = yield* reviews.onPullRequestEvent(
+				orgId,
+				job({ action: "synchronize", headSha: HEAD_2 }),
+			)
+			// No verdict phrase, so F1 is still open, and the reviewer reads the reply under it.
+			const kickoff = begun.at(-1)!.text
+			assert.include(
+				kickoff,
+				`- F1 · apps/api/src/auth.ts:10 · security · warn · Credential \`obj.legacyApiKey\` written to logs\n  octocat replied: "${reply}"`,
+			)
+			yield* reviews.submitReview(
+				orgId,
+				second.reviewId!,
+				new SubmitPrReviewRequest({
+					dismissed: [{ handle: "F1", reason: "A boolean, as the reply says." }],
+					report: report([credential(40, "API key flag `legacyApiKey` leaks into telemetry")]),
+				}),
+			)
+			assert.deepEqual(published[1].comments, [])
+			assert.notInclude(published[1].summaryComment.body, "Still open from earlier reviews")
+			assert.deepEqual(yield* statuses, [{ handle: "F1", status: "dismissed" }])
+			const stored = Option.getOrThrow(yield* reviews.getReview(orgId, second.reviewId!))
+			assert.deepEqual(stored.report?.findings, [])
+
+			yield* reviews.onPullRequestEvent(orgId, job({ action: "synchronize", headSha: HEAD_4 }))
+			const third = begun.at(-1)!.text
+			assert.include(third, "No finding from earlier reviews is still open.")
+			assert.include(
+				third,
+				"- F1 · apps/api/src/auth.ts:10 · security · Credential `obj.legacyApiKey` written to logs",
+			)
+		}).pipe(Effect.provide(layerFor(testDb, { published, begun, threads })))
 	})
 })
 

@@ -143,6 +143,7 @@ const routers = {
 		slash(segment("ruleId")),
 		Route.mapTo(AppRoute.IngestRule),
 	),
+	BillingAiCredits: pipe(path("settings", "billing", "ai-credits"), Route.mapTo(AppRoute.BillingAiCredits)),
 	// Retired: `routeRedirect` sends it to `/status-pages/$pageId`.
 	AlertsStatusPage: pipe(
 		path("alerts", "status-pages"),
@@ -157,6 +158,12 @@ const routers = {
 		slash(segment("pageId")),
 		search(Search.StatusPageSearch),
 		Route.mapTo(AppRoute.StatusPage),
+	),
+	StatusPageView: pipe(
+		path("status-pages"),
+		slash(segment("pageId")),
+		slash(path("view")),
+		Route.mapTo(AppRoute.StatusPageView),
 	),
 	Anomaly: pipe(
 		path("anomalies"),
@@ -202,6 +209,17 @@ const routers = {
 		path("security", "dependencies"),
 		search(Search.SecurityDependenciesSearch),
 		Route.mapTo(AppRoute.SecurityDependencies),
+	),
+	SecurityAuditLog: pipe(
+		path("security", "audit-log"),
+		search(Search.SecurityAuditLogSearch),
+		Route.mapTo(AppRoute.SecurityAuditLog),
+	),
+	SecurityDetections: pipe(path("security", "detections"), Route.mapTo(AppRoute.SecurityDetections)),
+	SecurityDetectionNew: pipe(
+		path("security", "detections", "new"),
+		search(Search.SecurityDetectionNewSearch),
+		Route.mapTo(AppRoute.SecurityDetectionNew),
 	),
 	SecurityRun: pipe(
 		path("security", "code", "runs"),
@@ -267,6 +285,7 @@ const routers = {
 		slash(segment("recommendationKey")),
 		Route.mapTo(AppRoute.Recommendation),
 	),
+	// Retired with the Releases pages; `routeRedirect` sends both on.
 	Release: pipe(
 		path("releases"),
 		slash(segment("commitSha")),
@@ -310,8 +329,20 @@ const routers = {
 		Route.mapTo(AppRoute.AlertsSection),
 	),
 	Analytics: pipe(path("analytics"), search(Search.AnalyticsSearch), Route.mapTo(AppRoute.Analytics)),
+	ProductAnalytics: pipe(
+		path("product-analytics"),
+		search(Search.ProductAnalyticsSearch),
+		Route.mapTo(AppRoute.ProductAnalytics),
+	),
 	Anomalies: pipe(path("anomalies"), search(Search.AnomaliesSearch), Route.mapTo(AppRoute.Anomalies)),
 	CodeReview: pipe(path("code-review"), search(Search.CodeReviewSearch), Route.mapTo(AppRoute.CodeReview)),
+	Cost: pipe(path("cost"), search(Search.CostSearch), Route.mapTo(AppRoute.Cost)),
+	CostBudgets: pipe(path("cost", "budgets"), Route.mapTo(AppRoute.CostBudgets)),
+	CostBudgetNew: pipe(
+		path("cost", "budgets", "new"),
+		search(Search.CostBudgetNewSearch),
+		Route.mapTo(AppRoute.CostBudgetNew),
+	),
 	Dashboards: pipe(path("dashboards"), search(Search.DashboardsSearch), Route.mapTo(AppRoute.Dashboards)),
 	Errors: pipe(path("errors"), search(Search.ErrorsSearch), Route.mapTo(AppRoute.Errors)),
 	Infra: pipe(path("infra"), search(Search.InfraSearch), Route.mapTo(AppRoute.Infra)),
@@ -381,6 +412,12 @@ const routers = {
 		slash(segment("serviceId")),
 		search(Search.InfraRailwayServiceSearch),
 		Route.mapTo(AppRoute.InfraRailwayService),
+	),
+	InfraVercelProject: pipe(
+		path("infra", "vercel"),
+		slash(segment("projectId")),
+		search(Search.InfraVercelProjectSearch),
+		Route.mapTo(AppRoute.InfraVercelProject),
 	),
 	InfraSupabaseProject: pipe(
 		path("infra", "supabase"),
@@ -459,6 +496,11 @@ const routers = {
 		path("infra", "railway"),
 		search(Search.InfraRailwaySearch),
 		Route.mapTo(AppRoute.InfraRailway),
+	),
+	InfraVercel: pipe(
+		path("infra", "vercel"),
+		search(Search.InfraVercelSearch),
+		Route.mapTo(AppRoute.InfraVercel),
 	),
 	InfraSupabase: pipe(
 		path("infra", "supabase"),
@@ -558,8 +600,10 @@ export const urlToAppRoute = Route.parseUrlWithFallback(
 		routers.AlertsEscalationChain,
 		routers.IngestRuleNew,
 		routers.IngestRule,
+		routers.BillingAiCredits,
 		routers.AlertsStatusPage,
 		routers.StatusPageNew,
+		routers.StatusPageView,
 		routers.StatusPage,
 		routers.DashboardsTemplates,
 		routers.SourcesNew,
@@ -572,6 +616,7 @@ export const urlToAppRoute = Route.parseUrlWithFallback(
 		routers.InfraKubernetes,
 		routers.InfraPlanetscale,
 		routers.InfraRailway,
+		routers.InfraVercel,
 		routers.InfraSupabase,
 		routers.McpServerSession,
 		routers.McpServerSessions,

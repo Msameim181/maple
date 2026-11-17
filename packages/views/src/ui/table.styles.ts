@@ -1,3 +1,5 @@
+import { ROW_FOCUSED_CLASS } from "./row-focus"
+
 export const tableContainerStyles = "relative w-full"
 
 export const tableContainerScrollStyles = "overflow-x-auto"
@@ -18,13 +20,11 @@ export const tableBodyStyles =
 
 // Body rows divide on the subtle hairline so the header rule reads as the stronger line. The hover is
 // unprefixed so a row's own `hover:bg-*` merges over it (card rows paint their cells instead).
-export const tableRowStyles =
-	"relative border-b border-border-subtle in-data-[slot=table-header]:border-border in-data-[variant=bare]:border-0 in-data-[variant=bare]:hover:bg-transparent in-data-[variant=bare]:active:bg-transparent hover:bg-surface-sunken active:bg-surface-sunken data-[state=selected]:bg-surface-strong in-data-[variant=card]:hover:bg-transparent in-data-[variant=card]:active:bg-transparent in-data-[variant=card]:data-[state=selected]:bg-transparent"
+export const tableRowStyles = `${ROW_FOCUSED_CLASS} relative border-b border-border-subtle in-data-[slot=table-header]:border-border in-data-[variant=bare]:border-0 in-data-[variant=bare]:hover:bg-transparent in-data-[variant=bare]:active:bg-transparent hover:bg-surface-sunken active:bg-surface-sunken data-[state=selected]:bg-surface-strong in-data-[variant=card]:hover:bg-transparent in-data-[variant=card]:active:bg-transparent in-data-[variant=card]:data-[state=selected]:bg-transparent`
 
 // Column labels share the eyebrow overline token (size, case, tracking, colour) with list headers.
 // Div-based tables (infra) use the label type alone.
-export const tableHeadLabelStyles =
-	"font-medium text-3xs uppercase tracking-overline text-muted-foreground leading-none"
+export const tableHeadLabelStyles = "font-medium text-2xs text-muted-foreground leading-none"
 
 export const tableHeadStyles = `h-10 whitespace-nowrap px-2.5 text-left align-middle ${tableHeadLabelStyles} in-data-[size=sm]:h-8 in-data-[size=sm]:px-2 in-data-[size=xs]:h-auto in-data-[size=xs]:px-0 in-data-[size=xs]:pr-2 in-data-[size=xs]:pb-1 has-[[role=checkbox]]:w-px last:has-[[role=checkbox]]:ps-0 first:has-[[role=checkbox]]:pe-0`
 
@@ -36,6 +36,14 @@ export const truncatedCellStyles = "w-full max-w-0"
 // A row's link stretched over the nearest positioned ancestor (the row); the ring shows on keyboard focus.
 export const tableRowLinkStyles =
 	"after:absolute after:inset-0 after:content-[''] focus-visible:outline-none focus-visible:after:ring-1 focus-visible:after:ring-ring focus-visible:after:ring-inset"
+
+// A group row's one header cell. In a card table it carries the card's side borders (and the top
+// edge when it is the first row), which the card only draws on `td`.
+export const tableGroupCellStyles =
+	"bg-surface-sunken py-1 text-left font-normal in-data-[variant=card]:border-x in-data-[variant=card]:border-b in-data-[variant=card]:[tr:first-child>&]:rounded-t-xl in-data-[variant=card]:[tr:first-child>&]:border-t"
+
+// A row's name when it is the row's link: one medium line that truncates.
+export const tableRowNameLinkStyles = "block truncate text-sm font-medium"
 
 // Lifts a control inside a linked row above the overlay so it keeps its own clicks.
 export const tableRowLinkLiftStyles = "relative z-10"

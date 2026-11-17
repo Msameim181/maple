@@ -6,11 +6,20 @@ import { AiTriageApiGroup } from "./ai-triage"
 import { BillingApiGroup } from "./billing"
 import { CodeReviewApiGroup } from "./code-review"
 import { DemoApiGroup } from "./demo"
+import { AuditTrailApiGroup } from "./audit-trail"
+import { AnthropicCostApiGroup } from "./anthropic-cost"
+import { CloudflareCostApiGroup } from "./cloudflare-cost"
+import { OpenAiCostApiGroup } from "./openai-cost"
 import { DependencyScanApiGroup } from "./dependency-scan"
 import { DigestApiGroup } from "./digest"
 import { ErrorsApiGroup } from "./errors"
+import { GithubCostApiGroup } from "./github-cost"
 import { IntegrationsApiGroup } from "./integrations"
+import { OpenRouterCostApiGroup } from "./openrouter-cost"
+import { CostBudgetsApiGroup } from "./cost-budgets"
 import { OpenRouterKeyApiGroup } from "./openrouter-key"
+import { EnterpriseSsoApiGroup } from "./enterprise-sso"
+import { PlanetScaleCostApiGroup } from "./planetscale-cost"
 import { OrgClickHouseSettingsApiGroup } from "./org-clickhouse-settings"
 import {
 	OrganizationCreationApiGroup,
@@ -18,9 +27,11 @@ import {
 	OrganizationsApiGroup,
 } from "./organizations"
 import { QueryEngineApiGroup } from "./query-engine"
+import { SavedViewsApiGroup } from "./saved-views"
 import { ServiceMapWorldApiGroup } from "./service-map-world"
 import { SessionReplaysInternalApiGroup } from "./session-replay"
 import { UsersInternalApiGroup } from "./users"
+import { VercelCostApiGroup } from "./vercel-cost"
 import { ApiSchemaErrors, ApiUnexpectedErrors } from "./api-boundary"
 
 /**
@@ -33,7 +44,7 @@ import { ApiSchemaErrors, ApiUnexpectedErrors } from "./api-boundary"
  * What belongs here is transport whose request and response shapes are allowed
  * to change with the UI — raw SQL, generic query documents, dashboard-builder
  * facet discovery, infrastructure drill-downs — plus the dashboard-only product
- * workflows (checkout and billing controls, digest subscriptions, demo seeding,
+ * workflows (checkout and billing controls, digest subscriptions, saved explorer views, demo seeding,
  * AI-triage settings, the error-issue workflow, integration and code-review
  * settings, organization setup, BYO ClickHouse configuration) that were never
  * public API and lived under `/api` until the v1 API was retired. Nothing here is a stable
@@ -50,6 +61,7 @@ export class MapleInternalApi extends HttpApi.make("MapleInternalApi")
 	.add(AiModelsInternalApiGroup)
 	.add(AiSessionsInternalApiGroup)
 	.add(AiTriageApiGroup)
+	.add(AuditTrailApiGroup)
 	.add(BillingApiGroup)
 	.add(CodeReviewApiGroup)
 	.add(DemoApiGroup)
@@ -59,11 +71,21 @@ export class MapleInternalApi extends HttpApi.make("MapleInternalApi")
 	.add(IntegrationsApiGroup)
 	.add(McpInternalApiGroup)
 	.add(OpenRouterKeyApiGroup)
+	.add(EnterpriseSsoApiGroup)
+	.add(OpenRouterCostApiGroup)
+	.add(CloudflareCostApiGroup)
+	.add(AnthropicCostApiGroup)
+	.add(OpenAiCostApiGroup)
+	.add(GithubCostApiGroup)
+	.add(PlanetScaleCostApiGroup)
+	.add(VercelCostApiGroup)
+	.add(CostBudgetsApiGroup)
 	.add(OrgClickHouseSettingsApiGroup)
 	.add(OrganizationsApiGroup)
 	.add(OrganizationCreationApiGroup)
 	.add(OrganizationRegionApiGroup)
 	.add(QueryEngineApiGroup)
+	.add(SavedViewsApiGroup)
 	.add(ServiceMapWorldApiGroup)
 	.add(SessionReplaysInternalApiGroup)
 	.add(UsersInternalApiGroup)

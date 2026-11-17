@@ -27,6 +27,7 @@ import {
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http"
 import { Database } from "@maple/backend/platform/DatabaseLive"
 import { Env, type EnvConfig } from "@maple/backend/platform/Env"
+import { PlanetScaleOAuthClientSecret } from "@maple/infra/secrets"
 import {
 	collectPages,
 	decodeConsumed,
@@ -34,6 +35,7 @@ import {
 	type PlanetScaleTokenRejectedError,
 	runPlanetScale,
 } from "@maple/backend/services/integrations/planetscale/api"
+import { releasePlanetScaleCostSources } from "../cost/planetscale-cost-sources"
 import { makeOAuthConnectionHelpers, toUpstreamError } from "./oauth/connection-helpers"
 import type { OAuthFlowInitiator } from "./oauth/oauth-state"
 import { newOAuthState } from "./oauth/oauth-state"
@@ -76,7 +78,10 @@ interface ResolvedPlanetScaleOAuthConfig {
 	readonly scopes: string
 }
 
-const resolveConfig = Effect.fn("PlanetScaleOAuthService.resolveConfig")(function* (env: EnvConfig) {
+const resolveConfig = Effect.fn("PlanetScaleOAuthService.resolveConfig")(function* (
+	env: EnvConfig,
+	configuredSecret: Option.Option<Redacted.Redacted>,
+) {
 	const clientId = yield* Effect.fromOption(
 		env.PLANETSCALE_OAUTH_CLIENT_ID,
 		() =>
@@ -85,7 +90,7 @@ const resolveConfig = Effect.fn("PlanetScaleOAuthService.resolveConfig")(functio
 			}),
 	)
 	const clientSecret = yield* Effect.fromOption(
-		env.PLANETSCALE_OAUTH_CLIENT_SECRET,
+		configuredSecret,
 		() =>
 			new IntegrationsConfigurationError({
 				message: "PLANETSCALE_OAUTH_CLIENT_SECRET is required to use the PlanetScale integration",
@@ -171,10 +176,13 @@ export interface PlanetScaleOAuthServiceApi {
 	/**
 	 * Run `use` with the org's access token. A 401 forces one refresh and a retry; when the
 	 * fresh token is rejected too, the grant is stamped revoked so pollers stop using it.
+	 * `stampRevoked: false` fails as revoked without stamping: for an endpoint whose 401 does not
+	 * prove the grant dead (invoices, which a grant without that scope has never been seen to ask).
 	 */
 	readonly withAccessToken: <A, E>(
 		orgId: OrgId,
 		use: (accessToken: string) => Effect.Effect<A, E | PlanetScaleTokenRejectedError>,
+		options?: { readonly stampRevoked?: boolean },
 	) => Effect.Effect<A, Exclude<E, PlanetScaleTokenRejectedError> | PlanetScaleAccessTokenError>
 	/** Organizations the stored grant can access: org-picker material. */
 	readonly listOrganizations: (
@@ -226,6 +234,7 @@ export class PlanetScaleOAuthService extends Context.Service<
 	make: Effect.gen(function* () {
 		const database = yield* Database
 		const env = yield* Env
+		const clientSecret = yield* PlanetScaleOAuthClientSecret
 		const httpClient = yield* HttpClient.HttpClient
 		const oauth = yield* makeOAuthConnectionHelpers({
 			provider: PLANETSCALE_PROVIDER,
@@ -234,11 +243,16 @@ export class PlanetScaleOAuthService extends Context.Service<
 			env,
 			// A new grant starts clean: an inventory failure from the old one must not count toward
 			// the repeated-403 revoke in PlanetScaleService.pollOrg, even if the callback fails after.
+			// The Cost page's source is due again too: the new grant may carry the invoice scope, and
+			// a grant that sees several organizations is never bound again to say so.
 			onUpsert: (db, orgId, currentTime) =>
-				db.run(
-					PG.update(PlanetscaleConnections)
-						.set({ lastInventoryError: null, updatedAt: currentTime })
-						.where(($) => [$.orgId.eq(orgId)]),
+				Effect.andThen(
+					db.run(
+						PG.update(PlanetscaleConnections)
+							.set({ lastInventoryError: null, updatedAt: currentTime })
+							.where(($) => [$.orgId.eq(orgId)]),
+					),
+					releasePlanetScaleCostSources(db, orgId, currentTime),
 				),
 		})
 
@@ -351,7 +365,7 @@ export class PlanetScaleOAuthService extends Context.Service<
 			options: { readonly callbackUrl: string; readonly returnTo?: string },
 		) {
 			yield* Effect.annotateCurrentSpan({ orgId })
-			const config = yield* resolveConfig(env)
+			const config = yield* resolveConfig(env, clientSecret)
 			const state = yield* newOAuthState
 			yield* oauth.saveState(
 				state,
@@ -379,7 +393,7 @@ export class PlanetScaleOAuthService extends Context.Service<
 			state: string,
 			initiator: OAuthFlowInitiator,
 		) {
-			const config = yield* resolveConfig(env)
+			const config = yield* resolveConfig(env, clientSecret)
 			const stateRow = yield* oauth.consumeStateRow(state, initiator)
 
 			const tokenResponse = yield* oauth.exchangeAuthorizationCode(config, code, stateRow.redirectUri)
@@ -503,7 +517,7 @@ export class PlanetScaleOAuthService extends Context.Service<
 			orgId: OrgId,
 		) {
 			yield* Effect.annotateCurrentSpan({ orgId })
-			const config = yield* resolveConfig(env)
+			const config = yield* resolveConfig(env, clientSecret)
 			// A stamped grant failed a refresh or had a fresh token rejected: refreshing or calling
 			// with it again only repeats the 401. Reconnecting clears the stamp.
 			const { accessToken } = yield* oauth.getValidConnectionToken(config, orgId, {
@@ -515,10 +529,11 @@ export class PlanetScaleOAuthService extends Context.Service<
 		const withAccessToken = <A, E>(
 			orgId: OrgId,
 			use: (accessToken: string) => Effect.Effect<A, E | PlanetScaleTokenRejectedError>,
+			options?: { readonly stampRevoked?: boolean },
 		) =>
-			resolveConfig(env).pipe(
+			resolveConfig(env, clientSecret).pipe(
 				Effect.flatMap((config) =>
-					oauth.withRejectedTokenRetry(config, orgId, isPlanetScaleTokenRejected, use),
+					oauth.withRejectedTokenRetry(config, orgId, isPlanetScaleTokenRejected, use, options),
 				),
 				Effect.withSpan("PlanetScaleOAuthService.withAccessToken", { attributes: { orgId } }),
 			)

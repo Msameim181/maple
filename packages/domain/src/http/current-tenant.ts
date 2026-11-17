@@ -1,8 +1,9 @@
 import { HttpApiMiddleware, HttpApiSecurity } from "effect/http-api"
 import { Schema, Context as EffectContext } from "effect"
 import { type ActorId, AuthMode, OrgId, RoleName, UserId } from "@maple/primitives"
-import type { ChatTurnOrigin } from "../chat-session"
+import type { ChatMode, ChatTurnOrigin } from "../chat-session"
 import { MapleRegion } from "../organization-regions"
+import { analystMessage } from "../policy"
 import { HttpTaggedError } from "./error-policy"
 
 export class UnauthorizedError extends HttpTaggedError<UnauthorizedError>()(
@@ -90,6 +91,21 @@ export class OrganizationWrongRegionError extends HttpTaggedError<OrganizationWr
 	},
 ) {}
 
+/** An analyst asked to operate the organization. 403: the session is fine, the role does not reach it. */
+export class LimitedRoleError extends HttpTaggedError<LimitedRoleError>()(
+	"@maple/http/errors/LimitedRoleError",
+	{ message: Schema.String },
+	{
+		status: 403,
+		code: "limited_role",
+		title: "Limited role",
+		message: analystMessage,
+		retry: "never",
+		recovery: "request_access",
+		exposure: "public_message",
+	},
+) {}
+
 /**
  * Who a request, tool call or job acts as. `TenantSchema` is the form the HTTP middleware
  * provides; the optional fields below it are set only by the MCP and chat surfaces.
@@ -109,6 +125,8 @@ export interface TenantContext {
 	readonly mcpClientName?: string
 	/** Who drove the chat-engine turn this invocation belongs to; audit attribution keys on it. */
 	readonly turnOrigin?: ChatTurnOrigin
+	/** Which Maple agent ran the chat-engine turn (investigation, code review, ...), so the audit log can name it. */
+	readonly chatMode?: ChatMode
 }
 
 export class TenantSchema extends Schema.Class<TenantSchema>("TenantSchema")({
@@ -135,6 +153,7 @@ export class Authorization extends HttpApiMiddleware.Service<
 		UnauthorizedError,
 		AuthorizationUnavailableError,
 		OrganizationAccessDeniedError,
+		LimitedRoleError,
 		OrganizationWrongRegionError,
 	],
 	security: {
@@ -184,6 +203,7 @@ export class SessionAuthorization extends HttpApiMiddleware.Service<
 		AuthorizationUnavailableError,
 		ApiKeyNotAcceptedError,
 		OrganizationAccessDeniedError,
+		LimitedRoleError,
 		OrganizationWrongRegionError,
 	],
 	security: {
@@ -228,6 +248,7 @@ export class RegionlessSessionAuthorization extends HttpApiMiddleware.Service<
 		AuthorizationUnavailableError,
 		ApiKeyNotAcceptedError,
 		OrganizationAccessDeniedError,
+		LimitedRoleError,
 	],
 	security: {
 		bearer: HttpApiSecurity.bearer,

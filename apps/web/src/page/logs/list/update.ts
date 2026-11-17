@@ -31,6 +31,7 @@ import { LOG_PAGE_PATH, logPageHref } from "../log-links"
 import { copyToast } from "../../kit/clipboard"
 import { SignalPresenceData } from "@maple/views/data/signal-presence"
 import { routeWindowStep, snapModeOf } from "../../kit/route-window"
+import * as SavedViews from "../../kit/saved-views"
 import * as TimeRangePicker from "../../kit/time-range-picker"
 import {
 	CompleteReloadSpin,
@@ -65,6 +66,7 @@ import {
 import { initSearchHelp } from "./view-search-help"
 import { advancedHandlers, initAdvanced } from "./advanced"
 import { navigate } from "./navigation"
+import { viewsExplorer } from "./saved-views"
 import { type Facet, Message } from "./message"
 import { editFacet, excludedValue, onlyValue, toggledValue } from "../../kit/facets"
 import type { LogsPage, Model } from "./model"
@@ -238,26 +240,22 @@ const requestAll = (
 }
 
 /**
- * Once the window's last row is within `FETCH_THRESHOLD` of the end, the next page is fetched, one
- * at a time, never while the first page refreshes.
+ * Asks for the next page, one at a time, never while the first page refreshes; also the retry of
+ * a page that failed.
  */
-const fetchIfNearEnd =
+const fetchNext =
 	(context: PageContext) =>
 	(result: Return): Return => {
 		const { model } = result
 		const firstPage = firstPageOf(model)
-		const lastIndex = model.stream.window.at(-1)?.index ?? -1
-		const count = allLogs(firstPage, model.pagination).length
 		const cursor = lastCursor(firstPage, model.pagination)
 		if (
-			lastIndex < 0 ||
 			model.window === null ||
 			model.firstPage.key === null ||
 			model.pagination.isFetching ||
 			AsyncData.isRefreshing(model.firstPage.data) ||
 			!hasNextPage(firstPage, model.pagination) ||
-			cursor === null ||
-			lastIndex < count - FETCH_THRESHOLD
+			cursor === null
 		)
 			return result
 		return {
@@ -277,6 +275,21 @@ const fetchIfNearEnd =
 		}
 	}
 
+/**
+ * Once the window's last row is within `FETCH_THRESHOLD` of the end, the next page is fetched.
+ * A failed page waits for its retry.
+ */
+const fetchIfNearEnd =
+	(context: PageContext) =>
+	(result: Return): Return => {
+		const { model } = result
+		const lastIndex = model.stream.window.at(-1)?.index ?? -1
+		const count = allLogs(firstPageOf(model), model.pagination).length
+		return lastIndex < 0 || model.pagination.isFailed || lastIndex < count - FETCH_THRESHOLD
+			? result
+			: fetchNext(context)(result)
+	}
+
 const searchHref = (search: Search) => hrefOf(AppRoute.Logs({ search }))
 
 const EXCLUDED_OF = {
@@ -294,6 +307,8 @@ const windowOnly = (search: Search): Search => ({
 	endTime: search.endTime,
 	timePreset: search.timePreset,
 })
+
+const toSavedViews = (message: SavedViews.Message) => Message.GotSavedViewsMessage({ message })
 
 export const init = (route: { readonly search: Search }, context: PageContext): Return => {
 	const model: Model = {
@@ -319,6 +334,7 @@ export const init = (route: { readonly search: Search }, context: PageContext): 
 		filterSections: FilterSections.init(),
 		timePicker: TimeRangePicker.init("logs-time-range"),
 		refreshMenu: Menu.init("logs-refresh-menu"),
+		savedViews: SavedViews.init("logs-views"),
 		toolbarTooltip: Tooltip.init("logs-toolbar-tooltip"),
 		columnsPopover: Popover.init("logs-columns-popover", { align: "end" }),
 		searchHelp: initSearchHelp(),
@@ -342,16 +358,13 @@ export const init = (route: { readonly search: Search }, context: PageContext): 
 				Message.GotFilterSectionsMessage({ message }),
 			),
 			LoadChartRuntime(),
+			SavedViews.loadCommand(viewsExplorer([model.search]), toSavedViews),
 		],
 	}
 }
 
 /** The search changed (a filter, the window, a column): re-resolve and re-request. */
-export const routeChanged = (
-	model: Model,
-	route: { readonly search: Search },
-	context: PageContext,
-): Return => {
+const routed = (model: Model, route: { readonly search: Search }, context: PageContext): Return => {
 	if (searchHref(model.search) === searchHref(route.search)) return { model }
 	const next = setStreamRows({ ...model, search: route.search }, context)
 	// A moved window re-resolves, unsnapped after a Reload; any other change reads under the kept one.
@@ -497,6 +510,7 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 			model: { ...model, presence: AsyncData.settle(model.presence, result) },
 		}),
 		ClickedReload: () => reload(model, context),
+		ClickedRetryNextPage: () => fetchNext(context)({ model }),
 		TickedAutoRefresh: () => reload(model, context),
 		ClickedJumpToLatest: () => {
 			const jumped = LogsStream.jumpToLatest(model.stream)
@@ -668,6 +682,8 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 			const next = pinned.includes(key) ? Arr.filter(pinned, (k) => k !== key) : [...pinned, key]
 			return navigate(model, { ...model.search, columns: next.length > 0 ? next : undefined })
 		},
+		GotSavedViewsMessage: ({ message: inner }) =>
+			SavedViews.pageStep(model, inner, viewsExplorer([model.search]), toSavedViews, draftFromView),
 		GotRefreshMenuMessage: ({ message: inner }) => {
 			const next = Menu.update(model.refreshMenu, inner)
 			const lifted = liftChild({ ...model, refreshMenu: next.model }, next.commands, (m) =>
@@ -730,3 +746,23 @@ const savePreferences = (model: Model): Return => ({
 	model,
 	commands: [SavePreferences({ wrap: model.wrap, density: model.density })],
 })
+
+// A picked view replaces the search box's draft, and a debounce still pending from the old
+// draft must not put it back over the view's search.
+const draftFromView = (model: Model, search: SavedViews.ViewSearch): Model => ({
+	...model,
+	searchText: typeof search["search"] === "string" ? search["search"] : "",
+	searchGeneration: model.searchGeneration + 1,
+})
+
+/** The view the old URL was stays the page's view as the URL moves on. */
+const withRememberedView = (model: Model): Model => {
+	const savedViews = SavedViews.remembered(model.savedViews, viewsExplorer([model.search]))
+	return savedViews === model.savedViews ? model : { ...model, savedViews }
+}
+
+export const routeChanged = (
+	model: Model,
+	route: { readonly search: Search },
+	context: PageContext,
+): Return => routed(withRememberedView(model), route, context)

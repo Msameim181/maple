@@ -11,10 +11,11 @@ import {
 	SUPABASE_SERVICE_NAME,
 } from "@maple/query-engine-integrations"
 import { Effect, Option, Schema, Array as Arr, Record as Rec, String as Str } from "effect"
-import { HttpClient, HttpClientRequest } from "effect/http"
+import type { HttpClient } from "effect/http"
 import type { SupabaseProjectRef } from "@maple/primitives"
 import { timestampMs } from "@maple/backend/platform/time"
-import { send, SupabaseApiError } from "./api"
+import * as VendorHttp from "../vendor-http"
+import { SupabaseApiError, supabaseCallSpan, supabaseClient } from "./api"
 
 /** Rows asked for per query; a full page means the window has more. */
 export const LOGS_PAGE_SIZE = 1000
@@ -52,18 +53,17 @@ export const logsQuerySql = (window: { readonly startMs: number; readonly endMs:
 const MINUTE_MS = 60_000
 
 /** The endpoint rounds its range to the minute, so widen it outward; the SQL bounds are exact. */
-export const logsQueryUrl = (
-	apiBaseUrl: string,
+export const logsQueryRequest = (
 	projectRef: SupabaseProjectRef,
 	window: { readonly startMs: number; readonly endMs: number },
-) => {
-	const params = new URLSearchParams({
+) => ({
+	path: `/v1/projects/${projectRef}/analytics/endpoints/logs`,
+	query: {
 		sql: logsQuerySql(window),
 		iso_timestamp_start: new Date(Math.floor(window.startMs / MINUTE_MS) * MINUTE_MS).toISOString(),
 		iso_timestamp_end: new Date(Math.ceil(window.endMs / MINUTE_MS) * MINUTE_MS).toISOString(),
-	})
-	return `${apiBaseUrl}/v1/projects/${projectRef}/analytics/endpoints/logs?${params.toString()}`
-}
+	},
+})
 
 const LogsResponse = Schema.Union([
 	Schema.Struct({ result: Schema.Array(Schema.Unknown) }),
@@ -79,26 +79,22 @@ const errorText = (error: unknown) =>
 	)(typeof error === "string" ? error : Option.getOrElse(encodeJsonOption(error), () => "unknown error"))
 
 /** One page of raw rows; a refused query fails with {@link SupabaseLogsQueryError}. */
-export const queryLogs = Effect.fn("SupabaseApi.queryLogs")(function* (
+export const queryLogs = Effect.fnUntraced(function* (
 	httpClient: HttpClient.HttpClient,
 	apiBaseUrl: string,
 	accessToken: string,
 	projectRef: SupabaseProjectRef,
 	window: { readonly startMs: number; readonly endMs: number },
 ) {
-	const text = yield* send(
-		httpClient,
-		HttpClientRequest.get(logsQueryUrl(apiBaseUrl, projectRef, window)).pipe(
-			HttpClientRequest.bearerToken(accessToken),
-			HttpClientRequest.acceptJson,
-		),
-		"reading project logs",
-	)
+	const text = yield* supabaseClient(httpClient, apiBaseUrl, VendorHttp.bearer(accessToken)).text({
+		...logsQueryRequest(projectRef, window),
+		operation: "reading project logs",
+	})
 	const body = decodeLogsResponse(text)
 	if (Option.isNone(body)) {
 		return yield* new SupabaseApiError({
 			message: "Supabase returned an unexpected body while reading project logs",
-			kind: "upstream",
+			kind: "invalid_response",
 		})
 	}
 	if ("error" in body.value) {
@@ -108,7 +104,7 @@ export const queryLogs = Effect.fn("SupabaseApi.queryLogs")(function* (
 	}
 	yield* Effect.annotateCurrentSpan("maple.supabase.logs.rows", body.value.result.length)
 	return body.value.result
-})
+}, supabaseCallSpan("SupabaseApi.queryLogs"))
 
 const LogRowSchema = Schema.Struct({
 	id: Schema.String,

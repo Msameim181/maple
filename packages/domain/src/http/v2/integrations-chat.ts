@@ -14,6 +14,7 @@ import { wireExample, Timestamp } from "./envelopes"
 import { V2CallbackHostUnavailable, V2InsufficientPermissions } from "./errors"
 import { publicErrors } from "./public-error"
 import { PublicId, PublicIdPrefixes } from "./public-id"
+import { AnalystAccess } from "../analyst-access"
 
 // The chat-platform surface: one contract for every chat platform Maple can
 // connect to. The platform is a value (`connector`), never a path segment or a
@@ -49,6 +50,9 @@ const chatWorkspaceExample = {
 	external_workspace_id: "123456789012345678",
 	name: "Acme Engineering",
 	settings: { default_channel_id: "987654321098765432" },
+	alerts_enabled: true,
+	direct_messages_enabled: true,
+	assistant_enabled: true,
 	created_at: "2026-09-01T12:00:00.000Z",
 } as const
 
@@ -68,6 +72,21 @@ export const V2ChatWorkspace = Schema.Struct({
 		examples: ["Acme Engineering"],
 	}),
 	settings: settingsField,
+	alerts_enabled: Schema.Boolean.annotate({
+		description:
+			"Whether alerts post to the channels alert destinations pick in this workspace. Off, those deliveries are recorded as skipped.",
+		examples: [true],
+	}),
+	direct_messages_enabled: Schema.Boolean.annotate({
+		description:
+			"Whether escalation policies page people by direct message through this workspace. The email page goes out either way.",
+		examples: [true],
+	}),
+	assistant_enabled: Schema.Boolean.annotate({
+		description:
+			"Whether the Maple bot answers mentions and follows up in its own threads here. Off, it stays quiet.",
+		examples: [true],
+	}),
 	created_at: Timestamp.annotate({ description: "When the workspace was linked to this organization." }),
 }).annotate({
 	identifier: "ChatWorkspace",
@@ -250,13 +269,29 @@ export const V2ChatIdentityDeleteResponse = Schema.Struct({
 export type V2ChatIdentityDeleteResponse = Schema.Schema.Type<typeof V2ChatIdentityDeleteResponse>
 
 export const V2ChatWorkspaceUpdateParams = Schema.Struct({
-	settings: settingsField,
+	settings: Schema.optionalKey(settingsField),
+	alerts_enabled: Schema.optionalKey(Schema.Boolean).annotate({
+		description:
+			"Turn alert posts to this workspace's channels on or off. Omit to keep the current setting.",
+		examples: [true],
+	}),
+	direct_messages_enabled: Schema.optionalKey(Schema.Boolean).annotate({
+		description: "Turn escalation pages by direct message on or off. Omit to keep the current setting.",
+		examples: [true],
+	}),
+	assistant_enabled: Schema.optionalKey(Schema.Boolean).annotate({
+		description: "Turn the bot's answers on or off. Omit to keep the current setting.",
+		examples: [false],
+	}),
 }).annotate({
 	identifier: "ChatWorkspaceUpdateParams",
 	title: "Chat workspace update parameters",
 	description:
-		"Request body for updating a linked workspace's settings. The record replaces the stored settings wholesale, so send every key you want to keep; a blank value unsets its key.",
-	examples: [wireExample({ settings: { default_channel_id: "987654321098765432" } })],
+		"Request body for updating a linked workspace. `settings`, when sent, replaces the stored settings wholesale, so send every key you want to keep; a blank value unsets its key. A feature switch left out keeps its value.",
+	examples: [
+		wireExample({ settings: { default_channel_id: "987654321098765432" } }),
+		wireExample({ assistant_enabled: false }),
+	],
 })
 export type V2ChatWorkspaceUpdateParams = Schema.Schema.Type<typeof V2ChatWorkspaceUpdateParams>
 
@@ -389,14 +424,16 @@ export class V2ChatIntegrationsApiGroup extends HttpApiGroup.make("chatIntegrati
 			params: { connector: ChatConnectorId },
 			success: V2ChatIdentityDeleteResponse,
 			error: [V2InsufficientPermissions.schema, chatNotFound, chatPersistence],
-		}).annotateMerge(
-			OpenApi.annotations({
-				identifier: "deleteChatIdentity",
-				summary: "Unlink your chat account",
-				description:
-					"Removes the link between your chat account and your Maple user on this connector. Your organization's workspaces stay linked; only your own account is forgotten, and nothing you do on the chat platform is attributed to you afterwards. Unlinking when you hold no link is not an error. Like linking, it must be called with a signed-in session rather than an API key. Requires the `integrations:write` scope.",
-			}),
-		),
+		})
+			.annotate(AnalystAccess, "personal")
+			.annotateMerge(
+				OpenApi.annotations({
+					identifier: "deleteChatIdentity",
+					summary: "Unlink your chat account",
+					description:
+						"Removes the link between your chat account and your Maple user on this connector. Your organization's workspaces stay linked; only your own account is forgotten, and nothing you do on the chat platform is attributed to you afterwards. Unlinking when you hold no link is not an error. Like linking, it must be called with a signed-in session rather than an API key. Requires the `integrations:write` scope.",
+				}),
+			),
 	)
 	.add(
 		HttpApiEndpoint.patch("updateWorkspace", "/chat_workspaces/:id", {
@@ -409,7 +446,7 @@ export class V2ChatIntegrationsApiGroup extends HttpApiGroup.make("chatIntegrati
 				identifier: "updateChatWorkspace",
 				summary: "Update a chat workspace",
 				description:
-					"Replaces a linked workspace's connector-defined settings. Requires an org-admin role and the `integrations:write` scope.",
+					"Replaces a linked workspace's connector-defined settings, and turns its features (alert posts, direct-message pages, the bot's answers) on or off. Requires an org-admin role and the `integrations:write` scope.",
 			}),
 		),
 	)

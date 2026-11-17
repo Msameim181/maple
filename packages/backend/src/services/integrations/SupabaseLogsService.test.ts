@@ -11,11 +11,17 @@ import {
 	Option,
 } from "effect"
 import { TestClock } from "effect/testing"
-import { FetchHttpClient } from "effect/http"
+import * as VendorFake from "@maple/backend/testing/vendor-fake"
 import { OrgId, UserId, SupabaseProjectUpdateRequest } from "@maple/domain/http"
 import { SourceId, SupabaseProjectRef } from "@maple/primitives"
-import { Env } from "@maple/backend/platform/Env"
-import { cleanupTestDbs, createTestDb, queryFirstRow, type TestDb } from "@maple/backend/testing/test-pglite"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
+import {
+	cleanupTestDbs,
+	createTestDb,
+	executeSql,
+	queryFirstRow,
+	type TestDb,
+} from "@maple/backend/testing/test-pglite"
 import { SupabaseOAuthService } from "@maple/backend/services/auth/SupabaseOAuthService"
 import { publicSourceId } from "@maple/backend/services/integrations/integration-sources"
 import {
@@ -107,19 +113,23 @@ const makeWorld = () => {
 	const authorizations: Array<string | null> = []
 	/** `failRequest` answers that request (1-based, counted across ticks) with a 503, once. */
 	const ingest = { status: 200, bodies, authorizations, requests: 0, failRequest: 0 }
-	const fetch: typeof globalThis.fetch = async (input, init) => {
-		const requestInit: RequestInit & { readonly duplex: "half" } = { ...init, duplex: "half" }
-		const request = new Request(input, requestInit)
-		if (new URL(request.url).host !== "ingest.example.com") return supabase.fetch(input, init)
-		const text = await request.text()
-		ingest.requests += 1
-		if (ingest.requests === ingest.failRequest) return new Response("unavailable", { status: 503 })
-		if (ingest.status >= 300) return new Response("unavailable", { status: ingest.status })
-		ingest.bodies.push(decodeIngestBody(text))
-		ingest.authorizations.push(request.headers.get("authorization"))
-		return new Response("{}", { status: 200, headers: { "content-type": "application/json" } })
-	}
-	return { supabase, ingest, fetch }
+	const api = VendorFake.make({
+		routes: [
+			{
+				respond: (request) => {
+					if (request.url.host !== "ingest.example.com") return undefined
+					ingest.requests += 1
+					if (ingest.requests === ingest.failRequest) return VendorFake.text("unavailable", 503)
+					if (ingest.status >= 300) return VendorFake.text("unavailable", ingest.status)
+					ingest.bodies.push(decodeIngestBody(request.body))
+					ingest.authorizations.push(request.authorization)
+					return VendorFake.json({})
+				},
+			},
+			...supabase.routes,
+		],
+	})
+	return { supabase, ingest, layer: api.layer }
 }
 type World = ReturnType<typeof makeWorld>
 
@@ -130,9 +140,9 @@ const makeLayer = (testDb: TestDb, world: World) =>
 		SupabaseOAuthService.layer,
 	).pipe(
 		Layer.provide(testDb.layer),
-		Layer.provide(Env.layer),
+		Layer.provide(EnvTestLive),
 		Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(config))),
-		Layer.merge(Layer.succeed(FetchHttpClient.Fetch, world.fetch)),
+		Layer.merge(world.layer),
 	)
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)
@@ -466,6 +476,42 @@ describe("SupabaseLogsService", () => {
 		)
 	})
 
+	it.effect("turning logs back on drops a tick's lease, so its late release cannot restore a hold", () => {
+		const testDb = createTestDb(trackedDbs)
+		const world = makeWorld()
+		return run(
+			testDb,
+			world,
+			Effect.gen(function* () {
+				yield* connectWithLogs(world)
+				// A refusal hold is set and a tick is still in flight when the user turns logs off and on.
+				yield* Effect.promise(() =>
+					executeSql(
+						testDb,
+						"UPDATE supabase_projects SET logs_lease_until = $1, logs_hold_until = $2 WHERE project_ref = $3",
+						[
+							DateTime.formatIso(DateTime.makeUnsafe(NOW + 2 * minute)),
+							DateTime.formatIso(DateTime.makeUnsafe(NOW + 60 * minute)),
+							REF_A,
+						],
+					),
+				)
+				const logs = yield* SupabaseLogsService
+				yield* logs.setLogsEnabled(ORG, asRef(REF_A), false)
+				yield* logs.setLogsEnabled(ORG, asRef(REF_A), true)
+				const state = yield* Effect.promise(() =>
+					queryFirstRow<{ logs_lease_until: Date | null; logs_hold_until: Date | null }>(
+						testDb,
+						"SELECT logs_lease_until, logs_hold_until FROM supabase_projects WHERE project_ref = $1",
+						[REF_A],
+					),
+				)
+				assert.isNull(state?.logs_lease_until ?? null)
+				assert.isNull(state?.logs_hold_until ?? null)
+			}),
+		)
+	})
+
 	it.effect("an ingest refusal holds the project for an hour, then polling resumes", () => {
 		const testDb = createTestDb(trackedDbs)
 		const world = makeWorld()
@@ -490,6 +536,29 @@ describe("SupabaseLogsService", () => {
 				yield* TestClock.setTime(NOW + 61 * minute)
 				yield* logs.pollAllOrgs
 				assert.isAbove(logsCalls(world).length, 1)
+				assert.deepStrictEqual(Arr.map(sentRecords(world), uidOf), ["a"])
+			}),
+		)
+	})
+
+	it.effect("reclaims a lease written too far ahead to be a live tick's", () => {
+		const testDb = createTestDb(trackedDbs)
+		const world = makeWorld()
+		world.supabase.state.logs = [row("a", ENABLED_FROM + 1_000)]
+		return run(
+			testDb,
+			world,
+			Effect.gen(function* () {
+				yield* connectWithLogs(world)
+				// A clock jump or a crashed writer left a lease ten minutes ahead; a tick holds three.
+				yield* Effect.promise(() =>
+					executeSql(testDb, "UPDATE supabase_projects SET logs_lease_until = $1", [
+						DateTime.formatIso(DateTime.makeUnsafe(NOW + 10 * minute)),
+					]),
+				)
+				const logs = yield* SupabaseLogsService
+				yield* logs.pollAllOrgs
+				assert.strictEqual(logsCalls(world).length, 1)
 				assert.deepStrictEqual(Arr.map(sentRecords(world), uidOf), ["a"])
 			}),
 		)
