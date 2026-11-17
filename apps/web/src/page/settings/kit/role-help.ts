@@ -1,4 +1,5 @@
 import * as Policy from "@maple/domain/policy"
+import { isClerkAuthEnabled } from "../../../platform/auth-mode"
 import { Array as Arr, Option, Record as Rec, String as Str } from "effect"
 
 /** One role's row in the "What can each role do?" dialog. */
@@ -15,15 +16,19 @@ export type RoleScope = Readonly<{
 const sentence = (action: string): string => Str.capitalize(action)
 
 /** Each assignable role with the permissions whose lowest role it is, so the text follows the policy. */
-export const roleScopes: ReadonlyArray<RoleScope> = Arr.map(Policy.assignableRoles, (entry) => ({
-	role: entry.role,
-	label: entry.label,
-	summary: entry.summary,
-	adds: Arr.map(
-		Arr.filter(Rec.values(Policy.permissions), (permission) => permission.min === entry.role),
-		(permission) => sentence(permission.action),
-	),
-}))
+// The self-hosted directory has no analyst role yet, so only Clerk lists it (as the members select does).
+export const roleScopes: ReadonlyArray<RoleScope> = Arr.map(
+	Arr.filter(Policy.assignableRoles, (entry) => isClerkAuthEnabled || entry.role !== "analyst"),
+	(entry) => ({
+		role: entry.role,
+		label: entry.label,
+		summary: entry.summary,
+		adds: Arr.map(
+			Arr.filter(Rec.values(Policy.permissions), (permission) => permission.min === entry.role),
+			(permission) => sentence(permission.action),
+		),
+	}),
+)
 
 /** The summary shown under a role in a select, by its Clerk key. */
 export const summaryOfRoleKey = (key: string): string =>
