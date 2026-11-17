@@ -11,6 +11,7 @@ import {
 	ChatWorkspaces,
 	CliDeviceAuthorizations,
 	DashboardShares,
+	DirectorySessions,
 	ExternalDataSources,
 	GcpConnectors,
 	OAuthConnections,
@@ -199,6 +200,18 @@ export const RESEAL_TARGETS = {
 		identity: ["deviceCodeHash"],
 		keys: One,
 		ref: ([deviceCodeHash]) => ({ deviceCodeHash }),
+	}),
+	directorySessionRefreshTokenSlot: tripleTarget({
+		slot: slots.directorySessionRefreshTokenSlot,
+		table: DirectorySessions,
+		columns: {
+			ciphertext: "refreshTokenCiphertext",
+			iv: "refreshTokenIv",
+			tag: "refreshTokenTag",
+		},
+		identity: ["userId", "id"],
+		keys: Two,
+		ref: ([userId, id]) => ({ userId, id }),
 	}),
 	dashboardShareTokenSlot: tripleTarget({
 		slot: slots.dashboardShareTokenSlot,

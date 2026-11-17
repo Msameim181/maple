@@ -3,6 +3,7 @@ import {
 	ApiKeyId,
 	McpOAuthAuthorizationActionResponse,
 	McpOAuthAuthorizationConflictError,
+	OrganizationAccessDeniedError,
 	McpOAuthAuthorizationExpiredError,
 	McpOAuthAuthorizationInfoResponse,
 	McpOAuthAuthorizationNotFoundError,
@@ -15,6 +16,7 @@ import * as PG from "@maple-dev/effect-orm/postgres"
 import { generateApiKey, hashApiKey } from "../../platform/credential-tokens"
 import { ApiKeys, McpOAuthAuthorizations, McpOAuthClients, McpOAuthRefreshTokens } from "@maple/db/tables"
 import { REFRESH_FAMILY_ABSOLUTE_TTL_MS, revokeRefreshFamily } from "./mcp-oauth-family"
+import { directoryAccessIsLive, oidcEnabled } from "@maple/backend/services/directory/live-access"
 import {
 	DateTime,
 	Clock,
@@ -285,6 +287,7 @@ export class McpOAuthService extends Context.Service<
 			| McpOAuthAuthorizationExpiredError
 			| McpOAuthAuthorizationConflictError
 			| McpOAuthPersistenceError
+			| OrganizationAccessDeniedError
 		>
 		readonly deny: (
 			requestId: string,
@@ -554,6 +557,12 @@ export class McpOAuthService extends Context.Service<
 			if (row.approvedAt !== null || row.deniedAt !== null || row.usedAt !== null) {
 				return yield* new McpOAuthAuthorizationConflictError({
 					message: "OAuth authorization request was already used",
+				})
+			}
+			// Self-hosted OIDC: the session token may outlive a removal; the grant must not.
+			if (oidcEnabled(env) && !(yield* dbExecute((db) => directoryAccessIsLive(db, identity)))) {
+				return yield* new OrganizationAccessDeniedError({
+					message: "You no longer have access to this organization",
 				})
 			}
 			const now = yield* Clock.currentTimeMillis

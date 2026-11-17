@@ -21,6 +21,7 @@ import { Env } from "@maple/backend/platform/Env"
 import { OrgMembershipService } from "@maple/backend/services/auth/OrgMembershipService"
 import { Database } from "@maple/backend/platform/DatabaseLive"
 import { makeDirectoryRenewal, oidcEnabled } from "@maple/backend/services/directory/DirectoryService"
+import { OidcClient } from "@maple/backend/services/directory/OidcClient"
 
 // The pure tenant-resolution + self-hosted login primitives live in the shared
 // `@maple/auth` package (consumed by apps/api AND the standalone
@@ -79,13 +80,16 @@ export class AuthService extends Context.Service<AuthService, AuthServiceApi>()(
 			const resolveTenant = makeResolveTenant(env, undefined, undefined, verifyOrgMembership)
 			const resolveMcpTenant = makeResolveMcpTenant(env)
 			const loginSelfHosted = makeLoginSelfHosted(env)
-			// With OIDC on, renewal re-reads directory membership (root-password sessions are exempt).
-			// The database is optional so hosts that never renew (maple-ai, tests) still build; without
-			// it an OIDC member's renewal fails closed.
+			// With OIDC on, renewal checks the session row, refreshes at the IdP and re-reads directory
+			// membership (root-password sessions are exempt). The database is optional so hosts that
+			// never renew (maple-ai, tests) still build; without it an OIDC renewal fails closed.
 			const database = yield* Effect.serviceOption(Database)
+			const oidc = yield* OidcClient
 			const refreshSelfHostedSession = makeRefreshSelfHostedSession(
 				env,
-				oidcEnabled(env) ? makeDirectoryRenewal(database) : undefined,
+				oidcEnabled(env)
+					? makeDirectoryRenewal({ env, database, oidc, keyring: env.secretKeyring })
+					: undefined,
 			)
 			const getUserEmail = makeGetUserEmail(env)
 			const getVerifiedPrimaryEmail = makeGetVerifiedPrimaryEmail(env)
@@ -103,5 +107,5 @@ export class AuthService extends Context.Service<AuthService, AuthServiceApi>()(
 		}),
 	},
 ) {
-	static readonly layer = Layer.effect(this, this.make)
+	static readonly layer = Layer.effect(this, this.make).pipe(Layer.provide(OidcClient.layer))
 }

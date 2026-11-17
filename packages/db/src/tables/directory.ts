@@ -65,7 +65,32 @@ export const DirectoryInvitations = PG.table("directory_invitations", {
 	],
 })
 
+/**
+ * One OIDC sign-in. The session token's `sid` names the row; renewal refreshes the IdP's refresh
+ * token through it and logout revokes it. No org: one sign-in spans every org the user can switch to.
+ */
+export const DirectorySessions = PG.table("directory_sessions", {
+	columns: {
+		id: PG.text,
+		userId: PG.column(PG.brand(PG.text, UserId), { name: "user_id" }),
+		// The IdP's own session id (ID token `sid`), when it sends one.
+		idpSid: PG.column(PG.nullable(PG.text), { name: "idp_sid" }),
+		// Sealed with slot `directory_sessions.refresh_token`; null when the IdP issued none.
+		refreshTokenCiphertext: PG.column(PG.nullable(PG.text), { name: "refresh_token_ciphertext" }),
+		refreshTokenIv: PG.column(PG.nullable(PG.text), { name: "refresh_token_iv" }),
+		refreshTokenTag: PG.column(PG.nullable(PG.text), { name: "refresh_token_tag" }),
+		createdAt: PG.column(PG.timestamptzMillis, { name: "created_at" }),
+		// The absolute end of the sign-in (the token's `session_exp`).
+		expiresAt: PG.column(PG.timestamptzMillis, { name: "expires_at" }),
+		refreshedAt: PG.column(PG.timestamptzMillis, { name: "refreshed_at" }),
+		revokedAt: PG.column(PG.nullable(PG.timestamptzMillis), { name: "revoked_at" }),
+	},
+	primaryKey: ["id"],
+	indexes: [PG.index("directory_sessions_user_idx", ["userId"])],
+})
+
 export type DirectoryOrgRow = PG.SelectRowOf<typeof DirectoryOrgs>
 export type DirectoryUserRow = PG.SelectRowOf<typeof DirectoryUsers>
 export type DirectoryMemberRow = PG.SelectRowOf<typeof DirectoryMembers>
 export type DirectoryInvitationRow = PG.SelectRowOf<typeof DirectoryInvitations>
+export type DirectorySessionRow = PG.SelectRowOf<typeof DirectorySessions>

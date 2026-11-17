@@ -3,6 +3,7 @@ import { CurrentTenant, MapleApi, type TenantContext } from "@maple/domain/http"
 import { Effect, String as Str } from "effect"
 import { HttpServerRequest } from "effect/http"
 import { DirectoryService } from "@maple/backend/services/directory/DirectoryService"
+import { KeycloakAdmin } from "@maple/backend/services/directory/KeycloakAdmin"
 
 const bearerToken = (header: string | undefined) => {
 	if (!header) return undefined
@@ -22,6 +23,7 @@ export const HttpDirectoryPublicLive = HttpApiBuilder.group(MapleApi, "directory
 export const HttpDirectoryLive = HttpApiBuilder.group(MapleApi, "directory", (handlers) =>
 	Effect.gen(function* () {
 		const directory = yield* DirectoryService
+		const idpAdmin = yield* KeycloakAdmin
 		const withTenant = <A, E, R>(f: (tenant: TenantContext) => Effect.Effect<A, E, R>) =>
 			Effect.flatMap(CurrentTenant.Context, f)
 		return handlers
@@ -61,5 +63,12 @@ export const HttpDirectoryLive = HttpApiBuilder.group(MapleApi, "directory", (ha
 				withTenant((tenant) => directory.deleteOrg(tenant, params.orgId)),
 			)
 			.handle("listUsers", () => withTenant(directory.listUsers))
+			.handle("listUnverifiedUsers", () => withTenant(idpAdmin.listUnverified))
+			.handle("resendVerification", ({ params }) =>
+				withTenant((tenant) => idpAdmin.resendVerification(tenant, params.userId)),
+			)
+			.handle("markVerified", ({ params }) =>
+				withTenant((tenant) => idpAdmin.markVerified(tenant, params.userId)),
+			)
 	}),
 )

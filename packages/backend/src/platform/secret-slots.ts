@@ -44,6 +44,15 @@ export const cliDeviceTokenSlot: SecretSlot<{ readonly deviceCodeHash: string }>
 	binding: (ref) => [ref.deviceCodeHash],
 }
 
+/** An OIDC sign-in spans orgs, so the IdP refresh token binds to its user and session id. */
+export const directorySessionRefreshTokenSlot: SecretSlot<{
+	readonly userId: string
+	readonly id: string
+}> = {
+	name: "directory_sessions.refresh_token",
+	binding: (ref) => [ref.userId, ref.id],
+}
+
 export const dashboardShareTokenSlot: SecretSlot<OrgRowRef> = {
 	name: "dashboard_shares.token",
 	binding: orgRowBinding,

@@ -1,7 +1,13 @@
 import { HttpApiEndpoint, HttpApiGroup } from "effect/http-api"
 import { Schema } from "effect"
 import { OrgId, UserId } from "@maple/primitives"
-import { Authorization, SessionAuthorization, TenantSchema, UnauthorizedError } from "./current-tenant"
+import {
+	Authorization,
+	OrganizationAccessDeniedError,
+	SessionAuthorization,
+	TenantSchema,
+	UnauthorizedError,
+} from "./current-tenant"
 
 export class CliDeviceStartRequest extends Schema.Class<CliDeviceStartRequest>("CliDeviceStartRequest")({
 	deviceName: Schema.String,
@@ -178,6 +184,34 @@ export class SelfHostedInvalidPasswordError extends Schema.TaggedError<SelfHoste
 	{ httpApiStatus: 401 },
 ) {}
 
+/** `{ ok: true }` for the self-hosted session endpoints (logout, logout-all). */
+export class SelfHostedSessionOkResponse extends Schema.Class<SelfHostedSessionOkResponse>(
+	"SelfHostedSessionOkResponse",
+)({
+	ok: Schema.Literal(true),
+}) {}
+
+/** One OIDC sign-in of the caller (a `directory_sessions` row). Times are epoch millis. */
+export class SelfHostedSession extends Schema.Class<SelfHostedSession>("SelfHostedSession")({
+	id: Schema.String,
+	createdAt: Schema.Number,
+	refreshedAt: Schema.Number,
+	/** True for the session the request's bearer token belongs to. */
+	current: Schema.Boolean,
+}) {}
+
+export class SelfHostedSessionsResponse extends Schema.Class<SelfHostedSessionsResponse>(
+	"SelfHostedSessionsResponse",
+)({
+	sessions: Schema.Array(SelfHostedSession),
+}) {}
+
+export class SelfHostedSessionPersistenceError extends Schema.TaggedError<SelfHostedSessionPersistenceError>()(
+	"@maple/http/errors/SelfHostedSessionPersistenceError",
+	{ message: Schema.String },
+	{ httpApiStatus: 503 },
+) {}
+
 export class PreviewSignInStatusResponse extends Schema.Class<PreviewSignInStatusResponse>(
 	"PreviewSignInStatusResponse",
 )({
@@ -246,6 +280,15 @@ export class AuthPublicApiGroup extends HttpApiGroup.make("authPublic")
 			error: [PreviewSignInDisabledError, PreviewSignInInvalidKeyError, PreviewSignInUnavailableError],
 		}),
 	)
+	// Ends the self-hosted OIDC session the bearer names, here and at the IdP. Outside the auth
+	// middleware on purpose: an idle tab's token may be past `exp`, yet must still sign out at the
+	// IdP. The handler verifies the bearer itself (signature, `sid`, session not at its absolute end).
+	.add(
+		HttpApiEndpoint.post("logout", "/logout", {
+			success: SelfHostedSessionOkResponse,
+			error: [SelfHostedAuthDisabledError, UnauthorizedError, SelfHostedSessionPersistenceError],
+		}),
+	)
 	.prefix("/api/auth") {}
 
 export class AuthApiGroup extends HttpApiGroup.make("auth")
@@ -264,6 +307,20 @@ export class AuthApiGroup extends HttpApiGroup.make("auth")
 		HttpApiEndpoint.post("sessionRefresh", "/session/refresh", {
 			success: SelfHostedLoginResponse,
 			error: [SelfHostedAuthDisabledError, UnauthorizedError],
+		}),
+	)
+	// Self-hosted OIDC sessions: revoke all of the caller's sessions here and at the IdP.
+	// (`logout` of one session is in `authPublic`: it must accept an idle tab's expired token.)
+	.add(
+		HttpApiEndpoint.post("logoutAll", "/logout-all", {
+			success: SelfHostedSessionOkResponse,
+			error: [SelfHostedAuthDisabledError, UnauthorizedError, SelfHostedSessionPersistenceError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.get("listSessions", "/sessions", {
+			success: SelfHostedSessionsResponse,
+			error: [SelfHostedAuthDisabledError, UnauthorizedError, SelfHostedSessionPersistenceError],
 		}),
 	)
 	.add(
@@ -296,6 +353,7 @@ export class AuthSessionApiGroup extends HttpApiGroup.make("authSession")
 				CliDeviceExpiredError,
 				CliDeviceConflictError,
 				CliDevicePersistenceError,
+				OrganizationAccessDeniedError,
 			],
 		}),
 	)
@@ -331,6 +389,7 @@ export class AuthSessionApiGroup extends HttpApiGroup.make("authSession")
 				McpOAuthAuthorizationExpiredError,
 				McpOAuthAuthorizationConflictError,
 				McpOAuthPersistenceError,
+				OrganizationAccessDeniedError,
 			],
 		}),
 	)

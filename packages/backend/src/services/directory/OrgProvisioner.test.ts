@@ -26,7 +26,8 @@ import { OrganizationRegionService } from "@maple/backend/services/org/Organizat
 import { OrganizationService } from "@maple/backend/services/org/OrganizationService"
 import { DirectoryService } from "./DirectoryService"
 import { EmailService } from "@maple/backend/platform/EmailService"
-import { OidcClient } from "./OidcClient"
+import { MembershipRevocationService } from "@maple/backend/services/auth/MembershipRevocationService"
+import { OidcClient, OidcUnavailableError } from "./OidcClient"
 import { ClickHouseAdmin, OrgProvisioner } from "./OrgProvisioner"
 
 const trackedDbs: TestDb[] = []
@@ -98,10 +99,12 @@ const makeHarness = (testDb: TestDb) => {
 	)
 	const noOidc = Layer.succeed(OidcClient)({
 		exchange: () => Effect.fail(new UnauthorizedError({ message: "not used" })),
+		refresh: () => Effect.fail(new OidcUnavailableError({ message: "not used" })),
+		logout: () => Effect.void,
 	})
 	const noEmail = Layer.succeed(EmailService)({ isConfigured: false, send: () => Effect.void })
 	const directory = Layer.effect(DirectoryService, DirectoryService.make).pipe(
-		Layer.provide(Layer.mergeAll(provisioner, noOidc, noEmail)),
+		Layer.provide(Layer.mergeAll(provisioner, noOidc, noEmail, MembershipRevocationService.layer)),
 	)
 	const layer = Layer.mergeAll(directory, OrgClickHouseSettingsService.layer).pipe(
 		Layer.provide(

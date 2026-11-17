@@ -70,6 +70,13 @@ export const apiConfiguredEnv = (stage: MapleStage, region: MapleRegion, domains
 		optionalPlain("MAPLE_OIDC_CLIENT_ID"),
 		optionalPlain("MAPLE_OIDC_ACCOUNT_URL"),
 		optionalPlain("MAPLE_OIDC_ROOT_ROLE"),
+		optionalPlain("MAPLE_OIDC_ISSUER"),
+		optionalPlain("MAPLE_OIDC_LOGOUT_URL"),
+		optionalPlain("MAPLE_OIDC_SESSION_TTL_SECONDS"),
+		optionalPlain("MAPLE_OIDC_SESSION_MAX_LIFETIME_SECONDS"),
+		optionalPlain("MAPLE_OIDC_ADMIN_URL"),
+		optionalPlain("MAPLE_OIDC_ADMIN_CLIENT_ID"),
+		optionalSecret("MAPLE_OIDC_ADMIN_CLIENT_SECRET"),
 		optionalPlain("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER"),
 		optionalSecret("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD"),
 	)

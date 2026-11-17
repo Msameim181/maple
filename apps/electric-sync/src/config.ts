@@ -38,6 +38,8 @@ const syncConfig = Config.all({
 	// Same default as @maple/api's Env; deploys derive it from the stage.
 	MAPLE_ENVIRONMENT: stringWithDefault("MAPLE_ENVIRONMENT", "development"),
 	MAPLE_ROOT_PASSWORD: optionalRedacted("MAPLE_ROOT_PASSWORD"),
+	// Session-token HMAC key; must match the API's (falls back to MAPLE_ROOT_PASSWORD there too).
+	MAPLE_SESSION_SECRET: optionalRedacted("MAPLE_SESSION_SECRET"),
 	CLERK_SECRET_KEY: optionalRedacted("CLERK_SECRET_KEY"),
 	CLERK_PUBLISHABLE_KEY: optionalString("CLERK_PUBLISHABLE_KEY"),
 	CLERK_JWT_KEY: optionalRedacted("CLERK_JWT_KEY"),

@@ -101,6 +101,11 @@ describe("parseExternalUrl", () => {
 		"http://api.default.svc/",
 		"http://DB.Internal./",
 		"http://internal/",
+		// Single-label names resolve only on a container or search-domain network.
+		"http://electric:3000/v1/shape",
+		"http://keycloak:8080/",
+		"http://Maple./",
+		"http://2130706433/",
 	])("rejects private/loopback host: %s", (raw) => {
 		expect(rejects(raw)).toBe(true)
 	})

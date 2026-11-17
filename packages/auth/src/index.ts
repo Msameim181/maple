@@ -129,6 +129,11 @@ const SelfHostedSessionClaims = Schema.Struct({
 	exp: Schema.optionalKey(JwtSeconds),
 	session_exp: Schema.optionalKey(JwtSeconds),
 	nbf: Schema.optionalKey(JwtSeconds),
+	/**
+	 * The server-side session (`directory_sessions` row) an OIDC token belongs to. Renewal and
+	 * logout look it up; verification ignores it. Root-password tokens never carry one.
+	 */
+	sid: Schema.optionalKey(Schema.String),
 })
 type SelfHostedSessionClaims = Schema.Schema.Type<typeof SelfHostedSessionClaims>
 
@@ -212,6 +217,11 @@ const encodeBase64Url = (value: unknown): string => Buffer.from(encodeJson(value
 export const verifySelfHostedSessionToken = Effect.fn("AuthService.verifySelfHostedSessionToken")(function* (
 	token: string,
 	secret: string,
+	/**
+	 * Logout only: accept a token past its `exp` (an idle tab must still be able to end its IdP
+	 * session). Signature, algorithm, claims, `session_exp` and the max-age backstop still apply.
+	 */
+	options?: { readonly allowExpiredForLogout?: boolean },
 ): Effect.fn.Return<SelfHostedSessionClaims, UnauthorizedError> {
 	const parts = Str.split(".")(token)
 	const [encodedHeader, encodedPayload, encodedSignature] = parts
@@ -259,7 +269,7 @@ export const verifySelfHostedSessionToken = Effect.fn("AuthService.verifySelfHos
 		return yield* unauthorized("JWT was issued in the future")
 	}
 
-	if (claims.exp !== undefined && now >= claims.exp) {
+	if (claims.exp !== undefined && now >= claims.exp && options?.allowExpiredForLogout !== true) {
 		return yield* unauthorized("JWT has expired")
 	}
 
@@ -289,6 +299,7 @@ type SelfHostedTokenClaims = {
 	readonly iat: number
 	readonly exp: number
 	readonly session_exp: number
+	readonly sid?: string
 }
 
 const signHs256Jwt = (payload: SelfHostedTokenClaims, secret: string): string => {
@@ -317,22 +328,22 @@ export const mintSessionToken = (
 		readonly nowSeconds: number
 		readonly ttlSeconds: number
 		readonly sessionExpiresAt: number
+		/** The server-side session id; only OIDC sessions have one. */
+		readonly sid?: string | undefined
 	},
 	secret: string,
 ): { readonly token: string; readonly expiresAt: number } => {
 	const expiresAt = Math.min(claims.nowSeconds + claims.ttlSeconds, claims.sessionExpiresAt)
-	const token = signHs256Jwt(
-		{
-			sub: claims.sub,
-			org_id: claims.orgId,
-			roles: [...claims.roles],
-			authMode: "self_hosted",
-			iat: claims.nowSeconds,
-			exp: expiresAt,
-			session_exp: claims.sessionExpiresAt,
-		},
-		secret,
-	)
+	const payload = {
+		sub: claims.sub,
+		org_id: claims.orgId,
+		roles: [...claims.roles],
+		authMode: "self_hosted" as const,
+		iat: claims.nowSeconds,
+		exp: expiresAt,
+		session_exp: claims.sessionExpiresAt,
+	}
+	const token = signHs256Jwt(claims.sid === undefined ? payload : { ...payload, sid: claims.sid }, secret)
 	return { token, expiresAt }
 }
 
@@ -413,10 +424,24 @@ export interface AuthEnv {
 	 */
 	readonly MAPLE_ORG_ID_OVERRIDE_ADMITS_NONMEMBERS?: boolean | undefined
 	readonly MAPLE_ROOT_PASSWORD: Option.Option<Redacted.Redacted>
+	/** The session-token HMAC key; absent (or unset) means `MAPLE_ROOT_PASSWORD` signs them. */
+	readonly MAPLE_SESSION_SECRET?: Option.Option<Redacted.Redacted> | undefined
 	readonly CLERK_SECRET_KEY: Option.Option<Redacted.Redacted>
 	readonly CLERK_PUBLISHABLE_KEY: Option.Option<string>
 	readonly CLERK_JWT_KEY: Option.Option<Redacted.Redacted>
 }
+
+type SessionSecretEnv = Pick<AuthEnv, "MAPLE_ROOT_PASSWORD" | "MAPLE_SESSION_SECRET">
+
+/**
+ * The key self-hosted session tokens are signed and verified with: `MAPLE_SESSION_SECRET`, else
+ * the root password. Every minter and verifier goes through this so they cannot disagree.
+ *
+ * The fallback keeps existing deployments working, but then the root password also signs every
+ * OIDC user's session; the directory logs a startup warning when OIDC is on without the secret.
+ */
+export const sessionSigningSecret = (env: SessionSecretEnv): Option.Option<Redacted.Redacted> =>
+	Option.orElse(env.MAPLE_SESSION_SECRET ?? Option.none(), () => env.MAPLE_ROOT_PASSWORD)
 
 const getOptionalString = <A>(option: Option.Option<A>): A | undefined => Option.getOrUndefined(option)
 
@@ -478,7 +503,10 @@ const makeClerkAuthenticateRequest = (env: ClerkEnv): ClerkAuthenticateRequest |
 }
 
 export const makeLoginSelfHosted = (
-	env: Pick<AuthEnv, "MAPLE_AUTH_MODE" | "MAPLE_DEFAULT_ORG_ID" | "MAPLE_ROOT_PASSWORD">,
+	env: Pick<
+		AuthEnv,
+		"MAPLE_AUTH_MODE" | "MAPLE_DEFAULT_ORG_ID" | "MAPLE_ROOT_PASSWORD" | "MAPLE_SESSION_SECRET"
+	>,
 ) =>
 	Effect.fn("AuthService.loginSelfHosted")(function* (
 		password: string,
@@ -505,7 +533,8 @@ export const makeLoginSelfHosted = (
 		// Entering the root password is what starts the absolute clock. Renewal
 		// never restarts it: only another login does.
 		const sessionExpiresAt = now + SELF_HOSTED_SESSION_MAX_LIFETIME_SECONDS
-		const { token, expiresAt } = mintSelfHostedSessionToken(tenant, now, sessionExpiresAt, rootPassword)
+		const signingSecret = yield* requireSecret(sessionSigningSecret(env), "MAPLE_SESSION_SECRET")
+		const { token, expiresAt } = mintSelfHostedSessionToken(tenant, now, sessionExpiresAt, signingSecret)
 
 		return new SelfHostedLoginResponse({
 			token,
@@ -539,10 +568,12 @@ export type RenewSelfHostedSession = (claims: {
 	readonly sub: UserId
 	readonly orgId: OrgId
 	readonly roles: ReadonlyArray<RoleName>
+	/** The token's server-side session id, when it has one. */
+	readonly sid: string | undefined
 }) => Effect.Effect<SelfHostedSessionRenewal, UnauthorizedError>
 
 export const makeRefreshSelfHostedSession = (
-	env: Pick<AuthEnv, "MAPLE_AUTH_MODE" | "MAPLE_ROOT_PASSWORD">,
+	env: Pick<AuthEnv, "MAPLE_AUTH_MODE" | "MAPLE_ROOT_PASSWORD" | "MAPLE_SESSION_SECRET">,
 	renew?: RenewSelfHostedSession,
 ) =>
 	Effect.fn("AuthService.refreshSelfHostedSession")(function* (
@@ -554,8 +585,8 @@ export const makeRefreshSelfHostedSession = (
 			})
 		}
 
-		const rootPassword = yield* requireSecret(env.MAPLE_ROOT_PASSWORD, "MAPLE_ROOT_PASSWORD")
-		const claims = yield* verifySelfHostedSessionToken(token, rootPassword)
+		const signingSecret = yield* requireSecret(sessionSigningSecret(env), "MAPLE_SESSION_SECRET")
+		const claims = yield* verifySelfHostedSessionToken(token, signingSecret)
 		const now = Math.floor((yield* Clock.currentTimeMillis) / 1000)
 
 		// A token minted before `session_exp` existed still gets a bounded renewal
@@ -567,7 +598,7 @@ export const makeRefreshSelfHostedSession = (
 		const renewal =
 			renew === undefined
 				? { roles: claims.roles, ttlSeconds: SELF_HOSTED_SESSION_TTL_SECONDS }
-				: yield* renew({ sub: claims.sub, orgId: claims.org_id, roles: claims.roles })
+				: yield* renew({ sub: claims.sub, orgId: claims.org_id, roles: claims.roles, sid: claims.sid })
 		const renewed = mintSessionToken(
 			{
 				sub: claims.sub,
@@ -576,8 +607,9 @@ export const makeRefreshSelfHostedSession = (
 				nowSeconds: now,
 				ttlSeconds: renewal.ttlSeconds,
 				sessionExpiresAt,
+				sid: claims.sid,
 			},
-			rootPassword,
+			signingSecret,
 		)
 
 		return new SelfHostedLoginResponse({
@@ -888,10 +920,10 @@ export const makeResolveTenant = (
 			return yield* unauthorized("Self-hosted mode requires a valid bearer token")
 		}
 
-		const rootPassword = yield* requireSecret(env.MAPLE_ROOT_PASSWORD, "MAPLE_ROOT_PASSWORD")
+		const signingSecret = yield* requireSecret(sessionSigningSecret(env), "MAPLE_SESSION_SECRET")
 		// `claims` is already the validated tenant: branded ids, a normalized role
 		// list and a literal `authMode`. Nothing below re-checks it.
-		const claims = yield* verifySelfHostedSessionToken(token, rootPassword)
+		const claims = yield* verifySelfHostedSessionToken(token, signingSecret)
 
 		const tenant: TenantContext = {
 			orgId: claims.org_id,

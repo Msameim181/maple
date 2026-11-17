@@ -23,6 +23,7 @@ export class DirectoryUser extends Schema.Class<DirectoryUser>("DirectoryUser")(
 	email: Schema.String,
 	name: Schema.NullOr(Schema.String),
 	lastSeenAt: Schema.NullOr(Schema.Number),
+	emailVerified: Schema.Boolean,
 }) {}
 
 export class OidcConfigResponse extends Schema.Class<OidcConfigResponse>("OidcConfigResponse")({
@@ -122,6 +123,18 @@ export class DirectoryOkResponse extends Schema.Class<DirectoryOkResponse>("Dire
 	ok: Schema.Literal(true),
 }) {}
 
+/** A directory user whose email the IdP has not verified yet (IT-only "Pending verification"). */
+export class UnverifiedUser extends Schema.Class<UnverifiedUser>("UnverifiedUser")({
+	id: UserId,
+	email: Schema.String,
+	name: Schema.NullOr(Schema.String),
+	createdAt: Schema.Number,
+}) {}
+
+export class UnverifiedUsersResponse extends Schema.Class<UnverifiedUsersResponse>("UnverifiedUsersResponse")({
+	users: Schema.Array(UnverifiedUser),
+}) {}
+
 export class NoOrganizationError extends Schema.TaggedError<NoOrganizationError>()(
 	"@maple/http/errors/NoOrganizationError",
 	{ message: Schema.String },
@@ -164,6 +177,20 @@ export class DirectoryPersistenceError extends Schema.TaggedError<DirectoryPersi
 	{ httpApiStatus: 503 },
 ) {}
 
+/** The IdP says the email is not verified yet; the user must confirm it before signing in. */
+export class DirectoryEmailNotVerifiedError extends Schema.TaggedError<DirectoryEmailNotVerifiedError>()(
+	"@maple/http/errors/DirectoryEmailNotVerifiedError",
+	{ message: Schema.String },
+	{ httpApiStatus: 403 },
+) {}
+
+/** The identity provider's admin API failed or could not be reached. */
+export class DirectoryUpstreamError extends Schema.TaggedError<DirectoryUpstreamError>()(
+	"@maple/http/errors/DirectoryUpstreamError",
+	{ message: Schema.String },
+	{ httpApiStatus: 502 },
+) {}
+
 export const DirectoryErrors = [
 	DirectoryDisabledError,
 	DirectoryForbiddenError,
@@ -180,7 +207,7 @@ export class DirectoryPublicApiGroup extends HttpApiGroup.make("directoryPublic"
 		HttpApiEndpoint.post("oidcCallback", "/oidc/callback", {
 			payload: OidcCallbackRequest,
 			success: SelfHostedLoginResponse,
-			error: [UnauthorizedError, NoOrganizationError, ...DirectoryErrors],
+			error: [UnauthorizedError, NoOrganizationError, DirectoryEmailNotVerifiedError, ...DirectoryErrors],
 		}),
 	)
 	.prefix("/api/auth") {}
@@ -248,5 +275,26 @@ export class DirectoryApiGroup extends HttpApiGroup.make("directory")
 		}),
 	)
 	.add(HttpApiEndpoint.get("listUsers", "/users", { success: UsersResponse, error: DirectoryErrors }))
+	// IT-only: verification is realm-wide, so an org admin could otherwise enrol an address into every org that invited it.
+	.add(
+		HttpApiEndpoint.get("listUnverifiedUsers", "/unverified-users", {
+			success: UnverifiedUsersResponse,
+			error: [...DirectoryErrors, DirectoryUpstreamError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("resendVerification", "/users/:userId/resend-verification", {
+			params: { userId: UserId },
+			success: DirectoryOkResponse,
+			error: [...DirectoryErrors, DirectoryUpstreamError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("markVerified", "/users/:userId/mark-verified", {
+			params: { userId: UserId },
+			success: DirectoryOkResponse,
+			error: [...DirectoryErrors, DirectoryUpstreamError],
+		}),
+	)
 	.prefix("/api/directory")
 	.middleware(SessionAuthorization) {}
