@@ -64,7 +64,10 @@ const telemetryEnv = {
 
 // https://astro.build/config
 export default defineConfig({
-	site: "https://maple.dev",
+	// maple.dev by default. The GitHub Pages build for a fork sets ASTRO_SITE / ASTRO_BASE
+	// (e.g. https://user.github.io and /maple), see .github/workflows/selfhost-docs.yml.
+	site: process.env.ASTRO_SITE?.trim() || "https://maple.dev",
+	base: process.env.ASTRO_BASE?.trim() || "/",
 	trailingSlash: "ignore",
 	redirects: {
 		// The monthly release became individual entries.
