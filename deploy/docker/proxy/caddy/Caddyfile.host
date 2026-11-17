@@ -1,15 +1,29 @@
 # For a Caddy installed on the server itself (apt/dnf/brew), with the stack started using
-# docker-compose.host-proxy.yml. Replace the five hostnames, then:
+# docker-compose.host-proxy.yml. Replace the six hostnames, then:
 #   sudo cp Caddyfile.host /etc/caddy/Caddyfile   (or `import` it from your existing Caddyfile)
 #   sudo systemctl reload caddy
 # Caddy obtains and renews the Let's Encrypt certificates itself.
 
 maple.example.com {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Content-Security-Policy "frame-ancestors 'none'"
+		# Report-only: the built index.html has an inline theme script, hence 'unsafe-inline'.
+		Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://api.maple.example.com https://sync.maple.example.com https://ingest.maple.example.com https://status.maple.example.com https://auth.maple.example.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://auth.maple.example.com"
+	}
 	reverse_proxy 127.0.0.1:8780
 }
 
 api.maple.example.com {
-	reverse_proxy 127.0.0.1:8701
+	handle /api/internal/* {
+		respond 404
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8701
+	}
 }
 
 sync.maple.example.com {
@@ -20,7 +34,17 @@ sync.maple.example.com {
 }
 
 auth.maple.example.com {
-	reverse_proxy 127.0.0.1:8080
+	@private path_regexp private (?i)^/(admin|realms/master)([/;]|$)
+	handle @private {
+		respond 404
+	}
+	handle {
+		reverse_proxy 127.0.0.1:8080
+	}
+}
+
+status.maple.example.com {
+	reverse_proxy 127.0.0.1:8706
 }
 
 ingest.maple.example.com {

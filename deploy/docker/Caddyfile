@@ -6,13 +6,27 @@
 
 {$APP_HOST} {
 	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		Content-Security-Policy "frame-ancestors 'none'"
+		# Report-only: the built index.html has an inline theme script, hence 'unsafe-inline'.
+		Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://{$API_HOST} https://{$SYNC_HOST} https://{$INGEST_HOST} https://{$STATUS_HOST} https://{$AUTH_HOST}; frame-ancestors 'none'; base-uri 'self'; form-action 'self' https://{$AUTH_HOST}"
+	}
 	root * /srv/web
 	try_files {path} /index.html
 	file_server
 }
 
 {$API_HOST} {
-	reverse_proxy maple:8701
+	# Scraper endpoints are for the compose network only (scraper -> maple:8701).
+	handle /api/internal/* {
+		respond 404
+	}
+	handle {
+		reverse_proxy maple:8701
+	}
 }
 
 {$SYNC_HOST} {
@@ -23,7 +37,19 @@
 }
 
 {$AUTH_HOST} {
-	reverse_proxy keycloak:8080
+	# Keycloak admin console and master realm stay off the internet.
+	@private path_regexp private (?i)^/(admin|realms/master)([/;]|$)
+	handle @private {
+		respond 404
+	}
+	handle {
+		reverse_proxy keycloak:8080
+	}
+}
+
+# Public status pages (/s/<slug>).
+{$STATUS_HOST} {
+	reverse_proxy maple:8706
 }
 
 # OTLP from your apps, authenticated per org by ingest key. gRPC (HTTP/2, application/grpc)

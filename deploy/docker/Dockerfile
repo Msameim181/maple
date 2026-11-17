@@ -19,6 +19,7 @@ FROM deps AS web-build
 ARG PUBLIC_API_URL
 ARG PUBLIC_SYNC_URL
 ARG PUBLIC_INGEST_URL
+ARG PUBLIC_STATUS_URL
 # Optional: one org's PUBLIC ingest key (maple_pk_...). The dashboard then reports its own
 # performance into that org; without it, its self-telemetry gets 401s (harmless).
 ARG WEB_INGEST_KEY=""
@@ -27,6 +28,7 @@ ENV VITE_API_BASE_URL=$PUBLIC_API_URL \
     VITE_API_PUBLIC_URL=$PUBLIC_API_URL \
     VITE_ELECTRIC_SYNC_URL=$PUBLIC_SYNC_URL \
     VITE_INGEST_URL=$PUBLIC_INGEST_URL \
+    VITE_STATUS_PAGE_BASE_URL=$PUBLIC_STATUS_URL \
     VITE_MAPLE_SELF_INGEST_URL=$PUBLIC_INGEST_URL \
     VITE_MAPLE_AUTH_MODE=self_hosted \
     VITE_MAPLE_REGION=us \
@@ -48,3 +50,8 @@ ENV NODE_ENV=production \
 VOLUME /app/.alchemy
 EXPOSE 8701 8702 8703 8704 8705 8706
 CMD ["deploy/docker/runner/start.sh"]
+
+# Uptime/scrape prober: polls the API for monitors, runs the checks, reports back.
+FROM deps AS scraper
+ENV NODE_ENV=production
+CMD ["bun", "run", "apps/scraper/src/main.ts"]
