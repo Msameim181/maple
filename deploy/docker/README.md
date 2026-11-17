@@ -2,8 +2,9 @@
 
 One server runs the whole stack. People sign in through Keycloak; each department or partner
 company is an **organization** with its own users, roles, ingest keys and its own ClickHouse
-database. The full documentation lives in one place, the Maple docs Markdown, and is also published
-as a GitHub Pages site: <https://msameim181.github.io/maple/>.
+database. The full documentation lives in one place, the Maple docs Markdown, and the whole Maple
+docs site is also published on GitHub Pages for this fork:
+<https://msameim181.github.io/maple/docs/self-hosting/multi-tenant/overview/>.
 
 ## Quick start
 
@@ -45,6 +46,7 @@ They appear on the Maple docs site under **Multi-tenant self-hosting**, and on G
 | Security | `/docs/self-hosting/multi-tenant/security` | [security.md](../../apps/landing/src/content/docs/self-hosting/multi-tenant/security.md) |
 | Troubleshooting | `/docs/self-hosting/multi-tenant/troubleshooting` | [troubleshooting.md](../../apps/landing/src/content/docs/self-hosting/multi-tenant/troubleshooting.md) |
 
-Build the Pages site locally with `pip install mkdocs-material==9.5.50 && scripts/build-docs.sh`
-(output in `site/`). Design notes:
+Build the Pages copy locally with
+`cd apps/landing && ASTRO_SITE=https://<owner>.github.io ASTRO_BASE=/<repo> bun --bun run build && node scripts/pages-base.mjs dist /<repo>`
+(output in `apps/landing/dist`). Design notes:
 [`docs/superpowers/specs/2026-11-11-selfhost-multitenant-design.md`](../../docs/superpowers/specs/2026-11-11-selfhost-multitenant-design.md).

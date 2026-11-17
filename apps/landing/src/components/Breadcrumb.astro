@@ -1,4 +1,5 @@
 ---
+import { pathWithoutBase, siteBase } from "../lib/site-path";
 import { getRelativeLocaleUrl } from "astro:i18n";
 
 interface BreadcrumbItem {
@@ -17,11 +18,11 @@ const { items, class: className = "mx-auto max-w-6xl px-6 pt-4" } = Astro.props;
 const locale = Astro.currentLocale ?? "en";
 const l = (path: string) => getRelativeLocaleUrl(locale, path);
 
-const siteUrl = Astro.site?.toString().replace(/\/$/, '') ?? 'https://maple.dev';
+const siteUrl = (Astro.site?.toString().replace(/\/$/, '') ?? 'https://maple.dev') + siteBase;
 // Astro.url.pathname reports the *English* path on a fallback-rewritten locale
 // route, so the leaf of a /ja or /ko trail would otherwise point at the English
 // URL. Rebuild it from the locale instead.
-const pathWithoutLocale = Astro.url.pathname.replace(/^\/(ja|ko)(\/|$)/, '/').replace(/\/+/g, '/');
+const pathWithoutLocale = pathWithoutBase(Astro.url.pathname).replace(/^\/(ja|ko)(\/|$)/, '/').replace(/\/+/g, '/');
 const currentUrl = `${siteUrl}${l(pathWithoutLocale)}`;
 
 const jsonLd = {

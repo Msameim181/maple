@@ -1,4 +1,5 @@
 ---
+import { pathWithoutBase } from "../lib/site-path";
 import { getRelativeLocaleUrl } from "astro:i18n";
 import * as m from "../paraglide/messages.js";
 
@@ -9,7 +10,7 @@ const locales = [
     { code: "ko", label: m.language_ko() },
 ] as const;
 
-const pathWithoutLocale = Astro.url.pathname
+const pathWithoutLocale = pathWithoutBase(Astro.url.pathname)
     .replace(/^\/(ja|ko)(\/|$)/, "/")
     .replace(/\/+/g, "/");
 ---

@@ -1,12 +1,15 @@
 name: Self-host docs
 
+# Publishes the Maple docs site (the Astro app in apps/landing) to GitHub Pages for this fork, under
+# https://<owner>.github.io/<repo>/. Same content as maple.dev/docs. Needs Settings -> Pages ->
+# Source: "GitHub Actions", and `selfhost` allowed in the github-pages environment's branches.
 on:
   push:
     branches: [selfhost]
     paths:
-      - "apps/landing/src/content/docs/self-hosting/multi-tenant/**"
-      - "deploy/docker/mkdocs.yml"
-      - "deploy/docker/scripts/build-docs.sh"
+      - "apps/landing/**"
+      - "scripts/install.sh"
+      - "scripts/uninstall.sh"
       - ".github/workflows/selfhost-docs.yml"
   workflow_dispatch:
 
@@ -24,14 +27,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: oven-sh/setup-bun@v2
         with:
-          python-version: "3.12"
-      - run: pip install mkdocs-material==9.5.50
-      - run: ./deploy/docker/scripts/build-docs.sh
+          bun-version: 1.4.4 # keep in sync with packageManager in package.json
+      - run: bun install --frozen-lockfile
+      - name: Build the site for the Pages sub-path
+        working-directory: apps/landing
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          export ASTRO_SITE="https://${owner}.github.io"
+          export ASTRO_BASE="/${{ github.event.repository.name }}"
+          bun --bun run build
+          # Hand-written links in Markdown and a few scripts are root-relative; prefix them.
+          node scripts/pages-base.mjs dist "$ASTRO_BASE"
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: deploy/docker/site
+          path: apps/landing/dist
 
   deploy:
     needs: build

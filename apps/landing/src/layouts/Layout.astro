@@ -42,7 +42,13 @@ const localeMap: Record<string, string>  = { en: "en_US", ja: "ja_JP", ko: "ko_K
 const ogLocale = localeMap[currentLocale] ?? "en_US";
 
 // Build path without locale prefix, used for both hreflang and the canonical.
-const pathWithoutLocale = Astro.url.pathname
+// A site served under a sub-path (the GitHub Pages copy sets ASTRO_BASE) reports it in
+// Astro.url.pathname; strip it so the locale prefix is found and getRelativeLocaleUrl,
+// which adds the base itself, does not add it twice. "" on maple.dev.
+const siteBase = import.meta.env.BASE_URL.replace(/\/+$/, "");
+const pathWithoutLocale = (siteBase && Astro.url.pathname.startsWith(siteBase)
+        ? Astro.url.pathname.slice(siteBase.length)
+        : Astro.url.pathname)
     .replace(/^\/(ja|ko)(\/|$)/, "/")
     .replace(/\/+/g, "/");
 const locales = alternates;
@@ -83,7 +89,7 @@ const absoluteImage = image.startsWith("http")
                 href={new URL(getRelativeLocaleUrl(locale, pathWithoutLocale), Astro.site).toString()}
             />
         ))}
-        <link rel="alternate" hreflang="x-default" href={new URL(pathWithoutLocale, Astro.site).toString()} />
+        <link rel="alternate" hreflang="x-default" href={new URL(siteBase + pathWithoutLocale, Astro.site).toString()} />
         {mdHref && (
             <link rel="alternate" type="text/markdown" href={new URL(mdHref, Astro.site).toString()} />
         )}
@@ -169,9 +175,11 @@ const absoluteImage = image.startsWith("http")
                 });
             })();
         </script>
-        <script is:inline>
+        <script is:inline define:vars={{ siteBase }}>
             (function() {
-                if (/^\/(ja|ko)(\/|$)/.test(window.location.pathname)) return;
+                var path = window.location.pathname;
+                if (siteBase && path.indexOf(siteBase) === 0) path = path.slice(siteBase.length) || '/';
+                if (/^\/(ja|ko)(\/|$)/.test(path)) return;
                 if (sessionStorage.getItem('locale-redirected')) return;
                 var supported = ['ja', 'ko'];
                 var langs = navigator.languages || [navigator.language];
@@ -179,7 +187,7 @@ const absoluteImage = image.startsWith("http")
                     var lang = langs[i].split('-')[0].toLowerCase();
                     if (supported.indexOf(lang) !== -1) {
                         sessionStorage.setItem('locale-redirected', '1');
-                        window.location.replace('/' + lang + window.location.pathname);
+                        window.location.replace(siteBase + '/' + lang + path);
                         return;
                     }
                 }
