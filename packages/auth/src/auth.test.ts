@@ -11,9 +11,11 @@ import {
 	makeResolveClerkUser,
 	makeResolveMcpTenant,
 	makeResolveTenant,
+	mintSessionToken,
 	ORG_SELECTION_HEADER,
 	SELF_HOSTED_SESSION_MAX_LIFETIME_SECONDS,
 	SELF_HOSTED_SESSION_TTL_SECONDS,
+	verifySelfHostedSessionToken,
 } from "./index"
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)
@@ -1079,6 +1081,66 @@ describe("self-hosted session lifetime", () => {
 			)
 
 			assertRejected(exit, "Invalid JWT header")
+		}),
+	)
+})
+
+describe("self-hosted session id and signing secret", () => {
+	const oidcClaims = {
+		sub: asUserId("alice-sub"),
+		orgId: asOrgId("acme"),
+		roles: [asRoleName("org:member")],
+		nowSeconds: clockSeconds,
+		ttlSeconds: 600,
+		sessionExpiresAt: clockSeconds + 3600,
+	}
+
+	it.effect("renewal hands the session id to the check and keeps it in the new token", () =>
+		Effect.gen(function* () {
+			const { token } = mintSessionToken({ ...oidcClaims, sid: "session-1" }, rootPassword)
+			const seen: Array<string | undefined> = []
+			const renewed = yield* atFixedTime(
+				makeRefreshSelfHostedSession(baseEnv, (claims) =>
+					Effect.sync(() => {
+						seen.push(claims.sid)
+						return { roles: claims.roles, ttlSeconds: 600 }
+					}),
+				)(token),
+			)
+			assert.deepStrictEqual(seen, ["session-1"])
+			const again = yield* verifySelfHostedSessionToken(renewed.token, rootPassword)
+			assert.strictEqual(again.sid, "session-1")
+		}),
+	)
+
+	it.effect("a token without a session id still verifies, and renews without one", () =>
+		Effect.gen(function* () {
+			const { token } = mintSessionToken(oidcClaims, rootPassword)
+			const tenant = yield* atFixedTime(makeResolveTenant(baseEnv)({ authorization: `Bearer ${token}` }))
+			assert.strictEqual(tenant.userId, "alice-sub")
+			const seen: Array<string | undefined> = []
+			yield* makeRefreshSelfHostedSession(baseEnv, (claims) =>
+				Effect.sync(() => {
+					seen.push(claims.sid)
+					return { roles: claims.roles, ttlSeconds: 600 }
+				}),
+			)(token)
+			assert.deepStrictEqual(seen, [undefined])
+		}),
+	)
+
+	it.effect("MAPLE_SESSION_SECRET signs and verifies in place of the root password", () =>
+		Effect.gen(function* () {
+			const env = { ...baseEnv, MAPLE_SESSION_SECRET: Option.some(Redacted.make("session-secret")) }
+			const login = yield* atFixedTime(makeLoginSelfHosted(env)(rootPassword))
+			// The password is still the root password; the token is signed with the session secret.
+			const tenant = yield* makeResolveTenant(env)({ authorization: `Bearer ${login.token}` })
+			assert.strictEqual(tenant.userId, "root")
+			yield* makeRefreshSelfHostedSession(env)(login.token)
+			const underRootPassword = yield* Effect.exit(
+				makeResolveTenant(baseEnv)({ authorization: `Bearer ${login.token}` }),
+			)
+			assertRejected(underRootPassword, "Invalid JWT signature")
 		}),
 	)
 })

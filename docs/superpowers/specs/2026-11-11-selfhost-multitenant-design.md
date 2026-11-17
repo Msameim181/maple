@@ -97,6 +97,8 @@ Notes:
 
 ### 4.2 Identity: Keycloak
 
+> **Superseded** by `docs/superpowers/plans/2026-11-16-selfhost-auth-hardening.md` (account links: the account page is now Maple's own, with Keycloak actions; the console link is IT-only).
+
 - **Keycloak 26** in compose, using its own database in the same Postgres server.
 - Realm `maple`, with one **public** OIDC client `maple-web` (authorization code + PKCE). Redirect to
   `PUBLIC_APP_URL`.
@@ -131,6 +133,8 @@ users             (id text pk = OIDC sub, email, name, last_seen_at)   -- upsert
 - These tables are used only when `MAPLE_AUTH_MODE=oidc`. Clerk mode is untouched.
 
 ### 4.4 Request auth: `MAPLE_AUTH_MODE=oidc`
+
+> **Superseded** by `docs/superpowers/plans/2026-11-16-selfhost-auth-hardening.md` (the session secret is `MAPLE_SESSION_SECRET`, falling back to the root password; sessions are server-tracked and renewed against the IdP, and TTL is configurable instead of 15 minutes).
 
 **Token exchange (builder's call, after review).** The Keycloak token proves *who*; Maple then mints
 its own short-lived session token that says *which org, which role*. This reuses the existing
@@ -176,6 +180,8 @@ membership automatically.
 - Deleting an org reuses the existing `OrganizationService` purge of org-scoped rows.
 
 ### 4.6 Web (`apps/web`, Foldkit)
+
+> **Superseded** by `docs/superpowers/plans/2026-11-16-selfhost-auth-hardening.md` (sign-in is hand-built code+PKCE with a server callback, not `oidc-client-ts`; the token lives in `localStorage` and is shared across tabs; the account card changed).
 
 - **Sign-in:** an OIDC code+PKCE flow using `oidc-client-ts` (one small, standard dependency; not
   hand-rolled auth). The token is kept in memory with silent refresh, and sent as a bearer token.

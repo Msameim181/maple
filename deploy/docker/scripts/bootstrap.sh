@@ -5,6 +5,7 @@
 #   - the first IT admin user, and optionally the first organization
 # Usage: scripts/bootstrap.sh <it-admin-email> [<first-org-id> <first-org-name> <org-admin-email>]
 set -eu
+umask 077 # secrets files and temp files must never be world-readable
 cd "$(dirname "$0")/.."
 . ./.env
 IT_EMAIL=${1:?usage: bootstrap.sh <it-admin-email> [org-id org-name org-admin-email]}
@@ -21,7 +22,11 @@ if ! kc get realms/maple >/dev/null 2>&1; then
 fi
 
 # Users see Maple-styled sign-in pages; only the admin console keeps Keycloak's look.
-kc update realms/maple -s loginTheme=maple -s "displayName=${REALM_DISPLAY_NAME:-Maple}"
+kc update realms/maple -s loginTheme=maple -s emailTheme=maple -s "displayName=${REALM_DISPLAY_NAME:-Maple}"
+
+# Brute-force lockout, password policy and session lifetimes (re-applied on every run).
+kc update realms/maple -s bruteForceProtected=true -s 'passwordPolicy=length(10)' \
+	-s ssoSessionIdleTimeout=7200 -s ssoSessionMaxLifespan=43200
 
 # SMTP for verification and password-reset mail, parsed from SMTP_URL (smtp[s]://user:pass@host:port).
 if [ -n "${SMTP_URL:-}" ]; then
@@ -38,12 +43,39 @@ if [ -n "${SMTP_URL:-}" ]; then
 	echo "realm SMTP set to $host:$port"
 fi
 
-if [ -z "$(kc get clients -r maple -q clientId=maple-web --fields id --format csv --noquotes)" ]; then
+web_id() { kc get clients -r maple -q clientId=maple-web --fields id --format csv --noquotes; }
+if [ -z "$(web_id)" ]; then
 	kc create clients -r maple -s clientId=maple-web -s publicClient=true -s standardFlowEnabled=true \
-		-s directAccessGrantsEnabled=false -s "redirectUris=[\"https://$APP_HOST/sign-in\"]" \
-		-s "webOrigins=[\"https://$APP_HOST\"]" -s 'attributes."pkce.code.challenge.method"=S256' \
-		-s "attributes.\"post.logout.redirect.uris\"=https://$APP_HOST/*"
+		-s directAccessGrantsEnabled=false -s 'attributes."pkce.code.challenge.method"=S256'
 	echo "client maple-web created"
+fi
+# Always re-applied, so changing APP_HOST (or upgrading) fixes the client too.
+kc update "clients/$(web_id)" -r maple -s "baseUrl=https://$APP_HOST/sign-in" \
+	-s "redirectUris=[\"https://$APP_HOST/sign-in\"]" -s "webOrigins=[\"https://$APP_HOST\"]" \
+	-s "attributes.\"post.logout.redirect.uris\"=https://$APP_HOST/*"
+
+# Confidential service-account client the API uses to manage users (and nothing else).
+: "${MAPLE_OIDC_ADMIN_CLIENT_SECRET:?set MAPLE_OIDC_ADMIN_CLIENT_SECRET (scripts/gen-secrets.sh)}"
+admin_id() { kc get clients -r maple -q clientId=maple-admin --fields id --format csv --noquotes; }
+if [ -z "$(admin_id)" ]; then
+	kc create clients -r maple -s clientId=maple-admin -s publicClient=false -s serviceAccountsEnabled=true \
+		-s standardFlowEnabled=false -s directAccessGrantsEnabled=false
+	echo "client maple-admin created"
+fi
+kc update "clients/$(admin_id)" -r maple -s publicClient=false -s serviceAccountsEnabled=true \
+	-s standardFlowEnabled=false -s directAccessGrantsEnabled=false -s "secret=$MAPLE_OIDC_ADMIN_CLIENT_SECRET"
+for role in view-users manage-users; do
+	kc add-roles -r maple --uusername service-account-maple-admin --cclientid realm-management --rolename "$role"
+done
+
+# Optional: users cannot open Keycloak's account console (no manage-account in default roles).
+# KEYCLOAK_CLOSE_ACCOUNT_CONSOLE=0 puts it back.
+if [ "${KEYCLOAK_CLOSE_ACCOUNT_CONSOLE:-1}" = 1 ]; then
+	kc remove-roles -r maple --rname default-roles-maple --cclientid account --rolename manage-account \
+		|| echo "warning: could not remove manage-account from default roles" >&2
+else
+	kc add-roles -r maple --rname default-roles-maple --cclientid account --rolename manage-account \
+		|| echo "warning: could not restore manage-account" >&2
 fi
 
 kc get roles/maple-root -r maple >/dev/null 2>&1 || kc create roles -r maple -s name=maple-root \

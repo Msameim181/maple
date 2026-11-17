@@ -7,6 +7,7 @@ import { button } from "@maple/views/ui/button"
 import { emptyMessage } from "@maple/views/ui/empty"
 import * as Field from "@maple/views/ui/field"
 import { field, type FieldIds, fieldLabel, input } from "@maple/views/ui/field"
+import { confirmDialog } from "@maple/views/ui/confirm-dialog"
 import { formDialog } from "@maple/views/ui/form-dialog"
 import { hstack } from "@maple/views/ui/stack"
 import { table, tableBody, tableCell, tableHead, tableHeader, tableRow } from "@maple/views/ui/table"
@@ -15,7 +16,7 @@ import type { PageViewInputs } from "../contract"
 import { dashboardPage } from "../kit/dashboard-page"
 import { settingsSection, settingsSections } from "../kit/settings-section"
 import type { BreadcrumbEntry } from "../../shell"
-import { type AdminOrg, type AdminUser, Message, type Model } from "./model"
+import { type AdminOrg, type AdminUser, type UnverifiedUser, Message, type Model } from "./model"
 import { isDeleteConfirmed } from "./update"
 
 type H = HtmlBuilder<Message>
@@ -121,6 +122,9 @@ const orgsSection = (h: H, model: Model, timeZone: string): Html =>
 		{
 			id: "admin-orgs",
 			title: "Organizations",
+			description: [
+				"You are the IT administrator (root). Root creates and deletes organizations and sees every user here. Each organization's admins manage the people inside it.",
+			],
 			padded: false,
 			actions: button(h, { attributes: [h.OnClick(Message.ClickedCreate())] }, ["Create organization"]),
 		},
@@ -179,7 +183,85 @@ const usersSection = (h: H, model: Model, timeZone: string): Html =>
 		),
 	])
 
+const unverifiedRow = (h: H, user: UnverifiedUser, model: Model, timeZone: string): Html =>
+	tableRow(h, [
+		tableCell(h, [user.email]),
+		tableCell(h, [user.name ?? ""]),
+		tableCell(h, [dateOf(user.createdAt, timeZone)]),
+		tableCell(h, [
+			hstack(h, { gap: "1", justify: "end" }, [
+				button(
+					h,
+					{
+						variant: "ghost",
+						size: "sm",
+						isLoading: model.resending.includes(user.email),
+						attributes: [
+							h.AriaLabel(`Resend verification to ${user.email}`),
+							h.OnClick(Message.ClickedResendVerification({ id: user.id, email: user.email })),
+						],
+					},
+					["Resend"],
+				),
+				button(
+					h,
+					{
+						variant: "ghost",
+						size: "sm",
+						attributes: [
+							h.AriaLabel(`Mark ${user.email} verified`),
+							h.OnClick(Message.ClickedMarkVerified({ id: user.id, email: user.email })),
+						],
+					},
+					["Mark verified"],
+				),
+			]),
+		]),
+	])
+
+const unverifiedSection = (h: H, model: Model, timeZone: string): Html =>
+	settingsSection(
+		h,
+		{
+			id: "admin-unverified",
+			title: "Pending verification",
+			description: [
+				"People who signed up but have not confirmed their email. They cannot sign in or join an organization until they do.",
+			],
+			padded: false,
+		},
+		[
+			rowsOr(h, model.unverified, "pending users", (users) =>
+				table(h, { ariaLabel: "Pending verification" }, [
+					tableHeader(h, [
+						tableRow(h, [
+							tableHead(h, ["Email"]),
+							tableHead(h, ["Name"]),
+							tableHead(h, ["Requested"]),
+							tableHead(h, []),
+						]),
+					]),
+					tableBody(
+						h,
+						Arr.map(users, (user) => unverifiedRow(h, user, model, timeZone)),
+					),
+				]),
+			),
+		],
+	)
+
 const dialogs = (h: H, model: Model): ReadonlyArray<Html> => [
+	confirmDialog(h, {
+		slotId: "admin-mark-verified",
+		model: model.verifyDialog,
+		toParentMessage: (message) => Message.GotVerifyDialogMessage({ message }),
+		title: "Mark email as verified?",
+		description: `This says you know ${model.verifying?.email ?? "this person"} owns that address. They can sign in right away and will join every organization that invited it.`,
+		confirmLabel: "Mark verified",
+		tone: "default",
+		isPending: model.isVerifying,
+		onConfirm: Message.ClickedConfirmMarkVerified(),
+	}),
 	formDialog(h, {
 		slotId: "admin-create-org",
 		model: model.createDialog,
@@ -268,6 +350,7 @@ export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, 
 	return dashboardPage(h, { title: "Admin", width: "settings" }, [
 		settingsSections(h, [
 			orgsSection(h, model, timeZone),
+			unverifiedSection(h, model, timeZone),
 			usersSection(h, model, timeZone),
 			...dialogs(h, model),
 		]),

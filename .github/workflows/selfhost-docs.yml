@@ -1,0 +1,44 @@
+name: Self-host docs
+
+on:
+  push:
+    branches: [selfhost]
+    paths:
+      - "apps/landing/src/content/docs/self-hosting/multi-tenant/**"
+      - "deploy/docker/mkdocs.yml"
+      - "deploy/docker/scripts/build-docs.sh"
+      - ".github/workflows/selfhost-docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: selfhost-docs
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install mkdocs-material==9.5.50
+      - run: ./deploy/docker/scripts/build-docs.sh
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: deploy/docker/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

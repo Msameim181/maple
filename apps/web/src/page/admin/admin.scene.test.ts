@@ -4,7 +4,7 @@ import { Command, expect, given, role, scene, text, withViewInputs } from "foldk
 import { describe, expect as expectVitest, test } from "vitest"
 import type { PageContext } from "../contract"
 import { Message, type Model } from "./model"
-import { init, LoadOrgs, LoadUsers, update } from "./update"
+import { init, LoadOrgs, LoadUnverified, LoadUsers, update } from "./update"
 import { view } from "./view"
 import * as Field from "@maple/views/ui/field"
 
@@ -47,6 +47,7 @@ describe("/admin", () => {
 		expectVitest(Arr.map(rootStep.commands ?? [], (command) => command.name)).toEqual([
 			LoadOrgs.name,
 			LoadUsers.name,
+			LoadUnverified.name,
 		])
 		const asking = updateAdmin(withUsers.model, Message.ClickedDelete({ id: "acme" })).model
 		const mistyped = updateAdmin(
@@ -65,5 +66,30 @@ describe("/admin", () => {
 			expect(role("button", { name: "Delete acme" })).toExist(),
 			Command.expectNone(),
 		)
+	})
+
+	test("pending verification: resend is guarded, mark verified asks first", () => {
+		const root = updateAdmin(init(undefined, context).model, Message.CompletedLoadViewer({ isRoot: true })).model
+		const loaded = updateAdmin(
+			root,
+			Message.CompletedLoadUnverified({
+				result: Result.succeed([{ id: "u1", email: "ada@x.io", name: null, createdAt: 0 }]),
+			}),
+		).model
+		const resend = updateAdmin(loaded, Message.ClickedResendVerification({ id: "u1", email: "ada@x.io" }))
+		expectVitest(resend.commands ?? []).toHaveLength(1)
+		expectVitest(
+			updateAdmin(resend.model, Message.ClickedResendVerification({ id: "u1", email: "ada@x.io" })).commands ?? [],
+		).toEqual([])
+		const asking = updateAdmin(loaded, Message.ClickedMarkVerified({ id: "u1", email: "ada@x.io" })).model
+		expectVitest(asking.verifyDialog.isOpen).toBe(true)
+		scene(
+			{ update: updateAdmin, view: adminView },
+			given(loaded),
+			expect(role("table", { name: "Pending verification" })).toExist(),
+			expect(role("button", { name: "Mark ada@x.io verified" })).toExist(),
+			Command.expectNone(),
+		)
+		expectVitest(updateAdmin(asking, Message.ClickedConfirmMarkVerified()).commands ?? []).toHaveLength(1)
 	})
 })

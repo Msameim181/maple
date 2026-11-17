@@ -1067,6 +1067,24 @@ const foldMessage = (model: Model, message: Message) =>
 		SucceededCheckSession: ({ orgId }) => signedIn(Option.some(orgId))(model),
 		FailedCheckSession: () => signedOut(model),
 		ChangedSelfHostedSession: () => ({ model, commands: [CheckSession()] }),
+		// A full load, so no tab keeps showing the previous user's or org's data.
+		ChangedSessionInOtherTab: ({ change }) =>
+			change === "SignedOut"
+				? model.session._tag === "SignedOut"
+					? { model }
+					: { model, commands: [LoadExternal({ href: "/sign-in" })] }
+				: {
+						model,
+						// Signed in elsewhere while this tab sat on `/sign-in`: go where it was headed.
+						commands: [
+							LoadExternal({
+								href:
+									model.route._tag === "SignIn"
+										? targetAfterSignIn(model.route)
+										: hrefOf(model.route),
+							}),
+						],
+					},
 		CompletedSaveSessionToken: () => ({ model, commands: [CheckSession()] }),
 		CompletedLoadClerk: ({ snapshot }) =>
 			appliedClerkSnapshot(snapshot, true)(modifyFields(model, { clerk: () => ClerkPhase.Loaded() })),

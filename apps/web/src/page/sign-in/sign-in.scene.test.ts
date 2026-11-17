@@ -189,4 +189,57 @@ describe("OIDC sign-in", () => {
 			expect(ssoButton).toBeEnabled(),
 		)
 	})
+
+	test("a callback this browser has no sign-in for starts a fresh one instead of failing", () => {
+		scene(
+			{ update, view },
+			...entered({ code: "abc", state: "from-another-browser" }),
+			Command.resolve(LoadOidcConfig, Message.LoadedOidcConfig({ oidc })),
+			Command.resolve(
+				CompleteOidcSignIn({ code: "abc", state: "from-another-browser" }),
+				Message.MissedSsoState({ oidc }),
+			),
+			Command.expectExact(BeginOidcSignIn(oidc)),
+			expect(ssoButton).toHaveAttr("data-loading", ""),
+			expect(role("alert")).not.toExist(),
+			Command.resolve(BeginOidcSignIn, Message.RedirectedToSso()),
+		)
+	})
+
+	test("a second unknown callback says the sign-in expired", () => {
+		scene(
+			{ update, view },
+			...entered({ code: "abc", state: "unknown" }),
+			Command.resolve(LoadOidcConfig, Message.LoadedOidcConfig({ oidc })),
+			Command.resolve(
+				CompleteOidcSignIn({ code: "abc", state: "unknown" }),
+				Message.FailedSignInWithSso({
+					failure: SignInFailure.Rejected({ message: "This sign-in expired. Sign in again." }),
+				}),
+			),
+			expectNoOutMessage(),
+			expect(role("alert")).toHaveText("This sign-in expired. Sign in again."),
+			expect(ssoButton).toBeEnabled(),
+		)
+	})
+
+	test("an unverified email asks the user to confirm it instead of reporting a failure", () => {
+		scene(
+			{ update, view },
+			...entered({ code: "abc", state: "s1" }),
+			Command.resolve(LoadOidcConfig, Message.LoadedOidcConfig({ oidc })),
+			Command.resolve(
+				CompleteOidcSignIn({ code: "abc", state: "s1" }),
+				Message.FailedSignInWithSso({ failure: SignInFailure.EmailNotVerified() }),
+			),
+			expectNoOutMessage(),
+			expect(role("alert")).not.toExist(),
+			expect(role("status")).toContainText("Verify your email"),
+			expect(role("status")).toContainText(
+				"Check your inbox for the confirmation link, then sign in again.",
+			),
+			expect(role("status")).toContainText("an administrator can resend it"),
+			expect(ssoButton).toBeEnabled(),
+		)
+	})
 })

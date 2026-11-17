@@ -573,8 +573,16 @@ const renderCollectorYaml = (input: {
  */
 const quoteYaml = (value: string): string => `"${Str.replace(/[\\"]/g, "\\$&")(value)}"`
 
-const normalizeHttpUrl = (raw: string): Effect.Effect<string, OrgClickHouseSettingsValidationError> =>
-	validateExternalUrl(raw).pipe(
+const normalizeHttpUrl = (
+	raw: string,
+	trustedHttpOrigin: string | undefined,
+): Effect.Effect<string, OrgClickHouseSettingsValidationError> =>
+	// The operator's own ClickHouse (`MAPLE_SELFHOST_CLICKHOUSE_URL`, e.g. `http://clickhouse:8123`)
+	// is private by design; every other URL must be a public host.
+	(URL.canParse(Str.trim(raw)) && new URL(Str.trim(raw)).origin === trustedHttpOrigin
+		? Effect.succeed(new URL(Str.trim(raw)))
+		: validateExternalUrl(raw)
+	).pipe(
 		Effect.flatMap((url) =>
 			url.username.length > 0 || url.password.length > 0
 				? Effect.fail(
@@ -1099,7 +1107,7 @@ export class OrgClickHouseSettingsService extends Context.Service<
 			yield* Effect.annotateCurrentSpan("tenant.userId", userId)
 			yield* requireWarehouseOwner(roles)
 
-			const url = yield* normalizeHttpUrl(payload.url)
+			const url = yield* normalizeHttpUrl(payload.url, trustedHttpOrigin)
 			const user = Str.trim(payload.user)
 			const dbName = Str.trim(payload.database)
 			if (user.length === 0) {

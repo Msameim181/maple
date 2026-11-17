@@ -231,6 +231,36 @@ export interface EnvConfig {
 	readonly MAPLE_OIDC_ACCOUNT_URL: Option.Option<string>
 	/** The IdP role (realm or client) that marks IT staff, who get Maple's `root`. */
 	readonly MAPLE_OIDC_ROOT_ROLE: string
+	/**
+	 * The ID token `iss` every sign-in must carry (e.g. `https://auth.example.com/realms/maple`).
+	 * Unset: `iss` is not checked (the token still comes straight from `MAPLE_OIDC_TOKEN_URL`).
+	 */
+	readonly MAPLE_OIDC_ISSUER: Option.Option<string>
+	/**
+	 * The IdP's end-session endpoint. Maple's logout POSTs `client_id` + `refresh_token` here so
+	 * the IdP session ends too. Unset: logout only revokes Maple's own session.
+	 */
+	readonly MAPLE_OIDC_LOGOUT_URL: Option.Option<string>
+	/**
+	 * Lifetime of one OIDC session token, seconds (default 600, clamped to 120..3600). Renewal
+	 * re-checks the IdP and membership at most this often; stateless Workers honour a token
+	 * until it expires, so this is also the longest a logged-out token keeps working there.
+	 */
+	readonly MAPLE_OIDC_SESSION_TTL_SECONDS: number
+	/** Absolute lifetime of one OIDC sign-in, seconds (default 43200, clamped to 3600..604800). */
+	readonly MAPLE_OIDC_SESSION_MAX_LIFETIME_SECONDS: number
+	/**
+	 * HMAC key for self-hosted session tokens (root-password and OIDC). Unset: falls back to
+	 * `MAPLE_ROOT_PASSWORD`. Every Worker that verifies sessions must see the same value.
+	 */
+	readonly MAPLE_SESSION_SECRET: Option.Option<Redacted.Redacted>
+	/**
+	 * Keycloak Admin REST base for the realm (e.g. `http://keycloak:8080/admin/realms/maple`) and the
+	 * confidential service-account client that calls it; IT's resend/mark-verified need URL + secret.
+	 */
+	readonly MAPLE_OIDC_ADMIN_URL: Option.Option<string>
+	readonly MAPLE_OIDC_ADMIN_CLIENT_ID: string
+	readonly MAPLE_OIDC_ADMIN_CLIENT_SECRET: Option.Option<Redacted.Redacted>
 	/** The self-hosted ClickHouse each directory org gets its own database and user on. */
 	readonly MAPLE_SELFHOST_CLICKHOUSE_URL: Option.Option<string>
 	/** deploy/docker's in-container HTTP-to-SMTP bridge; when set, email goes there, not to the binding. */
@@ -240,6 +270,13 @@ export interface EnvConfig {
 }
 
 const portConfig = Config.Number("PORT").pipe(Config.withDefault(3472))
+
+/** Whole seconds, defaulted and held inside [min, max] so a typo cannot disable expiry. */
+const clampedSeconds = (key: string, fallback: number, min: number, max: number) =>
+	Config.Number(key).pipe(
+		Config.withDefault(fallback),
+		Config.map((value) => Math.min(max, Math.max(min, Math.floor(value)))),
+	)
 
 const envConfig = Config.all({
 	PORT: portConfig,
@@ -412,6 +449,19 @@ const envConfig = Config.all({
 	MAPLE_OIDC_CLIENT_ID: optionalString("MAPLE_OIDC_CLIENT_ID"),
 	MAPLE_OIDC_ACCOUNT_URL: optionalString("MAPLE_OIDC_ACCOUNT_URL"),
 	MAPLE_OIDC_ROOT_ROLE: stringWithDefault("MAPLE_OIDC_ROOT_ROLE", "maple-root"),
+	MAPLE_OIDC_ISSUER: optionalString("MAPLE_OIDC_ISSUER"),
+	MAPLE_OIDC_LOGOUT_URL: optionalString("MAPLE_OIDC_LOGOUT_URL"),
+	MAPLE_OIDC_SESSION_TTL_SECONDS: clampedSeconds("MAPLE_OIDC_SESSION_TTL_SECONDS", 600, 120, 3600),
+	MAPLE_OIDC_SESSION_MAX_LIFETIME_SECONDS: clampedSeconds(
+		"MAPLE_OIDC_SESSION_MAX_LIFETIME_SECONDS",
+		43200,
+		3600,
+		604800,
+	),
+	MAPLE_SESSION_SECRET: optionalRedacted("MAPLE_SESSION_SECRET"),
+	MAPLE_OIDC_ADMIN_URL: optionalString("MAPLE_OIDC_ADMIN_URL"),
+	MAPLE_OIDC_ADMIN_CLIENT_ID: stringWithDefault("MAPLE_OIDC_ADMIN_CLIENT_ID", "maple-admin"),
+	MAPLE_OIDC_ADMIN_CLIENT_SECRET: optionalRedacted("MAPLE_OIDC_ADMIN_CLIENT_SECRET"),
 	MAPLE_SELFHOST_CLICKHOUSE_URL: optionalString("MAPLE_SELFHOST_CLICKHOUSE_URL"),
 	MAPLE_SMTP_BRIDGE_URL: optionalString("MAPLE_SMTP_BRIDGE_URL"),
 	MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: optionalString("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER"),

@@ -26,6 +26,15 @@ export const AdminUser = Schema.Struct({
 })
 export type AdminUser = typeof AdminUser.Type
 
+export const UnverifiedUser = Schema.Struct({
+	id: Schema.String,
+	email: Schema.String,
+	name: Schema.NullOr(Schema.String),
+	createdAt: Schema.Number,
+})
+export type UnverifiedUser = typeof UnverifiedUser.Type
+
+export const UnverifiedData = AsyncData.Schema(Schema.Array(UnverifiedUser), LoadFailure)
 export const OrgsData = AsyncData.Schema(Schema.Array(AdminOrg), LoadFailure)
 export const UsersData = AsyncData.Schema(Schema.Array(AdminUser), LoadFailure)
 
@@ -35,6 +44,12 @@ export const Model = Schema.Struct({
 	nowMs: Schema.Number,
 	orgs: OrgsData.schema,
 	users: UsersData.schema,
+	unverified: UnverifiedData.schema,
+	/** Emails whose verification message is being sent again. */
+	resending: Schema.Array(Schema.String),
+	verifying: Schema.NullOr(Schema.Struct({ id: Schema.String, email: Schema.String })),
+	verifyDialog: Dialog.Model,
+	isVerifying: Schema.Boolean,
 	createDialog: Dialog.Model,
 	createId: Field.Model,
 	createName: Field.Model,
@@ -58,6 +73,13 @@ export const Message = defineMessageUnion({
 	CompletedLoadViewer: { isRoot: Schema.Boolean },
 	CompletedLoadOrgs: { result: Schema.Result(Schema.Array(AdminOrg), LoadFailure) },
 	CompletedLoadUsers: { result: Schema.Result(Schema.Array(AdminUser), LoadFailure) },
+	CompletedLoadUnverified: { result: Schema.Result(Schema.Array(UnverifiedUser), LoadFailure) },
+	ClickedResendVerification: { id: Schema.String, email: Schema.String },
+	CompletedResendVerification: { email: Schema.String, ...done },
+	ClickedMarkVerified: { id: Schema.String, email: Schema.String },
+	GotVerifyDialogMessage: { message: Dialog.Message },
+	ClickedConfirmMarkVerified: {},
+	CompletedMarkVerified: { email: Schema.String, ...done },
 	ClickedCreate: {},
 	GotCreateDialogMessage: { message: Dialog.Message },
 	GotCreateIdMessage: { message: Field.Message },

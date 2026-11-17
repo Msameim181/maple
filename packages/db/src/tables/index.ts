@@ -28,7 +28,13 @@ import { DashboardShares } from "./dashboard-shares"
 import { Dashboards, DashboardVersions } from "./dashboards"
 import { DeviceCredentials, DeviceProofReplays } from "./device-credentials"
 import { DigestSubscriptions } from "./digest"
-import { DirectoryInvitations, DirectoryMembers, DirectoryOrgs, DirectoryUsers } from "./directory"
+import {
+	DirectoryInvitations,
+	DirectoryMembers,
+	DirectoryOrgs,
+	DirectorySessions,
+	DirectoryUsers,
+} from "./directory"
 import {
 	Actors,
 	ErrorIssues,
@@ -206,6 +212,7 @@ export const allTables: ReadonlyArray<PgSchemaTable<string, ColumnDefs>> = [
 	DirectoryUsers,
 	DirectoryMembers,
 	DirectoryInvitations,
+	DirectorySessions,
 	Actors,
 	ErrorIssues,
 	ErrorFingerprintCandidates,

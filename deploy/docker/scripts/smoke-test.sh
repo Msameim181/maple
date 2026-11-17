@@ -15,6 +15,12 @@ fail() { echo "FAIL $1" >&2; exit 1; }
 root=$(c "$api/api/auth/login" -H 'content-type: application/json' -d "{\"password\":\"$MAPLE_ROOT_PASSWORD\"}" | json token)
 [ -n "$root" ] && pass "root login" || fail "root login"
 
+# Edge lockdown: internal scraper endpoints and Keycloak admin are not reachable from outside.
+code() { curl -s -o /dev/null -w '%{http_code}' ${CURL_OPTS:-} "$@"; }
+[ "$(code "$api/api/internal/uptime-targets")" = 404 ] && pass "API_HOST hides /api/internal" || fail "/api/internal exposed"
+[ "$(code "https://$AUTH_HOST/admin/")" = 404 ] && pass "AUTH_HOST hides /admin" || fail "/admin exposed"
+[ "$(code "https://$STATUS_HOST/")" != 000 ] && pass "STATUS_HOST answers" || fail "STATUS_HOST unreachable"
+
 auth() { echo "authorization: Bearer $1"; }
 create_org() {
 	c "$api/api/directory/orgs" -H "$(auth "$root")" -H 'content-type: application/json' \

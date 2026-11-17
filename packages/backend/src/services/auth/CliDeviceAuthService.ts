@@ -13,6 +13,7 @@ import {
 	CliDeviceRateLimitError,
 	CliDeviceStartResponse,
 	ApiKeyId,
+	OrganizationAccessDeniedError,
 	type OrgId,
 	type RoleName,
 	type UserId,
@@ -28,6 +29,7 @@ import { Env } from "@maple/backend/platform/Env"
 import { openSecret, sealSecret, secretKeyringFromEnv } from "@maple/backend/platform/SecretBox"
 import { cliDeviceTokenSlot } from "@maple/backend/platform/secret-slots"
 import { CliAuthRateLimit } from "@maple/backend/platform/bindings"
+import { directoryAccessIsLive, oidcEnabled } from "@maple/backend/services/directory/live-access"
 
 const DEVICE_TTL_SECONDS = 15 * 60
 /**
@@ -103,6 +105,7 @@ export class CliDeviceAuthService extends Context.Service<
 			| CliDeviceExpiredError
 			| CliDeviceConflictError
 			| CliDevicePersistenceError
+			| OrganizationAccessDeniedError
 		>
 		readonly deny: (
 			userCode: string,
@@ -119,6 +122,22 @@ export class CliDeviceAuthService extends Context.Service<
 		const database = yield* Database
 		const dbExecute = makeDbExecute(database, "CliDeviceAuthService", persistenceError)
 		const env = yield* Env
+		// Self-hosted OIDC: a session token outlives a removal by up to its TTL, so minting a
+		// long-lived key from one re-reads the directory first. Clerk mode re-checks its own way.
+		const liveDirectoryAccess = (access: Parameters<typeof directoryAccessIsLive>[1]) =>
+			oidcEnabled(env) ? dbExecute((db) => directoryAccessIsLive(db, access)) : Effect.succeed(true)
+		const requireLiveDirectoryAccess = (access: Parameters<typeof directoryAccessIsLive>[1]) =>
+			liveDirectoryAccess(access).pipe(
+				Effect.flatMap((live) =>
+					live
+						? Effect.void
+						: Effect.fail(
+								new OrganizationAccessDeniedError({
+									message: "You no longer have access to this organization",
+								}),
+							),
+				),
+			)
 		// Absent outside the api Worker (tests, the CLI): the check then passes.
 		const rateLimit = yield* Effect.serviceOption(CliAuthRateLimit)
 		const apiKeyHmacKey = yield* ingestKeyLookupHmacKey(
@@ -236,6 +255,7 @@ export class CliDeviceAuthService extends Context.Service<
 			if (row.approvedAt !== null || row.deniedAt !== null) {
 				return yield* new CliDeviceConflictError({ message: "CLI login code was already used" })
 			}
+			yield* requireLiveDirectoryAccess(identity)
 			const now = yield* Clock.currentTimeMillis
 			const updated = yield* dbExecute((db) =>
 				db.run(
@@ -330,6 +350,13 @@ export class CliDeviceAuthService extends Context.Service<
 				})
 			}
 
+			// The approval may predate a removal: no key for someone who has since lost the access.
+			const live = yield* liveDirectoryAccess({
+				orgId: approvedOrgId,
+				userId: approvedUserId,
+				roles: approvedRoles,
+			})
+			if (!live) return new CliDeviceDeniedResponse({ status: "denied" })
 			const apiKeyId = decodeApiKeyId(randomUUID())
 			const rawToken = generateApiKey()
 			// Sealed for the row the claiming UPDATE below targets.

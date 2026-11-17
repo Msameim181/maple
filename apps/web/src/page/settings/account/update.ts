@@ -1,13 +1,19 @@
 import { readClock } from "@maple/views/data/timing"
 import { isClerkAuthEnabled } from "../../../platform/auth-mode"
 import { Command } from "foldkit"
-import { Effect, Option } from "effect"
-import { DirectoryMe } from "../../../data/directory-me"
+import { Effect, Option, Result } from "effect"
+import { load } from "foldkit/navigation"
+import { settleTo } from "@maple/views/data/load-failure"
+import { AsyncData } from "foldkit"
+import { MapleApiClient } from "../../../platform/api-clients"
+import { clearSessionToken } from "../../../platform/auth-api"
+import { beginOidcAccountAction } from "../../../platform/oidc"
+import { apiErrorMessage, DirectoryMe } from "../../../data/directory-me"
 import { MapleAuthApi } from "../../../platform/auth-api"
 import { REVERIFICATION_CANCELLED } from "../../../platform/clerk"
 import { AppRoute, hrefOf } from "../../../route"
 import { type PageContext, PageOutMessage, type PageReturn } from "../../contract"
-import { Message, type Model, type TabModel } from "./model"
+import { AccountAction, Message, type Model, type TabModel } from "./model"
 import { type AccountTab, resolveActiveAccountTab } from "./nav"
 import * as Profile from "./profile/update"
 import * as EmailPreferences from "./email-preferences/update"
@@ -23,17 +29,60 @@ type AccountRoute = Extract<AppRoute, { readonly _tag: "Account" }>
 
 const ReadAccountClock = readClock("ReadAccountClock", Message.ReadClock)
 
-/** Signed in through the directory: the provider's account page (`OidcConfig.accountUrl`). */
-export const LoadAccountUrl = Command.define("LoadAccountUrl", {
-	messages: [Message.LoadedAccountUrl],
+/** Signed in through the directory: who they are, the provider's endpoints, and (root only) its console. */
+export const LoadAccount = Command.define("LoadAccount", {
+	messages: [Message.LoadedAccount],
 	execute: Effect.gen(function* () {
 		const viewer = yield* (yield* DirectoryMe).get
-		if (Option.isNone(viewer)) return Message.LoadedAccountUrl({ url: null })
+		if (Option.isNone(viewer)) return Message.LoadedAccount({ account: null })
 		const config = yield* (yield* MapleAuthApi).oidcConfig
-		return Message.LoadedAccountUrl({
-			url: config.enabled && config.accountUrl !== "" ? config.accountUrl : null,
+		if (!config.enabled) return Message.LoadedAccount({ account: null })
+		const me = yield* (yield* MapleApiClient).directory.me()
+		return Message.LoadedAccount({
+			account: {
+				person: { name: me.user.name, email: me.user.email, isRoot: me.isRoot },
+				oidc: { authorizeUrl: config.authorizeUrl, clientId: config.clientId },
+				// The identity provider's URL is for IT only.
+				accountUrl: me.isRoot && config.accountUrl !== "" ? config.accountUrl : null,
+			},
 		})
-	}).pipe(Effect.orElseSucceed(() => Message.LoadedAccountUrl({ url: null }))),
+	}).pipe(Effect.orElseSucceed(() => Message.LoadedAccount({ account: null }))),
+})
+
+export const LoadSessions = Command.define("LoadAccountSessions", {
+	messages: [Message.CompletedLoadSessions],
+	execute: Effect.gen(function* () {
+		const client = yield* MapleApiClient
+		return (yield* client.auth.listSessions()).sessions
+	}).pipe(settleTo((result) => Message.CompletedLoadSessions({ result }))),
+})
+
+/** PKCE sign-in with a Keycloak Application-Initiated Action (`kc_action`), landing back on the account page. */
+export const BeginAccountAction = Command.define("BeginAccountAction", {
+	args: { action: AccountAction },
+	messages: [Message.FailedAccountAction],
+	execute: ({ action }) =>
+		beginOidcAccountAction(action).pipe(Effect.as(Message.FailedAccountAction())),
+})
+
+/** Ends every session here and at the provider, then drops the local token and goes to sign-in. */
+export const SignOutEverywhere = Command.define("SignOutEverywhere", {
+	messages: [Message.CompletedSignOutEverywhere],
+	execute: Effect.gen(function* () {
+		const client = yield* MapleApiClient
+		yield* client.auth.logoutAll()
+	}).pipe(
+		Effect.andThen(clearSessionToken),
+		Effect.andThen(load("/sign-in")),
+		Effect.as(Message.CompletedSignOutEverywhere({ result: Result.succeed(undefined) })),
+		Effect.catch((error) =>
+			Effect.succeed(
+				Message.CompletedSignOutEverywhere({
+					result: Result.fail(apiErrorMessage(error, "Couldn't sign you out everywhere")),
+				}),
+			),
+		),
+	),
 })
 
 const toSettings = PageOutMessage.RequestedNavigation({
@@ -138,15 +187,27 @@ const initTab = (model: Model, tab: AccountTab, _context: PageContext): Return =
 /** Self-hosted links the identity provider's account page, or has nothing here and goes to `/settings`. */
 const enter = (model: Model, context: PageContext): Return => {
 	if (!isClerkAuthEnabled)
-		return model.accountUrl === null
-			? { model: { ...model, tab: null }, commands: [LoadAccountUrl()] }
+		return model.person === null
+			? { model: { ...model, tab: null }, commands: [LoadAccount()] }
 			: { model }
 	const tab = activeTabOf(model)
 	return isTabCurrent(model.tab, tab) ? { model } : initTab(model, tab, context)
 }
 
 export const init = (route: AccountRoute, context: PageContext): Return => {
-	const entered = enter({ search: route.search, nowMs: 0, tab: null, accountUrl: null }, context)
+	const entered = enter(
+		{
+			search: route.search,
+			nowMs: 0,
+			tab: null,
+			person: null,
+			oidc: null,
+			accountUrl: null,
+			sessions: AsyncData.Loading(),
+			isSigningOut: false,
+		},
+		context,
+	)
 	return { ...entered, commands: [ReadAccountClock(), ...(entered.commands ?? [])] }
 }
 
@@ -167,8 +228,44 @@ export const update = (model: Model, message: Message, _context: PageContext): R
 const updateTab = (model: Model, message: Message): Return =>
 	Message.match<Return>(message, {
 		ReadClock: ({ nowMs }) => ({ model: { ...model, nowMs } }),
-		LoadedAccountUrl: ({ url }) =>
-			url === null ? { model, outMessage: toSettings } : { model: { ...model, accountUrl: url } },
+		LoadedAccount: ({ account }) =>
+			account === null
+				? { model, outMessage: toSettings }
+				: {
+						model: {
+							...model,
+							person: account.person,
+							oidc: account.oidc,
+							accountUrl: account.accountUrl,
+						},
+						commands: [LoadSessions()],
+					},
+		CompletedLoadSessions: ({ result }) => ({
+			model: { ...model, sessions: AsyncData.settle(model.sessions, result) },
+		}),
+		ClickedAccountAction: ({ action }) =>
+			model.oidc === null
+				? { model }
+				: { model, commands: [BeginAccountAction({ action })] },
+		FailedAccountAction: () => ({
+			model,
+			outMessage: PageOutMessage.RequestedToast({
+				type: "error",
+				title: "Couldn't open the sign-in page",
+				description: "",
+			}),
+		}),
+		ClickedSignOutEverywhere: () =>
+			model.isSigningOut ? { model } : { model: { ...model, isSigningOut: true }, commands: [SignOutEverywhere()] },
+		CompletedSignOutEverywhere: ({ result }) =>
+			Result.match(result, {
+				// The navigation to /sign-in is already under way.
+				onSuccess: () => ({ model }),
+				onFailure: (title) => ({
+					model: { ...model, isSigningOut: false },
+					outMessage: PageOutMessage.RequestedToast({ type: "error", title, description: "" }),
+				}),
+			}),
 		ClickedTab: ({ tab }) => ({
 			model,
 			outMessage: PageOutMessage.RequestedNavigation({

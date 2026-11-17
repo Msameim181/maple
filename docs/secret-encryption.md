@@ -22,7 +22,9 @@ slot, and bound to the slot, the org and the row.
   open. Someone with database write access but no key therefore cannot point Maple at another
   org's credentials.
 - **Exceptions**: `cli_device_authorizations.token` has no org until it is approved, so it
-  binds to the row's primary key alone. `cloudflare_logpush_connectors.secret_*` is not sealed
+  binds to the row's primary key alone. `directory_sessions.refresh_token` (the self-hosted
+  IdP refresh token) belongs to a sign-in that spans orgs, so it binds to the row's `user_id`
+  and `id`. `cloudflare_logpush_connectors.secret_*` is not sealed
   through `SecretBox`: nothing reads or writes those three columns.
 - **Key id**: `HKDF-SHA256(master, info = "maple/secret-box/v2/key-id")`, first 6 bytes,
   base64url. It names the master key that sealed the value and reveals nothing about it.

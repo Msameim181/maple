@@ -4,7 +4,6 @@ name: maple-selfhost
 x-maple-env: &maple-env
   MAPLE_PG_URL: postgres://maple:${POSTGRES_PASSWORD}@postgres:5432/maple?sslmode=disable
   MAPLE_ENVIRONMENT: selfhost
-  MAPLE_ROOT_PASSWORD: ${MAPLE_ROOT_PASSWORD}
   MAPLE_DEFAULT_ORG_ID: default
   MAPLE_INGEST_KEY_ENCRYPTION_KEY: ${MAPLE_INGEST_KEY_ENCRYPTION_KEY}
   MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY: ${MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY}
@@ -30,7 +29,7 @@ services:
     image: electricsql/electric:latest
     environment:
       DATABASE_URL: postgres://maple:${POSTGRES_PASSWORD}@postgres:5432/maple?sslmode=disable
-      ELECTRIC_INSECURE: "true" # internal network only; electric-sync authenticates every shape
+      ELECTRIC_SECRET: ${ELECTRIC_SECRET} # shape requests need it; only electric-sync (maple) holds it
       ELECTRIC_MANUAL_TABLE_PUBLISHING: "true"
     depends_on:
       postgres: { condition: service_healthy }
@@ -106,7 +105,19 @@ services:
       target: maple
     environment:
       <<: *maple-env
+      MAPLE_ROOT_PASSWORD: ${MAPLE_ROOT_PASSWORD}
       ELECTRIC_URL: http://electric:3000
+      ELECTRIC_SECRET: ${ELECTRIC_SECRET}
+      SD_INTERNAL_TOKEN: ${SD_INTERNAL_TOKEN}
+      MAPLE_STATUS_PAGE_BASE_URL: https://${STATUS_HOST}
+      MAPLE_SESSION_SECRET: ${MAPLE_SESSION_SECRET}
+      MAPLE_OIDC_SESSION_TTL_SECONDS: ${MAPLE_OIDC_SESSION_TTL_SECONDS:-600}
+      MAPLE_OIDC_SESSION_MAX_LIFETIME_SECONDS: ${MAPLE_OIDC_SESSION_MAX_LIFETIME_SECONDS:-43200}
+      MAPLE_OIDC_ISSUER: https://${AUTH_HOST}/realms/maple
+      MAPLE_OIDC_LOGOUT_URL: http://keycloak:8080/realms/maple/protocol/openid-connect/logout
+      MAPLE_OIDC_ADMIN_URL: http://keycloak:8080/admin/realms/maple
+      MAPLE_OIDC_ADMIN_CLIENT_ID: maple-admin
+      MAPLE_OIDC_ADMIN_CLIENT_SECRET: ${MAPLE_OIDC_ADMIN_CLIENT_SECRET}
       MAPLE_API_BASE_URL: https://${API_HOST}
       MAPLE_APP_BASE_URL: https://${APP_HOST}
       MAPLE_ELECTRIC_SYNC_URL: https://${SYNC_HOST}
@@ -137,6 +148,20 @@ services:
       electric: { condition: service_started }
     restart: unless-stopped
 
+  # Runs the uptime monitors and scrape targets. Reaches the API on the compose network, never
+  # through Caddy (which hides /api/internal/*).
+  scraper:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+      target: scraper
+    environment:
+      MAPLE_API_URL: http://maple:8701
+      MAPLE_INGEST_URL: http://ingest:3474
+      SD_INTERNAL_TOKEN: ${SD_INTERNAL_TOKEN}
+    depends_on: [maple, ingest]
+    restart: unless-stopped
+
   caddy:
     build:
       context: ../..
@@ -146,6 +171,7 @@ services:
         PUBLIC_API_URL: https://${API_HOST}
         PUBLIC_SYNC_URL: https://${SYNC_HOST}
         PUBLIC_INGEST_URL: https://${INGEST_HOST}
+        PUBLIC_STATUS_URL: https://${STATUS_HOST}
         WEB_INGEST_KEY: ${MAPLE_WEB_INGEST_KEY:-}
     environment:
       ACME_EMAIL: ${ACME_EMAIL}
@@ -154,6 +180,7 @@ services:
       SYNC_HOST: ${SYNC_HOST}
       AUTH_HOST: ${AUTH_HOST}
       INGEST_HOST: ${INGEST_HOST}
+      STATUS_HOST: ${STATUS_HOST}
     ports:
       - "80:80"
       - "443:443"

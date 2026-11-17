@@ -12,6 +12,7 @@ import { HttpServerRequest } from "effect/http"
 import { ApiKeysService } from "@maple/backend/services/org/ApiKeysService"
 import { AuthService } from "@maple/backend/services/auth/AuthService"
 import { CliDeviceAuthService } from "@maple/backend/services/auth/CliDeviceAuthService"
+import { DirectoryService } from "@maple/backend/services/directory/DirectoryService"
 import { McpOAuthService } from "@maple/backend/services/auth/McpOAuthService"
 import { PreviewSignInService } from "@maple/backend/services/auth/PreviewSignInService"
 
@@ -26,8 +27,15 @@ export const HttpAuthPublicLive = HttpApiBuilder.group(MapleApi, "authPublic", (
 		const authService = yield* AuthService
 		const cliAuth = yield* CliDeviceAuthService
 		const previewSignIn = yield* PreviewSignInService
+		const directory = yield* DirectoryService
 		return handlers
 			.handle("login", ({ payload }) => authService.loginSelfHosted(payload.password))
+			// No middleware here: the directory verifies the bearer itself, expired-but-signed included.
+			.handle("logout", () =>
+				Effect.flatMap(HttpServerRequest.HttpServerRequest, (request) =>
+					directory.logout(bearerToken(request.headers.authorization)),
+				),
+			)
 			.handle("cliDeviceStart", ({ payload }) =>
 				Effect.gen(function* () {
 					const request = yield* HttpServerRequest.HttpServerRequest
@@ -46,8 +54,14 @@ export const HttpAuthLive = HttpApiBuilder.group(MapleApi, "auth", (handlers) =>
 	Effect.gen(function* () {
 		const auth = yield* AuthService
 		const apiKeys = yield* ApiKeysService
+		const directory = yield* DirectoryService
+		const callerBearer = Effect.map(HttpServerRequest.HttpServerRequest, (request) =>
+			bearerToken(request.headers.authorization),
+		)
 		return handlers
 			.handle("session", () => CurrentTenant.Context)
+			.handle("logoutAll", () => Effect.flatMap(callerBearer, directory.logoutAll))
+			.handle("listSessions", () => Effect.flatMap(callerBearer, directory.listSessions))
 			.handle("sessionRefresh", () =>
 				Effect.gen(function* () {
 					const request = yield* HttpServerRequest.HttpServerRequest

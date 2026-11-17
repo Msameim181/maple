@@ -156,4 +156,38 @@ const alertNotification: Template = {
 	fragments: { detailRow: row(C.detailRow) },
 }
 
-export const TEMPLATES: ReadonlyArray<Template> = [weeklyDigest, webAnalyticsDigest, alertNotification]
+const invitation: Template = {
+	output: "invitation.ts",
+	page: (h) =>
+		C.shell(h, [
+			C.header(h, "[[brandName]]", ["Invitation"]),
+			C.divider(h),
+			C.section(h, "px-6 pt-6", [
+				h.p([h.Class("m-0 font-mono text-xs leading-snug text-maple-fg-muted")], ["[[lead]]"]),
+				h.p(
+					[h.Class("m-0 mt-2 font-mono text-[22px] font-semibold leading-snug text-maple-fg")],
+					["[[orgName]]"],
+				),
+				h.p(
+					[h.Class("m-0 mt-3 font-mono text-xs leading-snug text-maple-fg-muted")],
+					["Sign in or create your account with this email address: [[recipient]]"],
+				),
+			]),
+			C.section(h, "px-6 pb-2 pt-6", [C.cta(h, "[[signInUrl]]", "Accept invitation →")]),
+			C.section(h, "px-6 pt-3", [
+				h.p(
+					[h.Class("m-0 break-all font-mono text-[11px] leading-snug text-maple-fg-dim")],
+					["Button not working? Open this link: [[signInUrl]]"],
+				),
+			]),
+			C.footer(h, ["[[brandName]] · You got this because someone invited this address. If you do not know them, ignore it."]),
+		]),
+	fragments: {},
+}
+
+export const TEMPLATES: ReadonlyArray<Template> = [
+	weeklyDigest,
+	webAnalyticsDigest,
+	alertNotification,
+	invitation,
+]

@@ -14,7 +14,11 @@ import { Dom, Subscription } from "foldkit"
 import { Message } from "./message"
 import type { Resources } from "./platform/resources"
 import type { Model } from "./model"
-import { SELF_HOSTED_AUTH_EVENT } from "./platform/auth-api"
+import {
+	SELF_HOSTED_AUTH_EVENT,
+	SELF_HOSTED_TOKEN_STORAGE_KEY,
+	storedSessionChangeOf,
+} from "./platform/auth-api"
 import { readEffectiveTimeZone, TIME_ZONE_PREFERENCE_EVENT, TIMEZONE_STORAGE_KEY } from "./platform/time-zone"
 import { rendersShell } from "./page/chrome"
 import * as Preload from "./page/preload"
@@ -57,7 +61,30 @@ const unloadPrompt: Stream.Stream<Message> = Dom.streamFromEventFilterMap({
 	},
 })
 
-const selfHostedAuthTarget: Dom.TypedEventTarget<{ [SELF_HOSTED_AUTH_EVENT]: Event }> = window
+const selfHostedAuthTarget: Dom.TypedEventTarget<{ [SELF_HOSTED_AUTH_EVENT]: Event; storage: StorageEvent }> =
+	window
+
+/**
+ * This tab's renewal ended or replaced the session, or another tab's `storage` write of the token
+ * signed out or switched user or org. Another tab's plain renewal emits nothing.
+ */
+export const selfHostedSessionChanges: Stream.Stream<Message> = Stream.merge(
+	Dom.streamFromEvent({
+		target: selfHostedAuthTarget,
+		type: SELF_HOSTED_AUTH_EVENT,
+		mapEvent: () => Message.ChangedSelfHostedSession(),
+	}),
+	Dom.streamFromEventFilterMap({
+		target: selfHostedAuthTarget,
+		type: "storage",
+		filterMapEvent: (event): Option.Option<Message> =>
+			event.key === SELF_HOSTED_TOKEN_STORAGE_KEY
+				? Option.map(storedSessionChangeOf(event.oldValue, event.newValue), (change) =>
+						Message.ChangedSessionInOtherTab({ change }),
+					)
+				: Option.none(),
+	}),
+)
 
 const timeZoneTarget: Dom.TypedEventTarget<{ [TIME_ZONE_PREFERENCE_EVENT]: Event; storage: StorageEvent }> =
 	window
@@ -99,18 +126,14 @@ const shellAlertsInboxOrgId = (model: Model): string | null =>
 		: null
 
 const root = Subscription.make<Model, Message, Resources>()((entry) => ({
-	/** A renewal elsewhere ended or replaced the session. */
+	/** A renewal here, or another tab, ended or replaced the session. */
 	selfHostedSession: entry(
 		{ isSelfHosted: Schema.Boolean },
 		{
 			modelToDependencies: () => ({ isSelfHosted: !isClerkAuthEnabled }),
 			dependenciesToStream: ({ isSelfHosted }) =>
 				Stream.when(
-					Dom.streamFromEvent({
-						target: selfHostedAuthTarget,
-						type: SELF_HOSTED_AUTH_EVENT,
-						mapEvent: () => Message.ChangedSelfHostedSession(),
-					}),
+					selfHostedSessionChanges,
 					Effect.sync(() => isSelfHosted),
 				),
 		},

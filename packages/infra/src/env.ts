@@ -116,6 +116,8 @@ export const authEnv: Config.Config<WorkerEnv> = merge(
 	derived("CLERK_TELEMETRY_DISABLED", "1"),
 	plainWithDefault("MAPLE_DEFAULT_ORG_ID", "default"),
 	optionalSecret("MAPLE_ROOT_PASSWORD"),
+	// Session-token HMAC key; every verifier falls back to MAPLE_ROOT_PASSWORD without it.
+	optionalSecret("MAPLE_SESSION_SECRET"),
 	optionalSecret("CLERK_SECRET_KEY"),
 	optionalPlain("CLERK_PUBLISHABLE_KEY"),
 	optionalSecret("CLERK_JWT_KEY"),

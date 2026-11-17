@@ -11,6 +11,7 @@ import { field, type FieldIds, fieldLabel, input, type FieldState } from "@maple
 import * as Field from "@maple/views/ui/field"
 import { formDialog } from "@maple/views/ui/form-dialog"
 import { icon } from "@maple/views/ui/icon"
+import { infoDialog } from "@maple/views/ui/info-dialog"
 import * as Menu from "@maple/views/ui/menu"
 import { rowActionsMenu } from "@maple/views/ui/row-actions-menu"
 import * as SelectView from "@maple/views/ui/select-view"
@@ -28,10 +29,12 @@ import { truncatedText } from "@maple/views/ui/truncated-text"
 import { accountSectionSkeleton, noOrganization } from "../kit/account-skeleton"
 import { adminOnlyNotice } from "../kit/members"
 import { settingsSection, settingsSections } from "../../kit/settings-section"
+import { roleScopes, summaryOfRoleKey } from "../kit/role-help"
 import { canManage, type InvitationRow, type MemberRow, Message, type Model } from "./model"
 import { hasMore, roleSelectFor } from "./update"
 import { typographyClass } from "@maple/views/ui/typography"
-import { hstack } from "@maple/views/ui/stack"
+import { hstack, vstack } from "@maple/views/ui/stack"
+import { typography } from "@maple/views/ui/typography"
 import { timestamp } from "@maple/views/ui/timestamp"
 import { Array as Arr, String as Str } from "effect"
 
@@ -45,6 +48,14 @@ const ROLE_ENTRIES: ReadonlyArray<SelectView.SelectEntry> = Arr.map(
 		item: { value: entry.clerkKey, label: entry.label },
 	}),
 )
+
+/** A role in a select list: its name with the one-line scope under it. */
+const roleItem = (h: H, option: SelectView.SelectOption): ReadonlyArray<Html> => [
+	vstack(h, { gap: "0.5" }, [
+		typography(h, { size: "xs", weight: "medium" }, [option.label]),
+		typography(h, { size: "xs", tone: "muted" }, [summaryOfRoleKey(option.value)]),
+	]),
+]
 
 /** `isInset`: the members column holds role selects, so both tables put values and headers at their text inset. */
 const roleText = (h: H, role: string, isInset: boolean): Html =>
@@ -102,6 +113,7 @@ const roleCell = (h: H, model: Model, member: MemberRow, canEdit: boolean): Html
 				size: "sm",
 				className: cn("w-full min-w-0", isConfirming && "border-primary"),
 				renderValue: () => [orgRoleLabel(member.role)],
+				renderItem: (option) => roleItem(h, option),
 				toView: (parts) => h.div([h.Class("contents")], parts),
 			},
 		}),
@@ -250,12 +262,19 @@ export const description = "Admins manage billing, keys and members."
 
 /** The tab's primary action, drawn in the settings page header beside the `<h1>`. */
 export const headerActions = Submodel.defineView<Model, Message, Readonly<{}>>((model, _inputs, h) =>
-	canManage(model)
-		? button(h, { size: "sm", attributes: [h.OnClick(Message.ClickedInvite())] }, [
-				icon(h, "PlusIcon", { attributes: [h.DataAttribute("icon", "inline-start")] }),
-				"Invite member",
-			])
-		: h.empty,
+	hstack(h, { gap: "2" }, [
+		button(h, { variant: "ghost", size: "sm", attributes: [h.OnClick(Message.ClickedRoleHelp())] }, [
+			"What can each role do?",
+		]),
+		...(canManage(model)
+			? [
+					button(h, { size: "sm", attributes: [h.OnClick(Message.ClickedInvite())] }, [
+						icon(h, "PlusIcon", { attributes: [h.DataAttribute("icon", "inline-start")] }),
+						"Invite member",
+					]),
+				]
+			: []),
+	]),
 )
 
 const membersSection = (h: H, model: Model, inputs: Inputs): Html => {
@@ -444,6 +463,7 @@ const inviteDialog = (h: H, model: Model): Html => {
 					labelledBy: "invite-role-label",
 					className: "w-full",
 					renderValue: (value) => [orgRoleLabel(value)],
+					renderItem: (option) => roleItem(h, option),
 					toView: (parts) =>
 						field(h, { state: roleState }, [
 							fieldLabel(
@@ -466,8 +486,37 @@ const inviteDialog = (h: H, model: Model): Html => {
 	})
 }
 
+const roleHelpDialog = (h: H, model: Model): Html =>
+	infoDialog(h, {
+		slotId: "role-help",
+		model: model.roleHelpDialog,
+		toParentMessage: (message) => Message.GotRoleHelpDialogMessage({ message }),
+		title: "What can each role do?",
+		description: "Each role also does everything the roles above it in this list can.",
+		children: Arr.map(roleScopes, (scope, index) =>
+			vstack(h, { gap: "1.5" }, [
+				typography(h, { size: "sm", weight: "semibold" }, [scope.label]),
+				typography(h, { size: "xs", tone: "muted" }, [scope.summary]),
+				h.ul(
+					[h.Class("list-disc space-y-0.5 pl-4")],
+					Arr.map(scope.adds, (action) =>
+						h.li([h.Class(typographyClass({ size: "xs" })), h.Key(`${scope.role}-${action}`)], [action]),
+					),
+				),
+				...(index === roleScopes.length - 1
+					? [
+							typography(h, { size: "xs", tone: "muted" }, [
+								"The IT administrator (root) sits above all of these. It manages organizations and users on the admin page and is not given in an organization.",
+							]),
+						]
+					: []),
+			]),
+		),
+	})
+
 const dialogs = (h: H, model: Model): ReadonlyArray<Html> => [
 	inviteDialog(h, model),
+	roleHelpDialog(h, model),
 	confirmDialog(h, {
 		slotId: "invitation-revoke",
 		model: model.revokeDialog,

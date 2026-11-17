@@ -4,7 +4,7 @@ import { Effect, Option, Schema, String as Str, Array as Arr } from "effect"
 import { Command } from "foldkit"
 import { defineMessageUnion } from "foldkit/message"
 import { load } from "foldkit/navigation"
-import { clearSessionToken } from "../../platform/auth-api"
+import { endSelfHostedSession } from "../../platform/auth-api"
 import { signOutOfClerk } from "../../platform/clerk"
 import type { Resources } from "../../platform/resources"
 import { AppRoute, hrefOf } from "../../route"
@@ -275,12 +275,13 @@ export const fromConnectFlow = (message: SourcesFlow.Message): Message =>
 
 const unchanged = (model: Model): Step => ({ model, commands: [] })
 
-/** `signOut()` (Clerk routes to its sign-in), or the self-hosted token cleared and `/sign-in`. */
+/** `signOut()` (Clerk routes to its sign-in), or the self-hosted session ended and `/sign-in`. */
 export const LogOut = Command.define("OnboardingLogOut", {
 	messages: [Message.CompletedLogOut],
-	execute: (isClerkAuthEnabled ? signOutOfClerk : Effect.andThen(clearSessionToken, load("/sign-in"))).pipe(
-		Effect.as(Message.CompletedLogOut()),
-	),
+	execute: (isClerkAuthEnabled
+		? signOutOfClerk
+		: Effect.andThen(endSelfHostedSession, load("/sign-in"))
+	).pipe(Effect.as(Message.CompletedLogOut())),
 })
 
 /** The wrong-region notice, for a user with no org here: the same page on the org's own region. */

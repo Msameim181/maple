@@ -162,6 +162,9 @@ const canonicalHostname = (hostname: string): string => {
 const isPrivateHost = (hostname: string): boolean => {
 	const lower = canonicalHostname(hostname)
 	if (BLOCKED_HOSTNAMES.has(lower) || hasBlockedSuffix(lower)) return true
+	// A single-label name (`electric`, `keycloak`) only resolves through a search domain or a
+	// container network's DNS, never on the public internet. IPv6 literals carry colons, not dots.
+	if (!Str.includes(".")(lower) && !Str.includes(":")(lower)) return true
 	if (isPrivateIPv4(lower)) return true
 	if (isPrivateIPv6(lower)) return true
 	return false
