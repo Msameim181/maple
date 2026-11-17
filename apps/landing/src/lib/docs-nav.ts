@@ -50,8 +50,8 @@ export const SECTIONS = [
 		id: "self-hosting",
 		icon: "Self-hosting",
 		label: "Self-hosting",
-		blurb: "Maple on your own server, as one container.",
-		groups: ["Self-hosting", "Platforms"],
+		blurb: "Maple on your own server: one container, or a multi-tenant Docker stack.",
+		groups: ["Self-hosting", "Platforms", "Multi-tenant self-hosting"],
 	},
 	{
 		id: "reference",
