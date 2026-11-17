@@ -2,7 +2,7 @@ import { writeLocalStorage } from "@maple/ui/lib/local-storage"
 import { Array as Arr, Effect, Option, Schema } from "effect"
 import { Command } from "foldkit"
 import { load } from "foldkit/navigation"
-import { clearSessionToken, saveSessionToken } from "../platform/auth-api"
+import { endSelfHostedSession, saveSessionToken } from "../platform/auth-api"
 import { DirectoryMe } from "../data/directory-me"
 import { MapleApiClient } from "../platform/api-clients"
 import { writeLastOrg } from "../platform/oidc"
@@ -156,10 +156,13 @@ export const SaveSidebarState = Command.define("SaveSidebarState", {
 		}),
 })
 
-/** The guest menu's log out: drop the self-hosted token and reload into `/sign-in`. */
+/** The guest menu's log out: end the self-hosted session (server and token) and reload into `/sign-in`. */
 export const LogOut = Command.define("LogOut", {
 	messages: [Message.CompletedLogOut],
-	execute: clearSessionToken.pipe(Effect.andThen(load("/sign-in")), Effect.as(Message.CompletedLogOut())),
+	execute: endSelfHostedSession.pipe(
+		Effect.andThen(load("/sign-in")),
+		Effect.as(Message.CompletedLogOut()),
+	),
 })
 
 /** `GET /api/directory/me`, once per session token (`DirectoryMe`). */

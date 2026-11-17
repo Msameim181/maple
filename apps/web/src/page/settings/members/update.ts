@@ -423,6 +423,7 @@ export const init = (grants: ReadonlyArray<Policy.Permission>): Return => ({
 		membersGeneration: 0,
 		invitationsGeneration: 0,
 		inviteDialog: Dialog.init("invite-member", "dialog"),
+		roleHelpDialog: Dialog.init("role-help", "dialog"),
 		inviteEmail: Field.init(),
 		inviteRole: roleSelect("invite-role", "org:member"),
 		isInviting: false,
@@ -451,7 +452,7 @@ const toast = (type: "success" | "error", title: string, description = "") =>
 	PageOutMessage.RequestedToast({ type, title, description })
 
 const lift =
-	<K extends "inviteDialog" | "removeDialog" | "revokeDialog">(
+	<K extends "inviteDialog" | "roleHelpDialog" | "removeDialog" | "revokeDialog">(
 		key: K,
 		wrap: (message: Dialog.Message) => Message,
 	) =>
@@ -461,6 +462,7 @@ const lift =
 	})
 
 const liftInvite = lift("inviteDialog", (message) => Message.GotInviteDialogMessage({ message }))
+const liftRoleHelp = lift("roleHelpDialog", (message) => Message.GotRoleHelpDialogMessage({ message }))
 const liftRemove = lift("removeDialog", (message) => Message.GotRemoveDialogMessage({ message }))
 const liftRevoke = lift("revokeDialog", (message) => Message.GotRevokeDialogMessage({ message }))
 
@@ -673,6 +675,9 @@ export const update = (model: Model, message: Message): Return =>
 							},
 			}),
 		ClickedInvite: () => liftInvite(model, Dialog.open(model.inviteDialog)),
+		ClickedRoleHelp: () => liftRoleHelp(model, Dialog.open(model.roleHelpDialog)),
+		GotRoleHelpDialogMessage: ({ message: child }) =>
+			liftRoleHelp(model, Dialog.update(model.roleHelpDialog, child)),
 		GotInviteDialogMessage: ({ message: child }) =>
 			liftInvite(model, Dialog.update(model.inviteDialog, child)),
 		GotInviteEmailMessage: ({ message: child }) => {

@@ -1,4 +1,5 @@
 import { OrgId } from "@maple/domain"
+import { UserId } from "@maple/primitives"
 import { CreateOrgRequest, RenameOrgRequest } from "@maple/domain/http"
 import { Array as Arr, Effect, Option, Result, Schema, String as Str } from "effect"
 import { Command } from "foldkit"
@@ -60,6 +61,21 @@ export const LoadUsers = Command.define("LoadDirectoryUsers", {
 	),
 })
 
+export const LoadUnverified = Command.define("LoadUnverifiedUsers", {
+	messages: [Message.CompletedLoadUnverified],
+	execute: Effect.flatMap(directory, (api) => api.listUnverifiedUsers()).pipe(
+		Effect.map((response) =>
+			Arr.map(response.users, (user) => ({
+				id: user.id,
+				email: user.email,
+				name: user.name,
+				createdAt: user.createdAt,
+			})),
+		),
+		settleTo((result) => Message.CompletedLoadUnverified({ result })),
+	),
+})
+
 /** A write settled to `Result<void, message>`; the API's own message when it has one. */
 const settleWrite =
 	<B>(fallback: string, toMessage: (result: Result.Result<void, string>) => B) =>
@@ -70,6 +86,28 @@ const settleWrite =
 			Effect.result,
 			Effect.map(toMessage),
 		)
+
+const ResendVerification = Command.define("ResendVerification", {
+	args: { id: Schema.String, email: Schema.String },
+	messages: [Message.CompletedResendVerification],
+	execute: ({ id, email }) =>
+		Effect.flatMap(directory, (api) => api.resendVerification({ params: { userId: Schema.decodeSync(UserId)(id) } })).pipe(
+			settleWrite("Couldn't send the verification email", (result) =>
+				Message.CompletedResendVerification({ email, result }),
+			),
+		),
+})
+
+const MarkVerified = Command.define("MarkUserVerified", {
+	args: { id: Schema.String, email: Schema.String },
+	messages: [Message.CompletedMarkVerified],
+	execute: ({ id, email }) =>
+		Effect.flatMap(directory, (api) => api.markVerified({ params: { userId: Schema.decodeSync(UserId)(id) } })).pipe(
+			settleWrite("Couldn't mark the address verified", (result) =>
+				Message.CompletedMarkVerified({ email, result }),
+			),
+		),
+})
 
 const decodeOrgId = (raw: string) =>
 	Schema.decodeEffect(OrgId)(raw).pipe(
@@ -120,6 +158,11 @@ export const init = (_route: unknown, _context: PageContext): Return => ({
 		nowMs: 0,
 		orgs: AsyncData.Loading(),
 		users: AsyncData.Loading(),
+		unverified: AsyncData.Loading(),
+		resending: [],
+		verifying: null,
+		verifyDialog: Dialog.init("admin-mark-verified", "alert-dialog"),
+		isVerifying: false,
 		createDialog: Dialog.init("admin-create-org", "dialog"),
 		createId: Field.init(),
 		createName: Field.init(),
@@ -140,7 +183,7 @@ export const init = (_route: unknown, _context: PageContext): Return => ({
 const toast = (type: "success" | "error", title: string) =>
 	PageOutMessage.RequestedToast({ type, title, description: "" })
 
-type DialogKey = "createDialog" | "renameDialog" | "deleteDialog"
+type DialogKey = "verifyDialog" | "createDialog" | "renameDialog" | "deleteDialog"
 type FieldKey = "createId" | "createName" | "createEmail" | "renameName" | "deleteConfirm"
 
 const liftDialog = (
@@ -153,6 +196,7 @@ const liftDialog = (
 	commands: Command.mapMessages(step.commands ?? [], wrap),
 })
 
+const toVerifyDialog = (message: Dialog.Message) => Message.GotVerifyDialogMessage({ message })
 const toCreateDialog = (message: Dialog.Message) => Message.GotCreateDialogMessage({ message })
 const toRenameDialog = (message: Dialog.Message) => Message.GotRenameDialogMessage({ message })
 const toDeleteDialog = (message: Dialog.Message) => Message.GotDeleteDialogMessage({ message })
@@ -190,7 +234,7 @@ export const update = (model: Model, message: Message, _context: PageContext): R
 		ReadClock: ({ nowMs }) => ({ model: { ...model, nowMs } }),
 		CompletedLoadViewer: ({ isRoot }) => ({
 			model: { ...model, isRoot },
-			commands: isRoot ? [LoadOrgs(), LoadUsers()] : [],
+			commands: isRoot ? [LoadOrgs(), LoadUsers(), LoadUnverified()] : [],
 		}),
 		CompletedLoadOrgs: ({ result }) => ({
 			model: { ...model, orgs: AsyncData.settle(model.orgs, result) },
@@ -198,6 +242,66 @@ export const update = (model: Model, message: Message, _context: PageContext): R
 		CompletedLoadUsers: ({ result }) => ({
 			model: { ...model, users: AsyncData.settle(model.users, result) },
 		}),
+		CompletedLoadUnverified: ({ result }) => ({
+			model: { ...model, unverified: AsyncData.settle(model.unverified, result) },
+		}),
+		ClickedResendVerification: ({ id, email }) =>
+			model.resending.includes(email)
+				? { model }
+				: {
+						model: { ...model, resending: [...model.resending, email] },
+						commands: [ResendVerification({ id, email })],
+					},
+		CompletedResendVerification: ({ email, result }) => ({
+			model: { ...model, resending: Arr.filter(model.resending, (pending) => pending !== email) },
+			outMessage: Result.match(result, {
+				onSuccess: () => toast("success", `Verification email sent to ${email}`),
+				onFailure: (error) => toast("error", error),
+			}),
+		}),
+		ClickedMarkVerified: ({ id, email }) =>
+			liftDialog(
+				{ ...model, verifying: { id, email } },
+				"verifyDialog",
+				Dialog.open(model.verifyDialog),
+				toVerifyDialog,
+			),
+		GotVerifyDialogMessage: ({ message: child }) =>
+			model.isVerifying
+				? { model }
+				: liftDialog(model, "verifyDialog", Dialog.update(model.verifyDialog, child), toVerifyDialog),
+		ClickedConfirmMarkVerified: () =>
+			model.isVerifying || model.verifying === null
+				? { model }
+				: {
+						model: { ...model, isVerifying: true },
+						commands: [MarkVerified({ id: model.verifying.id, email: model.verifying.email })],
+					},
+		CompletedMarkVerified: ({ email, result }) =>
+			Result.match(result, {
+				onSuccess: () => {
+					const closed = liftDialog(
+						{ ...model, isVerifying: false, verifying: null },
+						"verifyDialog",
+						Dialog.close(model.verifyDialog),
+						toVerifyDialog,
+					)
+					return {
+						model: closed.model,
+						commands: [
+							...(closed.commands ?? []),
+							LoadUnverified(),
+							LoadUsers(),
+							LoadOrgs(),
+						],
+						outMessage: toast("success", `${email} marked verified`),
+					}
+				},
+				onFailure: (error) => ({
+					model: { ...model, isVerifying: false },
+					outMessage: toast("error", error),
+				}),
+			}),
 		ClickedCreate: () =>
 			liftDialog(model, "createDialog", Dialog.open(model.createDialog), toCreateDialog),
 		GotCreateDialogMessage: ({ message: child }) =>

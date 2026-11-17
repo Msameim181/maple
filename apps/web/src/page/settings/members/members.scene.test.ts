@@ -240,7 +240,7 @@ describe("members from the self-hosted directory", () => {
 		role: "org:admin" | "org:member",
 	) =>
 		new DirectoryMember({
-			user: new DirectoryUser({ id: Schema.decodeSync(UserId)(id), email, name, lastSeenAt: 0 }),
+			user: new DirectoryUser({ id: Schema.decodeSync(UserId)(id), email, name, lastSeenAt: 0, emailVerified: true }),
 			role,
 		})
 

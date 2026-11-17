@@ -16,6 +16,7 @@ import { readSessionTimeRange, writeSessionTimeRange } from "./platform/session-
 import { SessionTimeRange } from "./route/session-time-range"
 import { identifySession } from "./data/analytics"
 import { SessionIdentity } from "./platform/session-identity"
+import { withRenewLock } from "./platform/session-bearer"
 
 /** How long a signed-out Clerk answer may still turn into a session on a hard refresh. */
 const AUTH_SETTLE_TIMEOUT = Duration.seconds(2)
@@ -70,24 +71,42 @@ export const LoadExternal = Command.define("LoadExternal", {
 	execute: ({ href }) => load(href).pipe(Effect.as(Message.CompletedLoadExternal())),
 })
 
-/** A rejected token is cleared, an unreachable API keeps it. */
+/**
+ * Renews the stored session at the server, which asks the identity provider, so a session ended
+ * there ends here on the next load. A 401 clears the token; an unreachable API (or a 5xx) keeps it.
+ */
 export const CheckSession = Command.define("CheckSession", {
 	messages: [Message.SucceededCheckSession, Message.FailedCheckSession],
 	execute: Effect.gen(function* () {
-		const maybeToken = yield* readSessionToken
-		if (Option.isNone(maybeToken)) {
-			return Message.FailedCheckSession({ failure: "NoToken" })
-		}
 		const auth = yield* MapleAuthApi
-		const tenant = yield* auth.session(maybeToken.value)
-		return Message.SucceededCheckSession({ orgId: tenant.orgId })
-	}).pipe(
-		Effect.catchTag("@maple/web/SessionCheckError", (error) =>
-			error.reason === "Rejected"
-				? Effect.as(clearSessionToken, Message.FailedCheckSession({ failure: "Rejected" }))
-				: Effect.succeed(Message.FailedCheckSession({ failure: "Unreachable" })),
-		),
-	),
+		// Under the renewal lock, so it never races another tab renewing the same session.
+		return yield* withRenewLock(
+			Effect.gen(function* () {
+				const maybeToken = yield* readSessionToken
+				if (Option.isNone(maybeToken)) {
+					return Message.FailedCheckSession({ failure: "NoToken" })
+				}
+				const checked = maybeToken.value
+				// A sign-in may have stored a new token meanwhile: only the checked one is replaced or cleared.
+				const whileStored = (effect: Effect.Effect<void>) =>
+					Effect.flatMap(readSessionToken, (stored) =>
+						Option.getOrNull(stored) === checked ? effect : Effect.void,
+					)
+				return yield* auth.refresh(checked).pipe(
+					Effect.tap((renewed) => whileStored(saveSessionToken(renewed.token))),
+					Effect.map((renewed) => Message.SucceededCheckSession({ orgId: renewed.orgId })),
+					Effect.catchTag("@maple/web/SessionCheckError", (error) =>
+						error.reason === "Rejected"
+							? Effect.as(
+									whileStored(clearSessionToken),
+									Message.FailedCheckSession({ failure: "Rejected" }),
+								)
+							: Effect.succeed(Message.FailedCheckSession({ failure: "Unreachable" })),
+					),
+				)
+			}),
+		)
+	}),
 })
 
 export const SaveSessionToken = Command.define("SaveSessionToken", {

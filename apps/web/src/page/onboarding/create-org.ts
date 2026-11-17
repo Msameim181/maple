@@ -3,6 +3,9 @@ import { UnauthorizedError } from "@maple/domain/http"
 import { Cause, Effect, Option, Schema, String as Str } from "effect"
 import { Command, Mount, type Update } from "foldkit"
 import { defineMessageUnion } from "foldkit/message"
+import { load } from "foldkit/navigation"
+import { endSelfHostedSession } from "../../platform/auth-api"
+import { isClerkAuthEnabled } from "../../platform/auth-mode"
 import { suggestOrganizationName } from "./onboarding-org-name"
 import { currentRegion } from "../../platform/region"
 import {
@@ -117,7 +120,10 @@ export const LeaveFor = Command.define("OpenFirstOrganization", {
 
 const SignOut = Command.define("OrgRequiredSignOut", {
 	messages: [Message.CompletedLeave],
-	execute: signOutOfClerk.pipe(Effect.as(Message.CompletedLeave())),
+	execute: (isClerkAuthEnabled
+		? signOutOfClerk
+		: Effect.andThen(endSelfHostedSession, load("/sign-in"))
+	).pipe(Effect.as(Message.CompletedLeave())),
 })
 
 /** The preview's dithered backdrop, drawn until the canvas unmounts. */

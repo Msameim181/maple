@@ -1,6 +1,6 @@
 import { Effect, Option, Schema } from "effect"
 import { Command, type Update } from "foldkit"
-import { load, replaceUrl } from "foldkit/navigation"
+import { replaceUrl } from "foldkit/navigation"
 import { OidcCallbackRequest } from "@maple/domain/http"
 import { defineMessageUnion } from "foldkit/message"
 import { defineTaggedUnion } from "foldkit/schema"
@@ -8,12 +8,12 @@ import { modifyFields } from "foldkit/struct"
 import { MapleAuthApi } from "../../platform/auth-api"
 import { apiErrorMessage } from "../../data/directory-me"
 import {
-	authorizeUrlOf,
-	codeChallengeOf,
-	randomToken,
+	beginOidcSignIn,
+	claimSignInRestart,
+	clearSignInRestart,
+	OidcAction,
 	readLastOrg,
 	redirectUriOf,
-	savePendingSignIn,
 	takePendingSignIn,
 } from "../../platform/oidc"
 
@@ -22,6 +22,8 @@ export const SignInFailure = defineTaggedUnion({
 	Rejected: { message: Schema.String },
 	/** OIDC: the provider vouched for the user, but no org has them yet. */
 	NoOrganization: {},
+	/** OIDC: the provider has not seen the user confirm their email address yet. */
+	EmailNotVerified: {},
 	Unreachable: {},
 	Unexpected: {},
 })
@@ -79,6 +81,8 @@ export const Message = defineMessageUnion({
 	RedirectedToSso: {},
 	SucceededSignInWithSso: { token: Schema.String, returnTo: Schema.NullOr(Schema.String) },
 	FailedSignInWithSso: { failure: SignInFailure },
+	/** The callback's state is unknown here (a tab that did not start it): start over, once. */
+	MissedSsoState: { oidc: OidcProvider },
 })
 export type Message = typeof Message.Type
 
@@ -137,43 +141,40 @@ export const LoadOidcConfig = Command.define("LoadOidcConfig", {
 
 /** PKCE: keep the verifier, state and return path for the callback, then leave for the provider. */
 export const BeginOidcSignIn = Command.define("BeginOidcSignIn", {
-	args: { authorizeUrl: Schema.String, clientId: Schema.String },
+	args: { authorizeUrl: Schema.String, clientId: Schema.String, action: Schema.optionalKey(OidcAction) },
 	messages: [Message.RedirectedToSso, Message.FailedSignInWithSso],
-	execute: ({ authorizeUrl, clientId }) =>
-		Effect.gen(function* () {
-			const { verifier, state, returnTo, origin } = yield* Effect.sync(() => ({
-				verifier: randomToken(),
-				state: randomToken(),
-				returnTo: new URLSearchParams(window.location.search).get("redirect_url"),
-				origin: window.location.origin,
-			}))
-			const challenge = yield* codeChallengeOf(verifier)
-			yield* savePendingSignIn({ verifier, state, returnTo })
-			yield* load(
-				authorizeUrlOf({
-					authorizeUrl,
-					clientId,
-					redirectUri: redirectUriOf(origin),
-					challenge,
-					state,
-				}),
-			)
-			return Message.RedirectedToSso()
-		}).pipe(Effect.catchDefect(() => Effect.succeed(failedSso(SignInFailure.Unexpected())))),
+	execute: ({ authorizeUrl, clientId, action }) =>
+		Effect.sync(() => new URLSearchParams(window.location.search).get("redirect_url")).pipe(
+			Effect.flatMap((returnTo) => beginOidcSignIn({ authorizeUrl, clientId, returnTo, action })),
+			Effect.as(Message.RedirectedToSso()),
+			Effect.catchDefect(() => Effect.succeed(failedSso(SignInFailure.Unexpected()))),
+		),
+})
+
+const expired = failedSso(SignInFailure.Rejected({ message: "This sign-in expired. Sign in again." }))
+
+/** No pending sign-in for this state: restart with the provider the first time, else say it expired. */
+const missedState = Effect.gen(function* () {
+	if (!(yield* claimSignInRestart)) return expired
+	const config = yield* (yield* MapleAuthApi).oidcConfig
+	return config.enabled
+		? Message.MissedSsoState({ oidc: { authorizeUrl: config.authorizeUrl, clientId: config.clientId } })
+		: expired
 })
 
 /** The provider's redirect back: the state must be the one this tab sent, then the code is redeemed. */
 export const CompleteOidcSignIn = Command.define("CompleteOidcSignIn", {
 	args: { code: Schema.String, state: Schema.String },
-	messages: [Message.SucceededSignInWithSso, Message.FailedSignInWithSso],
+	messages: [Message.SucceededSignInWithSso, Message.FailedSignInWithSso, Message.MissedSsoState],
 	execute: ({ code, state }) =>
 		Effect.gen(function* () {
 			const origin = yield* Effect.sync(() => window.location.origin)
 			// The code is single-use: off the URL (and history) before anything else.
 			yield* replaceUrl("/sign-in")
-			const pending = yield* takePendingSignIn
-			if (Option.isNone(pending) || pending.value.state !== state)
-				return failedSso(SignInFailure.Rejected({ message: "This sign-in expired. Sign in again." }))
+			// Never redeem a code without the state this browser sent with it.
+			const pending = yield* takePendingSignIn(state)
+			if (Option.isNone(pending)) return yield* missedState
+			yield* clearSignInRestart
 			const lastOrg = yield* readLastOrg
 			const fields = { code, codeVerifier: pending.value.verifier, redirectUri: redirectUriOf(origin) }
 			const request = Option.match(lastOrg, {
@@ -186,6 +187,8 @@ export const CompleteOidcSignIn = Command.define("CompleteOidcSignIn", {
 			Effect.catchTags({
 				"@maple/http/errors/NoOrganizationError": () =>
 					Effect.succeed(failedSso(SignInFailure.NoOrganization())),
+				"@maple/http/errors/DirectoryEmailNotVerifiedError": () =>
+					Effect.succeed(failedSso(SignInFailure.EmailNotVerified())),
 				HttpClientError: (error) =>
 					Effect.succeed(
 						failedSso(
@@ -259,6 +262,10 @@ export const update = (model: Model, message: Message) =>
 		}),
 		FailedSignInWithSso: ({ failure }) => ({
 			model: modifyFields(model, { sso: () => Submission.Failed({ failure }) }),
+		}),
+		MissedSsoState: ({ oidc }) => ({
+			model: modifyFields(model, { sso: () => Submission.Submitting() }),
+			commands: [BeginOidcSignIn(oidc)],
 		}),
 	})
 

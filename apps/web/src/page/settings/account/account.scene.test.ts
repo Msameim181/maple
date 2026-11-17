@@ -1,7 +1,8 @@
 import { DigestSubscriptionResponse } from "@maple/domain/http"
 import { Result, Schema, Array as Arr } from "effect"
+import { AsyncData } from "foldkit"
 import { describe, expect, test } from "vitest"
-import { expect as expectView, given, role, scene, withViewInputs } from "foldkit/scene"
+import { expect as expectView, given, role, scene, text, withViewInputs } from "foldkit/scene"
 import { view } from "./view"
 import * as EmailPreferences from "./email-preferences/update"
 import { Message as EmailPreferencesMessage } from "./email-preferences/model"
@@ -76,7 +77,11 @@ describe("password tab", () => {
 			search: {},
 			nowMs: 0,
 			tab: { _tag: "Password", model: { ...typed, isSaving: true } },
+			person: null,
+			oidc: null,
 			accountUrl: null,
+			sessions: AsyncData.Loading(),
+			isSigningOut: false,
 		}
 		const failure = (message: string) =>
 			AccountMessage.GotPasswordMessage({
@@ -223,15 +228,33 @@ describe("profile", () => {
 })
 
 describe("account under the self-hosted directory", () => {
-	const entered: AccountModel = { search: {}, nowMs: 0, tab: null, accountUrl: null }
+	const entered: AccountModel = {
+		search: {},
+		nowMs: 0,
+		tab: null,
+		person: null,
+		oidc: null,
+		accountUrl: null,
+		sessions: AsyncData.Loading(),
+		isSigningOut: false,
+	}
 	const accountView = withViewInputs(view, { context })()
-
-	test("the identity provider's account page is the one thing linked", () => {
-		const loaded = updateAccount(
+	const oidc = { authorizeUrl: "https://id.example.com/auth", clientId: "maple" }
+	const loadedFor = (isRoot: boolean) =>
+		updateAccount(
 			entered,
-			AccountMessage.LoadedAccountUrl({ url: "https://id.example.com/realms/maple/account" }),
+			AccountMessage.LoadedAccount({
+				account: {
+					person: { name: "Ada", email: "ada@acme.test", isRoot },
+					oidc,
+					accountUrl: isRoot ? "https://id.example.com/realms/maple/account" : null,
+				},
+			}),
 			context,
 		)
+
+	test("a person sees their name, email and the three account actions, and no provider link", () => {
+		const loaded = loadedFor(false)
 		expect(loaded.outMessage).toBeUndefined()
 		scene(
 			{
@@ -240,16 +263,40 @@ describe("account under the self-hosted directory", () => {
 				view: accountView,
 			},
 			given(loaded.model),
-			expectView(role("link", { name: "Manage your account" })).toHaveAttr(
-				"href",
-				"https://id.example.com/realms/maple/account",
-			),
-			expectView(role("navigation")).toBeAbsent(),
+			expectView(text("ada@acme.test")).toExist(),
+			expectView(role("button", { name: "Change password" })).toExist(),
+			expectView(role("button", { name: "Two-factor authentication" })).toExist(),
+			expectView(role("button", { name: "Edit profile" })).toExist(),
+			expectView(role("button", { name: "Sign out everywhere" })).toExist(),
+			expectView(role("link", { name: "Open console" })).toBeAbsent(),
 		)
 	})
 
+	test("root alone gets the identity provider console link", () => {
+		scene(
+			{
+				update: (model: AccountModel, message: AccountMessage) =>
+					updateAccount(model, message, context),
+				view: accountView,
+			},
+			given(loadedFor(true).model),
+			expectView(role("link", { name: "Open console" })).toHaveAttr(
+				"href",
+				"https://id.example.com/realms/maple/account",
+			),
+		)
+	})
+
+	test("an account action starts the provider sign-in; sign out everywhere runs once", () => {
+		const model = loadedFor(false).model
+		expect(updateAccount(model, AccountMessage.ClickedAccountAction({ action: "CONFIGURE_TOTP" }), context).commands).toHaveLength(1)
+		const out = updateAccount(model, AccountMessage.ClickedSignOutEverywhere(), context)
+		expect(out.commands).toHaveLength(1)
+		expect(updateAccount(out.model, AccountMessage.ClickedSignOutEverywhere(), context).commands ?? []).toEqual([])
+	})
+
 	test("without an identity provider the page sends the viewer on to settings", () => {
-		const step = updateAccount(entered, AccountMessage.LoadedAccountUrl({ url: null }), context)
+		const step = updateAccount(entered, AccountMessage.LoadedAccount({ account: null }), context)
 		expect(step.outMessage).toMatchObject({
 			_tag: "RequestedNavigation",
 			url: "/settings",

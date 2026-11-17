@@ -6,35 +6,81 @@ import {
 	UnauthorizedError,
 } from "@maple/domain/http"
 import { apiBaseUrl } from "./api-base-url"
-import { Context, Effect, Layer, Option, Predicate, Schema } from "effect"
+import { readJwtIdentity } from "./auth-headers"
+import { Context, Duration, Effect, Layer, Option, Predicate, Schema } from "effect"
 import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/http"
 import { HttpApiClient } from "effect/http-api"
 import { KeyValueStore } from "effect/persistence"
 
-/** The self-hosted root-password session lives here, per tab. */
-const SELF_HOSTED_TOKEN_STORAGE_KEY = "maple.self_hosted.token"
+/**
+ * The self-hosted session token: in localStorage, so every tab shares it and follows its changes
+ * (`storage` events, `subscription.ts`).
+ */
+export const SELF_HOSTED_TOKEN_STORAGE_KEY = "maple.self_hosted.token"
 /** Dispatched when the stored token changes outside `update` (a rejected renewal). */
 export const SELF_HOSTED_AUTH_EVENT = "maple:self-hosted-auth-changed"
 
+const withLocalStorage = Effect.provide(BrowserKeyValueStore.layerLocalStorage)
 const withSessionStorage = Effect.provide(BrowserKeyValueStore.layerSessionStorage)
 
-export const readSessionToken: Effect.Effect<Option.Option<string>> = Effect.gen(function* () {
+const storedToken = Effect.gen(function* () {
 	const store = yield* KeyValueStore.KeyValueStore
 	const token = yield* store.get(SELF_HOSTED_TOKEN_STORAGE_KEY)
 	return Option.filter(Option.fromNullishOr(token), (value) => value.length > 0)
-}).pipe(withSessionStorage, Effect.orElseSucceed(Option.none))
+})
+
+/** Earlier builds kept the token per tab: taken out of sessionStorage, once. */
+const takeLegacyToken = Effect.gen(function* () {
+	const token = yield* storedToken
+	yield* (yield* KeyValueStore.KeyValueStore).remove(SELF_HOSTED_TOKEN_STORAGE_KEY)
+	return token
+}).pipe(withSessionStorage)
+
+export const readSessionToken: Effect.Effect<Option.Option<string>> = Effect.gen(function* () {
+	const token = yield* storedToken
+	if (Option.isSome(token)) return token
+	const legacy = yield* takeLegacyToken
+	if (Option.isSome(legacy)) yield* saveSessionToken(legacy.value)
+	return legacy
+}).pipe(withLocalStorage, Effect.orElseSucceed(Option.none))
 
 /** Storage failures are ignored: the session simply does not persist. */
 export const saveSessionToken = (token: string): Effect.Effect<void> =>
 	Effect.gen(function* () {
 		const store = yield* KeyValueStore.KeyValueStore
 		yield* store.set(SELF_HOSTED_TOKEN_STORAGE_KEY, token)
-	}).pipe(withSessionStorage, Effect.ignore)
+	}).pipe(withLocalStorage, Effect.ignore)
 
 export const clearSessionToken: Effect.Effect<void> = Effect.gen(function* () {
 	const store = yield* KeyValueStore.KeyValueStore
 	yield* store.remove(SELF_HOSTED_TOKEN_STORAGE_KEY)
-}).pipe(withSessionStorage, Effect.ignore)
+}).pipe(withLocalStorage, Effect.ignore)
+
+/** What another tab's write of the token means for this one; `none` for a plain renewal. */
+export type StoredSessionChange = "SignedOut" | "SwitchedIdentity"
+
+const sameIdentity = (a: string, b: string): boolean => {
+	const before = readJwtIdentity(a)
+	const after = readJwtIdentity(b)
+	return (
+		before !== undefined &&
+		after !== undefined &&
+		before.sub === after.sub &&
+		before.orgId === after.orgId
+	)
+}
+
+/** A `storage` event's old and new token: removed, another user or org, or the same session renewed. */
+export const storedSessionChangeOf = (
+	oldValue: string | null,
+	newValue: string | null,
+): Option.Option<StoredSessionChange> => {
+	if (newValue === null || newValue === "")
+		return oldValue === null ? Option.none() : Option.some("SignedOut")
+	return oldValue !== null && sameIdentity(oldValue, newValue)
+		? Option.none()
+		: Option.some("SwitchedIdentity")
+}
 
 export const announceSessionTokenChanged: Effect.Effect<void> = Effect.sync(() =>
 	window.dispatchEvent(new Event(SELF_HOSTED_AUTH_EVENT)),
@@ -89,8 +135,30 @@ export class MapleAuthApi extends Context.Service<MapleAuthApi>()("@maple/web/Ma
 					provide,
 					Effect.mapError(classifyRenewal),
 				),
+			/** `POST /api/auth/logout`: ends the session here and at the identity provider. */
+			logout: (token: string) =>
+				makeClient(withBearer(token)).pipe(
+					// Public group on purpose: an expired but signed token must still be able to log out.
+					Effect.flatMap((client) => client.authPublic.logout()),
+					provide,
+				),
 		}
 	}),
 }) {
 	static readonly layer = Layer.effect(this, this.make).pipe(Layer.provide(FetchHttpClient.layer))
 }
+
+/** How long a log out waits on the API before ending the session locally anyway. */
+const LOGOUT_TIMEOUT = Duration.seconds(4)
+
+/**
+ * Log out: the server ends the session (and the provider's), then the token goes. A failed or
+ * slow call still clears the token, which also signs out every other tab (`storage`).
+ */
+export const endSelfHostedSession: Effect.Effect<void, never, MapleAuthApi> = Effect.gen(function* () {
+	const token = yield* readSessionToken
+	if (Option.isSome(token)) {
+		yield* (yield* MapleAuthApi).logout(token.value).pipe(Effect.timeout(LOGOUT_TIMEOUT), Effect.ignore)
+	}
+	yield* clearSessionToken
+})

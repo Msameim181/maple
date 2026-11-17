@@ -2,7 +2,7 @@ import { Option } from "effect"
 import { Submodel } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { accountLayout } from "../../layout/account-layout"
-import { alert, alertDescription } from "@maple/views/ui/alert"
+import { alert, alertDescription, alertTitle } from "@maple/views/ui/alert"
 import { button } from "@maple/views/ui/button"
 import { heading } from "@maple/views/ui/heading"
 import { field, fieldError, fieldLabel, input, type FieldIds, type FieldState } from "@maple/views/ui/field"
@@ -12,12 +12,23 @@ import { Message, type Model, SignInFailure, Submission } from "./sign-in"
 // always empty here.
 const PASSWORD_FIELD: FieldIds = { control: "base-ui-_r_0_", label: "base-ui-_r_1_", error: "base-ui-_r_5_" }
 
+const VERIFY_EMAIL_COPY =
+	"Check your inbox for the confirmation link, then sign in again. If the email did not arrive, an administrator can resend it."
+
+/** The provider has not seen the user confirm their address: a next step, not an error. */
+const verifyEmailNotice = (h: HtmlBuilder<Message>): Html =>
+	alert(h, { variant: "info", role: "status" }, [
+		alertTitle(h, ["Verify your email"]),
+		alertDescription(h, [VERIFY_EMAIL_COPY]),
+	])
+
 /** The API's message, or the browser's fetch failure text. */
 const failureMessage = (failure: SignInFailure): string =>
 	SignInFailure.match(failure, {
 		Rejected: ({ message }) => message,
 		NoOrganization: () =>
 			"Your account is not a member of any organization yet. Ask your administrator for an invitation.",
+		EmailNotVerified: () => VERIFY_EMAIL_COPY,
 		Unreachable: () => "Couldn't reach the server",
 		Unexpected: () => "Invalid root password",
 	})
@@ -147,7 +158,9 @@ export const view = Submodel.defineView<Model, Message>((model, h) => {
 				...Option.match(maybeFailureOf(model.sso), {
 					onNone: () => [],
 					onSome: (failure) => [
-						alert(h, { variant: "crit" }, [alertDescription(h, [failureMessage(failure)])]),
+						failure._tag === "EmailNotVerified"
+							? verifyEmailNotice(h)
+							: alert(h, { variant: "crit" }, [alertDescription(h, [failureMessage(failure)])]),
 					],
 				}),
 				isSsoFirst ? ssoChoice(h, model.sso._tag === "Submitting") : passwordForm(model, h),

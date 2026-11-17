@@ -26,6 +26,8 @@ export const Message = defineMessageUnion({
 	SucceededCheckSession: { orgId: OrgId },
 	FailedCheckSession: { failure: SessionCheckFailure },
 	ChangedSelfHostedSession: {},
+	/** Another tab removed the session token, or stored one for another user or org. */
+	ChangedSessionInOtherTab: { change: Schema.Literals(["SignedOut", "SwitchedIdentity"]) },
 	CompletedSaveSessionToken: {},
 	CompletedLoadClerk: { snapshot: ClerkSnapshot },
 	FailedLoadClerk: { message: Schema.String },
