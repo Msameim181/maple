@@ -31,6 +31,9 @@ jobs:
         with:
           bun-version: 1.4.4 # keep in sync with packageManager in package.json
       - run: bun install --frozen-lockfile
+      # The landing app imports the browser SDK from its built output; the other workspace
+      # packages it uses are consumed from source.
+      - run: bunx turbo build --filter=@maple-dev/browser
       - name: Build the site for the Pages sub-path
         working-directory: apps/landing
         env:
