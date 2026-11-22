@@ -3,6 +3,8 @@ import type {
 	OrgClickHouseApplySchemaStatus,
 	OrgClickHouseSchemaDiffResponse,
 	OrgClickHouseSettingsResponse,
+	OrgRetentionResponse,
+	OrgStorageResponse,
 } from "@maple/domain/http"
 import { EMPTY_VALUE, formatNumber, formatStorageBytes } from "@maple/ui/lib/format"
 import { TONE_TEXT } from "@maple/ui/lib/tone"
@@ -36,7 +38,7 @@ import { relativeTime } from "../../kit/relative-time"
 import { statRail, statRailItem } from "../../kit/stat-rail"
 import { settingsSection, settingsSections } from "../../kit/settings-section"
 import { type ConnectionField, Message, type Model, type Totals } from "./model"
-import { draftOf, isRunActive } from "./update"
+import { draftOf, isRetentionHidden, isRunActive, retentionDaysOf } from "./update"
 import { statusDot } from "@maple/views/ui/status-dot"
 import { typography, typographyClass } from "@maple/views/ui/typography"
 import { hstack, vstack } from "@maple/views/ui/stack"
@@ -724,6 +726,138 @@ const usageSection = (h: H, model: Model): Html => {
 	)
 }
 
+const RETENTION_PRESETS = [7, 14, 30, 90] as const
+
+const storageTable = (h: H, storage: OrgStorageResponse): Html =>
+	vstack(h, { gap: "0" }, [
+		...(storage.tables.length === 0
+			? [
+					typography(h, { size: "sm", tone: "muted", className: "px-4 py-3" }, [
+						"No data stored yet.",
+					]),
+				]
+			: Arr.map(storage.tables, (table) =>
+					hstack(
+						h,
+						{ align: "center", justify: "between", gap: "4", className: "border-b px-4 py-2 text-xs" },
+						[
+							h.span([h.Class("font-mono")], [table.table]),
+							hstack(h, { gap: "4", className: "tabular-nums text-muted-foreground" }, [
+								h.span([], [`${formatNumber(table.rows)} rows`]),
+								h.span([], [`${table.partitions} partitions`]),
+								h.span([h.Class("text-foreground")], [formatStorageBytes(table.bytes)]),
+							]),
+						],
+					),
+				)),
+		hstack(h, { align: "center", justify: "between", className: "px-4 py-2 text-xs font-medium" }, [
+			h.span([], ["Total"]),
+			h.span([h.Class("tabular-nums")], [formatStorageBytes(storage.totalBytes)]),
+		]),
+	])
+
+const retentionPanel = (h: H, model: Model, retention: OrgRetentionResponse, inputs: Inputs): Html => {
+	const days = retentionDaysOf(model)
+	const text =
+		model.retentionDraft ?? (retention.maxAgeDays === null ? "" : String(retention.maxAgeDays))
+	return panel(h, { className: "overflow-hidden" }, [
+		vstack(h, { gap: "3", className: "p-4" }, [
+			textField(h, {
+				name: "retention-days",
+				label: "Keep data for (days)",
+				type: "number",
+				placeholder: "Default retention",
+				value: text,
+				isDisabled: model.isSavingRetention,
+				description:
+					retention.instanceMaxDays === null
+						? "Raw logs, traces and metrics older than this are dropped. Blank keeps each table's built-in limit (30 to 90 days); a value above it has no effect."
+						: `Raw logs, traces and metrics older than this are dropped. This server caps it at ${retention.instanceMaxDays} days.`,
+				onInput: (value) => Message.ChangedRetentionDays({ value }),
+			}),
+			hstack(
+				h,
+				{ gap: "2", align: "center" },
+				Arr.map(RETENTION_PRESETS, (preset) =>
+					button(
+						h,
+						{
+							variant: "outline",
+							size: "sm",
+							isDisabled: model.isSavingRetention,
+							attributes: [h.OnClick(Message.ChangedRetentionDays({ value: String(preset) }))],
+						},
+						[`${preset}d`],
+					),
+				),
+			),
+		]),
+		hstack(
+			h,
+			{
+				align: "center",
+				justify: "between",
+				wrap: true,
+				className: "bg-surface-sunken gap-x-4 gap-y-2 border-t px-4 py-3",
+			},
+			[
+				typography(
+					h,
+					{ size: "xs", tone: "muted" },
+					retention.lastSweepAt === null
+						? ["No sweep has run yet."]
+						: [
+								"Last sweep ",
+								relativeTime(h, {
+									value: retention.lastSweepAt,
+									nowMs: inputs.nowMs,
+									timeZone: inputs.timeZone,
+								}),
+								`, dropped ${retention.lastSweepDropped ?? 0} daily partitions.`,
+							],
+				),
+				button(
+					h,
+					{
+						size: "sm",
+						isLoading: model.isSavingRetention,
+						isDisabled: model.isSavingRetention || days === "invalid",
+						attributes: [h.OnClick(Message.ClickedSaveRetention())],
+					},
+					["Save retention"],
+				),
+			],
+		),
+	])
+}
+
+const retentionSection = (h: H, model: Model, inputs: Inputs): Html =>
+	settingsSection(
+		h,
+		{
+			id: "data-platform-retention-heading",
+			title: "Retention & storage",
+			description: ["How long this organization keeps raw telemetry, and what it uses on disk."],
+			framed: false,
+		},
+		[
+			vstack(h, { gap: "4" }, [
+				AsyncData.matchData(model.retention, {
+					onEmpty: () => skeleton(h, "h-48 w-full rounded-md"),
+					onFailure: (failure) => errorState(h, { failure, title: "Couldn't load retention" }),
+					onData: (data) => retentionPanel(h, model, data, inputs),
+				}),
+				panel(h, { className: "overflow-hidden" }, [
+					AsyncData.matchData(model.storage, {
+						onEmpty: () => skeleton(h, "h-40 w-full"),
+						onFailure: (failure) => errorState(h, { failure, title: "Couldn't load storage" }),
+						onData: (data) => storageTable(h, data),
+					}),
+				]),
+			]),
+		],
+	)
+
 export const view = Submodel.defineView<Model, Message, Inputs>((model, inputs, h) => {
 	const settings = AsyncData.getOrElse(model.settings, () => null)
 	return settingsSections(h, [
@@ -745,5 +879,6 @@ export const view = Submodel.defineView<Model, Message, Inputs>((model, inputs, 
 		),
 		...(settings?.configured === true ? [schemaSection(h, model, settings, inputs)] : []),
 		usageSection(h, model),
+		...(isRetentionHidden(model) ? [] : [retentionSection(h, model, inputs)]),
 	])
 })

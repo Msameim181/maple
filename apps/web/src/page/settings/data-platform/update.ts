@@ -1,4 +1,8 @@
-import { type OrgClickHouseSettingsResponse, OrgClickHouseSettingsUpsertRequest } from "@maple/domain/http"
+import {
+	type OrgClickHouseSettingsResponse,
+	OrgClickHouseSettingsUpsertRequest,
+	OrgRetentionUpsertRequest,
+} from "@maple/domain/http"
 import { snapTimestamp } from "@maple/web-data/lib/time-range"
 import { getServiceUsage } from "@maple/web-data/warehouse/service-usage"
 import { Duration, Effect, Option, Result, Schema, Array as Arr, String as Str } from "effect"
@@ -57,6 +61,29 @@ const FetchUsage = Command.define("FetchDataPlatformUsage", {
 	),
 })
 
+const FetchRetention = Command.define("FetchOrgRetention", {
+	messages: [Message.CompletedFetchRetention],
+	execute: Effect.flatMap(MapleInternalApiClient, (client) => client.orgClickHouseSettings.getRetention()).pipe(
+		settleTo((result) => Message.CompletedFetchRetention({ result })),
+	),
+})
+
+const FetchStorage = Command.define("FetchOrgStorage", {
+	messages: [Message.CompletedFetchStorage],
+	execute: Effect.flatMap(MapleInternalApiClient, (client) => client.orgClickHouseSettings.getStorage()).pipe(
+		settleTo((result) => Message.CompletedFetchStorage({ result })),
+	),
+})
+
+const SaveRetention = Command.define("SaveOrgRetention", {
+	args: { maxAgeDays: Schema.NullOr(Schema.Number) },
+	messages: [Message.CompletedSaveRetention],
+	execute: ({ maxAgeDays }) =>
+		Effect.flatMap(MapleInternalApiClient, (client) =>
+			client.orgClickHouseSettings.setRetention({ payload: new OrgRetentionUpsertRequest({ maxAgeDays }) }),
+		).pipe(settleTo((result) => Message.CompletedSaveRetention({ result }))),
+})
+
 const SaveConnection = Command.define("SaveOrgClickHouseConnection", {
 	args: { request: OrgClickHouseSettingsUpsertRequest },
 	messages: [Message.CompletedSave],
@@ -95,6 +122,10 @@ export const init = (): Return => ({
 		applyStatusSent: 0,
 		applyStatusAnswered: 0,
 		usage: AsyncData.Loading(),
+		retention: AsyncData.Loading(),
+		storage: AsyncData.Loading(),
+		retentionDraft: null,
+		isSavingRetention: false,
 		draft: null,
 		committedOver: null,
 		password: "",
@@ -106,7 +137,7 @@ export const init = (): Return => ({
 		showUpToDate: false,
 		collapsedDrift: [],
 	},
-	commands: [FetchSettings(), FetchDiff(), FetchUsage()],
+	commands: [FetchSettings(), FetchDiff(), FetchUsage(), FetchRetention(), FetchStorage()],
 })
 
 const toast = (type: "default" | "success" | "error" | "info", title: string, description = "") =>
@@ -131,6 +162,28 @@ export const draftOf = (model: Model): ConnectionDraft =>
 		user: "default",
 		database: "default",
 	}))
+
+/** The days field as the API takes it: blank keeps the shipped TTLs (`null`); anything but 1-3650 is invalid. */
+export const retentionDaysOf = (model: Model): number | null | "invalid" => {
+	const text = Str.trim(
+		model.retentionDraft ??
+			AsyncData.getOrElse(
+				AsyncData.map(model.retention, (r) => (r.maxAgeDays === null ? "" : String(r.maxAgeDays))),
+				() => "",
+			),
+	)
+	if (text === "") return null
+	const days = Number(text)
+	return Number.isInteger(days) && days >= 1 && days <= 3650 ? days : "invalid"
+}
+
+/** Retention is admin-only; a forbidden read hides the whole panel. */
+export const isRetentionHidden = (model: Model): boolean =>
+	AsyncData.matchData(model.retention, {
+		onEmpty: () => false,
+		onFailure: (failure) => failure.code === "clickhouse_settings_forbidden",
+		onData: () => false,
+	})
 
 const isRunActive = (model: Model) =>
 	AsyncData.getOrElse(
@@ -173,8 +226,17 @@ export const revisit = (model: Model): Return => {
 	const settings = revisitData(model.settings, FetchSettings)
 	const diff = revisitData(model.diff, FetchDiff)
 	const usage = revisitData(model.usage, FetchUsage)
+	const retention = revisitData(model.retention, FetchRetention)
+	const storage = revisitData(model.storage, FetchStorage)
 	// The apply poll only runs on the open tab: a run left in progress reads its status now.
-	const next = { ...model, settings: settings.data, diff: diff.data, usage: usage.data }
+	const next = {
+		...model,
+		settings: settings.data,
+		diff: diff.data,
+		usage: usage.data,
+		retention: retention.data,
+		storage: storage.data,
+	}
 	const applyStatus = AsyncData.isIdle(model.applyStatus) ? { model: next } : fetchApplyStatus(next)
 	return {
 		model: applyStatus.model,
@@ -182,6 +244,8 @@ export const revisit = (model: Model): Return => {
 			...settings.commands,
 			...diff.commands,
 			...usage.commands,
+			...retention.commands,
+			...storage.commands,
 			...(applyStatus.commands ?? []),
 		],
 	}
@@ -235,6 +299,38 @@ export const update = (model: Model, message: Message): Return =>
 		CompletedFetchUsage: ({ result }) => ({
 			model: { ...model, usage: AsyncData.settle(model.usage, result) },
 		}),
+		CompletedFetchRetention: ({ result }) => ({
+			model: { ...model, retention: AsyncData.settle(model.retention, result) },
+		}),
+		CompletedFetchStorage: ({ result }) => ({
+			model: { ...model, storage: AsyncData.settle(model.storage, result) },
+		}),
+		ChangedRetentionDays: ({ value }) => ({ model: { ...model, retentionDraft: value } }),
+		ClickedSaveRetention: () => {
+			if (model.isSavingRetention) return { model }
+			const days = retentionDaysOf(model)
+			if (days === "invalid") return { model }
+			return {
+				model: { ...model, isSavingRetention: true },
+				commands: [SaveRetention({ maxAgeDays: days })],
+			}
+		},
+		CompletedSaveRetention: ({ result }) =>
+			Result.match(result, {
+				onSuccess: (saved) => ({
+					model: {
+						...model,
+						isSavingRetention: false,
+						retentionDraft: null,
+						retention: AsyncData.settle(model.retention, Result.succeed(saved)),
+					},
+					outMessage: toast("success", "Retention saved"),
+				}),
+				onFailure: (error) => ({
+					model: { ...model, isSavingRetention: false },
+					outMessage: toast("error", "Couldn't save retention", error.message),
+				}),
+			}),
 		ChangedConnection: ({ field, value }) => ({
 			model: { ...model, draft: { ...draftOf(model), [field]: value }, committedOver: null },
 		}),
