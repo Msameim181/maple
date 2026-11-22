@@ -104,7 +104,8 @@ run_ddl() {
 	if [ "$DRY_RUN" = 1 ]; then echo "  [dry-run] $1"; return 0; fi
 	local err
 	if err=$(ch --query "$1" 2>&1 >/dev/null); then return 0; fi
-	if [[ $err == *"$2"* ]]; then
+	# The server's message says max_[table/partition]_size_to_drop, so match its error code name instead.
+	if [[ $err == *TABLE_SIZE_EXCEEDS_MAX_DROP_SIZE_LIMIT* ]]; then
 		echo "  refused by $2, retrying with --$2=0 for this statement" >&2
 		ch "--$2=0" --query "$1"
 	else

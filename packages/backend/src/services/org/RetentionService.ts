@@ -272,7 +272,7 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 						}),
 					)
 					if (!dryRun)
-						yield* admin.exec(`ALTER TABLE \`${p.db}\`.\`${p.table}\` DROP PARTITION ID '${p.partition}'`)
+						yield* admin.exec(`ALTER TABLE \`${p.db}\`.\`${p.table}\` DROP PARTITION ID '${p.partition}' SETTINGS max_partition_size_to_drop=0`)
 					return { database: p.db, reason, table: p.table, partition: p.partition, bytes: p.bytes }
 				})
 

@@ -104,7 +104,7 @@ describe("RetentionService", () => {
 					["20261001"],
 				)
 				assert.strictEqual(report?.dropped[0]?.reason, "age")
-				assert.deepStrictEqual(h.executed, ["ALTER TABLE `org_acme`.`traces` DROP PARTITION ID '20261001'"])
+				assert.deepStrictEqual(h.executed, ["ALTER TABLE `org_acme`.`traces` DROP PARTITION ID '20261001' SETTINGS max_partition_size_to_drop=0"])
 				assert.isTrue(h.queried.filter((q) => q.includes("system.parts")).every((q) => q.includes("database = 'org_acme'")))
 				const row = yield* s.get(ACME, ADMIN)
 				assert.strictEqual(row.lastSweepDropped, 1)
