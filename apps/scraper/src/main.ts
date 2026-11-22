@@ -13,6 +13,7 @@ import { FetchHttpClient, HttpRouter, HttpServerResponse } from "effect/http"
 import { ApiClient } from "./ApiClient"
 import { ScraperEnv } from "./Env"
 import { OtlpIngest } from "./OtlpIngest"
+import { runRetentionSweeper } from "./RetentionSweeper"
 import { ResultReporter, UptimeReporter } from "./ResultReporter"
 import { ScrapeScheduler } from "./ScrapeScheduler"
 import { Scraper } from "./Scraper"
@@ -55,7 +56,8 @@ const UptimeLive = UptimeScheduler.layer.pipe(
 const SchedulerLive = Layer.mergeAll(ScrapeLive, UptimeLive).pipe(
 	Layer.provide(ApiClient.layer),
 	Layer.provideMerge(ScraperEnv.layer),
-	Layer.provide(FetchHttpClient.layer),
+	// Merged, not just provided: the retention sweeper in `program` posts through it too.
+	Layer.provideMerge(FetchHttpClient.layer),
 )
 
 const HealthRoutes = HttpRouter.use((router) =>
@@ -96,7 +98,10 @@ const program = Effect.gen(function* () {
 	const uptime = yield* UptimeScheduler
 	yield* Effect.logInfo("Maple scraper starting")
 	// Both run forever; a defect in either ends the process instead of hiding behind the other.
-	return yield* Effect.all([scrapes.run, uptime.run], { concurrency: 2, discard: true })
+	return yield* Effect.all([scrapes.run, uptime.run, runRetentionSweeper], {
+		concurrency: 3,
+		discard: true,
+	})
 })
 
 // Telemetry intentionally owns the outer scope so its exporter flushes after MainLive closes.

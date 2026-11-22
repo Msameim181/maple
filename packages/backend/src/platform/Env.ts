@@ -425,7 +425,15 @@ const envConfig = Config.all({
 	MAPLE_SMTP_BRIDGE_URL: optionalString("MAPLE_SMTP_BRIDGE_URL"),
 	MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: optionalString("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER"),
 	MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: optionalRedacted("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD"),
-	MAPLE_RETENTION_MAX_DAYS: Config.option(Config.Number("MAPLE_RETENTION_MAX_DAYS")),
+	// Compose passes it empty when unset, so blank or non-numeric means no ceiling rather than a boot failure.
+	MAPLE_RETENTION_MAX_DAYS: Config.option(Config.String("MAPLE_RETENTION_MAX_DAYS")).pipe(
+		Config.map(
+			Option.flatMap((raw) => {
+				const days = Math.floor(Number(raw))
+				return raw.trim() !== "" && days >= 1 ? Option.some(days) : Option.none()
+			}),
+		),
+	),
 })
 
 const makeEnv = Effect.gen(function* () {
