@@ -108,4 +108,4 @@ Audit-log and alerting-discovery writes still target a placeholder warehouse. Se
 1. [Install](/docs/self-hosting/multi-tenant/install) on a fresh server.
 2. [Auth service options](/docs/self-hosting/multi-tenant/auth-options): Keycloak or another OIDC provider.
 3. [Configuration reference](/docs/self-hosting/multi-tenant/configuration) for every variable.
-4. [How authentication works](/docs/self-hosting/multi-tenant/how-auth-works), [Operations](/docs/self-hosting/multi-tenant/operations), [Status pages and uptime](/docs/self-hosting/multi-tenant/status-and-uptime), [Security](/docs/self-hosting/multi-tenant/security) and [Troubleshooting](/docs/self-hosting/multi-tenant/troubleshooting).
+4. [How authentication works](/docs/self-hosting/multi-tenant/how-auth-works), [Operations](/docs/self-hosting/multi-tenant/operations), [Data retention](/docs/self-hosting/multi-tenant/data-retention), [Status pages and uptime](/docs/self-hosting/multi-tenant/status-and-uptime), [Security](/docs/self-hosting/multi-tenant/security) and [Troubleshooting](/docs/self-hosting/multi-tenant/troubleshooting).

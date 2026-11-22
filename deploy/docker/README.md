@@ -42,6 +42,7 @@ They appear on the Maple docs site under **Multi-tenant self-hosting**, and on G
 | Configuration reference | `/docs/self-hosting/multi-tenant/configuration` | [configuration.md](../../apps/landing/src/content/docs/self-hosting/multi-tenant/configuration.md) |
 | How authentication works | `/docs/self-hosting/multi-tenant/how-auth-works` | [how-auth-works.md](../../apps/landing/src/content/docs/self-hosting/multi-tenant/how-auth-works.md) |
 | Operations: backup, upgrade, rollback, rotation | `/docs/self-hosting/multi-tenant/operations` | [operations.md](../../apps/landing/src/content/docs/self-hosting/multi-tenant/operations.md) |
+| Data retention and the disk-full emergency script | `/docs/self-hosting/multi-tenant/data-retention` | [data-retention.md](../../apps/landing/src/content/docs/self-hosting/multi-tenant/data-retention.md) |
 | Status pages and uptime | `/docs/self-hosting/multi-tenant/status-and-uptime` | [status-and-uptime.md](../../apps/landing/src/content/docs/self-hosting/multi-tenant/status-and-uptime.md) |
 | Security | `/docs/self-hosting/multi-tenant/security` | [security.md](../../apps/landing/src/content/docs/self-hosting/multi-tenant/security.md) |
 | Troubleshooting | `/docs/self-hosting/multi-tenant/troubleshooting` | [troubleshooting.md](../../apps/landing/src/content/docs/self-hosting/multi-tenant/troubleshooting.md) |

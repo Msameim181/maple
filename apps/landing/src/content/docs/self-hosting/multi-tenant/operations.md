@@ -71,6 +71,34 @@ Checked on a copy of a running stack with data: all new database migrations appl
 - **Rebuild the images.** The `maple` container now starts alchemy under Bun (the status Worker imports font files that Node cannot load), so a stale image fails to start with `Unknown file extension ".ttf"`. Rebuild with `docker compose build maple caddy scraper`.
 - **Disk.** A rebuild needs roughly 10 GB free for Docker (`docker system df`). If it fills, `docker builder prune -af` only removes build cache.
 
+### Upgrading to the retention release
+
+Adds per-org [data retention](/docs/self-hosting/multi-tenant/data-retention): one new Postgres table (applied when `maple` starts, nothing is removed) and four optional env vars. With none of them set and no retention saved in the panel, nothing is ever deleted, so the upgrade changes no data by itself.
+
+```bash
+cd ~/maple/deploy/docker            # your checkout
+cp .env ~/maple-env-$(date +%F) && chmod 600 ~/maple-env-$(date +%F)
+docker compose exec -T postgres pg_dumpall -U maple | gzip > pre-upgrade-$(date +%F).sql.gz
+git fetch origin && git merge origin/selfhost
+./scripts/gen-secrets.sh            # appends only what is missing
+docker compose build maple scraper  # retention runs in both
+docker compose up -d
+./scripts/smoke-test.sh
+chmod +x scripts/retention-emergency.sh
+./scripts/retention-emergency.sh status   # per-org and per-table disk use
+```
+
+Optional, in `.env` (blank means off). Recreate with `docker compose up -d maple scraper` after editing:
+
+| Variable | Meaning |
+|---|---|
+| `MAPLE_RETENTION_MAX_DAYS` | Ceiling on the days an org can keep |
+| `MAPLE_RETENTION_MAX_BYTES` | Ceiling on one org's size, in bytes |
+| `MAPLE_CLICKHOUSE_MIN_FREE_PERCENT` | Free-disk guard: below this, the sweep drops the oldest days across all orgs. Try `15` |
+| `MAPLE_RETENTION_SWEEP_MINUTES` | Sweep interval, default 60 |
+
+Your data stays in the existing volumes: do **not** run `docker compose down -v`. If the disk is already tight, run `docker system df` first and free build cache with `docker builder prune -af` (it never touches volumes). Retention deletes only when an admin saves a limit in **Settings, Data platform** or you set the guard; it drops whole days and never today's data.
+
 ## Roll back
 
 1. `git checkout <previous commit>` and `docker compose build && docker compose up -d`.
