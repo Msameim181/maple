@@ -24,7 +24,6 @@ import {
 import { Database } from "@maple/backend/platform/DatabaseLive"
 import { makeDbExecute, makePersistenceErrorMapper } from "@maple/backend/platform/db-execute"
 import { ALERTING_SYSTEM_USER_ID, systemTenant } from "@maple/backend/services/auth/system-tenant"
-import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/OrganizationFeatureFlagsService"
 import { WarehouseQueryService } from "@maple/backend/services/warehouse/WarehouseQueryService"
 import { leaseClaimable, leaseStillOurs } from "../integrations/lease"
 import { pollFleet } from "../integrations/poll-fleet"
@@ -40,16 +39,19 @@ import { AnthropicCostProvider } from "./providers/anthropic/AnthropicCostProvid
 import { CloudflareCostProvider } from "./providers/cloudflare/CloudflareCostProvider"
 import { GithubCostProvider } from "./providers/github/GithubCostProvider"
 import { OpenAiCostProvider } from "./providers/openai/OpenAiCostProvider"
+import { MorphCostProvider } from "./providers/morph/MorphCostProvider"
 import { OpenRouterCostProvider } from "./providers/openrouter/OpenRouterCostProvider"
 import { PlanetScaleCostProvider } from "./providers/planetscale/PlanetScaleCostProvider"
 import { VercelCostProvider } from "./providers/vercel/VercelCostProvider"
+import { GcpCostProvider } from "./providers/gcp/GcpCostProvider"
+import { reconcileGcpCostSources } from "./gcp-cost-sources"
 import {
 	advanceCostSync,
 	batchWholeDays,
 	COST_DATASOURCE,
 	type CostSyncPlan,
 	type CostSyncStep,
-	HEAD_INTERVAL_MS,
+	headIntervalMs,
 	historyFloor,
 	nextMonthStartMs,
 	oversizedDay,
@@ -59,7 +61,6 @@ import {
 	utcMonth,
 	utcToday,
 	BUDGET_REASON,
-	ROLLOUT_REASON,
 } from "./sync-plan"
 
 /** Longer than the lane's 270-second deadline, so a live tick never loses its claim. */
@@ -76,10 +77,6 @@ const TOO_LARGE_HOLD_MS = 24 * 60 * 60_000
 /** A source whose history waits on the month's request budget is looked at again this much later at most. */
 const BACKFILL_BUDGET_HOLD_MS = 24 * 60 * 60_000
 const BUDGET_MESSAGE = "This month's provider request budget is spent; pulls resume next month."
-// A flag that reads off is asked again within the hour: a failed lookup reads as off too, and so
-// costs under an hour. No pull is made until the flag reads on.
-const ROLLOUT_HOLD_MS = 50 * 60_000
-const ROLLOUT_MESSAGE = "Cloud cost is not enabled for this organization."
 /** A tick that starts a little early still picks up a backoff that ends on its schedule. */
 const TICK_SLACK_MS = 60_000
 /** At about a minute per claim (up to three steps) and two at a time, this fits the 270-second lane. */
@@ -171,7 +168,6 @@ export class CostSyncService extends Context.Service<CostSyncService, CostSyncSe
 		make: Effect.gen(function* () {
 			const database = yield* Database
 			const warehouse = yield* WarehouseQueryService
-			const featureFlags = yield* OrganizationFeatureFlagsService
 			// One adapter per provider literal: a new provider does not compile until it has one.
 			const adapters = {
 				aws: yield* AwsCostProvider,
@@ -182,6 +178,8 @@ export class CostSyncService extends Context.Service<CostSyncService, CostSyncSe
 				planetscale: yield* PlanetScaleCostProvider,
 				anthropic: yield* AnthropicCostProvider,
 				openai: yield* OpenAiCostProvider,
+				gcp: yield* GcpCostProvider,
+				morph: yield* MorphCostProvider,
 			} satisfies Record<CostProvider, CostProviderAdapter>
 			const dbExecute = makeDbExecute(
 				database,
@@ -263,6 +261,15 @@ export class CostSyncService extends Context.Service<CostSyncService, CostSyncSe
 				})
 			})
 
+			/** GCP sources whose billing export is gone, with its connector or by itself. */
+			const reconcileGcp = Effect.fn("CostSyncService.reconcileGcp")(function* () {
+				const reconciled = yield* dbExecute((db) => reconcileGcpCostSources(db))
+				yield* Effect.annotateCurrentSpan({
+					"maple.cost.provider": "gcp",
+					"maple.cost.sources_removed": reconciled.removed,
+				})
+			})
+
 			/** One function per provider or connection table; each owns the sources of its own. */
 			const reconcile = (now: number) =>
 				Effect.all(
@@ -273,6 +280,7 @@ export class CostSyncService extends Context.Service<CostSyncService, CostSyncSe
 						reconcileVercel(),
 						reconcileConnections(now),
 						reconcilePlanetScale(),
+						reconcileGcp(),
 					],
 					{ discard: true },
 				)
@@ -295,7 +303,13 @@ export class CostSyncService extends Context.Service<CostSyncService, CostSyncSe
 								PG.or(
 									$.watermarkDate.isNull(),
 									$.lastSyncedAt.isNull(),
-									$.lastSyncedAt.lte(now - HEAD_INTERVAL_MS),
+									// A head due, at each provider's own interval.
+									...Arr.map(CostProvider.literals, (provider) =>
+										PG.and(
+											$.provider.eq(provider),
+											$.lastSyncedAt.lte(now - headIntervalMs(provider)),
+										),
+									),
 									// History left to walk, down to each provider's own floor.
 									...Arr.map(CostProvider.literals, (provider) =>
 										PG.and(
@@ -533,30 +547,6 @@ export class CostSyncService extends Context.Service<CostSyncService, CostSyncSe
 					? Effect.succeed(state)
 					: syncStep(state, state.plan).pipe(Effect.flatMap(runSteps))
 
-			/**
-			 * Releases a claim on an org that lost the `cloudCost` rollout: its reads answer 403, so a
-			 * pull would bill requests nobody can see. Nothing failed, so the claim's count is undone.
-			 */
-			const holdOutsideRollout = (claimed: CostSourceRow) =>
-				Effect.gen(function* () {
-					const now = yield* Clock.currentTimeMillis
-					yield* finish(
-						claimed,
-						{
-							lastError: ROLLOUT_MESSAGE,
-							lastErrorReason: ROLLOUT_REASON,
-							nextAttemptAt: now + ROLLOUT_HOLD_MS,
-							consecutiveFailures: Math.max(0, claimed.consecutiveFailures - 1),
-						},
-						now,
-					)
-					yield* Effect.annotateCurrentSpan({
-						"maple.cost.outcome": "skipped",
-						"maple.cost.hold": ROLLOUT_REASON,
-					})
-					return SKIPPED
-				})
-
 			const syncSource = Effect.fn("CostSyncService.syncSource")(function* (
 				claimed: CostSourceRow,
 				claimedAt: number,
@@ -566,9 +556,6 @@ export class CostSyncService extends Context.Service<CostSyncService, CostSyncSe
 					"maple.cost.source_id": claimed.id,
 					"maple.cost.provider": claimed.provider,
 				})
-				// Checked on every claim, before a plan or a pull: the flag can be withdrawn at any time.
-				const flags = yield* featureFlags.flags(claimed.orgId)
-				if (!flags.cloudCost) return yield* holdOutsideRollout(claimed)
 				const first = planCostSync(claimed, claimedAt)
 				yield* Effect.annotateCurrentSpan("maple.cost.mode", first.mode)
 				const progress = yield* runSteps({
@@ -647,18 +634,17 @@ export class CostSyncService extends Context.Service<CostSyncService, CostSyncSe
 								now + BACKFILL_BUDGET_HOLD_MS,
 								source.lastSyncedAt === null
 									? now + BACKFILL_BUDGET_HOLD_MS
-									: source.lastSyncedAt + HEAD_INTERVAL_MS,
+									: source.lastSyncedAt + headIntervalMs(source.provider),
 							)
 						: null
 				if (!stepped) {
-					const wasHeld =
-						source.lastErrorReason === BUDGET_REASON || source.lastErrorReason === ROLLOUT_REASON
+					const wasHeld = source.lastErrorReason === BUDGET_REASON
 					yield* finish(
 						source,
 						{
 							nextAttemptAt: heldUntil,
 							consecutiveFailures: budget === "backfill" ? failuresBeforeClaim : 0,
-							// The hold ended (a new month, the rollout back) and nothing was due: it is no error to keep.
+							// The hold ended (a new month) and nothing was due: it is no error to keep.
 							lastError: wasHeld ? null : source.lastError,
 							lastErrorReason: wasHeld ? null : source.lastErrorReason,
 						},
@@ -743,8 +729,9 @@ export class CostSyncService extends Context.Service<CostSyncService, CostSyncSe
 				PlanetScaleCostProvider.layer,
 				AnthropicCostProvider.layer,
 				OpenAiCostProvider.layer,
+				GcpCostProvider.layer,
+				MorphCostProvider.layer,
 				WarehouseQueryService.layer,
-				OrganizationFeatureFlagsService.layer,
 			),
 		),
 	)

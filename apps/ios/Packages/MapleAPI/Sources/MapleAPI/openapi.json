@@ -2071,6 +2071,29 @@
           "id": {
             "$ref": "#/components/schemas/_maple_DashboardId"
           },
+          "import_report": {
+            "additionalProperties": false,
+            "properties": {
+              "items": {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 1000,
+                "type": "array"
+              },
+              "source": {
+                "enum": [
+                  "grafana"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "source",
+              "items"
+            ],
+            "type": "object"
+          },
           "name": {
             "type": "string"
           },
@@ -2218,6 +2241,31 @@
                             "metric_names",
                             "scope",
                             "attribute_key"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "kind": {
+                              "enum": [
+                                "promql"
+                              ],
+                              "type": "string"
+                            },
+                            "label": {
+                              "maxLength": 256,
+                              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+                              "type": "string"
+                            },
+                            "match": {
+                              "maxLength": 4096,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "kind",
+                            "label"
                           ],
                           "type": "object"
                         }
@@ -3594,6 +3642,141 @@
             "required": [
               "kind",
               "sql"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "display_type": {
+                "type": "string"
+              },
+              "kind": {
+                "enum": [
+                  "promql"
+                ],
+                "type": "string"
+              },
+              "legend_format": {
+                "maxLength": 500,
+                "type": "string"
+              },
+              "min_step_seconds": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "query": {
+                "maxLength": 10000,
+                "type": "string"
+              },
+              "transform": {
+                "additionalProperties": false,
+                "properties": {
+                  "compute_ratio": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "denominator_names": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "numerator_name": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "numerator_name",
+                      "denominator_names"
+                    ],
+                    "type": "object"
+                  },
+                  "field_map": {
+                    "additionalProperties": {
+                      "type": "string"
+                    },
+                    "type": "object"
+                  },
+                  "flatten_series": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "value_field": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "value_field"
+                    ],
+                    "type": "object"
+                  },
+                  "hide_series": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "base_names": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "base_names"
+                    ],
+                    "type": "object"
+                  },
+                  "limit": {
+                    "type": "number"
+                  },
+                  "reduce_to_value": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "aggregate": {
+                        "enum": [
+                          "first",
+                          "sum",
+                          "count",
+                          "avg",
+                          "max",
+                          "min"
+                        ],
+                        "type": "string"
+                      },
+                      "field": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "field"
+                    ],
+                    "type": "object"
+                  },
+                  "sort_by": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "direction": {
+                        "enum": [
+                          "asc",
+                          "desc"
+                        ],
+                        "type": "string"
+                      },
+                      "field": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "field",
+                      "direction"
+                    ],
+                    "type": "object"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "kind",
+              "query"
             ],
             "type": "object"
           },
@@ -14122,6 +14305,10 @@
     {
       "description": "Browse and query OpenTelemetry metrics.",
       "name": "Metrics"
+    },
+    {
+      "description": "The Prometheus HTTP query API over Maple metrics, for Grafana and other Prometheus clients.",
+      "name": "Prometheus"
     },
     {
       "description": "Observed service health summaries.",

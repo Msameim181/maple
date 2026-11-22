@@ -107,6 +107,46 @@ describe("withAuditedRead", () => {
 		}),
 	)
 
+	it.effect("records reads of AI sessions, MCP servers, services, the service map and anomaly series", () =>
+		Effect.gen(function* () {
+			const audit = makeMemoryAuditLog()
+			const ok = Effect.succeed(HttpServerResponse.empty({ status: 200 }))
+			const reads = [
+				[
+					"POST",
+					"/internal/ai-sessions/details",
+					endpointOf(MapleInternalApi, "aiSessionsInternal", "details"),
+				],
+				[
+					"POST",
+					"/internal/mcp-servers/session",
+					endpointOf(MapleInternalApi, "mcpInternal", "session"),
+				],
+				["GET", "/v2/services", endpointOf(MapleApiV2, "services", "list")],
+				["GET", "/v2/service_map", endpointOf(MapleApiV2, "serviceMap", "retrieve")],
+				[
+					"GET",
+					"/v2/anomalies/incidents/a1/timeseries",
+					endpointOf(MapleApiV2, "anomalies", "getIncidentTimeseries"),
+				],
+				// Incident records and settings are not telemetry.
+				["GET", "/v2/anomalies/incidents", endpointOf(MapleApiV2, "anomalies", "listIncidents")],
+			] as const
+			yield* Effect.forEach(reads, ([method, url, options]) =>
+				withAuditedRead(audit, request(method, url), options, subject)(ok),
+			)
+
+			const entries = yield* audit.list(ORG, { limit: 10, offset: 0 })
+			expect(Arr.map(entries, (entry) => entry.metadata?.endpoint).sort()).toEqual([
+				"aiSessionsInternal.details",
+				"anomalies.getIncidentTimeseries",
+				"mcpInternal.session",
+				"serviceMap.retrieve",
+				"services.list",
+			])
+		}),
+	)
+
 	it.effect("still records an attempted read when the handler fails", () =>
 		Effect.gen(function* () {
 			const audit = makeMemoryAuditLog()
@@ -272,6 +312,80 @@ describe("recordMcpToolAudit", () => {
 			expect(entry?.metadata?.["display_name"]).toBe(
 				`${Str.slice(0, 200)(Str.padEnd(500, "!")("Ada"))}…`,
 			)
+		}).pipe(Effect.provide(AuditLogService.layerMemory)),
+	)
+
+	it.effect("stores a tool call's URL parameters without their userinfo and query", () =>
+		Effect.gen(function* () {
+			const audit = yield* AuditLogService
+			yield* recordMcpToolAudit({
+				...toolCall,
+				name: "create_scrape_target",
+				input: {
+					name: "payments",
+					url: "https://scraper:p4ss@metrics.example.com/metrics?token=s3cr3t-token",
+					steps: [{ url: "https://api.example.com/login?api_key=k3y-123" }],
+					service: "api",
+				},
+				tenant: { orgId: ORG, userId: USER, roles: [], authMode: "self_hosted" },
+			})
+
+			const [entry] = yield* audit.list(ORG, { limit: 10, offset: 0 })
+			expect(JSON.parse(String(entry?.metadata?.["params"]))).toEqual({
+				name: "payments",
+				url: "https://metrics.example.com/metrics",
+				steps: [{ url: "https://api.example.com/login" }],
+				service: "api",
+			})
+		}).pipe(Effect.provide(AuditLogService.layerMemory)),
+	)
+
+	it.effect("keeps free text that starts with a URL whole, and cuts only a parameter that is a URL", () =>
+		Effect.gen(function* () {
+			const audit = yield* AuditLogService
+			const body =
+				"https://docs.example.com/runbook?step=2\n\nRestart the worker, then check the queue."
+			yield* recordMcpToolAudit({
+				...toolCall,
+				name: "create_note",
+				input: { body, link: "https://docs.example.com/runbook?step=2" },
+				tenant: { orgId: ORG, userId: USER, roles: [], authMode: "self_hosted" },
+			})
+
+			const [entry] = yield* audit.list(ORG, { limit: 10, offset: 0 })
+			expect(JSON.parse(String(entry?.metadata?.["params"]))).toEqual({
+				body,
+				link: "https://docs.example.com/runbook",
+			})
+		}).pipe(Effect.provide(AuditLogService.layerMemory)),
+	)
+
+	it.effect("still records a call whose parameters are nested deeper than any stack walks", () =>
+		Effect.gen(function* () {
+			const audit = yield* AuditLogService
+			const nest = (depth: number, leaf: unknown) =>
+				Arr.reduce(
+					Arr.makeBy(depth, () => null),
+					leaf,
+					(inner) => ({ next: [inner] }),
+				)
+			yield* recordMcpToolAudit({
+				...toolCall,
+				input: {
+					service: "api",
+					shallow: nest(5, "https://metrics.example.com/metrics?token=s3cr3t-token"),
+					deep: nest(100_000, "https://metrics.example.com/metrics?token=d33p-token"),
+				},
+				tenant: { orgId: ORG, userId: USER, roles: [], authMode: "self_hosted" },
+			})
+
+			const entries = yield* audit.list(ORG, { limit: 10, offset: 0 })
+			expect(entries).toHaveLength(1)
+			const params = String(entries[0]?.metadata?.["params"])
+			expect(params).toContain('"service":"api"')
+			expect(params).toContain("https://metrics.example.com/metrics")
+			expect(params).toContain("<nested too deep>")
+			expect(params).not.toContain("token")
 		}).pipe(Effect.provide(AuditLogService.layerMemory)),
 	)
 

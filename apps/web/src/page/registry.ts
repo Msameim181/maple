@@ -47,6 +47,8 @@ import * as SecurityFinding from "./security/finding"
 import * as SecurityRun from "./security/run"
 import * as SecurityTabs from "./security/tabs"
 import * as SecurityTelemetry from "./security/telemetry"
+import * as SecurityCloud from "./security/cloud"
+import * as SecurityDevices from "./security/devices"
 import * as ErrorsHub from "./errors/hub"
 import * as ErrorIssue from "./errors/issue"
 import * as InfraContainer from "./infra/containers/detail"
@@ -178,6 +180,8 @@ export const pages = [
 	CodeReview.page,
 	SecurityTabs.page,
 	SecurityTelemetry.page,
+	SecurityCloud.page,
+	SecurityDevices.page,
 	SecurityDependencies.page,
 	SecurityAuditLog.page,
 	SecurityDetections.page,

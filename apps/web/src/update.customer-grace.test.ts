@@ -59,7 +59,6 @@ const snapshot: ClerkSnapshot = {
 		isRegionOpen: false,
 		flags: {
 			aiAutoTriage: false,
-			cloudCost: false,
 			cloudSecurity: false,
 			dataSources: false,
 			productAnalytics: false,
@@ -112,15 +111,6 @@ describe("plan gate splash on a slow customer read", () => {
 		expect(Option.map(redirect, ({ url }) => Str.startsWith("/quick-start")(url))).toEqual(
 			Option.some(true),
 		)
-	})
-})
-
-describe("status pages", () => {
-	test("an org in no rollout gets the list", () => {
-		const atStatusPages: Model = { ...base({ [orgId]: true }), route: AppRoute.StatusPages() }
-		const loaded = update(atStatusPages, Message.CompletedLoadClerk({ snapshot }))
-		expect(loaded.model.page).not.toBeNull()
-		expect(namesOf(loaded)).not.toContain("ReplaceUrl")
 	})
 })
 

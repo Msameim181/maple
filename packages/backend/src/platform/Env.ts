@@ -10,6 +10,7 @@ import { type MapleRegion, parseMapleRegion } from "@maple/domain/organization-r
 import { type SecretKeyring, secretKeyringFrom } from "./SecretBox"
 import { DEFAULT_AUTUMN_API_URL } from "@maple/backend/services/billing/autumn-api"
 import { ingestKeyLookupHmacKeyFrom } from "./credential-tokens"
+import { rootPasswordProblem } from "@maple/auth"
 
 /** Fatal misconfiguration discovered at startup: fails the layer build, so the worker refuses to boot. */
 class EnvValidationError extends Schema.TaggedError<EnvValidationError>()(
@@ -30,8 +31,12 @@ export interface EnvConfig {
 	readonly CLICKHOUSE_USER: string
 	readonly CLICKHOUSE_PASSWORD: Option.Option<Redacted.Redacted>
 	readonly CLICKHOUSE_DATABASE: string
+	/** A Cloudflare Access service token, for an env-level ClickHouse behind an Access application. */
+	readonly CLICKHOUSE_ACCESS_CLIENT_ID: Option.Option<string>
+	readonly CLICKHOUSE_ACCESS_CLIENT_SECRET: Option.Option<Redacted.Redacted>
 	readonly MAPLE_AUTH_MODE: string
 	readonly MAPLE_ROOT_PASSWORD: Option.Option<Redacted.Redacted>
+	readonly MAPLE_SESSION_SIGNING_SECRET: Option.Option<Redacted.Redacted>
 	readonly MAPLE_DEFAULT_ORG_ID: string
 	readonly MAPLE_INGEST_KEY_ENCRYPTION_KEY: Redacted.Redacted
 	/** Comma-separated keys accepted for opening stored secrets only (docs/secret-encryption.md). */
@@ -219,11 +224,6 @@ export interface EnvConfig {
 	/** Absolute lifetime of one OIDC sign-in, seconds (default 43200, clamped to 3600..604800). */
 	readonly MAPLE_OIDC_SESSION_MAX_LIFETIME_SECONDS: number
 	/**
-	 * HMAC key for self-hosted session tokens (root-password and OIDC). Unset: falls back to
-	 * `MAPLE_ROOT_PASSWORD`. Every Worker that verifies sessions must see the same value.
-	 */
-	readonly MAPLE_SESSION_SECRET: Option.Option<Redacted.Redacted>
-	/**
 	 * Keycloak Admin REST base for the realm (e.g. `http://keycloak:8080/admin/realms/maple`) and the
 	 * confidential service-account client that calls it; IT's resend/mark-verified need URL + secret.
 	 */
@@ -259,8 +259,11 @@ const envConfig = Config.all({
 	CLICKHOUSE_USER: stringWithDefault("CLICKHOUSE_USER", "default"),
 	CLICKHOUSE_PASSWORD: optionalRedacted("CLICKHOUSE_PASSWORD"),
 	CLICKHOUSE_DATABASE: stringWithDefault("CLICKHOUSE_DATABASE", "default"),
+	CLICKHOUSE_ACCESS_CLIENT_ID: optionalString("CLICKHOUSE_ACCESS_CLIENT_ID"),
+	CLICKHOUSE_ACCESS_CLIENT_SECRET: optionalRedacted("CLICKHOUSE_ACCESS_CLIENT_SECRET"),
 	MAPLE_AUTH_MODE: stringWithDefault("MAPLE_AUTH_MODE", "self_hosted"),
 	MAPLE_ROOT_PASSWORD: optionalRedacted("MAPLE_ROOT_PASSWORD"),
+	MAPLE_SESSION_SIGNING_SECRET: optionalRedacted("MAPLE_SESSION_SIGNING_SECRET"),
 	MAPLE_DEFAULT_ORG_ID: stringWithDefault("MAPLE_DEFAULT_ORG_ID", "default"),
 	MAPLE_INGEST_KEY_ENCRYPTION_KEY: Config.Redacted("MAPLE_INGEST_KEY_ENCRYPTION_KEY"),
 	MAPLE_INGEST_KEY_DECRYPTION_KEYS: optionalRedacted("MAPLE_INGEST_KEY_DECRYPTION_KEYS"),
@@ -413,7 +416,6 @@ const envConfig = Config.all({
 		3600,
 		604800,
 	),
-	MAPLE_SESSION_SECRET: optionalRedacted("MAPLE_SESSION_SECRET"),
 	MAPLE_OIDC_ADMIN_URL: optionalString("MAPLE_OIDC_ADMIN_URL"),
 	MAPLE_OIDC_ADMIN_CLIENT_ID: stringWithDefault("MAPLE_OIDC_ADMIN_CLIENT_ID", "maple-admin"),
 	MAPLE_OIDC_ADMIN_CLIENT_SECRET: optionalRedacted("MAPLE_OIDC_ADMIN_CLIENT_SECRET"),
@@ -433,6 +435,33 @@ const makeEnv = Effect.gen(function* () {
 	if (env.CLICKHOUSE_PROVIDER !== "clickhouse" && env.CLICKHOUSE_PROVIDER !== "tinybird") {
 		return yield* new EnvValidationError({
 			message: "CLICKHOUSE_PROVIDER must be either 'clickhouse' or 'tinybird'",
+		})
+	}
+
+	if (
+		Option.isSome(env.CLICKHOUSE_ACCESS_CLIENT_ID) !== Option.isSome(env.CLICKHOUSE_ACCESS_CLIENT_SECRET)
+	) {
+		return yield* new EnvValidationError({
+			message:
+				"CLICKHOUSE_ACCESS_CLIENT_ID and CLICKHOUSE_ACCESS_CLIENT_SECRET must be configured together",
+		})
+	}
+	if (
+		Option.isSome(env.CLICKHOUSE_ACCESS_CLIENT_ID) &&
+		(Option.isNone(env.CLICKHOUSE_URL) || env.CLICKHOUSE_PROVIDER !== "clickhouse")
+	) {
+		return yield* new EnvValidationError({
+			message: "CLICKHOUSE_ACCESS_CLIENT_ID needs CLICKHOUSE_URL with CLICKHOUSE_PROVIDER=clickhouse",
+		})
+	}
+	// The service token rides every request, so it must never cross plain HTTP.
+	if (
+		Option.isSome(env.CLICKHOUSE_ACCESS_CLIENT_ID) &&
+		Option.isSome(env.CLICKHOUSE_URL) &&
+		!Str.startsWith("https://")(Str.toLowerCase(Str.trim(env.CLICKHOUSE_URL.value)))
+	) {
+		return yield* new EnvValidationError({
+			message: "CLICKHOUSE_URL must use https:// when CLICKHOUSE_ACCESS_CLIENT_ID is configured",
 		})
 	}
 
@@ -492,11 +521,14 @@ const makeEnv = Effect.gen(function* () {
 		})
 	}
 
-	if (
-		Option.isSome(env.MAPLE_ROOT_PASSWORD) &&
-		Str.trim(Redacted.value(env.MAPLE_ROOT_PASSWORD.value)).length === 0
-	) {
-		return yield* new EnvValidationError({ message: "MAPLE_ROOT_PASSWORD cannot be empty" })
+	if (authMode !== "clerk" && Option.isSome(env.MAPLE_ROOT_PASSWORD)) {
+		const problem = rootPasswordProblem(Redacted.value(env.MAPLE_ROOT_PASSWORD.value))
+		if (problem !== undefined) return yield* new EnvValidationError({ message: problem })
+		if (Option.isNone(env.MAPLE_SESSION_SIGNING_SECRET)) {
+			yield* Effect.logWarning(
+				"MAPLE_SESSION_SIGNING_SECRET is not set; session tokens are signed from the root password. Set it to `openssl rand -base64 32`.",
+			)
+		}
 	}
 
 	return Env.of({

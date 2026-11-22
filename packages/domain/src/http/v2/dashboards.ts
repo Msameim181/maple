@@ -29,6 +29,7 @@ import {
 } from "@maple/primitives"
 import {
 	DashboardConcurrencyError,
+	DashboardImportReport,
 	DashboardNotFoundError,
 	DashboardPersistenceError,
 	DashboardStoredConfigInvalidError,
@@ -85,6 +86,8 @@ const dashboardFields = {
 	variables: Schema.Array(V2DashboardVariable),
 	// `null` is off, matching `description`'s absence convention on this resource.
 	refreshIntervalSeconds: Schema.NullOr(DashboardRefreshIntervalSeconds),
+	// What an import could not carry over, until dismissed; absent when there is nothing to report.
+	importReport: optional(DashboardImportReport),
 	createdAt: Timestamp,
 	updatedAt: Timestamp,
 }
@@ -103,6 +106,7 @@ const DashboardSnapshot = Schema.Struct(dashboardFields)
 		Schema.encodeKeys({
 			timeRange: "time_range",
 			refreshIntervalSeconds: "refresh_interval_seconds",
+			importReport: "import_report",
 			createdAt: "created_at",
 			updatedAt: "updated_at",
 		}),
@@ -118,6 +122,7 @@ export const V2Dashboard = Schema.Struct(liveDashboardFields)
 		Schema.encodeKeys({
 			timeRange: "time_range",
 			refreshIntervalSeconds: "refresh_interval_seconds",
+			importReport: "import_report",
 			createdAt: "created_at",
 			updatedAt: "updated_at",
 		}),
@@ -137,6 +142,7 @@ export const V2DashboardMutation = Schema.Struct({
 		Schema.encodeKeys({
 			timeRange: "time_range",
 			refreshIntervalSeconds: "refresh_interval_seconds",
+			importReport: "import_report",
 			createdAt: "created_at",
 			updatedAt: "updated_at",
 		}),
@@ -158,6 +164,12 @@ export const V2DashboardUpdateParams = Schema.Struct({
 	sections: optional(Schema.Array(V2DashboardSection)),
 	variables: optional(Schema.Array(V2DashboardVariable)),
 	refreshIntervalSeconds: optional(Schema.NullOr(DashboardRefreshIntervalSeconds)),
+	importReport: optional(
+		Schema.NullOr(DashboardImportReport).annotate({
+			description:
+				"What an import could not carry over, shown on the dashboard. `null` dismisses it; omitted keeps it.",
+		}),
+	),
 	expectedVersion: optional(
 		Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)).annotate({
 			description:
@@ -169,6 +181,7 @@ export const V2DashboardUpdateParams = Schema.Struct({
 		Schema.encodeKeys({
 			timeRange: "time_range",
 			refreshIntervalSeconds: "refresh_interval_seconds",
+			importReport: "import_report",
 			expectedVersion: "expected_version",
 		}),
 	)
@@ -353,6 +366,32 @@ export const V2DashboardPersesImportResponse = Schema.Struct({
 	warnings: Schema.Array(Schema.String),
 }).annotate({ identifier: "DashboardPersesImport", title: "Perses dashboard import" })
 
+export const V2DashboardGrafanaImportParams = Schema.Struct({
+	dashboard: Schema.Record(Schema.String, Schema.Unknown),
+}).annotate({
+	identifier: "DashboardGrafanaImportParams",
+	title: "Grafana import parameters",
+	description:
+		"A Grafana dashboard JSON: the bare dashboard, the `{ dashboard, meta }` API envelope, or an export for sharing.",
+})
+
+export const V2DashboardGrafanaImportStats = Schema.Struct({
+	panels: Schema.Number,
+	converted: Schema.Number,
+	placeholders: Schema.Number,
+}).annotate({
+	identifier: "DashboardGrafanaImportStats",
+	title: "Grafana import stats",
+	description: "Panels read (rows excluded), panels that became working widgets, and panels kept as notes.",
+})
+
+export const V2DashboardGrafanaImportResponse = Schema.Struct({
+	object: Schema.Literal("dashboard_import"),
+	dashboard: V2DashboardMutation,
+	warnings: Schema.Array(Schema.String),
+	stats: V2DashboardGrafanaImportStats,
+}).annotate({ identifier: "DashboardGrafanaImport", title: "Grafana dashboard import" })
+
 /**
  * A dashboard's share link, as its owner sees it.
  *
@@ -380,6 +419,8 @@ export const V2DashboardShare = Schema.Struct({
 	tokenSuffix: Schema.String,
 	createdAt: Timestamp,
 	updatedAt: Timestamp,
+	/** Absent = the link never expires. Past it, the link stops resolving. */
+	expiresAt: optional(Timestamp),
 })
 	.pipe(
 		Schema.encodeKeys({
@@ -388,6 +429,7 @@ export const V2DashboardShare = Schema.Struct({
 			tokenSuffix: "token_suffix",
 			createdAt: "created_at",
 			updatedAt: "updated_at",
+			expiresAt: "expires_at",
 		}),
 	)
 	.annotate({
@@ -400,7 +442,14 @@ export type V2DashboardShare = Schema.Schema.Type<typeof V2DashboardShare>
 
 export const V2DashboardShareParams = Schema.Struct({
 	mode: DashboardShareMode,
-}).annotate({ identifier: "DashboardShareParams", title: "Dashboard share parameters" })
+	/**
+	 * When the link stops resolving. Omitted keeps the current expiry (none for a
+	 * new link); `null` clears it so the link never expires.
+	 */
+	expiresAt: optional(Schema.NullOr(Timestamp)),
+})
+	.pipe(Schema.encodeKeys({ expiresAt: "expires_at" }))
+	.annotate({ identifier: "DashboardShareParams", title: "Dashboard share parameters" })
 export type V2DashboardShareParams = Schema.Schema.Type<typeof V2DashboardShareParams>
 
 export const V2DashboardShareDeleteResponse = Schema.Struct({
@@ -554,6 +603,22 @@ export class V2DashboardsApiGroup extends HttpApiGroup.make("dashboards")
 					summary: "Import a Perses dashboard",
 					description:
 						"Converts a Perses dashboard into Maple's dashboard model and returns any conversion warnings.",
+				}),
+			),
+	)
+	.add(
+		HttpApiEndpoint.post("importGrafana", "/import/grafana", {
+			payload: V2DashboardGrafanaImportParams,
+			success: V2DashboardGrafanaImportResponse,
+			error: dashboardCreateErrors,
+		})
+			.annotate(AnalystAccess, "author")
+			.annotateMerge(
+				OpenApi.annotations({
+					identifier: "importGrafanaDashboard",
+					summary: "Import a Grafana dashboard",
+					description:
+						"Converts a Grafana dashboard into Maple's dashboard model: rows become sections, Prometheus targets PromQL widgets, and panels Maple cannot run notes. Returns the warnings and how many panels converted.",
 				}),
 			),
 	)

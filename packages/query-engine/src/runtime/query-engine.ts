@@ -18,6 +18,7 @@ import {
 	type QuerySpec,
 	type TimeseriesPoint,
 	type AttributeFilter,
+	type TracesNumericAggregation,
 	MAX_METRICS_GROUP_BY_KEYS,
 } from "@maple/domain/query-engine"
 import {
@@ -277,6 +278,7 @@ export function snapWindowForQueryKind(kind: string): number {
 	return Match.value(kind).pipe(
 		Match.when("attributeKeys", () => 300), // 5 min
 		Match.when("attributeValues", () => 60), // 1 min
+		Match.when("promqlLabelValues", () => 60), // a label's values, as attributeValues
 		// 15 min — environments / commit SHAs / service names rarely change,
 		// and the dashboard route reuses this cache for demo-detection + the
 		// environment dropdown (was a heavy `serviceOverview` probe). This is
@@ -300,6 +302,7 @@ export function cacheTtlForQueryKind(kind: string): number {
 	return Match.value(kind).pipe(
 		Match.when("attributeKeys", () => 300),
 		Match.when("attributeValues", () => 60),
+		Match.when("promqlLabelValues", () => 60),
 		Match.when("facets", () => 900), // matches snapWindowForQueryKind — see comment above
 		Match.orElse(() => 15),
 	)
@@ -432,7 +435,7 @@ const normalizeBucket = (bucket: string | Date | DateTime.Utc): string => {
 	return raw
 }
 
-const validateTimeRange = Effect.fn("QueryEngineService.validateTimeRange")(function* (
+export const validateTimeRange = Effect.fn("QueryEngineService.validateTimeRange")(function* (
 	request: {
 		readonly startTime: string
 		readonly endTime: string
@@ -1212,8 +1215,15 @@ function extractTracesOpts(filters: Record<string, unknown> | undefined) {
 		excludedEnvironments: filters?.excludedEnvironments as readonly string[] | undefined,
 		excludedNamespaces: filters?.excludedNamespaces as readonly string[] | undefined,
 		excludedCommitShas: filters?.excludedCommitShas as readonly string[] | undefined,
+		numericAggregation: filters?.numericAggregation as TracesNumericAggregation | undefined,
 	}
 }
+
+/** The row column a traces chart plots: the numeric-attribute value when one is set. */
+const tracesChartField = (
+	metric: keyof typeof tracesMetricFieldMap,
+	numericAggregation: TracesNumericAggregation | undefined,
+) => (numericAggregation === undefined ? tracesMetricFieldMap[metric] : "value")
 
 /**
  * Map TracesFilters to the flat opts format expected by tracesFacetsQuery / tracesDurationStatsQuery.
@@ -1377,7 +1387,8 @@ export const makeQueryEngineExecute = <T extends QueryTenant>(warehouse: QueryEn
 			const tracesQuery = request.query
 			const opts = extractTracesOpts(request.query.filters)
 
-			if (tracesQuery.allMetrics) {
+			// The all-metrics series carry no attribute value, so a numeric aggregation takes the single path.
+			if (tracesQuery.allMetrics && opts.numericAggregation === undefined) {
 				const runAllMetrics = (overviewTiers: "hour" | "minute" | undefined) =>
 					executeCHQuery(
 						warehouse,
@@ -1469,7 +1480,7 @@ export const makeQueryEngineExecute = <T extends QueryTenant>(warehouse: QueryEn
 				"tracesTimeseries",
 			)
 
-			const field = tracesMetricFieldMap[tracesQuery.metric]
+			const field = tracesChartField(tracesQuery.metric, opts.numericAggregation)
 			return new QueryEngineExecuteResponse({
 				result: {
 					kind: "timeseries",
@@ -1655,7 +1666,7 @@ export const makeQueryEngineExecute = <T extends QueryTenant>(warehouse: QueryEn
 				"tracesBreakdown",
 			)
 
-			const field = tracesMetricFieldMap[tracesQuery.metric]
+			const field = tracesChartField(tracesQuery.metric, opts.numericAggregation)
 			return new QueryEngineExecuteResponse({
 				result: {
 					kind: "breakdown",
@@ -2388,8 +2399,15 @@ export const computeAlertBuckets = Effect.fnUntraced(function* <T extends QueryT
 			// confidence guard and must see rows actually observed. They differ only
 			// under sampling, and only the hourly rollup (which stores no raw count)
 			// falls back to the estimate.
-			const sampleCount = row.spanCount
-			const value = sampleCount > 0 ? tracesAggregateValueForMetric(query.metric, row) : null
+			// A numeric-attribute rule's samples are the spans that carried a value; none is no data.
+			const sampleCount =
+				opts.numericAggregation === undefined ? row.spanCount : Number(row.valueCount ?? 0)
+			const value =
+				sampleCount === 0
+					? null
+					: opts.numericAggregation === undefined
+						? tracesAggregateValueForMetric(query.metric, row)
+						: (row.value ?? null)
 			obs.push({
 				bucket: normalizeBucket(row.bucket),
 				groupKey: row.groupName || ENGINE_UNGROUPED_GROUP_KEY,

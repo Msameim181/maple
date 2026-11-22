@@ -48,6 +48,7 @@ const RETURN_PATH_MAX_LENGTH = 2048
 // One leading `/`, never `//` or `/\` (protocol-relative or backslash origin
 // tricks), and no backslash, whitespace or control character anywhere — which
 // leaves no room for a scheme or embedded credentials.
+// oxlint-disable-next-line no-control-regex -- refusing control characters is the point
 export const RETURN_PATH_PATTERN = /^\/(?![/\\])[^\\\s\u0000-\u001f\u007f]*$/u
 
 /**
@@ -914,6 +915,8 @@ export class GithubIntegrationStatus extends Schema.Class<GithubIntegrationStatu
 		repositorySelection: Schema.NullOr(VcsRepoSelection),
 		/** Whether GitHub Actions runs become traces. True before the org has connected. */
 		ciTracesEnabled: Schema.Boolean,
+		/** Whether organization and repository changes go to the Security audit log. True before the org has connected. */
+		auditLogEnabled: Schema.Boolean,
 		repositoryDiscovery: Schema.NullOr(VcsRepositoryDiscovery),
 		repositories: Schema.Array(GithubRepoSummary),
 	},
@@ -983,6 +986,18 @@ export class GithubSetCiTracesRequest extends Schema.Class<GithubSetCiTracesRequ
 
 export class GithubSetCiTracesResponse extends Schema.Class<GithubSetCiTracesResponse>(
 	"GithubSetCiTracesResponse",
+)({
+	enabled: Schema.Boolean,
+}) {}
+
+export class GithubSetAuditLogRequest extends Schema.Class<GithubSetAuditLogRequest>(
+	"GithubSetAuditLogRequest",
+)({
+	enabled: Schema.Boolean,
+}) {}
+
+export class GithubSetAuditLogResponse extends Schema.Class<GithubSetAuditLogResponse>(
+	"GithubSetAuditLogResponse",
 )({
 	enabled: Schema.Boolean,
 }) {}
@@ -1169,6 +1184,50 @@ export class RailwayDisconnectResponse extends Schema.Class<RailwayDisconnectRes
 )({
 	disconnected: Schema.Boolean,
 }) {}
+
+/** Connection state of the Fleet integration (one server per org, read with an API token). */
+/**
+ * How Maple names a Fleet server everywhere (card, inventory, audit log): the organization it
+ * reports, trimmed, else its host.
+ */
+export const fleetServerName = (server: {
+	readonly organizationName: string | null
+	readonly baseUrl: string
+}): string => {
+	const name = server.organizationName === null ? "" : Str.trim(server.organizationName)
+	if (!Str.isEmpty(name)) return name
+	return URL.canParse(server.baseUrl) ? new URL(server.baseUrl).host : server.baseUrl
+}
+
+export class FleetIntegrationStatus extends Schema.Class<FleetIntegrationStatus>("FleetIntegrationStatus")({
+	connected: Schema.Boolean,
+	/** The server's base URL as stored. */
+	baseUrl: Schema.NullOr(Schema.String),
+	organizationName: Schema.NullOr(Schema.String),
+	apiUserName: Schema.NullOr(Schema.String),
+	/** The token user's global role in Fleet (`observer`, `admin`, ...). */
+	apiUserRole: Schema.NullOr(Schema.String),
+	serverVersion: Schema.NullOr(Schema.String),
+	/** `free` or `premium`. */
+	licenseTier: Schema.NullOr(Schema.String),
+	connectedByUserId: Schema.NullOr(UserId),
+	connectedAt: Schema.NullOr(Schema.Number),
+	/** True when Fleet rejected the stored token; polling is paused until a new one is saved. */
+	authFailed: Schema.Boolean,
+	lastSyncedAt: Schema.NullOr(Schema.Number),
+	lastError: Schema.NullOr(Schema.String),
+}) {}
+
+export class FleetConnectRequest extends Schema.Class<FleetConnectRequest>("FleetConnectRequest")({
+	url: Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(4), Schema.isMaxLength(2048)),
+	token: Schema.String.check(Schema.isTrimmed(), Schema.isMinLength(8), Schema.isMaxLength(2048)),
+}) {}
+
+export class FleetDisconnectResponse extends Schema.Class<FleetDisconnectResponse>("FleetDisconnectResponse")(
+	{
+		disconnected: Schema.Boolean,
+	},
+) {}
 
 export const VercelProjectScope = Schema.Literals(["all", "some"])
 export type VercelProjectScope = Schema.Schema.Type<typeof VercelProjectScope>
@@ -1719,6 +1778,7 @@ export class IntegrationsApiGroup extends HttpApiGroup.make("integrations")
 		HttpApiEndpoint.get("linearTeams", "/linear/teams", {
 			success: LinearTeamsListResponse,
 			error: [
+				IntegrationsForbiddenError,
 				IntegrationsValidationError,
 				IntegrationsNotConnectedError,
 				IntegrationsRevokedError,
@@ -1759,6 +1819,7 @@ export class IntegrationsApiGroup extends HttpApiGroup.make("integrations")
 		HttpApiEndpoint.get("searchConsoleSites", "/google-search-console/sites", {
 			success: SearchConsoleAvailableSitesResponse,
 			error: [
+				IntegrationsForbiddenError,
 				IntegrationsNotConnectedError,
 				IntegrationsRevokedError,
 				IntegrationsValidationError,
@@ -1905,6 +1966,26 @@ export class IntegrationsApiGroup extends HttpApiGroup.make("integrations")
 	.add(
 		HttpApiEndpoint.delete("railwayDisconnect", "/railway", {
 			success: RailwayDisconnectResponse,
+			error: [IntegrationsForbiddenError, IntegrationsPersistenceError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.get("fleetStatus", "/fleet/status", {
+			success: FleetIntegrationStatus,
+			error: IntegrationsPersistenceError,
+		}),
+	)
+	.add(
+		// Checks the token against the server (its user, version and settings) before storing it.
+		HttpApiEndpoint.put("fleetConnect", "/fleet", {
+			payload: FleetConnectRequest,
+			success: FleetIntegrationStatus,
+			error: [IntegrationsForbiddenError, IntegrationsValidationError, IntegrationsPersistenceError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.delete("fleetDisconnect", "/fleet", {
+			success: FleetDisconnectResponse,
 			error: [IntegrationsForbiddenError, IntegrationsPersistenceError],
 		}),
 	)
@@ -2115,6 +2196,14 @@ export class IntegrationsApiGroup extends HttpApiGroup.make("integrations")
 		HttpApiEndpoint.put("githubSetCiTraces", "/github/ci-traces", {
 			payload: GithubSetCiTracesRequest,
 			success: GithubSetCiTracesResponse,
+			error: [IntegrationsForbiddenError, IntegrationsValidationError, IntegrationsPersistenceError],
+		}),
+	)
+	.add(
+		// Org-wide opt-out of GitHub events in the Security audit log. Admin only.
+		HttpApiEndpoint.put("githubSetAuditLog", "/github/audit-log", {
+			payload: GithubSetAuditLogRequest,
+			success: GithubSetAuditLogResponse,
 			error: [IntegrationsForbiddenError, IntegrationsValidationError, IntegrationsPersistenceError],
 		}),
 	)

@@ -64,7 +64,7 @@ const NonEmptyString = Schema.String.check(Schema.isMinLength(1))
 
 const slugField = Schema.String.annotate({
 	description:
-		"The page's address, `<slug>.<status domain>`: 3 to 48 lowercase letters, digits or inner hyphens. Unique across Maple.",
+		"The page's address, `/s/<org key>/<slug>` on the status domain: 3 to 48 lowercase letters, digits or inner hyphens. Unique within the organization.",
 	examples: ["acme-status"],
 })
 
@@ -76,7 +76,7 @@ const autoIncidentsField = StatusPageAutoIncidents.annotate({
 
 const visibilityField = StatusPageVisibility.annotate({
 	description:
-		"Who can read the page: `public` (anyone), `password` (visitors who enter the page password, set with `PUT /v2/status_pages/{id}/password`; no feeds or badge without it) or `internal` (only members of your organization, in Maple; the page is not served at its address or custom domain). Omitted from an update or a config, the page keeps its visibility. Changing it needs an org admin.",
+		"Who can read the page: `public` (anyone), `password` (visitors who enter the page password, set with `PUT /v2/status_pages/{id}/password`; no feeds or badge without it) or `internal` (only members of your organization, in Maple; the page is not served at its address or custom domain). Omitted from an update or a config, the page keeps its visibility.",
 	examples: ["public"],
 })
 
@@ -193,12 +193,15 @@ export const V2StatusPage = Schema.Struct({
 	slug: slugField,
 	description: Schema.NullOr(Schema.String).annotate({ description: "Text under the title, or `null`." }),
 	website_url: Schema.NullOr(Schema.String).annotate({ description: "Your site, linked from the page." }),
-	logo_url: Schema.NullOr(Schema.String).annotate({ description: "An https logo URL, or `null`." }),
+	logo_url: Schema.NullOr(Schema.String).annotate({
+		description:
+			"An https logo URL or an uploaded image as a base64 `data:image/...` URL (at most 128 KB), or `null`.",
+	}),
 	logo_dark_url: Schema.NullOr(Schema.String).annotate({
-		description: "An https logo URL shown in dark mode instead of `logo_url`, or `null`.",
+		description: "A logo shown in dark mode instead of `logo_url`, as `logo_url` takes it, or `null`.",
 	}),
 	favicon_url: Schema.NullOr(Schema.String).annotate({
-		description: "An https URL of the page's browser tab icon, or `null`.",
+		description: "The page's browser tab icon, as `logo_url` takes it, or `null`.",
 	}),
 	support_url: Schema.NullOr(Schema.String).annotate({
 		description: "An https link to your support or contact page, shown in the page header, or `null`.",
@@ -346,7 +349,7 @@ export const V2StatusPageCustomDomainDnsRecord = Schema.Struct({
 	value: Schema.String,
 	purpose: StatusPageCustomDomainRecordPurpose.annotate({
 		description:
-			"`routing` sends the hostname to Maple (always needed), `ownership` proves you own it before the CNAME is live, `certificate` lets the certificate be issued.",
+			"`routing` sends the hostname to Maple (always needed), `ownership` proves you own the domain (the `_maple-challenge` record is needed before Maple sets a new domain up), `certificate` lets the certificate be issued.",
 	}),
 }).annotate({
 	identifier: "StatusPageCustomDomainDnsRecord",
@@ -399,6 +402,12 @@ export const V2StatusPageCustomDomain = Schema.Struct({
 					name: "status.acme.com",
 					value: "status-domains.maple.dev",
 					purpose: "routing",
+				},
+				{
+					type: "TXT",
+					name: "_maple-challenge.status.acme.com",
+					value: "maple-status-page=1c2ba8fdad86fbbe9cdd85449b0e85c6",
+					purpose: "ownership",
 				},
 			],
 			last_error: null,
@@ -1166,6 +1175,7 @@ const ApplyConfigQuery = Schema.Struct({
 
 const pageParams = { id: StatusPagePublicId }
 const componentParams = { id: StatusPagePublicId, component_id: StatusPageComponentPublicId }
+const writeNote = "Requires the `status_pages:write` scope and a caller with at least the engineer role."
 const adminNote = "Requires the `status_pages:write` scope and an org-admin caller."
 
 export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
@@ -1192,7 +1202,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "createStatusPage",
 				summary: "Create a status page",
-				description: `Creates a status page with its components in one write. It is published within a minute, right away with \`publish: true\`, or created as a draft with \`publish: false\`. ${adminNote}`,
+				description: `Creates a status page with its components in one write. It is published within a minute, right away with \`publish: true\`, or created as a draft with \`publish: false\`. ${writeNote}`,
 			}),
 		),
 	)
@@ -1248,7 +1258,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "updateStatusPage",
 				summary: "Update a status page",
-				description: `Updates a status page; omitted fields are unchanged. ${adminNote}`,
+				description: `Updates a status page; omitted fields are unchanged. ${writeNote}`,
 			}),
 		),
 	)
@@ -1261,7 +1271,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "deleteStatusPage",
 				summary: "Delete a status page",
-				description: `Deletes a status page with its components and incidents, and takes it offline. ${adminNote}`,
+				description: `Deletes a status page with its components and incidents, and takes it offline. ${writeNote}`,
 			}),
 		),
 	)
@@ -1274,7 +1284,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "publishStatusPage",
 				summary: "Publish a status page",
-				description: `Publishes the page now instead of within the minute, making a draft public first. ${adminNote}`,
+				description: `Publishes the page now instead of within the minute, making a draft public first. ${writeNote}`,
 			}),
 		),
 	)
@@ -1314,7 +1324,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "setStatusPagePassword",
 				summary: "Set a status page password",
-				description: `Sets or replaces the password visitors enter on a \`password\` page; replacing it signs every visitor out. Setting one does not change the visibility. ${adminNote}`,
+				description: `Sets or replaces the password visitors enter on a \`password\` page; replacing it signs every visitor out. Setting one does not change the visibility. ${writeNote}`,
 			}),
 		),
 	)
@@ -1327,7 +1337,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "removeStatusPagePassword",
 				summary: "Remove a status page password",
-				description: `Removes the page password. A \`password\` page must be made \`public\` or \`internal\` first. ${adminNote}`,
+				description: `Removes the page password. A \`password\` page must be made \`public\` or \`internal\` first. ${writeNote}`,
 			}),
 		),
 	)
@@ -1362,7 +1372,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "setStatusPageCustomDomain",
 				summary: "Set a status page's custom domain",
-				description: `Serves the page on a subdomain you control, like \`status.acme.com\`, replacing a different one it has; the same hostname again changes nothing. Add the returned DNS records; the page goes live there once the certificate is issued. ${adminNote}`,
+				description: `Serves the page on a subdomain you control, like \`status.acme.com\`, replacing a different one it has; the same hostname again changes nothing. Add the returned DNS records: Maple sets a new domain up once it finds the ownership TXT record, and the page goes live there once the certificate is issued. A hostname held by a page that never proved it owns the domain answers 409 with the record that claims it. ${writeNote}`,
 			}),
 		),
 	)
@@ -1375,7 +1385,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "removeStatusPageCustomDomain",
 				summary: "Remove a status page's custom domain",
-				description: `Stops serving the page on its custom domain within a minute. The page stays up at its Maple address. ${adminNote}`,
+				description: `Stops serving the page on its custom domain within a minute. The page stays up at its Maple address. ${writeNote}`,
 			}),
 		),
 	)
@@ -1394,7 +1404,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "checkStatusPageCustomDomain",
 				summary: "Check a status page's custom domain now",
-				description: `Checks the domain's DNS and certificate now instead of waiting for the next scheduled check, and retries a failed certificate. ${adminNote}`,
+				description: `Checks the domain's DNS and certificate now instead of waiting for the next scheduled check, and retries a failed certificate. ${writeNote}`,
 			}),
 		),
 	)
@@ -1434,7 +1444,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 				OpenApi.annotations({
 					identifier: "applyStatusPageConfig",
 					summary: "Apply a status page config",
-					description: `Replaces the page with the document in one write: components listed with an \`id\` are updated, without one created, and left out deleted; list order is display order. Any invalid part, or a key the document does not define, rejects the whole document. With \`if_version\`, a config that changed since that version was read answers 409 and nothing is written; status flips and publishes do not change it. Returns the applied config. ${adminNote}`,
+					description: `Replaces the page with the document in one write: components listed with an \`id\` are updated, without one created, and left out deleted; list order is display order. Any invalid part, or a key the document does not define, rejects the whole document. With \`if_version\`, a config that changed since that version was read answers 409 and nothing is written; status flips and publishes do not change it. Returns the applied config. ${writeNote}`,
 				}),
 			),
 	)
@@ -1463,7 +1473,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "createStatusPageComponent",
 				summary: "Add a status page component",
-				description: `Adds a component after the existing ones; a page holds at most ${MAX_STATUS_PAGE_COMPONENTS}. ${adminNote}`,
+				description: `Adds a component after the existing ones; a page holds at most ${MAX_STATUS_PAGE_COMPONENTS}. ${writeNote}`,
 			}),
 		),
 	)
@@ -1477,7 +1487,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "reorderStatusPageComponents",
 				summary: "Reorder status page components",
-				description: `Sets the display order; the list must name every component once. ${adminNote}`,
+				description: `Sets the display order; the list must name every component once. ${writeNote}`,
 			}),
 		),
 	)
@@ -1497,7 +1507,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "updateStatusPageComponent",
 				summary: "Update a status page component",
-				description: `Updates a component; omitted fields are unchanged. ${adminNote}`,
+				description: `Updates a component; omitted fields are unchanged. ${writeNote}`,
 			}),
 		),
 	)
@@ -1516,7 +1526,7 @@ export class V2StatusPagesApiGroup extends HttpApiGroup.make("statusPages")
 			OpenApi.annotations({
 				identifier: "deleteStatusPageComponent",
 				summary: "Remove a status page component",
-				description: `Removes a component from its page. ${adminNote}`,
+				description: `Removes a component from its page. ${writeNote}`,
 			}),
 		),
 	)

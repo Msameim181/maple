@@ -2,6 +2,7 @@ import * as PG from "@maple-dev/effect-orm/postgres"
 import {
 	AwsConnections,
 	ChatWorkspaces,
+	CloudSecurityServiceStates,
 	CloudflareAnalyticsState,
 	CloudflareHyperdriveConfigs,
 	CloudflareLogpushConnectors,
@@ -11,6 +12,7 @@ import {
 	PlanetscaleConnections,
 	PlanetscaleDatabases,
 	PlanetscalePollState,
+	FleetConnections,
 	RailwayConnections,
 	SearchConsoleSites,
 	RailwayEnvironments,
@@ -79,7 +81,14 @@ const make: Effect.Effect<IntegrationInventoryServiceApi, never, Database> = Eff
 					),
 					vcsInstallations: db.run(
 						PG.from(VcsInstallations)
-							.select("provider", "accountLogin", "status", "ciTracesEnabled", "createdAt")
+							.select(
+								"provider",
+								"accountLogin",
+								"status",
+								"ciTracesEnabled",
+								"auditLogEnabled",
+								"createdAt",
+							)
 							.where(($) => [$.orgId.eq(orgId)]),
 					),
 					vcsRepositories: db.run(
@@ -151,6 +160,24 @@ const make: Effect.Effect<IntegrationInventoryServiceApi, never, Database> = Eff
 							])
 							.groupBy("connectorId", "assetType"),
 					),
+					// The CloudTrail feed's regions the poller could not read, with their connection's account.
+					awsCloudTrailProblems: db.run(
+						PG.from(CloudSecurityServiceStates)
+							.innerJoin(AwsConnections, "c", (state, connection) =>
+								connection.id.eq(state.connectionId),
+							)
+							.select(($) => ({
+								accountId: $.c.accountId,
+								state: $.state,
+								lastError: $.lastError,
+							}))
+							.where(($) => [
+								$.orgId.eq(orgId),
+								$.c.orgId.eq(orgId),
+								$.source.eq("cloudtrail"),
+								PG.inList($.state, ["denied", "failing"]),
+							]),
+					),
 					awsConnections: db.run(
 						PG.from(AwsConnections)
 							.select(
@@ -195,6 +222,23 @@ const make: Effect.Effect<IntegrationInventoryServiceApi, never, Database> = Eff
 								"logsError",
 							)
 							.where(($) => [$.orgId.eq(orgId), $.removedAt.isNull()]),
+					),
+					fleetConnections: db.run(
+						PG.from(FleetConnections)
+							.select(
+								"organizationName",
+								"baseUrl",
+								"authFailedAt",
+								"lastSuccessAt",
+								"lastErrorAt",
+								"lastError",
+								"createdAt",
+								"findingsSyncedAt",
+								"findingsErrorAt",
+								"findingsError",
+							)
+							.where(($) => [$.orgId.eq(orgId)])
+							.limit(1),
 					),
 					railwayConnections: db.run(
 						PG.from(RailwayConnections)
@@ -336,6 +380,7 @@ const make: Effect.Effect<IntegrationInventoryServiceApi, never, Database> = Eff
 				gcpConnectors: rows.gcpConnectors,
 				gcpResourceCounts: rows.gcpResourceCounts,
 				awsConnections: rows.awsConnections,
+				awsCloudTrailProblems: rows.awsCloudTrailProblems,
 				supabaseConnection:
 					supabase === undefined
 						? null
@@ -350,6 +395,17 @@ const make: Effect.Effect<IntegrationInventoryServiceApi, never, Database> = Eff
 					rows.supabaseProjects,
 					(project) => project.connectionId === supabase?.id,
 				),
+				fleetConnection: Option.match(Arr.head(rows.fleetConnections), {
+					onNone: () => null,
+					onSome: ({ findingsSyncedAt, findingsErrorAt, findingsError, ...connection }) => ({
+						...connection,
+						findings: {
+							lastSuccessAt: findingsSyncedAt,
+							lastErrorAt: findingsErrorAt,
+							lastError: findingsError,
+						},
+					}),
+				}),
 				railwayConnection: rows.railwayConnections[0] ?? null,
 				railwayEnvironments: Arr.map(rows.railwayEnvironments, ({ servicesJson, ...env }) => ({
 					...env,

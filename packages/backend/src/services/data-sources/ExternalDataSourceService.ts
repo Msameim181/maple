@@ -17,6 +17,7 @@ import {
 	type CatalogEntryView,
 	type CreateExternalDataSourceInput,
 	type DataSourceDriverError,
+	DataSourceForbiddenError,
 	DataSourceLimitError,
 	DataSourceNotFoundError,
 	DataSourcePersistenceError,
@@ -35,6 +36,7 @@ import {
 	type UpdateCatalogEntryInput,
 	type UpdateExternalDataSourceInput,
 } from "@maple/domain/data-sources"
+import * as Policy from "@maple/domain/policy"
 import type { OrgId, UserId } from "@maple/primitives"
 import {
 	ExternalDataSourceCatalogEntries,
@@ -67,6 +69,9 @@ import { Env } from "@maple/backend/platform/Env"
 import { DataSourceCallBudget, DataSourceDrivers } from "./DataSourceDrivers"
 import { DataSourceCallBudgetLive } from "./DataSourceCallBudgetLive"
 import { DATA_SOURCE_DRIVERS } from "./drivers"
+import type { QueryCaller } from "./query-caller"
+
+export { mayQueryDataSources, queryCallerOf, type QueryCaller } from "./query-caller"
 
 // Connected systems Maple queries in place. Owns storage, secrets, catalogs, search and the
 // query path every surface (dashboards, alerts, MCP tools, the API) goes through.
@@ -163,14 +168,18 @@ export interface ExternalDataSourceServiceApi {
 		query: string,
 		audience: Audience,
 		limit?: number,
+		/** Only this source's catalog, by name: ranked on its own, so other sources cannot crowd it out. */
+		sourceName?: string,
 	) => Effect.Effect<ReadonlyArray<DataSourceSearchHit>, DataSourcePersistenceError>
+	/** Refused unless the caller holds `data_sources:query`; an unattended run always reads as an agent. */
 	readonly query: (
 		orgId: OrgId,
 		ref: string,
 		query: ExternalQuery,
 		input: QueryInput,
 		audience: Audience,
-	) => Effect.Effect<DataSourceQueryResult, ExternalDataSourceServiceError>
+		caller: QueryCaller,
+	) => Effect.Effect<DataSourceQueryResult, ExternalDataSourceServiceError | DataSourceForbiddenError>
 }
 
 const toPersistenceError = makePersistenceErrorMapper(
@@ -224,6 +233,7 @@ const toDocument = (
 	row: ExternalDataSourceRow,
 	entryCount: number,
 	storedCount: number,
+	supportsPiiRedaction: boolean,
 ): ExternalDataSourceDocument => ({
 	id: row.id,
 	name: row.name,
@@ -234,6 +244,7 @@ const toDocument = (
 	tags: row.tags,
 	agentAccess: row.agentAccess,
 	agentPii: row.agentPii,
+	supportsPiiRedaction,
 	config: row.config,
 	hasSecret: row.secretCiphertext !== null,
 	secretHint: row.secretHint,
@@ -307,6 +318,10 @@ export class ExternalDataSourceService extends Context.Service<
 				: Effect.succeed(driver)
 		}
 
+		/** Whether the kind's catalog marks personal data; a kind this deployment cannot query marks none. */
+		const marksPersonalData = (kind: ExternalDataSourceRow["kind"]): boolean =>
+			drivers.get(kind)?.marksPersonalData ?? false
+
 		// A source that answered 429 is left alone until its Retry-After passes. Per isolate: it stops a
 		// burst of widgets or retries from one Worker, the rate-limit bindings cover the fleet.
 		const cooldowns = MutableHashMap.empty<ExternalDataSourceId, number>()
@@ -318,7 +333,10 @@ export class ExternalDataSourceService extends Context.Service<
 		) =>
 			Effect.provideService(effect, HttpClient.HttpClient, httpClient).pipe(
 				Effect.tapError((error) =>
-					Schema.is(DataSourceRateLimitedError)(error) && error.retryAfterSeconds !== undefined
+					// Only the source's own answer starts a wait: a refusal Maple made must not extend one.
+					Schema.is(DataSourceRateLimitedError)(error) &&
+					error.limitedBy !== "maple" &&
+					error.retryAfterSeconds !== undefined
 						? Effect.map(Clock.currentTimeMillis, (now) => {
 								MutableHashMap.set(
 									cooldowns,
@@ -340,6 +358,7 @@ export class ExternalDataSourceService extends Context.Service<
 									message:
 										"The source asked Maple to slow down; waiting for its Retry-After before calling again.",
 									retryAfterSeconds: Math.ceil((until - now) / 1000),
+									limitedBy: "maple",
 								}),
 							)
 						: budget.spend({ id: row.id, config: row.config }, calls)
@@ -440,6 +459,7 @@ export class ExternalDataSourceService extends Context.Service<
 					row,
 					entriesFor(row, entries, audience).length,
 					entriesFor(row, entries, PEOPLE).length,
+					marksPersonalData(row.kind),
 				),
 			)
 		const documentForPeople = (row: ExternalDataSourceRow) => documentFor(row, PEOPLE)
@@ -453,7 +473,7 @@ export class ExternalDataSourceService extends Context.Service<
 			const secret = yield* openSecret(
 				keyring,
 				externalDataSourceSecretSlot,
-				{ orgId: row.orgId, id: row.id },
+				{ orgId: row.orgId, id: row.id, config: row.config },
 				{ ciphertext: row.secretCiphertext, iv: row.secretIv, tag: row.secretTag },
 				persistenceError,
 			)
@@ -692,6 +712,7 @@ export class ExternalDataSourceService extends Context.Service<
 						row,
 						entriesFor(row, entries, audience).length,
 						entriesFor(row, entries, PEOPLE).length,
+						marksPersonalData(row.kind),
 					),
 			)
 		})
@@ -743,7 +764,7 @@ export class ExternalDataSourceService extends Context.Service<
 					: yield* sealSecret(
 							keyring,
 							externalDataSourceSecretSlot,
-							{ orgId, id },
+							{ orgId, id, config: validated.config },
 							validated.secret,
 							persistenceError,
 						)
@@ -843,7 +864,7 @@ export class ExternalDataSourceService extends Context.Service<
 						: yield* sealSecret(
 								keyring,
 								externalDataSourceSecretSlot,
-								{ orgId: row.orgId, id: row.id },
+								{ orgId: row.orgId, id: row.id, config: validated.config },
 								validated.secret,
 								persistenceError,
 							)
@@ -939,7 +960,12 @@ export class ExternalDataSourceService extends Context.Service<
 			const shown = Arr.map(entriesFor(row, stored, audience), toEntryView)
 			const redacted = audience.agent && !row.agentPii ? Arr.map(shown, withoutPiiSamples) : shown
 			return {
-				source: toDocument(row, shown.length, entriesFor(row, stored, PEOPLE).length),
+				source: toDocument(
+					row,
+					shown.length,
+					entriesFor(row, stored, PEOPLE).length,
+					marksPersonalData(row.kind),
+				),
 				entries: Arr.sort(
 					redacted,
 					Order.mapInput(Order.String, (entry: CatalogEntryView) => entry.name),
@@ -1000,12 +1026,16 @@ export class ExternalDataSourceService extends Context.Service<
 			query: string,
 			audience: Audience,
 			limit?: number,
+			sourceName?: string,
 		) {
 			const [rows, entries] = yield* Effect.all([loadRows(orgId), loadEntries(orgId)], {
 				concurrency: 2,
 			})
 			const sources: ReadonlyArray<SearchableSource> = Arr.map(
-				Arr.filter(rows, (row) => visible(row, audience)),
+				Arr.filter(
+					rows,
+					(row) => visible(row, audience) && (sourceName === undefined || row.name === sourceName),
+				),
 				(row) => ({
 					id: row.id,
 					name: row.name,
@@ -1030,8 +1060,23 @@ export class ExternalDataSourceService extends Context.Service<
 			ref: string,
 			externalQuery: ExternalQuery,
 			input: QueryInput,
-			audience: Audience,
+			requested: Audience,
+			caller: QueryCaller,
 		) {
+			if (caller.kind === "principal") {
+				yield* Policy.check(
+					caller.roles,
+					"data_sources:query",
+					(denial) =>
+						new DataSourceForbiddenError({
+							message: denial.message,
+							permission: denial.permission,
+						}),
+				)
+			}
+			// Nobody holds an unattended run to a role, so it never reads as a person either.
+			const audience: Audience = caller.kind === "unattended" ? { agent: true } : requested
+			yield* Effect.annotateCurrentSpan({ "maple.data_source.caller": caller.kind })
 			const row = yield* resolve(orgId, ref, audience)
 			yield* Effect.annotateCurrentSpan({
 				"maple.data_source.id": row.id,
@@ -1051,7 +1096,7 @@ export class ExternalDataSourceService extends Context.Service<
 				return yield* new DataSourceValidationError({
 					message: wantsSql
 						? `"${row.name}" is a ${row.kind} database: send SQL (\`sql\`), not a resource query.`
-						: `"${row.name}" is a ${row.kind} API: it takes a resource query, not SQL. Use describe_data_source to see its resources and an example.`,
+						: `"${row.name}" is a ${row.kind} API: it takes a resource query, not SQL. Use list_data_sources with this data_source to see its resources and an example.`,
 					field: "query",
 				})
 			}
@@ -1082,6 +1127,7 @@ export class ExternalDataSourceService extends Context.Service<
 					limits,
 					workload: input.workload,
 					redactPii: audience.agent && !row.agentPii,
+					hiddenEntries: audience.agent ? hiddenOf(row, stored) : [],
 				},
 				sourceCatalogFor(
 					entries,
@@ -1151,7 +1197,7 @@ export class ExternalDataSourceService extends Context.Service<
 	static readonly layer = Layer.effect(this, this.make).pipe(Layer.provide(FetchHttpClient.layer))
 }
 
-/** The service with this deployment's drivers, and API sources on the rate-limit bindings' budget. */
+/** The service with this deployment's drivers, and every source on the rate-limit bindings' budget. */
 export const ExternalDataSourceServiceLive = ExternalDataSourceService.layer.pipe(
 	Layer.provide(DataSourceDrivers.fromList(DATA_SOURCE_DRIVERS)),
 	Layer.provide(DataSourceCallBudgetLive),

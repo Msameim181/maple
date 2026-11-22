@@ -891,6 +891,24 @@ SELECT
           AND ci_runs.Result != 'skip'
         FORMAT JSON
 
+-- builder:cloud-resources:cloudResourceServicesQuery:default  [dbe0d8a8]
+SELECT
+          arrayJoin([if(traces.ResourceAttributes['host.id'] IN ('i-0abc123'), concat('host.id', traces.ResourceAttributes['host.id']), ''), if(((traces.ResourceAttributes['faas.name'] IN ('checkout-fn') AND traces.ResourceAttributes['cloud.account.id'] IN ('', '111111111111')) AND traces.ResourceAttributes['cloud.region'] IN ('', 'us-east-1')), concat('faas.name111111111111/us-east-1', traces.ResourceAttributes['faas.name']), ''), if(traces.ResourceAttributes['cloud.resource_id'] IN ('arn:aws:lambda:us-east-1:123456789012:function:checkout-fn'), concat('cloud.resource_id', traces.ResourceAttributes['cloud.resource_id']), '')]) AS match,
+          traces.ServiceName AS service,
+          toUInt64(sum(traces.SampleRate)) AS requests
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND traces.IsEntryPoint = 1
+          AND hasAny(mapValues(traces.ResourceAttributes), ['i-0abc123', 'checkout-fn', 'arn:aws:lambda:us-east-1:123456789012:function:checkout-fn']) = 1
+          AND (traces.ResourceAttributes['host.id'] IN ('i-0abc123') OR traces.ResourceAttributes['faas.name'] IN ('checkout-fn') OR traces.ResourceAttributes['cloud.resource_id'] IN ('arn:aws:lambda:us-east-1:123456789012:function:checkout-fn'))
+        GROUP BY match, service
+        HAVING match != ''
+        ORDER BY requests DESC
+        LIMIT 1001
+        FORMAT JSON
+
 -- builder:containers:containerCountersSummaryQuery:default  [1b4fe1f9]
 SELECT
           avg(hosts.memoryBytesAvg) AS memoryBytesAvg,
@@ -15604,6 +15622,30 @@ SELECT
         LIMIT 10
         FORMAT JSON
 
+-- pipe:custom_traces_breakdown:numeric-attribute:baseline  [cfa967c2]
+SELECT
+          traces.ServiceName AS name,
+          sum(traces.SampleRate) AS count,
+          count() AS spanCount,
+          avg(traces.Duration) / 1000000 AS avgDuration,
+          quantile(0.5)(traces.Duration) / 1000000 AS p50Duration,
+          quantile(0.95)(traces.Duration) / 1000000 AS p95Duration,
+          quantile(0.99)(traces.Duration) / 1000000 AS p99Duration,
+          if(sum(traces.SampleRate) > 0, sumIf(traces.SampleRate, traces.StatusCode = 'Error') / sum(traces.SampleRate), 0) AS errorRate,
+          countIf((NOT (traces.StatusCode = 'Error') AND traces.Duration / 1000000 < 500)) AS satisfiedCount,
+          countIf((NOT (traces.StatusCode = 'Error') AND (traces.Duration / 1000000 >= 500 AND traces.Duration / 1000000 < 2000))) AS toleratingCount,
+          if(count() > 0, round(countIf((NOT (traces.StatusCode = 'Error') AND traces.Duration / 1000000 < 500)) / count() + (countIf((NOT (traces.StatusCode = 'Error') AND (traces.Duration / 1000000 >= 500 AND traces.Duration / 1000000 < 2000))) * 0.5 / count()), 4), 0) AS apdexScore,
+          ifNull(sum(if(isFinite(toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost'])), toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost']), NULL) * traces.SampleRate), 0) AS value,
+          countIf(if(isFinite(toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost'])), toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost']), NULL) IS NOT NULL) AS valueCount
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+        GROUP BY name
+        ORDER BY value DESC
+        LIMIT 10
+        FORMAT JSON
+
 -- pipe:custom_traces_timeseries:errors-only:baseline  [dba698c6]
 SELECT
           toStartOfInterval(service_overview_spans.Timestamp, INTERVAL 3600 SECOND) AS bucket,
@@ -15758,6 +15800,31 @@ SELECT
           countIf((NOT (traces.StatusCode = 'Error') AND (traces.Duration / 1000000 >= 500 AND traces.Duration / 1000000 < 2000))) AS toleratingCount,
           if(count() > 0, round(countIf((NOT (traces.StatusCode = 'Error') AND traces.Duration / 1000000 < 500)) / count() + (countIf((NOT (traces.StatusCode = 'Error') AND (traces.Duration / 1000000 >= 500 AND traces.Duration / 1000000 < 2000))) * 0.5 / count()), 4), 0) AS apdexScore,
           sum(traces.SampleRate) AS estimatedSpanCount
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+        GROUP BY bucket, groupName
+        ORDER BY bucket ASC, groupName ASC
+        FORMAT JSON
+
+-- pipe:custom_traces_timeseries:numeric-attribute:baseline  [da4083a3]
+SELECT
+          toStartOfInterval(traces.Timestamp, INTERVAL 3600 SECOND) AS bucket,
+          'all' AS groupName,
+          sum(traces.SampleRate) AS count,
+          count() AS spanCount,
+          avg(traces.Duration) / 1000000 AS avgDuration,
+          quantile(0.5)(traces.Duration) / 1000000 AS p50Duration,
+          quantile(0.95)(traces.Duration) / 1000000 AS p95Duration,
+          quantile(0.99)(traces.Duration) / 1000000 AS p99Duration,
+          if(sum(traces.SampleRate) > 0, sumIf(traces.SampleRate, traces.StatusCode = 'Error') / sum(traces.SampleRate), 0) AS errorRate,
+          countIf((NOT (traces.StatusCode = 'Error') AND traces.Duration / 1000000 < 500)) AS satisfiedCount,
+          countIf((NOT (traces.StatusCode = 'Error') AND (traces.Duration / 1000000 >= 500 AND traces.Duration / 1000000 < 2000))) AS toleratingCount,
+          if(count() > 0, round(countIf((NOT (traces.StatusCode = 'Error') AND traces.Duration / 1000000 < 500)) / count() + (countIf((NOT (traces.StatusCode = 'Error') AND (traces.Duration / 1000000 >= 500 AND traces.Duration / 1000000 < 2000))) * 0.5 / count()), 4), 0) AS apdexScore,
+          sum(traces.SampleRate) AS estimatedSpanCount,
+          ifNull(avg(if(isFinite(toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost'])), toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost']), NULL)), 0) AS value,
+          countIf(if(isFinite(toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost'])), toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost']), NULL) IS NOT NULL) AS valueCount
         FROM traces
         WHERE traces.OrgId = 'org_sql_catalog'
           AND traces.Timestamp >= '2026-01-01 10:30:00'
@@ -21795,6 +21862,44 @@ SELECT
         LIMIT 10
         FORMAT JSON
 
+-- spec:traces-breakdown-numeric-attribute#1:baseline  [ff25b047]
+SELECT
+          service_usage.ServiceName AS serviceName,
+          sum(service_usage.TraceCount) AS spanCount,
+          sumIf(service_usage.TraceCount, service_usage.Hour = toStartOfHour(toDateTime('2026-01-03 10:30:00'))) AS firstHourSpanCount,
+          sumIf(service_usage.TraceCount, service_usage.Hour = toStartOfHour(toDateTime('2026-01-03 14:15:00'))) AS lastHourSpanCount
+        FROM service_usage
+        WHERE service_usage.OrgId = 'org_sql_catalog'
+          AND service_usage.Hour >= toStartOfHour(toDateTime('2026-01-03 10:30:00'))
+          AND service_usage.Hour <= toStartOfHour(toDateTime('2026-01-03 14:15:00'))
+        GROUP BY serviceName
+        FORMAT JSON
+
+-- spec:traces-breakdown-numeric-attribute#2:baseline  [e7607252]
+SELECT
+          traces.ServiceName AS name,
+          sum(traces.SampleRate) AS count,
+          count() AS spanCount,
+          0 AS avgDuration,
+          0 AS p50Duration,
+          0 AS p95Duration,
+          0 AS p99Duration,
+          0 AS errorRate,
+          0 AS satisfiedCount,
+          0 AS toleratingCount,
+          0 AS apdexScore,
+          ifNull(quantile(0.95)(if(isFinite(toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.output_tokens'])), toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.output_tokens']), NULL)), 0) AS value,
+          countIf(if(isFinite(toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.output_tokens'])), toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.output_tokens']), NULL) IS NOT NULL) AS valueCount
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-03 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND (traces.SpanKind IN ('Server', 'Consumer') OR traces.ParentSpanId = '')
+        GROUP BY name
+        ORDER BY value DESC
+        LIMIT 10
+        FORMAT JSON
+
 -- spec:traces-breakdown#1:baseline  [ff25b047]
 SELECT
           service_usage.ServiceName AS serviceName,
@@ -23975,6 +24080,34 @@ SELECT
           AND traces.ServiceName = 'api'
           AND coalesce(nullIf(traces.ResourceAttributes['deployment.environment.name'], ''), traces.ResourceAttributes['deployment.environment']) IN ('production')
           AND ((has(SpanAttributeItems, concat('http.method', char(31), 'GET')) OR has(SpanAttributeItems, concat('http.request.method', char(31), 'GET'))) AND if(SpanAttributes['http.method'] != '', SpanAttributes['http.method'], SpanAttributes['http.request.method']) = 'GET')
+        GROUP BY bucket, groupName
+        ORDER BY bucket ASC, groupName ASC
+        FORMAT JSON
+
+-- spec:traces-timeseries-numeric-attribute:baseline  [001cf954]
+SELECT
+          toStartOfInterval(traces.Timestamp, INTERVAL 3600 SECOND) AS bucket,
+          coalesce(nullIf(toString(traces.ServiceName), ''), 'all') AS groupName,
+          sum(traces.SampleRate) AS count,
+          count() AS spanCount,
+          0 AS avgDuration,
+          0 AS p50Duration,
+          0 AS p95Duration,
+          0 AS p99Duration,
+          0 AS errorRate,
+          0 AS satisfiedCount,
+          0 AS toleratingCount,
+          0 AS apdexScore,
+          0 AS estimatedSpanCount,
+          ifNull(sum(if(isFinite(toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost'])), toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost']), NULL) * traces.SampleRate), 0) AS value,
+          countIf(if(isFinite(toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost'])), toFloat64OrNull(traces.SpanAttributes['gen_ai.usage.cost']), NULL) IS NOT NULL) AS valueCount
+        FROM traces
+        WHERE traces.OrgId = 'org_sql_catalog'
+          AND traces.Timestamp >= '2026-01-01 10:30:00'
+          AND traces.Timestamp <= '2026-01-03 14:15:00'
+          AND traces.ServiceName = 'api'
+          AND (traces.SpanKind IN ('Server', 'Consumer') OR traces.ParentSpanId = '')
+          AND coalesce(nullIf(traces.ResourceAttributes['deployment.environment.name'], ''), traces.ResourceAttributes['deployment.environment']) IN ('production')
         GROUP BY bucket, groupName
         ORDER BY bucket ASC, groupName ASC
         FORMAT JSON

@@ -74,8 +74,8 @@ docker compose up -d
 | Secret | Effect and procedure |
 |---|---|
 | `MAPLE_INGEST_KEY_ENCRYPTION_KEY`, `MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY` | **Do not change.** Encrypted secrets and every ingest key stop working |
-| `MAPLE_ROOT_PASSWORD` | Edit `.env`, `docker compose up -d maple`. Root sessions end. If `MAPLE_SESSION_SECRET` is empty, the root password also signs session tokens, so **all** users are signed out |
-| `MAPLE_SESSION_SECRET` | Edit `.env`, `docker compose up -d maple`. All Maple sessions end; everyone signs in again |
+| `MAPLE_ROOT_PASSWORD` | Edit `.env`, `docker compose up -d maple`. Root sessions end. The session key is salted with the root password, so **all** users are signed out |
+| `MAPLE_SESSION_SIGNING_SECRET` | Edit `.env`, `docker compose up -d maple`. All Maple sessions end; everyone signs in again |
 | `SD_INTERNAL_TOKEN` | Must match in `maple` and `scraper`: `docker compose up -d maple scraper` |
 | `ELECTRIC_SECRET` | Must match in `electric` and `maple`: `docker compose up -d electric maple` |
 | `INTERNAL_SERVICE_TOKEN`, `SANDBOX_INTERNAL_SERVICE_TOKEN`, `MAPLE_SHARE_TOKEN_HMAC_KEY` | Edit `.env`, `docker compose up -d maple`. Existing share links stop working when the HMAC key changes |

@@ -183,7 +183,7 @@ jobs:
               env:
                   CHANGED_FILES: ${{ steps.filter.outputs.base != 'true' && fromJSON(steps.filter.outputs.changed_count) <= 1000 && steps.filter.outputs.changed_files || '' }}
               run: |
-                  bun test scripts/ci/plan-tests.test.ts scripts/lib/pr-state.test.ts scripts/lib/preview-handoff.test.ts
+                  bun test scripts/ci/plan-tests.test.ts scripts/lib/pr-state.test.ts scripts/lib/preview-handoff.test.ts scripts/lib/prd-deploy-guard.test.ts
                   matrix="$(bun scripts/ci/plan-tests.ts)"
                   echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
                   echo "has-tests=$(jq '.include | length > 0' <<< "$matrix")" >> "$GITHUB_OUTPUT"
@@ -426,7 +426,7 @@ jobs:
                   MAPLE_INGEST_KEY_ENCRYPTION_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
                   MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
                   MAPLE_SHARE_TOKEN_HMAC_KEY: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
-                  MAPLE_ROOT_PASSWORD: placeholder
+                  MAPLE_ROOT_PASSWORD: ci-placeholder-root-password
               run: bun run test:alchemy
 
     # One server version, pinned to docker-compose.development.yml's tag.
@@ -537,14 +537,28 @@ jobs:
             # MAPLE_REQUIRE_LIBCHDB turns a missing library into a failure, not a skip. One
             # process per file: chDB is process-global.
             - name: Run chDB-backed CLI tests
-              timeout-minutes: 4
+              timeout-minutes: 8
               working-directory: apps/cli
               env:
                   MAPLE_LIBCHDB: ${{ github.workspace }}/dist/libchdb.so
                   MAPLE_REQUIRE_LIBCHDB: "1"
                   MAPLE_TELEMETRY: off
               run: |
-                  for file in tenant-isolation scoped-delete local-service-map-rollup checkpoint-merge-freeze local-store-traces-rekey local-query-guard local-query-guard.fuzz funnel-scenarios users-identity histogram-metrics exponential-histogram-metrics release-verification profile-sample-types profile-hotspots service-usage-profiles search-traces-filters; do
+                  for file in tenant-isolation scoped-delete local-service-map-rollup checkpoint-merge-freeze local-store-traces-rekey local-query-guard local-query-guard.fuzz funnel-scenarios users-identity histogram-metrics exponential-histogram-metrics release-verification profile-sample-types profile-hotspots service-usage-profiles search-traces-filters cloud-resources traces-numeric-aggregation; do
+                      bun test --timeout 30000 "test/$file.test.ts"
+                  done
+
+            # The PromQL reference suite runs every corpus query on chDB in five grids, with and without
+            # pushdown (6 to 7.5 minutes on CI runners, more on slow ones), so it has its own budget.
+            - name: Run PromQL chDB suites
+              timeout-minutes: 12
+              working-directory: apps/cli
+              env:
+                  MAPLE_LIBCHDB: ${{ github.workspace }}/dist/libchdb.so
+                  MAPLE_REQUIRE_LIBCHDB: "1"
+                  MAPLE_TELEMETRY: off
+              run: |
+                  for file in promql-source promql-engine; do
                       bun test --timeout 30000 "test/$file.test.ts"
                   done
 

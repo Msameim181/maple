@@ -3,9 +3,13 @@ import { assert, describe, expect, it } from "vitest"
 import { StatusPageComponentId, StatusPageId } from "@maple/primitives"
 import {
 	applyOverlay,
+	isStatusPageImageDataUrl,
+	STATUS_PAGE_MAX_IMAGE_BYTES,
 	contrastRatio,
 	customDomainIssue,
+	isCustomDomainChallengeRecord,
 	normalizeCustomDomain,
+	slugFromName,
 	StatusPageCustomDomainHostname,
 	DEFAULT_STATUS_PAGE_THEME,
 	decodeStatusPageSnapshotJson,
@@ -13,7 +17,7 @@ import {
 	type StatusPageTheme,
 	themeContrastIssue,
 	isListedIncident,
-	dayState,
+	classifyDay,
 	deriveComponentStatus,
 	fillDays,
 	lastDays,
@@ -39,6 +43,7 @@ const snapshot = (overrides: Partial<StatusPageSnapshot> = {}): StatusPageSnapsh
 	page: {
 		name: "Acme",
 		slug: "acme",
+		orgKey: "",
 		description: null,
 		websiteUrl: null,
 		logoUrl: null,
@@ -72,6 +77,33 @@ const snapshot = (overrides: Partial<StatusPageSnapshot> = {}): StatusPageSnapsh
 	...overrides,
 })
 
+describe("isStatusPageImageDataUrl", () => {
+	/** Base64 that decodes to exactly `bytes` bytes. */
+	const payloadOf = (bytes: number): string => {
+		const rest = bytes % 3
+		const whole = Str.repeat(Math.floor(bytes / 3))("AAAA")
+		return rest === 0 ? whole : rest === 1 ? `${whole}AA==` : `${whole}AAA=`
+	}
+
+	it("takes an image up to the cap and refuses one byte over, whatever its type", () => {
+		for (const type of ["image/png", "image/svg+xml", "image/vnd.microsoft.icon"]) {
+			expect(
+				isStatusPageImageDataUrl(`data:${type};base64,${payloadOf(STATUS_PAGE_MAX_IMAGE_BYTES)}`),
+			).toBe(true)
+			expect(
+				isStatusPageImageDataUrl(`data:${type};base64,${payloadOf(STATUS_PAGE_MAX_IMAGE_BYTES + 1)}`),
+			).toBe(false)
+		}
+	})
+
+	it("refuses other types and broken base64", () => {
+		expect(isStatusPageImageDataUrl("data:text/html;base64,PHNjcmlwdD4=")).toBe(false)
+		expect(isStatusPageImageDataUrl("data:image/png;base64,abc")).toBe(false)
+		expect(isStatusPageImageDataUrl("data:image/png;base64,")).toBe(false)
+		expect(isStatusPageImageDataUrl("data:image/png;base64,iVBORw0KGgo=")).toBe(true)
+	})
+})
+
 describe("deriveComponentStatus", () => {
 	it("is a major outage while the monitor is down, whatever the override says", () => {
 		expect(
@@ -94,10 +126,34 @@ describe("deriveComponentStatus", () => {
 })
 
 describe("bars", () => {
-	it("colours a day by its worst moment and reports uptime as the share of checks not down", () => {
-		expect(dayState({ day: "2026-10-28", checks: 0, failures: 0, downChecks: 0 })).toBe("none")
-		expect(dayState({ day: "2026-10-28", checks: 10, failures: 1, downChecks: 0 })).toBe("degraded")
-		expect(dayState({ day: "2026-10-28", checks: 10, failures: 3, downChecks: 2 })).toBe("down")
+	const bar = (checks: number, failures: number, downChecks: number) => ({
+		day: "2026-10-28",
+		checks,
+		failures,
+		downChecks,
+	})
+
+	it.each([
+		["no checks", bar(0, 0, 0), "operational", "none"],
+		["clean checks", bar(1440, 0, 0), "operational", "ok"],
+		["a few scattered failed checks", bar(1431, 4, 0), "operational", "ok"],
+		["failed checks short of 5%", bar(1000, 49, 0), "operational", "ok"],
+		["5% of checks failed without going down", bar(1000, 50, 0), "operational", "degraded"],
+		["a minute of downtime", bar(1424, 9, 1), "operational", "degraded"],
+		["downtime short of 1% of the day", bar(1000, 9, 9), "operational", "degraded"],
+		["downtime of 1% of the day", bar(1000, 10, 10), "operational", "down"],
+		["a minor incident on a clean day", bar(1440, 0, 0), "degraded", "degraded"],
+		["a minor incident with an outage's downtime", bar(1000, 50, 50), "degraded", "down"],
+		["a major incident on a clean day", bar(1440, 0, 0), "partial_outage", "down"],
+		["a critical incident on a day without checks", bar(0, 0, 0), "major_outage", "down"],
+		["maintenance on a clean day", bar(1440, 0, 0), "maintenance", "maintenance"],
+		["downtime during maintenance", bar(1000, 300, 300), "maintenance", "maintenance"],
+		["maintenance on a day without checks", bar(0, 0, 0), "maintenance", "maintenance"],
+	] as const)("classifies %s", (_, day, incident, expected) => {
+		expect(classifyDay(day, incident)).toBe(expected)
+	})
+
+	it("reports uptime as the share of checks not down", () => {
 		expect(
 			uptimePercent([
 				{ day: "2026-10-27", checks: 100, failures: 0, downChecks: 0 },
@@ -640,5 +696,29 @@ describe("custom domain hostnames", () => {
 		])
 			assert.isNotNull(customDomainIssue(normalizeCustomDomain(hostname)), hostname)
 		assert.isTrue(Result.isFailure(decode("status.maple.dev")))
+	})
+
+	it("tells the record that proves a claim from the other records a domain lists", () => {
+		assert.isTrue(
+			isCustomDomainChallengeRecord({ type: "TXT", name: "_maple-challenge.status.acme.com" }),
+		)
+		for (const record of [
+			{ type: "TXT", name: "_cf-custom-hostname.status.acme.com" },
+			{ type: "TXT", name: "_acme-challenge.status.acme.com" },
+			{ type: "CNAME", name: "_maple-challenge.status.acme.com" },
+			{ type: "CNAME", name: "status.acme.com" },
+		] as const)
+			assert.isFalse(isCustomDomainChallengeRecord(record), record.name)
+	})
+})
+
+describe("slugFromName", () => {
+	it("keeps accented letters as their base letter instead of splitting them with hyphens", () => {
+		expect(slugFromName("Crème Brûlée")).toBe("creme-brulee")
+		expect(slugFromName("Über Status")).toBe("uber-status")
+	})
+
+	it("collapses punctuation and trims hyphens at the ends", () => {
+		expect(slugFromName("  Acme Status! ")).toBe("acme-status")
 	})
 })

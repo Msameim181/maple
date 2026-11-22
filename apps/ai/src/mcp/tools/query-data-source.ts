@@ -2,7 +2,10 @@ import { McpInvalidInputError, type McpToolRegistrar } from "./types"
 import { Array as Arr, Effect, Record as Rec, Schema, String as Str } from "effect"
 import { parseWarehouseDateTime } from "@maple/query-engine"
 import { ResourceExternalQuery, type ExternalQuery } from "@maple/domain/data-sources"
-import { ExternalDataSourceService } from "@maple/backend/services/data-sources/ExternalDataSourceService"
+import {
+	ExternalDataSourceService,
+	queryCallerOf,
+} from "@maple/backend/services/data-sources/ExternalDataSourceService"
 import * as P from "../lib/params"
 import { doc } from "../lib/tool-doc"
 import {
@@ -33,18 +36,18 @@ export function registerQueryDataSourceTool(server: McpToolRegistrar) {
 		title: "Query Data Source",
 		description:
 			"Run one read-only query against a connected data source (an external database or API, not Maple's own " +
-			"telemetry) and return its rows, capped. Send exactly one of `sql` (database data sources; macros " +
+			"telemetry) and return its rows, capped. Org admins and engineers only. Send exactly one of `sql` (database data sources; macros " +
 			"$__timeFilter(col), $__timeGroup(col), $__interval_s, $__from, $__to bind the time window) or `resource` " +
 			"(API data sources such as Clerk; a JSON resource query). The wrong form is refused with the right one. " +
 			"The window is the last 24 hours unless you set start_time/end_time (up to 90 days); it binds the macros " +
 			"and a resource query's time filter and groups. " +
 			"The answer starts with the data source, its query language and the plan (the SQL as sent, or the API " +
 			"calls and rows it reads); `explain=true` returns only the plan without running anything. Call " +
-			"describe_data_source first for entry and field names. For Maple's own traces, logs and metrics use " +
+			"list_data_sources with `data_source` and `entries` first for entry and field names. For Maple's own traces, logs and metrics use " +
 			"run_sql or query_data instead.",
 		parameters: Schema.Struct({
 			data_source: P.text(
-				"Data source name (from list_data_sources or search_data_sources), e.g. shop-prod",
+				"Data source name (from list_data_sources), e.g. shop-prod",
 			),
 			sql: P.optionalText("One read-only SELECT, for database data sources"),
 			resource: P.optionalJson(
@@ -114,8 +117,9 @@ export function registerQueryDataSourceTool(server: McpToolRegistrar) {
 						...(granularity === undefined ? undefined : { granularitySeconds: granularity }),
 					},
 					AGENT_AUDIENCE,
+					queryCallerOf(tenant),
 				)
-				.pipe(mapDataSourceError(TOOL, "data_source"))
+				.pipe(mapDataSourceError(TOOL, "data_source", tenant))
 			yield* Effect.annotateCurrentSpan({
 				"maple.data_source.kind": source.kind,
 				"maple.data_source.executed": result.executed,

@@ -20,28 +20,32 @@ interface Props {
 }
 
 const { competitor } = Astro.props;
+const cell = "pair-cell flex flex-col items-center gap-4 px-6 py-10 text-center md:py-12";
+const tile = "flex h-16 w-16 items-center justify-center rounded-xl border border-border bg-bg-elevated";
+const name = "font-display text-lg font-medium tracking-[-0.01em] text-fg md:text-xl";
+const site = "mt-1 font-mono text-[11px] text-fg-muted";
 // The vendor's brand color drives its cell's dither; near-black marks tint
 // with the muted foreground so the field stays visible on the dark ground.
 const vendorColor = markTint(brandMark(competitor.mark));
 ---
 
 <div class="relative grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border">
-	<div class="pair-cell flex flex-col items-center gap-4 px-6 py-10 text-center md:py-12" style="--pair: var(--primary)">
-		<span class="flex h-16 w-16 items-center justify-center rounded-xl border border-border bg-bg-elevated">
+	<div class={cell} style="--pair: var(--primary)">
+		<span class={tile}>
 			<Icon name="MapleMark" size={34} class="text-primary" />
 		</span>
-		<div>
-			<div class="font-display text-lg font-medium tracking-[-0.01em] text-fg md:text-xl">Maple</div>
-			<div class="mt-1 font-mono text-[11px] text-fg-muted">maple.dev</div>
+		<div class="min-w-0">
+			<div class={name}>Maple</div>
+			<div class={site}>maple.dev</div>
 		</div>
 	</div>
-	<div class="pair-cell flex flex-col items-center gap-4 px-6 py-10 text-center md:py-12" style={`--pair: ${vendorColor}`}>
-		<span class="flex h-16 w-16 items-center justify-center rounded-xl border border-border bg-bg-elevated">
+	<div class={cell} style={`--pair: ${vendorColor}`}>
+		<span class={tile}>
 			<BrandMarkIcon id={competitor.mark} class="h-8 w-8" />
 		</span>
-		<div>
-			<div class="font-display text-lg font-medium tracking-[-0.01em] text-fg md:text-xl">{competitor.name}</div>
-			<div class="mt-1 font-mono text-[11px] text-fg-muted">{competitor.site}</div>
+		<div class="min-w-0">
+			<div class:list={[name, "truncate"]}>{competitor.name}</div>
+			<div class:list={[site, "truncate"]}>{competitor.site}</div>
 		</div>
 	</div>
 	<span

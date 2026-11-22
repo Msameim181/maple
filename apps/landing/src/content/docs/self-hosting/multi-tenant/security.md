@@ -33,7 +33,7 @@ Caddy sets these on `APP_HOST`: `Strict-Transport-Security`, `X-Content-Type-Opt
 
 - `.env` holds every secret. Keep it mode 600 and owned by root. Back it up somewhere safe.
 - `MAPLE_INGEST_KEY_ENCRYPTION_KEY` and `MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY` can never change after first start.
-- `MAPLE_SESSION_SECRET` signs session tokens. If it is empty, Maple falls back to `MAPLE_ROOT_PASSWORD`, which makes the root password a signing key too. Keep them separate (`gen-secrets.sh` creates both).
+- Session tokens are signed with a key derived (HKDF-SHA256) from `MAPLE_SESSION_SIGNING_SECRET`, salted with `MAPLE_ROOT_PASSWORD`, so a captured token reveals nothing about the password. If the secret is empty, the key is derived from the root password alone and the API logs a warning at start. Keep both set (`gen-secrets.sh` creates both). The API refuses to start with a root password shorter than 16 characters or a known placeholder, and root-password login is limited to 10 attempts per minute per client address.
 - `MAPLE_ROOT_PASSWORD` is **not** passed to the `ingest` service.
 - Electric (`ELECTRIC_SECRET`) only accepts shape requests that carry the secret, and only `maple` holds it. Without it, a compromised service on the network could read other organizations' rows.
 - The IdP refresh token of each session is stored encrypted in Postgres.

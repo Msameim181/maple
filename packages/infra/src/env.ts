@@ -111,8 +111,7 @@ export const authEnv: Config.Config<WorkerEnv> = merge(
 	derived("CLERK_TELEMETRY_DISABLED", "1"),
 	plainWithDefault("MAPLE_DEFAULT_ORG_ID", "default"),
 	Secrets.MapleRootPassword.optional,
-	// Session-token HMAC key; every verifier falls back to MAPLE_ROOT_PASSWORD without it.
-	Secrets.MapleSessionSecret.optional,
+	Secrets.MapleSessionSigningSecret.optional,
 	Secrets.ClerkSecretKey.optional,
 	optionalPlain("CLERK_PUBLISHABLE_KEY"),
 	Secrets.ClerkJwtKey.optional,
@@ -137,6 +136,8 @@ export const clickhouseEnv: Config.Config<WorkerEnv> = merge(
 	optionalPlain("CLICKHOUSE_USER"),
 	optionalPlain("CLICKHOUSE_DATABASE"),
 	Secrets.ClickhousePassword.optional,
+	optionalPlain("CLICKHOUSE_ACCESS_CLIENT_ID"),
+	Secrets.ClickhouseAccessClientSecret.optional,
 )
 
 /** Ingest-key envelope encryption + lookup HMAC. Required wherever ingest keys are read. */
@@ -172,7 +173,8 @@ export const STATUS_DOMAINS_CNAME_TARGET = "status-domains.maple.dev"
 /**
  * Status page custom domains (docs/status-page-custom-domains.md): the zone and a token that may
  * edit its custom hostnames and Worker routes. Either unset (every dev stage by default) leaves
- * custom domains unavailable. The status Worker's name is where per-hostname routes point.
+ * custom domains unavailable. The status Worker's name is where per-hostname routes point. Bound
+ * by api and alerting only, the two Workers that build `CloudflareCustomHostnames`.
  */
 export const statusDomainsEnv = (
 	stage: MapleStage,
@@ -258,7 +260,6 @@ export const mapleServerEnv = (
 		authEnv,
 		ingestKeyCryptoEnv,
 		appUrlsEnv(domains),
-		statusDomainsEnv(stage, region),
 		selfObservabilityEnv(stage, region),
 		// Dev-only; the runtime ignores it outside MAPLE_ENVIRONMENT=development.
 		optionalPlain("MAPLE_IGNORE_ORG_CLICKHOUSE"),

@@ -7,6 +7,7 @@ import { ADVISORY_SEVERITIES } from "../runtime-advisories"
 import { ATTACK_STAGES } from "../security-telemetry"
 import { SERVICE_RUNTIME_KIND_IDS } from "../service-runtimes"
 import { MAX_RAW_SQL_LENGTH } from "../raw-sql"
+import { MAX_PROMQL_LEGEND_LENGTH, MAX_PROMQL_QUERY_LENGTH } from "../promql"
 import { RawSqlDisplayType } from "@maple/widgets"
 import {
 	CommitSha,
@@ -1702,6 +1703,8 @@ export class UptimeChecksRequest extends Schema.Class<UptimeChecksRequest>("Upti
 	endTime: TinybirdDateTime,
 	/** Most checks returned, newest kept. */
 	limit: Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(5000)),
+	/** Only the failed checks. */
+	failedOnly: Schema.optionalKey(Schema.Boolean),
 }) {}
 
 /** An HTTP check's phases in ms; a phase the check skipped is 0 (TLS on http://, no body read). */
@@ -1719,6 +1722,8 @@ const UptimeCheck = Schema.Struct({
 	durationMs: Schema.Number,
 	ok: Schema.Boolean,
 	statusCode: Schema.NullOr(Schema.Number),
+	/** Why a failed check failed; null on a pass. */
+	error: Schema.NullOr(Schema.String),
 	/** Null when the check recorded none: TCP and DNS checks, older checks, no response. */
 	phases: Schema.NullOr(UptimeCheckPhases),
 })
@@ -3148,21 +3153,6 @@ export class SearchConsoleLandingPagesResponse extends Schema.Class<SearchConsol
 }) {}
 
 // Cloud cost: provider spend synced into the ingest-pinned `cost_daily`, read per whole UTC day.
-// Every endpoint answers `CloudCostDisabledError` for an org outside the `cloudCost` rollout.
-
-/** The org is not in the `cloudCost` rollout. */
-export class CloudCostDisabledError extends HttpTaggedError<CloudCostDisabledError>()(
-	"@maple/http/errors/CloudCostDisabledError",
-	{ message: Schema.String },
-	{
-		status: 403,
-		code: "cloud_cost_disabled",
-		title: "Cloud cost is not enabled",
-		retry: "never",
-		recovery: "contact_support",
-		exposure: "public_message",
-	},
-) {}
 
 /** The application database could not be read for the org's cost sources. */
 export class CloudCostPersistenceError extends HttpTaggedError<CloudCostPersistenceError>()(
@@ -4086,6 +4076,52 @@ export class RawSqlExecuteResponse extends Schema.Class<RawSqlExecuteResponse>("
 	}),
 }) {}
 
+/**
+ * A PromQL widget query over a window. The server picks the step from the window,
+ * `maxDataPoints` and `minStepSeconds`, fills the time built-ins, and shapes the rows
+ * for `displayType` with `legendFormat` naming the series.
+ */
+export class PromqlExecuteRequest extends Schema.Class<PromqlExecuteRequest>("PromqlExecuteRequest")({
+	query: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(MAX_PROMQL_QUERY_LENGTH)),
+	startTime: TinybirdDateTime,
+	endTime: TinybirdDateTime,
+	legendFormat: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(MAX_PROMQL_LEGEND_LENGTH))),
+	minStepSeconds: Schema.optionalKey(Schema.Number.check(Schema.isFinite(), Schema.isGreaterThan(0))),
+	maxDataPoints: Schema.optionalKey(Schema.Number.check(Schema.isFinite(), Schema.isGreaterThan(0))),
+	displayType: Schema.optionalKey(RawSqlDisplayType),
+}) {}
+
+export class PromqlExecuteResponse extends Schema.Class<PromqlExecuteResponse>("PromqlExecuteResponse")({
+	data: Schema.Array(WireRow),
+	meta: Schema.Struct({
+		resultType: Schema.Literals(["matrix", "vector", "scalar", "string"]),
+		seriesCount: Schema.Number,
+		stepSeconds: Schema.Number,
+		/** Prometheus-style warnings: the nearest names when a selector matched nothing. */
+		warnings: Schema.optionalKey(Schema.Array(Schema.String)),
+	}),
+}) {}
+
+/**
+ * PromQL editor discovery over a window: label names with no `label`, else that label's values
+ * (`__name__` lists metric names), narrowed to the series `match` selects.
+ */
+export class PromqlDiscoverRequest extends Schema.Class<PromqlDiscoverRequest>("PromqlDiscoverRequest")({
+	label: Schema.optionalKey(Schema.String.check(Schema.isPattern(/^[a-zA-Z_][a-zA-Z0-9_]*$/))),
+	match: Schema.optionalKey(
+		Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(MAX_PROMQL_QUERY_LENGTH)),
+	),
+	startTime: TinybirdDateTime,
+	endTime: TinybirdDateTime,
+	limit: Schema.optionalKey(
+		Schema.Number.check(Schema.isInt(), Schema.isBetween({ minimum: 1, maximum: 1000 })),
+	),
+}) {}
+
+export class PromqlDiscoverResponse extends Schema.Class<PromqlDiscoverResponse>("PromqlDiscoverResponse")({
+	data: Schema.Array(Schema.String),
+}) {}
+
 export class RawSqlValidationError extends Schema.TaggedError<RawSqlValidationError>()(
 	"@maple/http/errors/RawSqlValidationError",
 	{
@@ -4197,7 +4233,6 @@ const securityEndpointErrors = [...queryEngineEndpointErrors, DependencyScanForb
 
 /** What any read of the org's cost can answer with. */
 export const costEndpointErrors = [
-	CloudCostDisabledError,
 	CloudCostPersistenceError,
 	// A window wider than `COST_MAX_WINDOW_DAYS`.
 	QueryEngineValidationError,
@@ -5052,7 +5087,7 @@ export class QueryEngineApiGroup extends HttpApiGroup.make("queryEngine")
 	.add(
 		HttpApiEndpoint.get("costSources", "/cost-sources", {
 			success: CostSourcesResponse,
-			error: [CloudCostDisabledError, CloudCostPersistenceError] as const,
+			error: [CloudCostPersistenceError] as const,
 		}),
 	)
 	.add(
@@ -5125,6 +5160,20 @@ export class QueryEngineApiGroup extends HttpApiGroup.make("queryEngine")
 			payload: ProductEventTraceSamplesRequest,
 			success: ProductEventTraceSamplesResponse,
 			error: queryEngineEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("executePromql", "/execute-promql", {
+			payload: PromqlExecuteRequest,
+			success: PromqlExecuteResponse,
+			error: validatedQueryEndpointErrors,
+		}),
+	)
+	.add(
+		HttpApiEndpoint.post("discoverPromql", "/discover-promql", {
+			payload: PromqlDiscoverRequest,
+			success: PromqlDiscoverResponse,
+			error: validatedQueryEndpointErrors,
 		}),
 	)
 	.add(

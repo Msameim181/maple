@@ -80,6 +80,7 @@ const VERB_ICONS = {
 	request: "BracketsCurlyIcon",
 	tested: "MediaPlayIcon",
 	paused: "MediaPauseIcon",
+	disabled: "MediaPauseIcon",
 	resumed: "MediaPlayIcon",
 	published: "PaperPlaneIcon",
 	update_posted: "PaperPlaneIcon",
@@ -122,6 +123,17 @@ const VERB_ICONS = {
 	role_mapping_updated: "ShieldIcon",
 	bypass_added: "PlusIcon",
 	bypass_removed: "TrashIcon",
+	repository_enabled: "MediaPlayIcon",
+	repository_disabled: "MediaPauseIcon",
+	repository_rules_updated: "PencilIcon",
+	events_key_read: "EyeIcon",
+	stream_key_read: "EyeIcon",
+	push_secret_read: "EyeIcon",
+	webhook_secret_read: "EyeIcon",
+	events_key_rotated: "ArrowRotateClockwiseIcon",
+	granted: "KeyIcon",
+	approved: "CircleCheckIcon",
+	impersonation: "UserIcon",
 } as const satisfies { readonly [Verb in AuditVerb]: IconName }
 
 const hasVerbIcon = (verb: string): verb is keyof typeof VERB_ICONS =>

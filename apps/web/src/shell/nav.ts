@@ -40,6 +40,8 @@ export interface NavSubItem {
 	readonly alsoActive?: ReadonlyArray<string>
 	/** A live count beside the title, read by the shell (the Inbox's unacknowledged incidents). */
 	readonly count?: "alertsInbox"
+	/** A tag beside the title ("New"); a live count wins when both are set. */
+	readonly badge?: NavBadge
 	/** Starts a group of rows: a small gap above it, no heading. */
 	readonly startsGroup?: boolean
 }
@@ -49,9 +51,11 @@ export interface NavItem {
 	readonly href: string
 	readonly icon: IconName
 	readonly subItems?: ReadonlyArray<NavSubItem>
-	readonly badge?: string
+	readonly badge?: NavBadge
 	/** Routes with no row of their own that this row stands in for (`/anomalies` under Alerts). */
 	readonly alsoActive?: ReadonlyArray<string>
+	/** Sets the row apart from the ones above it with a small gap, no heading. */
+	readonly startsGroup?: boolean
 }
 
 export interface NavGroup {
@@ -59,6 +63,9 @@ export interface NavGroup {
 	readonly label?: string
 	readonly items: ReadonlyArray<NavItem>
 }
+
+/** "New" marks a page shipped in the last few weeks; drop it once the page has settled in. */
+export type NavBadge = "Beta" | "New"
 
 type InfraProvider = "cloudflare" | "planetscale" | "railway" | "vercel" | "supabase" | "gcp" | "aws"
 
@@ -111,14 +118,20 @@ const infrastructureItem: NavItem = {
 }
 
 const costItem: NavItem = {
-	title: "Cost",
+	title: "Cloud cost",
 	href: "/cost",
 	icon: "CircleDollarIcon",
 	badge: "Beta",
 	subItems: [
 		// Not "Explorer": the palette finds the Explore pages by that word.
-		{ title: "Spend", href: "/cost", icon: "ChartBarHorizontalIcon", paletteTitle: "Cost" },
-		{ title: "Budgets", href: "/cost/budgets", icon: "GaugeIcon", paletteTitle: "Cost budgets" },
+		{ title: "Spend", href: "/cost", icon: "ChartBarHorizontalIcon", paletteTitle: "Cloud cost" },
+		{
+			title: "Budgets",
+			href: "/cost/budgets",
+			icon: "GaugeIcon",
+			paletteTitle: "Cloud cost budgets",
+			badge: "New",
+		},
 	],
 }
 
@@ -148,6 +161,7 @@ const exploreItem = (productAnalytics: boolean): NavItem => ({
 						title: "Product analytics",
 						href: "/product-analytics",
 						icon: "ChartBarTrendUpIcon",
+						badge: "New",
 					} as const,
 				]
 			: []),
@@ -179,7 +193,7 @@ const alertsItem: NavItem = {
 			startsGroup: true,
 		},
 		{ title: "Uptime", href: "/alerts/uptime", icon: "GlobeIcon", paletteTitle: "Uptime checks" },
-		{ title: "SLOs", href: "/alerts/slos", icon: "GaugeIcon" },
+		{ title: "SLOs", href: "/alerts/slos", icon: "GaugeIcon", badge: "New" },
 		{ title: "Silences", href: "/alerts/silences", icon: "BellSlashIcon", startsGroup: true },
 		{
 			title: "Maintenance",
@@ -193,6 +207,7 @@ const alertsItem: NavItem = {
 			icon: "UsersIcon",
 			alsoActive: ["/alerts/schedules"],
 			startsGroup: true,
+			badge: "New",
 		},
 		{
 			title: "Routing",
@@ -200,6 +215,7 @@ const alertsItem: NavItem = {
 			icon: "BranchForkIcon",
 			paletteTitle: "Alert routing",
 			alsoActive: ["/alerts/escalation-chains"],
+			badge: "New",
 		},
 	],
 }
@@ -233,12 +249,13 @@ export type NavAudience = typeof NavAudience.Type
 
 /** The org rollout flags that gate a nav row each. */
 export type NavFlags = Readonly<{
-	cloudCost: boolean
+	/** Cloud security findings live in the Security hub, so they show its row too. */
+	cloudSecurity: boolean
 	productAnalytics: boolean
 	securityAudit: boolean
 }>
 
-const analystNavGroups = (flags: NavFlags): ReadonlyArray<NavGroup> => [
+const analystNavGroups = (): ReadonlyArray<NavGroup> => [
 	{ id: "overview", items: [{ title: "Overview", href: "/", icon: "HouseIcon" }] },
 	{
 		id: "reliability",
@@ -246,7 +263,7 @@ const analystNavGroups = (flags: NavFlags): ReadonlyArray<NavGroup> => [
 		items: [
 			analystIncidentsItem,
 			{ title: "Errors", href: "/errors", icon: "CircleWarningIcon" },
-			{ title: "Status pages", href: "/status-pages", icon: "WindowChartLineIcon" },
+			{ title: "Status pages", href: "/status-pages", icon: "WindowChartLineIcon", badge: "New" },
 		],
 	},
 	{
@@ -257,7 +274,7 @@ const analystNavGroups = (flags: NavFlags): ReadonlyArray<NavGroup> => [
 			{ title: "Users", href: "/users", icon: "UsersIcon" },
 			{ title: "Replays", href: "/replays", icon: "PlayRotateClockwiseIcon" },
 			{ title: "Dashboards", href: "/dashboards", icon: "GridSquareCirclePlusIcon" },
-			...(flags.cloudCost ? [costItem] : []),
+			costItem,
 		],
 	},
 ]
@@ -267,7 +284,7 @@ const operatorNavGroups = (flags: NavFlags): ReadonlyArray<NavGroup> => [
 	{
 		id: "monitor",
 		label: "Monitor",
-		items: [servicesItem, infrastructureItem, ...(flags.cloudCost ? [costItem] : [])],
+		items: [servicesItem, infrastructureItem, costItem],
 	},
 	{
 		id: "analyze",
@@ -289,22 +306,28 @@ const operatorNavGroups = (flags: NavFlags): ReadonlyArray<NavGroup> => [
 				title: "Review & CI",
 				href: "/code-review",
 				icon: "PullRequestIcon",
-				alsoActive: flags.securityAudit ? [] : ["/security"],
+				alsoActive: flags.securityAudit || flags.cloudSecurity ? [] : ["/security"],
 			},
-			...(flags.securityAudit
+			...(flags.securityAudit || flags.cloudSecurity
 				? [{ title: "Security", href: "/security", icon: "ShieldCheckIcon", badge: "Beta" } as const]
 				: []),
-			{ title: "Status pages", href: "/status-pages", icon: "WindowChartLineIcon" },
+			{
+				title: "Status pages",
+				href: "/status-pages",
+				icon: "WindowChartLineIcon",
+				startsGroup: true,
+				badge: "New",
+			},
 		],
 	},
 ]
 
 /**
- * `navGroups(flags, audience)`; `cloudCost`, `productAnalytics`, `releases` and `securityAudit` gate a
- * row each, and an analyst gets {@link analystNavGroups}.
+ * `navGroups(flags, audience)`; `productAnalytics`, `releases` and `securityAudit` (or
+ * `cloudSecurity`) gate a row each, and an analyst gets {@link analystNavGroups}.
  */
 export const navGroups = (flags: NavFlags, audience: NavAudience = "operator"): ReadonlyArray<NavGroup> =>
-	audience === "analyst" ? analystNavGroups(flags) : operatorNavGroups(flags)
+	audience === "analyst" ? analystNavGroups() : operatorNavGroups(flags)
 
 /** Segment-aware prefix match: `/services` must not claim `/service-map`. */
 export const isPathActive = (currentPath: string, href: string): boolean =>

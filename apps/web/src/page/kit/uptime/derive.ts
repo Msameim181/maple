@@ -4,6 +4,7 @@ import { formatSpan } from "../alert-time"
 import { Array as Arr, String as Str } from "effect"
 import { toEpochMs } from "@maple/ui/lib/time-format"
 import { UPTIME_CERTIFICATE_WARNING_DAYS } from "@maple/domain/uptime"
+import { type StatusPageDayBar, uptimePercent } from "@maple/domain/status-page"
 
 // Pure reads of an uptime monitor shared by the Uptime tab, the monitor page and the service card.
 
@@ -60,6 +61,7 @@ export const KIND_LABEL = {
 	http: "HTTP",
 	tcp: "TCP",
 	dns: "DNS",
+	multistep: "Multi-step",
 	heartbeat: "Heartbeat",
 } as const satisfies Record<UptimeMonitor["kind"], string>
 
@@ -73,6 +75,13 @@ export const heartbeatScheduleLabel = (
 		? `Every ${formatEvery(config.schedule.seconds)}`
 		: `Cron ${config.schedule.expression} (${config.schedule.timezone})`
 
+/** `3 steps from api.acme.dev/login`: a multi-step check's size and where it starts. */
+export const stepsLine = (config: Extract<UptimeMonitor["config"], { type: "multistep" }>): string => {
+	const count = `${config.steps.length} ${config.steps.length === 1 ? "step" : "steps"}`
+	const first = config.steps[0]
+	return first === undefined ? count : `${count} from ${bareUrl(first.url)}`
+}
+
 /** The second line of a monitor: what it checks. */
 export const targetLine = (monitor: UptimeMonitor, nowMs: number): string => {
 	const config = monitor.config
@@ -83,6 +92,8 @@ export const targetLine = (monitor: UptimeMonitor, nowMs: number): string => {
 			return `${config.host}:${config.port}`
 		case "dns":
 			return `${config.record_type} ${config.hostname}${config.expected === undefined ? "" : ` = ${config.expected}`}`
+		case "multistep":
+			return stepsLine(config)
 		case "heartbeat": {
 			const ping = monitor.state.last_ping_at
 			const pinged =
@@ -102,6 +113,8 @@ export const requestLine = (monitor: UptimeMonitor): string => {
 			return `${config.host}:${config.port}`
 		case "dns":
 			return `${config.record_type} ${config.hostname}`
+		case "multistep":
+			return stepsLine(config)
 		case "heartbeat":
 			return `${heartbeatScheduleLabel(config)}, ${formatEvery(config.grace_seconds)} grace`
 	}
@@ -110,6 +123,12 @@ export const requestLine = (monitor: UptimeMonitor): string => {
 /** Share of passing checks, or `null` with none. */
 export const uptimeShare = (recent: ReadonlyArray<RecentCheck>): number | null =>
 	recent.length === 0 ? null : Arr.filter(recent, (check) => check.ok).length / recent.length
+
+/** `99.98%` over daily bars, floored like the public page so downtime never reads 100; null without checks. */
+export const formatDaysUptime = (days: ReadonlyArray<StatusPageDayBar>): string | null => {
+	const percent = uptimePercent(days)
+	return percent === null ? null : `${(Math.floor(Number((percent * 100).toFixed(6))) / 100).toFixed(2)}%`
+}
 
 /** `99.58%`; whole shares drop the decimals. */
 export const formatShare = (share: number | null): string => {

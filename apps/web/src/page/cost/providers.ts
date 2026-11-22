@@ -71,13 +71,36 @@ export const COST_PROVIDERS = {
 		iconClassName: "text-foreground",
 		requestUsd: null,
 	},
+	// Morph serves only this month's spend so far: Maple reads it hourly and keeps the readings.
+	morph: {
+		name: "Morph",
+		icon: "MorphBrandIcon",
+		requestUsd: null,
+		sourceNote:
+			"Morph reports only this month's spend so far, so Maple reads it every hour and counts each day's change. What was spent before Maple's first reading shows on the month's first day, and spend after a month's last reading, up to an hour, is not counted. Morph has no split by model.",
+	},
+	// Read from the org's BigQuery billing export: no per-request price, but each sync's query
+	// scans bytes BigQuery bills to the connection's host project.
+	gcp: {
+		name: PROVIDERS.gcp.name,
+		icon: PROVIDERS.gcp.icon,
+		requestUsd: null,
+		sourceNote:
+			"Read from the BigQuery billing export. Each sync runs one query, which BigQuery bills to the connection's project, usually a fraction of a cent.",
+	},
 } as const satisfies Record<CostProvider, CostProviderEntry>
 
 /**
  * The providers added by pasting a credential on the Cost page, which can also replace it and
  * remove the source. Each one's form and wording are in `credential-sources.ts`.
  */
-export const CredentialProvider = Schema.Literals(["openrouter", "cloudflare", "anthropic", "openai"])
+export const CredentialProvider = Schema.Literals([
+	"openrouter",
+	"cloudflare",
+	"anthropic",
+	"openai",
+	"morph",
+])
 export type CredentialProvider = typeof CredentialProvider.Type
 
 /** Whether a dialog step or a provider is one added by pasting a credential. */

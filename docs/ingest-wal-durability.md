@@ -9,6 +9,20 @@ destroyed with the task.
 
 This is how it stays durable.
 
+```mermaid
+flowchart TD
+    accTitle: Ingest WAL write, export and recovery
+    accDescr: Ingest acknowledges the request after a disk sync. Export and sealed segment backups run in the background.
+    Decode["Decode OTLP and apply ingest rules"] --> Append["Append native rows to the active WAL segment"]
+    Append --> Sync["Sync the appended bytes to disk"]
+    Sync --> Ack["Acknowledge the request"]
+    Sync --> Export["Export committed frames in the background"]
+    Export --> Warehouse["Tinybird or ClickHouse"]
+    Sync --> Seal["Seal the segment on rotation or shutdown"]
+    Seal -->|"If the exporter hasn't passed it"| Ship["Ship the sealed segment to S3"]
+    Ship -->|"A new task claims the backlog"| Recover["Re-commit and re-ship before deleting the source object"]
+```
+
 ## Ingest rules
 
 Customer drop and redact rules ([ingest-rules.md](ingest-rules.md)) run in
@@ -150,7 +164,11 @@ has an S3 gateway endpoint and no NAT, so this traffic is free.
 | `INGEST_REQUEST_TIMEOUT_SECS`     | 30                                  | Gateway request deadline; 0 disables                    |
 
 The bucket, its lifecycle rule (7-day expiry as a backstop for deletes that were lost) and the
-task-role policy are in `apps/ingest/alchemy.run.ts`.
+task-role policy are in `apps/ingest/alchemy.run.ts`. New objects are encrypted with the WAL's own
+KMS key (`alias/<bucket>`, bucket key on), whose policy (`apps/ingest/alchemy/wal-key.ts`) lets only
+the gateway's task role, and the prd deploy role, use it through S3. Objects written before the
+switch keep the SSE-S3 encryption recorded on each of them and stay readable. The key's policy names
+the task role, so the key and the bucket are declared after the ECS service.
 
 ## What bounds the backlog
 

@@ -5,15 +5,21 @@ import { MCP_TOOL_MODULES } from "../tool-modules.generated"
 import { mapleToolCatalog, mapleToolCatalogFor, mapleToolTitle } from "./registry"
 import { makeModuleToolLookup, mcpToolTitle } from "./tool-lookup"
 import { canonicalToolName, TOOL_NAME_ALIASES } from "./tool-name-aliases"
-import type { McpToolRegistrar } from "./types"
+import { ignoreFamily, type McpToolRegistrar } from "./types"
 
-const SURFACES: ReadonlyArray<McpToolSurface> = ["mcp", "chat", "bot", "workflow", "rpc"]
+const SURFACES: ReadonlyArray<McpToolSurface> = ["mcp", "chat", "bot", "bot_anonymous", "workflow", "rpc"]
 
 const definedBy = (entry: (typeof MCP_TOOL_MODULES)[number]) =>
 	Effect.promise(entry.load).pipe(
 		Effect.map((register) => {
 			const names: Array<string> = []
-			const registrar: McpToolRegistrar = { define: (spec) => void names.push(spec.name) }
+			const registrar: McpToolRegistrar = {
+				define: (spec) => void names.push(spec.name),
+				family: (spec) => {
+					names.push(spec.name)
+					return ignoreFamily()
+				},
+			}
 			register(registrar)
 			return names
 		}),
@@ -29,10 +35,14 @@ describe("MCP_TOOL_MODULES", () => {
 		for (const entry of MCP_TOOL_MODULES) {
 			const tool = canonicalToolName(entry.name)
 			const registered = mapleToolCatalog.find((candidate) => candidate.name === tool)
-			expect({ tool: entry.tool, title: entry.title, audience: entry.audience }, entry.name).toEqual({
+			expect(
+				{ tool: entry.tool, title: entry.title, audience: entry.audience, readOnly: entry.readOnly },
+				entry.name,
+			).toEqual({
 				tool,
 				title: registered?.title,
 				audience: registered?.audience,
+				readOnly: registered?.hints.readOnly,
 			})
 		}
 	})

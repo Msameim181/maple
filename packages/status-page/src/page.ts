@@ -1,7 +1,6 @@
 import type { StatusPageComponentStatus } from "@maple/primitives"
 import { Schema, Array as Arr, Record as Rec, String as Str } from "effect"
 import {
-	dayState,
 	incidentComponentStatus,
 	overallStatus,
 	STATUS_PAGE_STALE_AFTER_MS,
@@ -16,6 +15,7 @@ import {
 import { pageHref, previewIdAttr, type RenderOptions, renderDocument, renderHeader } from "./document"
 import { escapeHtml } from "@maple/strings"
 import { safeUrl } from "./escape"
+import { OG_CARD_HEIGHT, OG_CARD_WIDTH, statusOgAlt, statusOgCard, statusOgCardVersion } from "./og-card"
 import {
 	COMPONENT_STATUS_LABEL,
 	DAY_STATE_LABEL,
@@ -33,11 +33,14 @@ import {
 } from "./format"
 import {
 	barComponents,
+	type BarMark,
+	barState,
 	type CalendarDay,
 	type CalendarEntry,
 	calendarDays,
 	calendarEntries,
 	calendarMonthCount,
+	componentMarks,
 	monthCells,
 	rangeLabel,
 	windowCount,
@@ -45,7 +48,7 @@ import {
 } from "./history"
 import { chevron, MAPLE_MARK, statusIcon } from "./icons"
 import { renderUpdateBody } from "./markdown"
-import { PAGE_SCRIPT } from "./script"
+import { DAY_STATE_LETTER, PAGE_SCRIPT } from "./script"
 import { activeIncidents, groupComponents, pastIncidents, upcomingMaintenance } from "./select"
 import { pageStyles } from "./styles"
 import { renderSubscribeDialog, SUBSCRIBE_LINK } from "./subscribe"
@@ -115,7 +118,7 @@ const renderHero = (
 }
 
 /** The hero as the page's components and active incidents call it. */
-export const renderPageHero = (snapshot: StatusPagePublicSnapshot): string =>
+const renderPageHero = (snapshot: StatusPagePublicSnapshot): string =>
 	renderHero(
 		overallStatus(snapshot),
 		activeIncidents(snapshot),
@@ -130,7 +133,7 @@ const pager = (name: "window" | "month", label: string, unit: string): string =>
 const statusName = (name: string, status: StatusPageComponentStatus): string =>
 	`<span class="name"><span class="st" title="${COMPONENT_STATUS_LABEL[status]}">${statusIcon(status)}</span><span>${escapeHtml(name)}</span><span class="sr">: ${COMPONENT_STATUS_LABEL[status]}</span></span>`
 
-const renderBars = (days: ReadonlyArray<StatusPageDayBar>): string => {
+const renderBars = (days: ReadonlyArray<StatusPageDayBar>, marks: ReadonlyMap<string, BarMark>): string => {
 	const first = days[0]
 	const last = days.at(-1)
 	const label =
@@ -139,8 +142,9 @@ const renderBars = (days: ReadonlyArray<StatusPageDayBar>): string => {
 			: `Uptime, ${formatDay(first.day)} to ${formatDay(last.day)}`
 	const bars = Arr.join(
 		Arr.map(days, (bar) => {
-			const state = dayState(bar)
-			return `<li class="d-${state}" data-day="${escapeHtml(bar.day)}" data-state="${state}" title="${escapeHtml(dayTitle(bar, state))}"></li>`
+			const mark = marks.get(bar.day)
+			const state = barState(bar, mark)
+			return `<li class="d-${state}" data-day="${escapeHtml(bar.day)}" data-state="${state}" title="${escapeHtml(dayTitle(bar, mark?.entry))}"></li>`
 		}),
 		"",
 	)
@@ -150,13 +154,23 @@ const renderBars = (days: ReadonlyArray<StatusPageDayBar>): string => {
 /** What each bar colour means, under the bars. */
 const BAR_LEGEND = `<ul class="legend" aria-label="Bar colours">${Arr.join(
 	Arr.map(
-		["ok", "degraded", "down", "none"] as const,
+		["ok", "maintenance", "degraded", "down", "none"] as const,
 		(state) => `<li><span class="key d-${state}"></span>${DAY_STATE_LABEL[state]}</li>`,
 	),
 	"",
 )}</ul>`
 
-const renderComponent = (component: StatusPageSnapshotComponent, options: RenderOptions): string => {
+/** What the bars need beyond the component: the incidents to mark, and the snapshot's time, where the bars end. */
+interface BarContext {
+	readonly entries: ReadonlyArray<CalendarEntry>
+	readonly nowMs: number
+}
+
+const renderComponent = (
+	component: StatusPageSnapshotComponent,
+	bars: BarContext,
+	options: RenderOptions,
+): string => {
 	const description =
 		component.description === null ? "" : `<p class="desc">${escapeHtml(component.description)}</p>`
 	const showsBars = component.showUptime && component.days.length > 0
@@ -165,12 +179,13 @@ const renderComponent = (component: StatusPageSnapshotComponent, options: Render
 	const uptime = !showsBars
 		? ""
 		: `<span class="uptime">${percent === null ? "No data" : `${formatPercent(percent)} uptime`}</span>`
-	return `<div class="component" data-component="${escapeHtml(component.id)}"${previewIdAttr(options, "component", component.id)}><div class="row">${statusName(component.name, component.status)}${uptime}</div>${description}${showsBars ? renderBars(days) : ""}</div>`
+	return `<div class="component" data-component="${escapeHtml(component.id)}"${previewIdAttr(options, "component", component.id)}><div class="row">${statusName(component.name, component.status)}${uptime}</div>${description}${showsBars ? renderBars(days, componentMarks(component.id, bars.entries, bars.nowMs)) : ""}</div>`
 }
 
 /** The System status panel; with `onlyId`, just that component under its group's head. */
-export const renderSystemStatus = (
+const renderSystemStatus = (
 	snapshot: StatusPagePublicSnapshot,
+	bars: BarContext,
 	options: RenderOptions,
 	onlyId?: string,
 ): string => {
@@ -184,14 +199,16 @@ export const renderSystemStatus = (
 				onlyId === undefined
 					? group.components
 					: Arr.filter(group.components, (component) => component.id === onlyId)
-			if (shown.length === 0) return []
+			// The editor edits a group's name on its components; a click on it opens the first one.
+			const first = shown[0]
+			if (first === undefined) return []
 			const groupHead =
 				group.name === null
 					? ""
-					: `<div class="group-head">${statusName(group.name, group.status)}</div>`
+					: `<div class="group-head"${previewIdAttr(options, "group", first.id)}>${statusName(group.name, group.status)}</div>`
 			return [
 				`<div class="group">${groupHead}${Arr.join(
-					Arr.map(shown, (component) => renderComponent(component, options)),
+					Arr.map(shown, (component) => renderComponent(component, bars, options)),
 					"",
 				)}</div>`,
 			]
@@ -249,7 +266,11 @@ const renderCalendar = (
 	return `<section class="panel" aria-labelledby="h-calendar"><div class="panel-head"><h2 id="h-calendar">Calendar <small>(UTC)</small></h2>${pager("month", `${MONTHS[month - 1] ?? ""} ${year}`, "month")}</div><table class="cal"><thead><tr>${head}</tr></thead><tbody id="cal-body">${rows}</tbody></table><div class="cal-panel" id="cal-panel" role="region" aria-label="Incidents on the chosen day" hidden></div></section>`
 }
 
-/** What the script pages through. Bars are `[checks, failures, downChecks]`, or 0 for no data. */
+/**
+ * What the script pages through. Bars are `[checks, failures, downChecks]`, or 0 for no data;
+ * `states` holds each day's state as a letter, decided here so the script never re-derives it;
+ * `marks` maps a day's index to the entry marked on it.
+ */
 const pageData = (
 	snapshot: StatusPagePublicSnapshot,
 	today: string,
@@ -257,6 +278,10 @@ const pageData = (
 	days: ReadonlyMap<string, CalendarDay>,
 ) => {
 	const withBars = barComponents(snapshot.components)
+	const withMarks = Arr.map(withBars, (component) => ({
+		component,
+		marks: componentMarks(component.id, entries, snapshot.generatedAt),
+	}))
 	const longest = Arr.reduce<StatusPageSnapshotComponent, StatusPageSnapshotComponent | undefined>(
 		withBars,
 		undefined,
@@ -266,12 +291,34 @@ const pageData = (
 	return {
 		end: longest?.days.at(-1)?.day ?? today,
 		len: longest?.days.length ?? 0,
-		windows: windowCount(snapshot.components),
+		windows: windowCount(snapshot.components, entries, snapshot.generatedAt),
 		bars: Rec.fromEntries(
 			Arr.map(withBars, (component) => [
 				component.id,
 				Arr.map(component.days, (bar) =>
 					bar.checks === 0 ? 0 : [bar.checks, bar.failures, bar.downChecks],
+				),
+			]),
+		),
+		states: Rec.fromEntries(
+			Arr.map(withMarks, ({ component, marks }) => [
+				component.id,
+				Arr.join(
+					Arr.map(component.days, (bar) => DAY_STATE_LETTER[barState(bar, marks.get(bar.day))]),
+					"",
+				),
+			]),
+		),
+		marks: Rec.fromEntries(
+			Arr.map(withMarks, ({ component, marks }) => [
+				component.id,
+				Rec.fromEntries(
+					Arr.flatMap(component.days, (bar, index) => {
+						const mark = marks.get(bar.day)
+						return mark === undefined
+							? []
+							: [[String(index), entries.indexOf(mark.entry)] as const]
+					}),
 				),
 			]),
 		),
@@ -311,7 +358,7 @@ const scriptJson = (value: ReturnType<typeof pageData>): string =>
 		),
 	)
 
-export const renderFooter = (
+const renderFooter = (
 	snapshot: StatusPagePublicSnapshot,
 	freshness: StatusPageFreshness,
 	nowMs: number,
@@ -325,13 +372,17 @@ export const renderFooter = (
 			snapshot.page.visibility === "public"
 				? `<a href="${pageHref(options, "/feed.atom")}">Atom feed</a>`
 				: "",
-			privacy === null ? "" : `<a href="${escapeHtml(privacy)}" rel="noopener">Privacy policy</a>`,
-			terms === null ? "" : `<a href="${escapeHtml(terms)}" rel="noopener">Terms of service</a>`,
+			privacy === null
+				? ""
+				: `<a href="${escapeHtml(privacy)}" rel="noopener"${previewIdAttr(options, "field", "privacyUrl")}>Privacy policy</a>`,
+			terms === null
+				? ""
+				: `<a href="${escapeHtml(terms)}" rel="noopener"${previewIdAttr(options, "field", "termsUrl")}>Terms of service</a>`,
 		],
 		(link) => link !== "",
 	)
 	const powered = snapshot.page.showPoweredBy
-		? `<p class="powered">Powered by <a href="https://maple.dev" rel="noopener">${MAPLE_MARK}Maple</a></p>`
+		? `<p class="powered"${previewIdAttr(options, "field", "showPoweredBy")}>Powered by <a href="https://maple.dev" rel="noopener">${MAPLE_MARK}Maple</a></p>`
 		: ""
 	return `<footer>${powered}<p class="links">${Arr.join(links, " · ")}</p><p id="updated">Updated ${formatAge(nowMs - freshness.updatedAt)}</p></footer>`
 }
@@ -348,20 +399,48 @@ const statusSummary = (
 				", ",
 			)}.`
 
+/** Where the social preview lives, relative to the page. */
+export const OG_IMAGE_PATH = "/og.png"
+
 /**
- * Link previews (Open Graph and Twitter) and the canonical address. The address needs
- * `publicUrl`; the image is the logo, when there is one.
+ * Link previews (Open Graph and Twitter) and the canonical address, both from `publicUrl`. The
+ * image is the drawn card; its `?v=` changes with anything drawn on it, so a chat app that caches
+ * previews by URL fetches the new state.
  */
 const shareTags = (
 	snapshot: StatusPagePublicSnapshot,
+	freshness: StatusPageFreshness,
 	title: string,
 	summary: string,
 	options: RenderOptions,
 ): string => {
 	const url = options.publicUrl === undefined ? null : safeUrl(`${options.publicUrl}/`, ["https:", "http:"])
-	const image = safeUrl(snapshot.page.logoUrl, ["https:"]) ?? safeUrl(snapshot.page.logoDarkUrl, ["https:"])
+	const card = statusOgCard(snapshot, freshness, url === null ? null : new URL(url).host)
+	// A copy with no public address cannot link its card, so it shows the logo, as before cards.
+	const drawn =
+		options.publicUrl === undefined
+			? null
+			: safeUrl(`${options.publicUrl}${OG_IMAGE_PATH}?v=${statusOgCardVersion(card)}`, [
+					"https:",
+					"http:",
+				])
+	const image =
+		drawn ?? safeUrl(snapshot.page.logoUrl, ["https:"]) ?? safeUrl(snapshot.page.logoDarkUrl, ["https:"])
 	const meta = (attr: "property" | "name", key: string, value: string) =>
 		`<meta ${attr}="${key}" content="${escapeHtml(value)}">`
+	const imageTags =
+		drawn === null
+			? image === null
+				? []
+				: [meta("property", "og:image", image), meta("name", "twitter:image", image)]
+			: [
+					meta("property", "og:image", drawn),
+					meta("property", "og:image:type", "image/png"),
+					meta("property", "og:image:width", String(OG_CARD_WIDTH)),
+					meta("property", "og:image:height", String(OG_CARD_HEIGHT)),
+					meta("property", "og:image:alt", statusOgAlt(card)),
+					meta("name", "twitter:image", drawn),
+				]
 	return Arr.join(
 		[
 			url === null ? "" : `<link rel="canonical" href="${escapeHtml(url)}">`,
@@ -370,11 +449,10 @@ const shareTags = (
 			meta("property", "og:title", title),
 			meta("property", "og:description", summary),
 			url === null ? "" : meta("property", "og:url", url),
-			image === null ? "" : meta("property", "og:image", image),
-			meta("name", "twitter:card", "summary"),
+			meta("name", "twitter:card", drawn === null ? "summary" : "summary_large_image"),
 			meta("name", "twitter:title", title),
 			meta("name", "twitter:description", summary),
-			image === null ? "" : meta("name", "twitter:image", image),
+			...imageTags,
 		],
 		"",
 	)
@@ -426,7 +504,7 @@ export const renderPage = (
 							"",
 						),
 					),
-			renderSystemStatus(snapshot, options),
+			renderSystemStatus(snapshot, { entries, nowMs: snapshot.generatedAt }, options),
 			renderCalendar(today, days, entries),
 			renderSection(
 				"past",
@@ -456,7 +534,7 @@ export const renderPage = (
 		bodyAttrs: ` data-generated-at="${snapshot.generatedAt}" data-updated-at="${freshness.updatedAt}" data-stale-after="${STATUS_PAGE_STALE_AFTER_MS}" data-freshness="${freshness._tag}"`,
 		// Share tags would show a non-public page's status in link previews.
 		head: isPublic
-			? `${shareTags(snapshot, title, summary, options)}<link rel="alternate" type="application/atom+xml" title="${escapeHtml(snapshot.page.name)} status" href="${pageHref(options, "/feed.atom")}"><link rel="alternate" type="application/rss+xml" title="${escapeHtml(snapshot.page.name)} status" href="${pageHref(options, "/feed.rss")}">`
+			? `${shareTags(snapshot, freshness, title, summary, options)}<link rel="alternate" type="application/atom+xml" title="${escapeHtml(snapshot.page.name)} status" href="${pageHref(options, "/feed.atom")}"><link rel="alternate" type="application/rss+xml" title="${escapeHtml(snapshot.page.name)} status" href="${pageHref(options, "/feed.rss")}">`
 			: `<meta name="robots" content="noindex">`,
 		script: PAGE_SCRIPT,
 	})

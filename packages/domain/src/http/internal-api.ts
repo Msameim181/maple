@@ -7,9 +7,13 @@ import { BillingApiGroup } from "./billing"
 import { CodeReviewApiGroup } from "./code-review"
 import { DemoApiGroup } from "./demo"
 import { AuditTrailApiGroup } from "./audit-trail"
+import { CloudSecurityApiGroup } from "./cloud-security"
+import { DeviceSecurityApiGroup } from "./device-security"
 import { AnthropicCostApiGroup } from "./anthropic-cost"
+import { FeatureRequestApiGroup } from "./feature-requests"
 import { CloudflareCostApiGroup } from "./cloudflare-cost"
 import { OpenAiCostApiGroup } from "./openai-cost"
+import { MorphCostApiGroup } from "./morph-cost"
 import { DependencyScanApiGroup } from "./dependency-scan"
 import { DigestApiGroup } from "./digest"
 import { ErrorsApiGroup } from "./errors"
@@ -28,10 +32,12 @@ import {
 } from "./organizations"
 import { QueryEngineApiGroup } from "./query-engine"
 import { SavedViewsApiGroup } from "./saved-views"
+import { SecurityAuditReadsApiGroup } from "./security-audit"
 import { ServiceMapWorldApiGroup } from "./service-map-world"
 import { SessionReplaysInternalApiGroup } from "./session-replay"
 import { UsersInternalApiGroup } from "./users"
 import { VercelCostApiGroup } from "./vercel-cost"
+import { GcpCostApiGroup } from "./gcp-cost"
 import { ApiSchemaErrors, ApiUnexpectedErrors } from "./api-boundary"
 
 /**
@@ -63,11 +69,13 @@ export class MapleInternalApi extends HttpApi.make("MapleInternalApi")
 	.add(AiTriageApiGroup)
 	.add(AuditTrailApiGroup)
 	.add(BillingApiGroup)
+	.add(CloudSecurityApiGroup)
 	.add(CodeReviewApiGroup)
 	.add(DemoApiGroup)
 	.add(DependencyScanApiGroup)
 	.add(DigestApiGroup)
 	.add(ErrorsApiGroup)
+	.add(DeviceSecurityApiGroup)
 	.add(IntegrationsApiGroup)
 	.add(McpInternalApiGroup)
 	.add(OpenRouterKeyApiGroup)
@@ -75,10 +83,13 @@ export class MapleInternalApi extends HttpApi.make("MapleInternalApi")
 	.add(OpenRouterCostApiGroup)
 	.add(CloudflareCostApiGroup)
 	.add(AnthropicCostApiGroup)
+	.add(FeatureRequestApiGroup)
 	.add(OpenAiCostApiGroup)
+	.add(MorphCostApiGroup)
 	.add(GithubCostApiGroup)
 	.add(PlanetScaleCostApiGroup)
 	.add(VercelCostApiGroup)
+	.add(GcpCostApiGroup)
 	.add(CostBudgetsApiGroup)
 	.add(OrgClickHouseSettingsApiGroup)
 	.add(OrganizationsApiGroup)
@@ -86,6 +97,8 @@ export class MapleInternalApi extends HttpApi.make("MapleInternalApi")
 	.add(OrganizationRegionApiGroup)
 	.add(QueryEngineApiGroup)
 	.add(SavedViewsApiGroup)
+	// The security audit's reads; its writes stay on the ai Worker (`MapleAiApi`).
+	.add(SecurityAuditReadsApiGroup)
 	.add(ServiceMapWorldApiGroup)
 	.add(SessionReplaysInternalApiGroup)
 	.add(UsersInternalApiGroup)

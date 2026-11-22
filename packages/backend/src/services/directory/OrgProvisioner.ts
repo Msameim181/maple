@@ -16,7 +16,7 @@ import { Database } from "@maple/backend/platform/DatabaseLive"
 import { makeDbExecute } from "@maple/backend/platform/db-execute"
 import { Env } from "@maple/backend/platform/Env"
 import { OrgClickHouseSettingsService } from "@maple/backend/services/org/OrgClickHouseSettingsService"
-import { OrganizationService } from "@maple/backend/services/org/OrganizationService"
+import { OrganizationDeletionService } from "@maple/backend/services/org/OrganizationDeletionService"
 
 const persistence = (error: { readonly message: string }) =>
 	new DirectoryPersistenceError({ message: error.message })
@@ -116,7 +116,7 @@ export class OrgProvisioner extends Context.Service<OrgProvisioner, OrgProvision
 			const dbExecute = makeDbExecute(database, "OrgProvisioner", persistence)
 			const admin = yield* ClickHouseAdmin
 			const byo = yield* OrgClickHouseSettingsService
-			const organizations = yield* OrganizationService
+			const organizations = yield* OrganizationDeletionService
 
 			// The name is spliced into DDL, so the slug shape is re-checked here, not trusted.
 			const nameFor = (orgId: OrgId) =>
@@ -177,7 +177,7 @@ export class OrgProvisioner extends Context.Service<OrgProvisioner, OrgProvision
 			Layer.mergeAll(
 				ClickHouseAdmin.layer,
 				OrgClickHouseSettingsService.layer,
-				OrganizationService.layer,
+				OrganizationDeletionService.layer,
 			),
 		),
 	)

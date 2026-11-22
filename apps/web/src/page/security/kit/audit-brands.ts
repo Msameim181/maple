@@ -15,6 +15,9 @@ const BRANDS = {
 	maple: { icon: "MapleMark", accent: "var(--color-brand-maple)" },
 	vercel: PROVIDERS.vercel,
 	gcp: PROVIDERS.gcp,
+	aws: PROVIDERS.aws,
+	github: PROVIDERS.github,
+	fleet: PROVIDERS.fleet,
 } satisfies Record<AuditTrailProvider, IntegrationBrand>
 
 /** A platform a newer writer added gets a neutral history mark. */

@@ -26,7 +26,7 @@ import {
 	parseReplyCommand,
 } from "@maple/domain/http"
 import { wrapChatContext } from "@maple/domain/chat-preamble"
-import { encodeChatTurnTenant, prReplySessionId } from "@maple/domain/chat-session"
+import { encodeChatTurnTenant, prReplySessionId, pullRequestTurnOrigin } from "@maple/domain/chat-session"
 import { UserId } from "@maple/primitives"
 import * as PG from "@maple-dev/effect-orm/postgres"
 import {
@@ -563,6 +563,10 @@ export class PrReviewConversationService extends Context.Service<
 			const sessionId = prReplySessionId(orgId, replyId)
 			const stub = chatSessions?.session(sessionId)
 			if (stub === undefined) return yield* fail("agent_unavailable")
+			// A reply runs under the review's ruleset, so the repository's Maple tools switch holds here too.
+			const config = yield* repositories
+				.getEffectivePrReviewConfig(orgId, repo.id)
+				.pipe(Effect.mapError(toPersistence))
 			const kickoff = buildReplyKickoff({
 				repository: repo.fullName,
 				head: head.value,
@@ -596,7 +600,7 @@ export class PrReviewConversationService extends Context.Service<
 					sessionId,
 					messageId: randomUUID(),
 					text: kickoff,
-					origin: { kind: "autonomous" },
+					origin: pullRequestTurnOrigin(repo, config),
 					tenant: encodeChatTurnTenant({
 						orgId,
 						userId: internalServiceUserId,

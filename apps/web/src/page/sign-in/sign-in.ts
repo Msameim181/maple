@@ -110,6 +110,7 @@ export const SignInWithRootPassword = Command.define("SignInWithRootPassword", {
 			Effect.catchTags({
 				"@maple/http/errors/SelfHostedInvalidPasswordError": rejected,
 				"@maple/http/errors/SelfHostedAuthDisabledError": rejected,
+				"@maple/http/errors/SelfHostedLoginRateLimitError": rejected,
 				HttpClientError: (error) =>
 					Effect.succeed(
 						Message.FailedSignInWithRootPassword({

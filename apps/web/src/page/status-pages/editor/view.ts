@@ -5,15 +5,14 @@ import { AsyncData, Submodel } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import type { LoadFailure } from "@maple/views/data/load-failure"
 import { alert, alertDescription, alertTitle } from "@maple/views/ui/alert"
-import { button, linkButton } from "@maple/views/ui/button"
+import { button } from "@maple/views/ui/button"
 import { confirmDialog } from "@maple/views/ui/confirm-dialog"
 import { badge } from "@maple/views/ui/display"
 import { errorState } from "@maple/views/ui/error-state"
 import { icon } from "@maple/views/ui/icon"
-import type { MenuEntry } from "@maple/views/ui/menu-view"
+import type { MenuEntry, MenuItemEntry } from "@maple/views/ui/menu-view"
 import { rowActionsMenu } from "@maple/views/ui/row-actions-menu"
 import { skeleton } from "@maple/views/ui/skeleton"
-import { tooltipTrigger } from "@maple/views/ui/tooltip-host"
 import type { PageViewInputs } from "../../contract"
 import { dashboardPage } from "../../kit/dashboard-page"
 import { detailActions, detailTitle, detailTitleSkeleton } from "../../kit/detail-header"
@@ -21,9 +20,10 @@ import { relativeTime } from "../../kit/relative-time"
 import { linkTabStrip } from "../../kit/underline-tabs"
 import type * as Dialog from "@maple/views/ui/dialog"
 import { sidePanelSheet } from "@maple/views/ui/sheet"
-import { statusPageHref, statusPagesHref, statusPageViewHref } from "../shared/commands"
-import { statusPageNotFound } from "../shared/not-found"
+import { publicPageLink, statusPageHref, statusPagesHref } from "../shared/commands"
+import { openMenuEntries } from "../shared/open-page"
 import { pageUrlOf } from "./update-domain"
+import { statusPageNotFound } from "../shared/not-found"
 import {
 	COMPONENT_STATUS_LABEL,
 	COMPONENT_STATUS_TONE,
@@ -31,14 +31,23 @@ import {
 	pageStatus,
 } from "../shared/derive"
 import { Message } from "./message"
-import { canBreakGlass, canManage, canPostIncidents, type Model } from "./model"
+import { canBreakGlass, canManage, type Model } from "./model"
+import { denialReason, gatedControl } from "../../kit/session-grants"
 import { componentsOf, incidentsOf, monitorsOf, pageOf, statusReadsReady } from "./reads"
 import { type EditorTab, PAGE_MENU_ID, resolveView } from "./update"
 import { livePage } from "./view-canvas"
-import { incidentsTab, maintenanceTab, openIncidentCount } from "./view-incidents"
-import { addressLine, liveView } from "./view-live"
+import { incidentsTab, isEmptyTab, maintenanceTab, openIncidentCount, postButton } from "./view-incidents"
+import { addressLine } from "./view-address"
+import { liveView } from "./view-live"
 import { addSheetBody, addSheetFooter, incidentSheetBody, type TimeInputs } from "./view-panel"
-import { breakGlassDialog, deletePageDialog, sectionLabel, settingsView } from "./view-settings"
+import {
+	breakGlassDialog,
+	deletePageDialog,
+	sectionLabel,
+	settingsLayout,
+	settingsView,
+} from "./view-settings"
+import { brandingImageDialog } from "./view-appearance"
 import { removeCustomDomainDialog } from "./view-domain"
 import { incidentDialogs } from "./view-incident-dialogs"
 import { typography, typographyClass } from "@maple/views/ui/typography"
@@ -76,111 +85,66 @@ const stateLine = (h: H, model: Model, page: V2StatusPage, timeZone: string): Ht
 	)
 }
 
-/** An internal page has no public address to post to, so it has no break-glass token. */
+/**
+ * Open the public page or the dev preview, then the page's own actions. An internal page has no
+ * public address to post to, so it has no break-glass token.
+ */
 const menuEntries = (model: Model, page: V2StatusPage): ReadonlyArray<MenuEntry> => {
 	const hasBreakGlass = canBreakGlass(model) && page.visibility !== "internal"
+	const remove: MenuItemEntry = {
+		_tag: "Item",
+		value: "delete",
+		label: "Delete",
+		icon: "TrashIcon",
+		variant: "destructive",
+	}
+	const lockedRemove: MenuItemEntry = {
+		...remove,
+		isDisabled: true,
+		tooltip: { content: [denialReason("status_pages:edit")] },
+	}
 	return [
+		...openMenuEntries(publicPageLink(page, pageUrlOf(model, page))),
+		{ _tag: "Separator" },
 		...(hasBreakGlass
 			? ([{ _tag: "Item", value: "break-glass", label: "Break-glass token", icon: "KeyIcon" }] as const)
 			: []),
-		...(canManage(model)
-			? ([
-					...(hasBreakGlass ? ([{ _tag: "Separator" }] as const) : []),
-					{
-						_tag: "Item",
-						value: "delete",
-						label: "Delete",
-						icon: "TrashIcon",
-						variant: "destructive",
-					},
-				] as const)
-			: []),
+		...(hasBreakGlass ? ([{ _tag: "Separator" }] as const) : []),
+		canManage(model) ? remove : lockedRemove,
 	]
 }
 
 const publishButton = (h: H, model: Model): Html =>
-	button(
-		h,
-		{
-			size: "sm",
-			isLoading: model.isPublishing,
-			attributes: [h.OnClick(Message.ClickedPublish())],
-		},
-		[icon(h, "PaperPlaneIcon"), "Publish page"],
-	)
-
-/** The public page in a new tab; disabled, with the reason on hover, while it has no address. */
-const openPageButton = (h: H, model: Model, page: V2StatusPage): Html => {
-	const url = pageUrlOf(model, page)
-	const label = [icon(h, "ExternalLinkIcon"), "Open page"]
-	if (page.visibility === "internal")
-		return linkButton(h, { size: "sm", variant: "outline", href: statusPageViewHref(page.id) }, [
-			icon(h, "EyeIcon"),
-			"Open page",
-		])
-	if (url !== null && !page.draft)
-		return linkButton(
+	gatedControl(h, model, "status_pages:edit", (isDisabled) =>
+		button(
 			h,
 			{
 				size: "sm",
-				variant: "outline",
-				href: url,
-				attributes: [h.Target("_blank"), h.Rel("noopener")],
+				isLoading: model.isPublishing,
+				isDisabled,
+				attributes: isDisabled ? [] : [h.OnClick(Message.ClickedPublish())],
 			},
-			label,
-		)
-	// A disabled button fires no hover, so its wrapper carries the reason as a tooltip.
-	return h.span(
-		tooltipTrigger(
-			h,
-			url === null ? "No status domain is configured yet" : "Publish the page to open it",
+			[icon(h, "PaperPlaneIcon"), "Publish page"],
 		),
-		[button(h, { size: "sm", variant: "outline", isDisabled: true }, label)],
 	)
-}
 
 /** Incidents and Maintenance lead with posting one; the other tabs with the page itself. */
 const headerActions = (h: H, model: Model, page: V2StatusPage): Html => {
 	const tab = resolveView(model.search).tab
-	if (tab === "incidents" || tab === "maintenance")
-		return detailActions(
-			h,
-			canPostIncidents(model)
-				? [
-						button(
-							h,
-							{
-								size: "sm",
-								attributes: [
-									h.OnClick(
-										Message.ClickedNewIncident({
-											kind: tab === "incidents" ? "incident" : "maintenance",
-										}),
-									),
-								],
-							},
-							tab === "incidents"
-								? [icon(h, "PlusIcon"), "Declare incident"]
-								: [icon(h, "CalendarIcon"), "Schedule maintenance"],
-						),
-					]
-				: [],
-		)
-	const entries = menuEntries(model, page)
+	if (tab === "incidents" || tab === "maintenance") {
+		const kind = tab === "incidents" ? "incident" : "maintenance"
+		// An empty tab's own empty state carries the button.
+		return detailActions(h, isEmptyTab(model, kind) ? [] : [postButton(h, model, kind)])
+	}
 	return detailActions(h, [
-		...(canManage(model) && page.draft ? [publishButton(h, model)] : []),
-		openPageButton(h, model, page),
-		...(entries.length === 0
-			? []
-			: [
-					rowActionsMenu(h, {
-						slotId: PAGE_MENU_ID,
-						model: model.pageMenu,
-						entries,
-						label: "Page actions",
-						toParentMessage: (message) => Message.GotPageMenuMessage({ message }),
-					}),
-				]),
+		...(page.draft ? [publishButton(h, model)] : []),
+		rowActionsMenu(h, {
+			slotId: PAGE_MENU_ID,
+			model: model.pageMenu,
+			entries: menuEntries(model, page),
+			label: "Page actions",
+			toParentMessage: (message) => Message.GotPageMenuMessage({ message }),
+		}),
 	])
 }
 
@@ -259,7 +223,10 @@ const body = (h: H, model: Model, page: V2StatusPage, time: TimeInputs): Html =>
 			return maintenanceTab(h, model, time)
 		case "page":
 			return canManage(model) && page.draft
-				? vstack(h, { gap: "4" }, [draftCallout(h), livePage(h, model, page)])
+				? vstack(h, { gap: "4", className: "min-h-0 flex-1" }, [
+						draftCallout(h),
+						livePage(h, model, page),
+					])
 				: livePage(h, model, page)
 	}
 }
@@ -339,6 +306,23 @@ const deleteComponentDialog = (h: H, model: Model, page: V2StatusPage): Html => 
 	})
 }
 
+/** Leaving a component with unsaved edits: discard them and go on, or stay on them. */
+const discardComponentDialog = (h: H, model: Model): Html => {
+	const component = Option.getOrUndefined(
+		Arr.findFirst(componentsOf(model), (row) => row.id === model.pendingLeave?.componentId),
+	)
+	return confirmDialog(h, {
+		slotId: "status-page-discard-component",
+		model: model.discardComponentDialog,
+		toParentMessage: (message) => Message.GotDiscardComponentDialogMessage({ message }),
+		title: `Discard changes to ${component?.name ?? "this component"}?`,
+		description: "Your edits to it are not saved.",
+		confirmLabel: "Discard changes",
+		cancelLabel: "Keep editing",
+		onConfirm: Message.ClickedConfirmDiscardComponent(),
+	})
+}
+
 const deleteIncidentDialog = (h: H, model: Model, page: V2StatusPage): Html => {
 	const incident = Option.getOrUndefined(
 		Arr.findFirst(incidentsOf(model), (row) => row.id === model.confirmDeleteIncidentId),
@@ -364,6 +348,7 @@ const loaded = (h: H, model: Model, page: V2StatusPage, inputs: PageViewInputs):
 	const time = { nowMs: model.nowMs ?? 0, timeZone }
 	const overall = overallOf(model)
 	const hasStatus = canvasRead(model).isReady && componentsOf(model).length > 0
+	const location = resolveView(model.search)
 	return h.div(
 		[h.Class("contents")],
 		[
@@ -371,7 +356,6 @@ const loaded = (h: H, model: Model, page: V2StatusPage, inputs: PageViewInputs):
 				h,
 				{
 					titleContent: detailTitle(h, {
-						kind: ["Status page"],
 						title: [page.name],
 						adornment: page.draft
 							? badge(h, { variant: "meta" }, ["Draft, not public"])
@@ -391,14 +375,31 @@ const loaded = (h: H, model: Model, page: V2StatusPage, inputs: PageViewInputs):
 					actions: headerActions(h, model, page),
 					tabs: tabs(h, model, page),
 					gap: "md",
+					// Settings and the Live page own their scrolling: Settings' panes each scroll alone,
+					// and the Live page's frame takes exactly the height left, so the page never scrolls.
+					fill: location.tab === "settings" || location.tab === "page",
+					// The Live page's frame takes the height under the header, so only it stays pinned.
+					unpinHeaderOnMobile: location.tab !== "page",
 				},
-				[body(h, model, page, time)],
+				[
+					location.tab === "settings"
+						? settingsLayout(h, model, page, location.section, body(h, model, page, time))
+						: location.tab === "page"
+							? vstack(
+									h,
+									{ className: "min-h-0 flex-1 px-(--page-gutter) pb-(--page-gutter)" },
+									[body(h, model, page, time)],
+								)
+							: body(h, model, page, time),
+				],
 			),
 			panelSheet(h, model, time),
 			deleteComponentDialog(h, model, page),
+			discardComponentDialog(h, model),
 			...incidentDialogs(h, model, page, time),
 			deleteIncidentDialog(h, model, page),
 			breakGlassDialog(h, model),
+			brandingImageDialog(h, model),
 			deletePageDialog(h, model, page),
 			removeCustomDomainDialog(h, model),
 		],

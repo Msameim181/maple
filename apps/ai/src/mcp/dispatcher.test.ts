@@ -2,10 +2,16 @@ import { assert, describe, expect, it } from "@effect/vitest"
 import { Context, Effect, Layer, Option, Schema, Tracer, Array as Arr, String as Str } from "effect"
 import type { McpToolNotFoundError } from "@maple/domain/mcp-tool-contract"
 import { ActorId } from "@maple/primitives"
-import { McpToolExecutor } from "./dispatcher"
+import { familyActionOf, McpToolExecutor } from "./dispatcher"
 import { listMcpTools } from "./tool-descriptors-render"
 import { MCP_ANTICIPATED_ERROR_IDENTIFIERS, recordExpectedMcpFailure } from "./expected-failures"
-import { mapleToolCatalog, mapleToolCatalogFor, toInputSchema, toOutputSchema } from "./tools/registry"
+import {
+	inputSchemaOf,
+	mapleToolCatalog,
+	mapleToolCatalogFor,
+	toInputSchema,
+	toOutputSchema,
+} from "./tools/registry"
 import type { McpToolRuntimeRequirements } from "./tools/runtime-services"
 import type { TenantContext } from "@maple/domain/http"
 import { AuditLogService, makeMemoryAuditLog } from "@maple/backend/services/audit/AuditLogService"
@@ -70,6 +76,21 @@ const makeRecordingTracer = () => {
 	return { spans, tracer }
 }
 
+describe("familyActionOf", () => {
+	it("names the action a family call asks for, under its own name or a retired one", () => {
+		expect(familyActionOf("manage_slo", { action: "Update", slo: "Checkout" })).toBe("update")
+		// Spelled as the call itself forgives it.
+		expect(familyActionOf("manage_oncall_schedule", { action: "Add Override" })).toBe("add_override")
+		expect(familyActionOf("delete_slo", { slo: "Checkout", confirm: true })).toBe("delete")
+	})
+
+	it("names nothing a family does not have, since the value is the caller's text", () => {
+		expect(familyActionOf("manage_slo", { action: "drop everything" })).toBeUndefined()
+		expect(familyActionOf("manage_slo", { slo: "Checkout" })).toBeUndefined()
+		expect(familyActionOf("run_sql", { action: "create" })).toBeUndefined()
+	})
+})
+
 describe("MCP dispatcher", () => {
 	it("publishes an object input schema for every tool", () => {
 		// Strict MCP clients (the Vercel AI SDK's `tools/list` validator) drop the
@@ -99,7 +120,7 @@ describe("MCP dispatcher", () => {
 				Arr.map(mapleToolCatalogFor("mcp"), (definition) => ({
 					name: definition.name,
 					description: definition.description,
-					inputSchema: toInputSchema(definition.schema),
+					inputSchema: inputSchemaOf(definition),
 				})),
 			)
 		}),
@@ -200,6 +221,73 @@ describe("MCP dispatcher", () => {
 				// before the handler reads a sandbox service this executor lacks.
 				const result = yield* executor.execute(TENANT, "sandbox_exec", {}, "chat")
 				expect(result.isError).toBe(true)
+				expect(result.content[0]?.text).toContain("Invalid parameters")
+			}),
+		)
+
+		// Reads an unnamed asker is not given: connected systems, SQL, end users, sessions, agents.
+		const WITHHELD_READS = [
+			"query_data_source",
+			"list_data_sources",
+			"run_sql",
+			"list_users",
+			"inspect_user",
+			"search_sessions",
+			"get_session_transcript",
+			"get_agent_session_transcript",
+			"list_integrations",
+			"get_dashboard",
+		]
+
+		it("offers a turn nobody is named on telemetry reads and nothing that changes data", () => {
+			const anonymous = new Set(Arr.map(mapleToolCatalogFor("bot_anonymous"), (d) => d.name))
+			expect(Arr.filter([...WITHHELD_READS, ...INTERNAL_TOOLS], (name) => anonymous.has(name))).toEqual(
+				[],
+			)
+			const changes = Arr.filter(mapleToolCatalog, (d) => !d.hints.readOnly)
+			expect(changes.length).toBeGreaterThan(0)
+			expect(Arr.filter(changes, (d) => anonymous.has(d.name))).toEqual([])
+			expect(anonymous.has("search_traces")).toBe(true)
+			// A linked asker, and a key on the public transport, still get the withheld reads.
+			const bot = new Set(Arr.map(mapleToolCatalogFor("bot"), (d) => d.name))
+			const mcp = new Set(Arr.map(mapleToolCatalogFor("mcp"), (d) => d.name))
+			expect(Arr.filter(WITHHELD_READS, (name) => !bot.has(name) || !mcp.has(name))).toEqual([])
+		})
+
+		it.effect("refuses by name, as an unknown tool, every tool that surface does not list", () =>
+			Effect.gen(function* () {
+				const executor = yield* makeValidationExecutor
+				const listed = new Set(Arr.map(mapleToolCatalogFor("bot_anonymous"), (d) => d.name))
+				const unlisted = Arr.filter(mapleToolCatalog, (d) => !listed.has(d.name))
+				expect(unlisted.length).toBeGreaterThan(listed.size)
+				// Refused before the handler, so this needs none of the services this executor lacks.
+				const answers = yield* Effect.forEach(unlisted, (tool) =>
+					executor.execute(TENANT, tool.name, {}, "bot_anonymous").pipe(
+						Effect.as("ran"),
+						Effect.catchTag("@maple/mcp/ToolNotFoundError", (error) =>
+							Effect.succeed(error.message),
+						),
+					),
+				)
+				expect(Arr.filter(unlisted, (_tool, index) => answers[index] === "ran")).toEqual([])
+				// The names it is told about instead are only ones it may call.
+				const suggested = (message: string | undefined, asked: string) =>
+					Arr.filter(
+						unlisted,
+						(other) =>
+							other.name !== asked && new RegExp(`\\b${other.name}\\b`).test(message ?? ""),
+					)
+				expect(Arr.flatMap(unlisted, (tool, index) => suggested(answers[index], tool.name))).toEqual(
+					[],
+				)
+			}),
+		)
+
+		it.effect("still dispatches a telemetry tool on that surface", () =>
+			Effect.gen(function* () {
+				const executor = yield* makeValidationExecutor
+				// Empty input stops at schema decoding, which is past the surface check.
+				const result = yield* executor.execute(TENANT, "inspect_trace", {}, "bot_anonymous")
 				expect(result.content[0]?.text).toContain("Invalid parameters")
 			}),
 		)

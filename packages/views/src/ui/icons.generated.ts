@@ -26,27 +26,11 @@ import {
 	StackPerspectiveIcon,
 	RedisIcon,
 } from "./flow-icons"
+import type { IconNode } from "./icon-node"
 
-export const ICON_SIZE_MARK = "7777"
-export const ICON_CLASS_MARK = "__icon_class__"
-export const ICON_ID_MARK = "__icon_id__"
-
-export type IconTag =
-	| "svg"
-	| "path"
-	| "g"
-	| "line"
-	| "circle"
-	| "rect"
-	| "polyline"
-	| "polygon"
-	| "ellipse"
-	| "defs"
-	| "linearGradient"
-	| "stop"
-	| "radialGradient"
-
-export type IconNode = readonly [IconTag, ReadonlyArray<readonly [string, string]>, ReadonlyArray<IconNode>]
+// The marks and the tree type live with the registry-free renderer (./icon-node).
+export { ICON_CLASS_MARK, ICON_ID_MARK, ICON_SIZE_MARK } from "./icon-node"
+export type { IconNode, IconTag } from "./icon-node"
 
 export const ICON_TREES = {
 	AlertWarningIcon: [
@@ -4186,6 +4170,140 @@ export const ICON_TREES = {
 			],
 		],
 	],
+	CircleIcon: [
+		"svg",
+		[
+			["xmlns", "http://www.w3.org/2000/svg"],
+			["viewBox", "0 0 24 24"],
+			["width", "7777"],
+			["height", "7777"],
+			["class", "__icon_class__"],
+			["fill", "none"],
+			["aria-hidden", "true"],
+		],
+		[
+			[
+				"path",
+				[
+					["d", "M8 2L16 2"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M8 22L16 22"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M2 8L2 16"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M22 8L22 16"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M6 4L6 4.01"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M4 6L4 6.01"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M18 4L18 4.01"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M20 6L20 6.01"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M6 20L6 20.01"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M4 18L4 18.01"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M18 20L18 20.01"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M20 18L20 18.01"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+		],
+	],
 	CircleCheckIcon: [
 		"svg",
 		[
@@ -5439,6 +5557,270 @@ export const ICON_TREES = {
 		],
 	],
 	CodeIcon,
+	CloudNodesIcon: [
+		"svg",
+		[
+			["xmlns", "http://www.w3.org/2000/svg"],
+			["viewBox", "0 0 24 24"],
+			["width", "7777"],
+			["height", "7777"],
+			["class", "__icon_class__"],
+			["fill", "none"],
+			["aria-hidden", "true"],
+		],
+		[
+			[
+				"path",
+				[
+					["d", "M19.01 8L19 8"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M12.01 10L12 10"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M12.01 14L12 14"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M14 12.01L14 12"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M10 12.01L10 12"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M17.01 18L17 18"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M7.01001 18L7.00001 18"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M17.01 22L17 22"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M7.01001 22L7.00001 22"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M19 20.01L19 20"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M9 20.01L9 20"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M15 20.01L15 20"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M5 20.01L5 20"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M5.01001 8L5.00001 8"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M9.01001 3L9.00001 3"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M15.01 3L15 3"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M19.01 14L19 14"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M5.01001 14L5.00001 14"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M11 2H13"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M21 10V12"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M3 10V12"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M17 6V5"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M7 6V5"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M15 16H14"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M10 16H9"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+		],
+	],
 	ComputerIcon: [
 		"svg",
 		[
@@ -13453,6 +13835,160 @@ export const ICON_TREES = {
 			],
 		],
 	],
+	Palette2Icon: [
+		"svg",
+		[
+			["xmlns", "http://www.w3.org/2000/svg"],
+			["viewBox", "0 0 24 24"],
+			["width", "7777"],
+			["height", "7777"],
+			["class", "__icon_class__"],
+			["fill", "none"],
+			["aria-hidden", "true"],
+		],
+		[
+			[
+				"path",
+				[
+					["d", "M11 5H13V7H11V5Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M15 7H17V9H15V7Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M17 21H19V23H17V21Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M19 19H21V21H19V19Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M5 11H7V13H5V11Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M7 7H9V9H7V7Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M5 3H7V5H5V3Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M3 5H5V7H3V5Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M17 3H19V5H17V3Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M19 5H21V7H19V5Z"],
+					["fill", "currentColor"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M8 2L16 2"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M2 16V8"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M22 18V8"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M10 16L14 16"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M4 18H8"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["d", "M16 18V20"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+		],
+	],
 	PaperPlaneIcon,
 	PencilIcon: [
 		"svg",
@@ -17732,6 +18268,19 @@ export const ICON_TREES = {
 			],
 		],
 	],
+	VitessIcon: [
+		"svg",
+		[
+			["xmlns", "http://www.w3.org/2000/svg"],
+			["viewBox", "0 0 24 24"],
+			["width", "7777"],
+			["height", "7777"],
+			["class", "__icon_class__"],
+			["fill", "#F16728"],
+			["aria-hidden", "true"],
+		],
+		[["path", [["d", "m19.206 1.045-7.217 13.186L4.817 1.045H0l11.904 21.91L24 1.045h-4.794Z"]], []]],
+	],
 	MysqlDolphinIcon: [
 		"svg",
 		[
@@ -19627,6 +20176,31 @@ export const ICON_TREES = {
 			],
 		],
 	],
+	// Morph's own mark, in its brand green (morphllm.com/favicon.svg).
+	MorphBrandIcon: [
+		"svg",
+		[
+			["xmlns", "http://www.w3.org/2000/svg"],
+			["viewBox", "0 -3.333 36.666 36.666"],
+			["width", "7777"],
+			["height", "7777"],
+			["class", "__icon_class__"],
+			["aria-hidden", "true"],
+		],
+		[
+			[
+				"path",
+				[
+					["fill", "#99d52a"],
+					[
+						"d",
+						"M6.667 22.038C6.687 23.677 8.022 25 9.666 25h2.383c1.545 0 2.72 1.387 2.466 2.911-.201 1.205-1.244 2.089-2.466 2.089h-2.008c-1.466 0-2.718-1.06-2.959-2.507L6.666 25v-2.962zm4.965-22.038c1.371 0 2.554.93 2.895 2.234l.113.531c.34 1.305 1.523 2.235 2.894 2.235h1.598c1.371 0 2.554-.93 2.894-2.234l.114-.531C22.48.93 23.663 0 25.034 0h1.591c1.466 0 2.718 1.06 2.959 2.507l.048.287c.218 1.309 1.27 2.319 2.587 2.484l1.82.227c1.501.188 2.627 1.464 2.627 2.977v13.037c0 1.513-1.126 2.789-2.627 2.976l-1.82.228c-1.316.165-2.369 1.175-2.587 2.484l-.048.287c-.241 1.447-1.493 2.507-2.959 2.507h-2.008c-1.222 0-2.265-.884-2.466-2.089-.254-1.524.921-2.911 2.466-2.911H27c1.657 0 3-1.343 3-3V8c0-1.657-1.343-3-3-3h-2.334c-1.657 0-3 1.343-3 3v9c0 1.657-1.343 3-3 3h-.666c-1.657 0-3-1.343-3-3V8c0-1.657-1.343-3-3-3H9.666C8.01 5 6.666 6.343 6.666 8v17l-4.038-.505C1.127 24.308 0 23.032 0 21.519V8.481c0-1.513 1.127-2.789 2.628-2.976l1.82-.228c1.316-.165 2.368-1.175 2.586-2.484l.048-.287C7.323 1.06 8.575 0 10.041 0h1.591z",
+					],
+				],
+				[],
+			],
+		],
+	],
 	NousResearchIcon: [
 		"svg",
 		[
@@ -20519,6 +21093,160 @@ export const ICON_TREES = {
 					[
 						"d",
 						"M12 0C5.373 0 0 5.372 0 12c0 6.627 5.373 12 12 12s12-5.373 12-12c0-6.628-5.373-12-12-12zm0 22.46c-1.885 0-3.414-1.26-3.414-2.814h6.828c0 1.553-1.528 2.813-3.414 2.813zm5.64-3.745H6.36v-2.046h11.28v2.046zm-.04-3.098H6.391c-.037-.043-.075-.086-.111-.13-1.155-1.401-1.427-2.133-1.69-2.879-.005-.025 1.4.287 2.395.511 0 0 .513.119 1.262.255-.72-.843-1.147-1.915-1.147-3.01 0-2.406 1.845-4.508 1.18-6.207.648.053 1.34 1.367 1.387 3.422.689-.951.977-2.69.977-3.755 0-1.103.727-2.385 1.454-2.429-.648 1.069.168 1.984.894 4.256.272.854.237 2.29.447 3.201.07-1.892.395-4.652 1.595-5.605-.529 1.2.079 2.702.494 3.424.671 1.164 1.078 2.047 1.078 3.716a4.642 4.642 0 01-1.11 2.996c.792-.149 1.34-.283 1.34-.283l2.573-.502s-.374 1.538-1.81 3.019z",
+					],
+				],
+				[],
+			],
+		],
+	],
+	FleetIcon: [
+		"svg",
+		[
+			["xmlns", "http://www.w3.org/2000/svg"],
+			["viewBox", "15 15.6 34 32"],
+			["width", "7777"],
+			["height", "7777"],
+			["class", "__icon_class__"],
+			["fill", "currentColor"],
+			["aria-hidden", "true"],
+		],
+		[
+			[
+				"path",
+				[
+					["fill", "#63C740"],
+					[
+						"d",
+						"M20 23.8049C22.2091 23.8049 24 22.0577 24 19.9024C24 17.7472 22.2091 16 20 16C17.7909 16 16 17.7472 16 19.9024C16 22.0577 17.7909 23.8049 20 23.8049Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["fill", "#5CABDF"],
+					[
+						"d",
+						"M32 23.8049C34.2091 23.8049 36 22.0577 36 19.9024C36 17.7472 34.2091 16 32 16C29.7909 16 28 17.7472 28 19.9024C28 22.0577 29.7909 23.8049 32 23.8049Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["fill", "#D66C7B"],
+					[
+						"d",
+						"M44 23.8049C46.2091 23.8049 48 22.0577 48 19.9024C48 17.7472 46.2091 16 44 16C41.7909 16 40 17.7472 40 19.9024C40 22.0577 41.7909 23.8049 44 23.8049Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["fill", "#C98DEF"],
+					[
+						"d",
+						"M20 35.5122C22.2091 35.5122 24 33.765 24 31.6098C24 29.4545 22.2091 27.7073 20 27.7073C17.7909 27.7073 16 29.4545 16 31.6098C16 33.765 17.7909 35.5122 20 35.5122Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["fill", "#FAA669"],
+					[
+						"d",
+						"M32 35.5122C34.2091 35.5122 36 33.765 36 31.6098C36 29.4545 34.2091 27.7073 32 27.7073C29.7909 27.7073 28 29.4545 28 31.6098C28 33.765 29.7909 35.5122 32 35.5122Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					["fill", "#3AEFC4"],
+					[
+						"d",
+						"M20 47.2195C22.2091 47.2195 24 45.4723 24 43.3171C24 41.1618 22.2091 39.4146 20 39.4146C17.7909 39.4146 16 41.1618 16 43.3171C16 45.4723 17.7909 47.2195 20 47.2195Z",
+					],
+				],
+				[],
+			],
+		],
+	],
+	FleetMonoIcon: [
+		"svg",
+		[
+			["xmlns", "http://www.w3.org/2000/svg"],
+			["viewBox", "15 15.6 34 32"],
+			["width", "7777"],
+			["height", "7777"],
+			["class", "__icon_class__"],
+			["fill", "currentColor"],
+			["aria-hidden", "true"],
+		],
+		[
+			[
+				"path",
+				[
+					[
+						"d",
+						"M20 23.8049C22.2091 23.8049 24 22.0577 24 19.9024C24 17.7472 22.2091 16 20 16C17.7909 16 16 17.7472 16 19.9024C16 22.0577 17.7909 23.8049 20 23.8049Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					[
+						"d",
+						"M32 23.8049C34.2091 23.8049 36 22.0577 36 19.9024C36 17.7472 34.2091 16 32 16C29.7909 16 28 17.7472 28 19.9024C28 22.0577 29.7909 23.8049 32 23.8049Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					[
+						"d",
+						"M44 23.8049C46.2091 23.8049 48 22.0577 48 19.9024C48 17.7472 46.2091 16 44 16C41.7909 16 40 17.7472 40 19.9024C40 22.0577 41.7909 23.8049 44 23.8049Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					[
+						"d",
+						"M20 35.5122C22.2091 35.5122 24 33.765 24 31.6098C24 29.4545 22.2091 27.7073 20 27.7073C17.7909 27.7073 16 29.4545 16 31.6098C16 33.765 17.7909 35.5122 20 35.5122Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					[
+						"d",
+						"M32 35.5122C34.2091 35.5122 36 33.765 36 31.6098C36 29.4545 34.2091 27.7073 32 27.7073C29.7909 27.7073 28 29.4545 28 31.6098C28 33.765 29.7909 35.5122 32 35.5122Z",
+					],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					[
+						"d",
+						"M20 47.2195C22.2091 47.2195 24 45.4723 24 43.3171C24 41.1618 22.2091 39.4146 20 39.4146C17.7909 39.4146 16 41.1618 16 43.3171C16 45.4723 17.7909 47.2195 20 47.2195Z",
 					],
 				],
 				[],
@@ -22434,6 +23162,43 @@ export const ICON_TREES = {
 				"path",
 				[
 					["d", "M11 18H13"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+		],
+	],
+	LaptopIcon: [
+		"svg",
+		[
+			["xmlns", "http://www.w3.org/2000/svg"],
+			["viewBox", "0 0 24 24"],
+			["width", "7777"],
+			["height", "7777"],
+			["class", "__icon_class__"],
+			["fill", "none"],
+			["aria-hidden", "true"],
+		],
+		[
+			[
+				"path",
+				[
+					["d", "M3 13V5C3 3.89543 3.89543 3 5 3H19C20.1046 3 21 3.89543 21 5V13"],
+					["stroke", "currentColor"],
+					["stroke-width", "2"],
+					["stroke-linecap", "square"],
+				],
+				[],
+			],
+			[
+				"path",
+				[
+					[
+						"d",
+						"M1 17V19C1 20.1046 1.89543 21 3 21H21C22.1046 21 23 20.1046 23 19V17H16C16 17.5523 15.5523 18 15 18H9C8.44772 18 8 17.5523 8 17H1Z",
+					],
 					["stroke", "currentColor"],
 					["stroke-width", "2"],
 					["stroke-linecap", "square"],

@@ -18,8 +18,9 @@ import { WorkerTelemetry } from "@maple/infra/worker-telemetry"
 import * as Cloudflare from "@alchemy.run/cloudflare"
 import { Clock, Effect } from "effect"
 import * as SecureRandom from "effect/crypto/SecureRandom"
-import { HttpServerRequest, HttpServerResponse } from "effect/http"
+import { FetchHttpClient, HttpClient, HttpServerRequest, HttpServerResponse } from "effect/http"
 import { handleRequest, sharedHostMatcher } from "./handler"
+import { nativeOgImage } from "./og-image"
 import { nativeStorage } from "./storage"
 
 /** `__ALCHEMY_RUNTIME__` folds to `true` in the bundle, so the stack-side branch is tree-shaken. */
@@ -30,14 +31,16 @@ const props = Effect.gen(function* () {
 	return {
 		main: import.meta.url,
 		...mapleWorkerProps("status", stack),
-		// The status domain serves `/s/<slug>`; every other host but workers.dev is a custom domain.
+		// The status domain serves `/s/<org key>/<slug>`; every other host but workers.dev is a custom domain.
 		env: {
 			...env,
 			...(stack.domains.status === undefined ? undefined : { MAPLE_STATUS_HOST: stack.domains.status }),
 		},
-		// Pages are served at `/s/<slug>`; previews get a domain, prd stays on workers.dev until it has one.
+		// Pages are served at `/s/<org key>/<slug>`; prd and previews on their status domain, dev stages on workers.dev.
 		domain: stack.domains.status,
 		workersDev: true,
+		// The link preview's fonts, as Data modules: this Worker has no static assets.
+		rules: [{ globs: ["**/*.ttf"] }],
 	}
 })
 
@@ -52,18 +55,27 @@ export default class StatusWorker extends Cloudflare.Worker<StatusWorker>()(
 			namespaceId: 2026102801,
 			simple: { limit: 10, period: 60 },
 		})
+		// Password attempts on one page from every address together.
+		const pageLimiter = yield* Cloudflare.RateLimit("STATUS_PAGE_ACCESS_RATE_LIMITER", {
+			namespaceId: 2026111702,
+			simple: { limit: 100, period: 60 },
+		})
+		// Fetches the page's logo for its link preview; nothing in Maple.
+		const httpClient = yield* HttpClient.HttpClient
 
 		return {
 			fetch: Effect.gen(function* () {
 				const request = yield* HttpServerRequest.HttpServerRequest
 				const web = yield* HttpServerRequest.toWeb(request).pipe(Effect.orDie)
-				const [kvBinding, bucketBinding, limiterBinding] = yield* dischargeRuntimeContext(
-					Effect.all([kv.raw, bucket.raw, limiter.raw]),
-				)
+				const [kvBinding, bucketBinding, limiterBinding, pageLimiterBinding] =
+					yield* dischargeRuntimeContext(
+						Effect.all([kv.raw, bucket.raw, limiter.raw, pageLimiter.raw]),
+					)
 				const storage = nativeStorage({
 					kv: kvBinding,
 					bucket: bucketBinding,
 					limiter: limiterBinding,
+					pageLimiter: pageLimiterBinding,
 					cache: caches.open("status-snapshots"),
 				})
 				const nowMs = yield* Clock.currentTimeMillis
@@ -72,6 +84,7 @@ export default class StatusWorker extends Cloudflare.Worker<StatusWorker>()(
 					storage,
 					nowMs,
 					randomId: () => SecureRandom.uuidV4Unsafe(),
+					ogImage: nativeOgImage(caches.open("status-og"), httpClient),
 					isSharedHost: sharedHostMatcher(
 						typeof workerEnv.MAPLE_STATUS_HOST === "string" ? workerEnv.MAPLE_STATUS_HOST : null,
 					),
@@ -85,6 +98,7 @@ export default class StatusWorker extends Cloudflare.Worker<StatusWorker>()(
 			Cloudflare.KV.ReadWriteNamespaceBinding,
 			Cloudflare.R2.ReadBucketBinding,
 			Cloudflare.Workers.RateLimitBinding,
+			FetchHttpClient.layer,
 			WorkerTelemetry({ serviceName: "status" }),
 		]),
 	),

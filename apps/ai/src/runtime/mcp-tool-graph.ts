@@ -15,6 +15,7 @@ import {
 	PlanetScaleOAuthClientSecret,
 	SandboxInternalServiceToken,
 	SearchConsoleClientSecret,
+	StatusDomainsApiToken,
 	SupabaseOAuthClientSecret,
 } from "@maple/infra/secrets"
 import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/OrganizationFeatureFlagsService"
@@ -35,8 +36,13 @@ const McpToolSecretsLive = Layer.mergeAll(
 	PlanetScaleOAuthClientSecret.layer,
 	SandboxInternalServiceToken.layer,
 	SearchConsoleClientSecret.layer,
+	// Status page custom domains (Cloudflare for SaaS); unset, they read as unavailable.
+	StatusDomainsApiToken.layer,
 	SupabaseOAuthClientSecret.layer,
 )
+
+/** What the tools' services need beyond the app root; a test runtime that serves them provides it too. */
+export const McpToolPlatformLive = Layer.mergeAll(Env.layer, McpToolSecretsLive, EdgeCacheServiceLive)
 
 /**
  * The tool executor over the given org rollout flags and data source service; tests pass a fixed
@@ -53,7 +59,7 @@ export const mcpServicesWithFeatureFlags = (
 	McpToolExecutor.layer.pipe(
 		Layer.provide(dataSources),
 		Layer.provide(featureFlags),
-		Layer.provide(Layer.mergeAll(Env.layer, McpToolSecretsLive, EdgeCacheServiceLive)),
+		Layer.provide(McpToolPlatformLive),
 	)
 
 export const McpServicesLive = mcpServicesWithFeatureFlags(OrganizationFeatureFlagsService.layer)

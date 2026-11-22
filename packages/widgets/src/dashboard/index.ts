@@ -30,11 +30,14 @@ export {
 export {
 	dataSourceEndpoint,
 	dataSourceQuerySet,
+	dataSourcePromql,
 	dataSourceRawSql,
 	dataSourceRouteParams,
 	dataSourceTransform,
 	isQueryDataSource,
 	QUERY_RESULT_ENDPOINTS,
+	PROMQL_ENDPOINT,
+	type PromqlDataSource,
 	RAW_SQL_ENDPOINT,
 	type RawSqlDataSource,
 	type WidgetQuerySet,
@@ -44,6 +47,7 @@ export {
 	makeProductEventsFunnelDataSource,
 	makeProductEventsPathsDataSource,
 	makeQueryDataSource,
+	makePromqlDataSource,
 	makeRawSqlDataSource,
 	makeRouteDataSource,
 	makeStaticDataSource,
@@ -52,12 +56,14 @@ export {
 	type ProductEventsFunnelDefinition,
 	type ProductEventsPathsDefinition,
 	type QueryDataSourceInput,
+	type PromqlDataSourceInput,
 	type RawSqlDataSourceInput,
 } from "./construct"
 // v3 — what the unsuffixed aliases below now point at. The suffixed names stay
 // exported for the upgrade transform and its tests, which must name a version
 // explicitly.
 export {
+	PromqlWidgetDataSource,
 	QueryWidgetDataSource,
 	RawSqlWidgetDataSource,
 	RouteWidgetDataSource,
@@ -79,6 +85,7 @@ export { type DashboardParseOutcome, parseStoredDashboard, stampCurrentVersion }
 export { CURRENT_DASHBOARD_SCHEMA_VERSION, DashboardSchemaVersion } from "./version"
 export { makeWidgetDisplayConfigSchema } from "./shared/display"
 export { WidgetLayoutSchema } from "./shared/layout"
+export { DashboardImportReport, MAX_IMPORT_REPORT_ITEMS } from "./shared/document"
 export {
 	DASHBOARD_MAX_SECTIONS,
 	DASHBOARD_MAX_TABS_PER_SECTION,
@@ -112,6 +119,8 @@ export {
 	type DashboardVariable,
 	DashboardVariableName,
 	DashboardVariableSchema,
+	PromqlVariableLabel,
+	PromqlVariableMatch,
 } from "./shared/variables"
 
 // Current-version aliases. When a version is added, these move to it and every

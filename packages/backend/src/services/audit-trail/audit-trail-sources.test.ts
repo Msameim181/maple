@@ -43,6 +43,42 @@ describe("auditTrailSources", () => {
 		})
 	})
 
+	it("reads a GitHub installation as feeding the audit log, and a removed one as failing", () => {
+		const github = (overrides: Partial<IntegrationEntry>) =>
+			entry({
+				provider: "github",
+				account: "acme",
+				resources: [resource({ kind: "repository", name: "acme/api" })],
+				...overrides,
+			})
+		const connected = github({
+			resources: [
+				resource({ kind: "repository", name: "acme/api" }),
+				resource({ kind: "audit log", name: "acme" }),
+			],
+		})
+		const stats = [{ provider: "github", events: 3, lastEventAt: 10 }]
+		expect(
+			sourceOf(auditTrailSources(stats, { integrations: [connected], available: [] }), "github"),
+		).toEqual({
+			provider: "github",
+			state: "receiving",
+			account: "acme",
+			problem: null,
+			events: 3,
+			lastEventAt: 10,
+		})
+		expect(
+			stateOf(
+				auditTrailSources([], {
+					integrations: [github({ status: "disconnected", problem: "reinstall" })],
+					available: [],
+				}),
+				"github",
+			),
+		).toBe("failing")
+	})
+
 	it("reads a connected Vercel team without the audit drain as off", () => {
 		const sources = auditTrailSources([], {
 			integrations: [entry({ resources: [resource({ name: "logs" })] })],
@@ -99,7 +135,30 @@ describe("auditTrailSources", () => {
 
 	it("keeps a platform a newer writer added, so its events are not unaccounted for", () => {
 		const sources = auditTrailSources([{ provider: "github", events: 2, lastEventAt: 9 }], null)
-		expect(Arr.map(sources, (source) => source.provider)).toEqual(["maple", "vercel", "gcp", "github"])
+		expect(Arr.map(sources, (source) => source.provider)).toEqual([
+			"maple",
+			"vercel",
+			"gcp",
+			"aws",
+			"github",
+			"fleet",
+		])
 		expect(stateOf(sources, "github")).toBe("receiving")
+	})
+
+	it("reads AWS as feeding through its audit log resource, and off without one", () => {
+		const inventory = (resources: ReadonlyArray<IntegrationResource>) => ({
+			integrations: [entry({ provider: "aws", resources })],
+			available: [],
+		})
+		const auditLog = [resource({ kind: "audit log" })]
+		expect(stateOf(auditTrailSources([], inventory(auditLog)), "aws")).toBe("waiting")
+		expect(
+			stateOf(
+				auditTrailSources([{ provider: "aws", events: 4, lastEventAt: 9 }], inventory(auditLog)),
+				"aws",
+			),
+		).toBe("receiving")
+		expect(stateOf(auditTrailSources([], inventory([resource({ kind: "role" })])), "aws")).toBe("off")
 	})
 })

@@ -15,12 +15,15 @@ import {
 	AWS_NO_DELIVERY,
 	AWS_TEMPLATE_VERSION,
 	type AwsMetricStream,
+	awsGrantsMatch,
+	awsModuleGranted,
 	awsStreamState,
 } from "@maple/domain/aws"
 import { GCP_PROJECT_ASSET_TYPE } from "@maple/domain/gcp-metrics"
 import { type SourceHealthResult, worstSourceStatus } from "@maple/domain/source-health"
 import { redactUrlSecrets } from "@maple/domain/url-redaction"
 import { Array as Arr, Option, Record as Rec, String as Str } from "effect"
+import { fleetServerName } from "@maple/domain/http"
 
 const STATUS_RANK = {
 	disconnected: 0,
@@ -35,6 +38,8 @@ export const worstStatus = worstSourceStatus
 
 /** The alerting pollers tick every 5 minutes; six missed ticks is no longer a blip. */
 const POLLER_STALE_MS = 30 * 60 * 1000
+/** Fleet's device findings sync hourly; three hours without one is no longer a blip. */
+const FLEET_FINDINGS_STALE_MS = 3 * 60 * 60 * 1000
 /** PlanetScale inventory refreshes hourly and deploy requests round-robin 25 databases per tick. */
 const PLANETSCALE_STALE_MS = 3 * 60 * 60 * 1000
 /** The per-database poll-state rows the events switch stops (`PlanetScaleService`). */
@@ -72,6 +77,7 @@ export interface IntegrationInventoryInputs {
 		readonly accountLogin: string
 		readonly status: string
 		readonly ciTracesEnabled: boolean
+		readonly auditLogEnabled: boolean
 		readonly createdAt: number
 	}>
 	readonly vcsRepositories: ReadonlyArray<{
@@ -105,6 +111,16 @@ export interface IntegrationInventoryInputs {
 				readonly workspaceNames: string | null
 				readonly authFailedAt: number | null
 				readonly createdAt: number
+		  })
+		| null
+	readonly fleetConnection:
+		| (PollState & {
+				readonly organizationName: string | null
+				readonly baseUrl: string
+				readonly authFailedAt: number | null
+				readonly createdAt: number
+				/** The hourly device findings sync, apart from the activity poll. */
+				readonly findings: PollState
 		  })
 		| null
 	readonly railwayEnvironments: ReadonlyArray<
@@ -207,6 +223,12 @@ export interface IntegrationInventoryInputs {
 		readonly streamLastError: string | null
 		readonly createdAt: number
 	}>
+	/** CloudTrail regions the security poller could not read, by account. Absent: none known. */
+	readonly awsCloudTrailProblems?: ReadonlyArray<{
+		readonly accountId: string
+		readonly state: string
+		readonly lastError: string | null
+	}>
 	/** Its grant is the `oauthConnections` row with provider "supabase". */
 	readonly supabaseConnection: {
 		readonly organizationName: string
@@ -245,6 +267,7 @@ export const INTEGRATION_FEEDS = {
 		"source code for Maple's investigations and pull request review",
 		"commit metadata for deploys (service_deployments)",
 		"GitHub Actions runs as traces under service.name=github-actions, with job logs as logs on their step spans",
+		"organization, member, team, repository and branch protection changes in the Security audit log",
 	],
 	cloudflare: [
 		"zone HTTP traffic and Worker invocations as metrics",
@@ -257,6 +280,7 @@ export const INTEGRATION_FEEDS = {
 	],
 	aws: ["CloudWatch metrics through a metric stream, for the regions and namespaces picked"],
 	railway: ["per-service CPU, memory, network and disk metrics"],
+	fleet: ["Fleet admin activity in the audit log", "failing device policies and vulnerable software"],
 	vercel: [
 		"function, edge, build and request logs through a log drain",
 		"deployment and AI Gateway traces through a trace drain",
@@ -388,6 +412,19 @@ const github = (inputs: IntegrationInventoryInputs, now: number): IntegrationEnt
 			}
 		},
 	)
+	// An active installation feeds the audit log unless the org turned it off: its own lifecycle
+	// needs no permission, and the organization events ride the permissions the app already holds.
+	const auditLogs = Arr.map(
+		Arr.filter(active, (i) => i.auditLogEnabled),
+		(i): IntegrationResource => ({
+			kind: "audit log",
+			name: i.accountLogin,
+			status: "healthy",
+			lastSuccessAt: null,
+			lastError: null,
+			note: null,
+		}),
+	)
 	const ciTraces = Arr.some(active, (i) => i.ciTracesEnabled)
 	return entry("github", now, {
 		account: Arr.join(
@@ -405,10 +442,12 @@ const github = (inputs: IntegrationInventoryInputs, now: number): IntegrationEnt
 						)}; reinstall it in Sources.`,
 					}
 				: undefined,
-		resources,
+		resources: [...resources, ...auditLogs],
 		feeds: Arr.filter(
 			INTEGRATION_FEEDS.github,
-			(feed) => ciTraces || !Str.startsWith("GitHub Actions")(feed),
+			(feed) =>
+				(ciTraces || !Str.startsWith("GitHub Actions")(feed)) &&
+				(auditLogs.length > 0 || !Str.includes("Security audit log")(feed)),
 		),
 	})
 }
@@ -489,6 +528,53 @@ const railway = (inputs: IntegrationInventoryInputs, now: number): IntegrationEn
 		connectedAt: connection.createdAt,
 		own,
 		resources,
+	})
+}
+
+const fleet = (inputs: IntegrationInventoryInputs, now: number): IntegrationEntry | null => {
+	const connection = inputs.fleetConnection
+	if (connection === null) return null
+	const status = pollStatus(connection, now, POLLER_STALE_MS)
+	const devicesStatus = pollStatus(connection.findings, now, FLEET_FINDINGS_STALE_MS)
+	const own =
+		connection.authFailedAt !== null
+			? {
+					status: "disconnected" as const,
+					problem: "Fleet rejected the API token; save a new one in Integrations.",
+				}
+			: status === "healthy"
+				? undefined
+				: {
+						status,
+						problem:
+							status === "pending"
+								? "Connected; waiting for the first read of Fleet."
+								: status === "stale"
+									? "No successful read of Fleet lately."
+									: (connection.lastError ?? "Reading Fleet failed"),
+					}
+	return entry("fleet", now, {
+		account: fleetServerName(connection),
+		connectedAt: connection.createdAt,
+		own,
+		resources: [
+			{
+				kind: "audit log",
+				name: "activity feed",
+				status,
+				lastSuccessAt: connection.lastSuccessAt,
+				lastError: failingError(connection, status),
+				note: null,
+			},
+			{
+				kind: "devices",
+				name: "failing policies and vulnerable software",
+				status: devicesStatus,
+				lastSuccessAt: connection.findings.lastSuccessAt,
+				lastError: failingError(connection.findings, devicesStatus),
+				note: null,
+			},
+		],
 	})
 }
 
@@ -786,16 +872,13 @@ const gcp = (inputs: IntegrationInventoryInputs, now: number): IntegrationEntry 
 	})
 }
 
-const sameModules = (a: ReadonlyArray<string>, b: ReadonlyArray<string>) =>
-	a.length === b.length && Arr.every(a, (module) => b.includes(module))
-
 const aws = (inputs: IntegrationInventoryInputs, now: number): IntegrationEntry | null => {
 	const connections = inputs.awsConnections
 	if (connections.length === 0) return null
 	const resources = Arr.flatMap(connections, (c): ReadonlyArray<IntegrationResource> => {
 		const outdated =
 			c.grantedModules !== null &&
-			(c.templateVersion !== AWS_TEMPLATE_VERSION || !sameModules(c.modules, c.grantedModules))
+			(c.templateVersion !== AWS_TEMPLATE_VERSION || !awsGrantsMatch(c.modules, c.grantedModules))
 		// Before the first check that assumed the role, the setup is still being done.
 		const role: IntegrationResource =
 			c.verifiedAt === null
@@ -853,7 +936,32 @@ const aws = (inputs: IntegrationInventoryInputs, now: number): IntegrationEntry 
 					return stream(state._tag === "silent" ? "stale" : "healthy", null, regions)
 			}
 		})()
-		return [role, ...streams]
+		// CloudTrail feeds the audit log once the role grants the audit module. Before that there is
+		// no feed: the Sources panel reads off and points at the AWS source.
+		const granted = Arr.contains(c.modules, "audit") && awsModuleGranted(c.grantedModules, "audit")
+		const trailProblem = Arr.findFirst(
+			inputs.awsCloudTrailProblems ?? [],
+			(problem) => problem.accountId === c.accountId,
+		)
+		// A role that cannot be assumed reads nothing, whatever the last CloudTrail read said.
+		const trailError = Option.isSome(trailProblem)
+			? (trailProblem.value.lastError ?? `CloudTrail could not be read (${trailProblem.value.state})`)
+			: role.status === "failing"
+				? role.lastError
+				: null
+		const auditLog: ReadonlyArray<IntegrationResource> = !granted
+			? []
+			: [
+					{
+						kind: "audit log",
+						name: c.accountId,
+						status: trailError === null ? "healthy" : "failing",
+						lastSuccessAt: null,
+						lastError: trailError,
+						note: null,
+					},
+				]
+		return [role, ...streams, ...auditLog]
 	})
 	return entry("aws", now, {
 		account: Arr.join(
@@ -1034,6 +1142,7 @@ const BUILDERS = {
 	gcp,
 	aws,
 	railway,
+	fleet,
 	vercel,
 	planetscale,
 	supabase,

@@ -12,8 +12,10 @@ import { HttpMcpInternalLive } from "@/routes/internal/mcp.http"
 import { HttpUsersInternalLive } from "@/routes/internal/users.http"
 import { HttpAiTriageLive } from "@/routes/internal/ai-triage.http"
 import { HttpAnthropicCostLive } from "@/routes/internal/anthropic-cost.http"
+import { HttpFeatureRequestsLive } from "@/routes/internal/feature-requests.http"
 import { HttpCloudflareCostLive } from "@/routes/internal/cloudflare-cost.http"
 import { HttpOpenAiCostLive } from "@/routes/internal/openai-cost.http"
+import { HttpMorphCostLive } from "@/routes/internal/morph-cost.http"
 import { HttpGithubCostLive } from "@/routes/internal/github-cost.http"
 import { HttpOpenRouterCostLive } from "@/routes/internal/openrouter-cost.http"
 import { HttpCostBudgetsLive } from "@/routes/internal/cost-budgets.http"
@@ -22,6 +24,7 @@ import { HttpEnterpriseSsoLive } from "@/routes/internal/enterprise-sso.http"
 import { HttpPlanetScaleCostLive } from "@/routes/internal/planetscale-cost.http"
 import { HttpServiceMapWorldLive } from "@/routes/internal/service-map-world.http"
 import { HttpVercelCostLive } from "@/routes/internal/vercel-cost.http"
+import { HttpGcpCostLive } from "@/routes/internal/gcp-cost.http"
 import { HttpAuthLive, HttpAuthPublicLive, HttpAuthSessionLive } from "@/routes/auth.http"
 import { HttpDirectoryLive, HttpDirectoryPublicLive } from "@/routes/directory.http"
 import { HttpBillingLive } from "@/routes/internal/billing.http"
@@ -36,6 +39,9 @@ import { HttpDigestLive } from "@/routes/internal/digest.http"
 import { HttpSavedViewsLive } from "@/routes/internal/saved-views.http"
 import { HttpCodeReviewLive } from "@/routes/internal/code-review.http"
 import { HttpAuditTrailLive } from "@/routes/internal/audit-trail.http"
+import { HttpCloudSecurityLive } from "@/routes/internal/cloud-security.http"
+import { HttpSecurityAuditReadsLive } from "@maple/backend/http/security-audit-reads"
+import { HttpDeviceSecurityLive } from "@/routes/internal/device-security.http"
 import { HttpDependencyScanLive } from "@/routes/internal/dependency-scan.http"
 import { HttpErrorsLive } from "@/routes/internal/errors.http"
 import { HttpIntegrationsLive } from "@/routes/internal/integrations.http"
@@ -48,6 +54,7 @@ import {
 	HttpOrganizationsLive,
 } from "@/routes/internal/organizations.http"
 import { PlanetScaleWebhookRouter } from "@/routes/webhooks/planetscale.http"
+import { AwsEventsRouter } from "@/routes/webhooks/aws-events.http"
 import { HttpQueryEngineLive } from "@/routes/internal/query-engine.http"
 import { HttpSessionReplaysInternalLive } from "@/routes/internal/session-replays.http"
 import { ScraperInternalRouter } from "@/routes/scraper-internal.http"
@@ -105,6 +112,7 @@ import {
 	HttpV2TracesLive,
 } from "@/routes/v2/telemetry.http"
 import { HttpV2WidgetSummaryLive } from "@/routes/v2/widget-summary.http"
+import { HttpV2PrometheusLive } from "@/routes/v2/prometheus.http"
 import { HttpV2WidgetCredentialsLive } from "@/routes/v2/widget-credentials.http"
 import { HttpV2DeviceCredentialsLive, HttpV2DeviceTokensLive } from "@/routes/v2/device-credentials.http"
 import { DeviceCredentialsService } from "@maple/backend/services/auth/DeviceCredentialsService"
@@ -180,12 +188,17 @@ const ApiInternalRoutes = HttpApiBuilder.layer(MapleInternalApi).pipe(
 			HttpBillingLive,
 			HttpDemoLive,
 			HttpAuditTrailLive,
+			HttpCloudSecurityLive,
+			HttpSecurityAuditReadsLive,
+			HttpDeviceSecurityLive,
 			HttpDependencyScanLive,
 			HttpDigestLive,
 			HttpSavedViewsLive,
 			HttpCloudflareCostLive,
 			HttpAnthropicCostLive,
+			HttpFeatureRequestsLive,
 			HttpOpenAiCostLive,
+			HttpMorphCostLive,
 			HttpGithubCostLive,
 			HttpPlanetScaleCostLive,
 			HttpOpenRouterCostLive,
@@ -194,6 +207,7 @@ const ApiInternalRoutes = HttpApiBuilder.layer(MapleInternalApi).pipe(
 			HttpEnterpriseSsoLive,
 			HttpServiceMapWorldLive,
 			HttpVercelCostLive,
+			HttpGcpCostLive,
 		),
 	),
 	Layer.provide(
@@ -256,6 +270,7 @@ const ApiV2Routes = HttpApiBuilder.layer(MapleApiV2).pipe(
 			HttpV2TracesLive,
 			HttpV2LogsLive,
 			HttpV2MetricsLive,
+			HttpV2PrometheusLive,
 			HttpV2ServicesLive,
 			HttpV2ServiceMapLive,
 			HttpV2EnvironmentsLive,
@@ -274,6 +289,7 @@ const RawRoutes = rawRoutes<Layer.Success<ApiPortsLayer>>()(
 		ChatCallbackRouter,
 		OAuthDiscoveryRouter,
 		PlanetScaleWebhookRouter,
+		AwsEventsRouter,
 		ScraperInternalRouter,
 		UptimeInternalRouter,
 		UptimeHeartbeatRouter,

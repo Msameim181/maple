@@ -11,12 +11,36 @@ import { Route } from "foldkit"
 import { query, schemaSegment, slash } from "foldkit/route"
 import { AppRoute } from "./app-route"
 import * as Search from "./search"
-import { boundedRestSegments, boundedSegment, path, restSegments, segment } from "./segment"
+import {
+	boundedRestSegments,
+	boundedSegment,
+	mapBiparser,
+	optionalLiteralSegment,
+	path,
+	restSegments,
+	segment,
+} from "./segment"
 import { tanstackSearch } from "./tanstack-search"
 
 const search = <A, I>(schema: Schema.Codec<A, I>) => query(tanstackSearch(schema))
 
 const WorkloadKind = Search.InfraKubernetesWorkloadParams.fields.kind
+
+/**
+ * `/settings/<tab>`, the tab a path segment. An old `?tab=` link parses into `legacyTab`, and
+ * `routeRedirect` moves it to its path.
+ */
+const settingsUrl = mapBiparser(
+	pipe(
+		path("settings"),
+		slash(optionalLiteralSegment(Search.settingsTabValues)),
+		search(Search.SettingsQuery),
+	),
+	({ segment, search: { tab, ...rest } }): { readonly search: typeof Search.SettingsSearch.Type } => ({
+		search: { ...rest, tab: segment, legacyTab: tab },
+	}),
+	({ search: { tab, legacyTab, ...rest } }) => ({ segment: tab, search: { ...rest, tab: legacyTab } }),
+)
 
 /** One biparser per route tag: parses URLs and prints them back (`hrefOf`). */
 const routers = {
@@ -45,8 +69,8 @@ const routers = {
 	QuickStart: pipe(path("quick-start"), search(Search.QuickStartSearch), Route.mapTo(AppRoute.QuickStart)),
 	SelectPlan: pipe(path("select-plan"), search(Search.SelectPlanSearch), Route.mapTo(AppRoute.SelectPlan)),
 	ServiceMap: pipe(path("service-map"), search(Search.ServiceMapSearch), Route.mapTo(AppRoute.ServiceMap)),
-	Settings: pipe(path("settings"), search(Search.SettingsSearch), Route.mapTo(AppRoute.Settings)),
-	Sources: pipe(path("sources"), Route.mapTo(AppRoute.Sources)),
+	Settings: pipe(settingsUrl, Route.mapTo(AppRoute.Settings)),
+	Sources: pipe(path("sources"), search(Search.SourcesSearch), Route.mapTo(AppRoute.Sources)),
 	SourcesNew: pipe(
 		path("sources", "new"),
 		search(Search.SourcesNewSearch),
@@ -152,7 +176,11 @@ const routers = {
 		Route.mapTo(AppRoute.AlertsStatusPage),
 	),
 	StatusPages: pipe(path("status-pages"), Route.mapTo(AppRoute.StatusPages)),
-	StatusPageNew: pipe(path("status-pages", "new"), Route.mapTo(AppRoute.StatusPageNew)),
+	StatusPageNew: pipe(
+		path("status-pages", "new"),
+		search(Search.StatusPageNewSearch),
+		Route.mapTo(AppRoute.StatusPageNew),
+	),
 	StatusPage: pipe(
 		path("status-pages"),
 		slash(segment("pageId")),
@@ -210,6 +238,17 @@ const routers = {
 		search(Search.SecurityDependenciesSearch),
 		Route.mapTo(AppRoute.SecurityDependencies),
 	),
+	SecurityCloudFinding: pipe(
+		path("security", "cloud", "finding"),
+		search(Search.SecurityCloudFindingSearch),
+		Route.mapTo(AppRoute.SecurityCloudFinding),
+	),
+	SecurityCloud: pipe(
+		path("security", "cloud"),
+		search(Search.SecurityCloudSearch),
+		Route.mapTo(AppRoute.SecurityCloud),
+	),
+	SecurityDevices: pipe(path("security", "devices"), Route.mapTo(AppRoute.SecurityDevices)),
 	SecurityAuditLog: pipe(
 		path("security", "audit-log"),
 		search(Search.SecurityAuditLogSearch),

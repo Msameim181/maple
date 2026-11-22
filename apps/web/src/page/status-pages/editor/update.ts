@@ -1,6 +1,7 @@
 import type { StatusPagePreviewParams } from "@maple/domain/http/v2"
-import { STATUS_PAGE_PRESET_DEFAULTS } from "@maple/domain/status-page"
-import { Option, Result, Array as Arr } from "effect"
+import { STATUS_PAGE_PRESET_DEFAULTS, statusPageOrgKey } from "@maple/domain/status-page"
+import { PREVIEW_FIELDS } from "@maple/status-page"
+import { Option, Result, Schema, Array as Arr } from "effect"
 import { AsyncData, Command as FoldkitCommand } from "foldkit"
 import * as Keyed from "@maple/views/data/keyed"
 import type { AppRoute } from "../../../route"
@@ -13,17 +14,23 @@ import {
 	pageIdFromUrl,
 	SETTINGS_SECTIONS,
 	type SettingsSection,
+	publicPageLink,
 	STATUS_PAGE_BASE_URL,
 	statusPageHref,
+	statusPageViewHref,
 } from "../shared/commands"
+import { OPEN_PREVIEW_VALUE, OPEN_PUBLIC_VALUE } from "../shared/open-page"
 import { emptyComponentForm, emptyIncidentForm } from "../shared/form"
+import { initGroupPicker } from "../shared/group-picker"
 import { emptyPicker } from "../shared/picker"
-import { historyFrom } from "../shared/preview"
+import { historyFrom, type PreviewSelection } from "../shared/preview"
 import {
 	FetchEditorPreview,
 	FetchEditorSession,
-	FocusEditorElement,
+	OpenPublicPage,
+	PREVIEW_FIELD_TARGETS,
 	ReadEditorClock,
+	RevealEditorField,
 	WaitEditorPreview,
 } from "./command"
 import { Message } from "./message"
@@ -46,17 +53,24 @@ import {
 	addPickerStep,
 	askDeleteComponent,
 	changeComponent,
-	commitComponent,
-	componentRowId,
 	confirmDeleteComponent,
+	confirmDiscardComponent,
 	deleteComponentDialog,
 	deletedComponent,
+	discardComponentDialog,
+	discardMonitors,
+	groupPickerStep,
+	leaveComponent,
 	moveComponent,
-	openAdd,
+	moveGroup,
+	nudgeGroup,
+	nudgeComponent,
 	reordered,
+	saveMonitors,
 	savedComponent,
-	selectComponent,
 	submitAdd,
+	toggleComponentUptime,
+	unsavedComponent,
 } from "./update-components"
 import {
 	askDeleteIncident,
@@ -104,18 +118,17 @@ import {
 	savedSettings,
 	saveSettings,
 	togglePoweredBy,
+	pickBrandingImage,
+	editBrandingImage,
+	brandingDialog,
+	submitBrandingLink,
+	takeBrandingImage,
+	readBrandingImage,
+	removeBrandingImage,
 	changeTheme,
 	updateTokenCopy,
 } from "./update-settings"
-import {
-	cancelPassword,
-	changedAccess,
-	changePassword,
-	openPassword,
-	pickVisibility,
-	removePassword,
-	submitPassword,
-} from "./update-access"
+import { changedAccess, changePassword, discardAccess, pickVisibility, saveAccess } from "./update-access"
 import {
 	appliedJson,
 	applyJson,
@@ -130,6 +143,7 @@ import {
 	checkCustomDomain,
 	checkedCustomDomain,
 	confirmRemoveCustomDomain,
+	pageUrlOf,
 	readCustomDomain,
 	removeCustomDomainDialog,
 	removedCustomDomain,
@@ -170,6 +184,14 @@ export const resolveView = (search: typeof StatusPageSearch.Type): EditorLocatio
 	}
 }
 
+/** The Settings sections whose fields change how the page looks, so the page's preview sits beside them. */
+// Not Basic settings: nothing there changes how the page looks, so a preview beside it only misleads.
+export const PREVIEWED_SECTIONS: ReadonlyArray<SettingsSection> = ["monitors", "appearance"]
+
+/** Whether the location draws the page in a frame whose components and incidents click. */
+export const hasClickablePreview = (location: EditorLocation): boolean =>
+	location.tab === "page" || (location.tab === "settings" && PREVIEWED_SECTIONS.includes(location.section))
+
 /** Whether the tab shows what is open: a component under Monitors, an incident under its tab. */
 const showsPanel = (panel: Model["panel"], location: EditorLocation): boolean => {
 	if (panel === null) return false
@@ -191,6 +213,7 @@ export const init = (route: EditorRoute, context: PageContext): Return => {
 		pageId: Option.getOrNull(pageIdFromUrl(route.pageId)),
 		nowMs: null,
 		revealComponentId: null,
+		revealFieldId: null,
 		page: Keyed.idle(),
 		components: Keyed.idle(),
 		incidents: Keyed.idle(),
@@ -211,11 +234,15 @@ export const init = (route: EditorRoute, context: PageContext): Return => {
 		previewHistory: [],
 		componentForm: emptyComponentForm,
 		componentSave: null,
-		queuedComponentForms: [],
+		groupPicker: initGroupPicker("status-page-component-group"),
+		pendingLeave: null,
+		discardComponentDialog: Dialog.init("status-page-discard-component", "alert-dialog"),
 		confirmDeleteComponentId: null,
 		deleteComponentDialog: Dialog.init("status-page-delete-component", "alert-dialog"),
 		isDeletingComponent: false,
-		isReordering: false,
+		pendingOrder: null,
+		isSavingOrder: false,
+		orderFailure: null,
 		addPicker: emptyPicker,
 		isAddingComponents: false,
 		addSession: 0,
@@ -235,10 +262,18 @@ export const init = (route: EditorRoute, context: PageContext): Return => {
 		deleteIncidentDialog: Dialog.init("status-page-delete-incident", "alert-dialog"),
 		isDeletingIncident: false,
 		publicBaseUrl: STATUS_PAGE_BASE_URL,
+		orgKey: statusPageOrgKey(context.orgId),
 		urlCopy: CopyButton.init(),
 		settingsEdits: null,
+		brandingDrag: null,
+		brandingDialog: Dialog.init("status-page-branding-image", "dialog"),
+		brandingDialogField: "logoUrl",
+		brandingLink: "",
+		brandingRead: 0,
 		isSavingSettings: false,
+		savesAccessNext: false,
 		settingsFailure: null,
+		takenSlug: null,
 		isPublishing: false,
 		breakGlassDialog: Dialog.init("status-page-break-glass", "alert-dialog"),
 		breakGlassAction: null,
@@ -248,7 +283,8 @@ export const init = (route: EditorRoute, context: PageContext): Return => {
 		deletePageDialog: Dialog.init("status-page-delete", "alert-dialog"),
 		isDeletingPage: false,
 		accessAction: null,
-		passwordDraft: null,
+		visibilityDraft: null,
+		passwordDraft: "",
 		accessFailure: null,
 		customDomain: Keyed.idle(),
 		customDomainDraft: null,
@@ -298,22 +334,37 @@ const whenSettings =
 		resolveView(model.search).tab === "settings" ? readCustomDomain(context, mode)(model) : { model }
 
 /**
- * A tab switch is a search change; what is open stays open only where the new tab shows it.
- * Opening Advanced re-reads the config, since other sections write too.
+ * What is open stays open only where `location` shows it. A navigation cannot wait on a confirm, so
+ * a component's unsaved edits stay in the form, neither saved nor dropped, and Monitors opens on them.
+ */
+const settlePanel = (model: Model, location: EditorLocation): Model =>
+	showsPanel(model.panel, location)
+		? model
+		: Option.match(unsavedComponent(model), {
+				onNone: () => ({ ...model, panel: null, componentForm: emptyComponentForm }),
+				onSome: (component) => ({
+					...model,
+					panel:
+						location.tab === "settings" && location.section === "monitors"
+							? { _tag: "Component", componentId: component.id }
+							: null,
+				}),
+			})
+
+/**
+ * A tab switch is a search change. Opening Advanced re-reads the config, since other sections
+ * write too.
  */
 export const routeChanged = (model: Model, route: EditorRoute, context: PageContext): Return =>
 	withSheet(
 		chain(
-			{ ...model, search: route.search },
-			// A route change can skip the field's blur (a keyboard Back): typed edits save first.
-			(next) =>
-				showsPanel(next.panel, resolveView(route.search))
-					? { model: next }
-					: chain(next, commitComponent, (committed) => ({
-							model: { ...committed, panel: null, componentForm: emptyComponentForm },
-						})),
+			settlePanel({ ...model, search: route.search, revealFieldId: null }, resolveView(route.search)),
 			whenJson(context, "Refresh"),
 			whenSettings(context, "Refresh"),
+			(next) =>
+				model.revealFieldId === null
+					? { model: next }
+					: { model: next, commands: [RevealEditorField({ id: model.revealFieldId })] },
 		),
 	)
 
@@ -321,6 +372,8 @@ export const routeChanged = (model: Model, route: EditorRoute, context: PageCont
 const whenIdle = (isBusy: boolean, model: Model, run: () => Return): Return => (isBusy ? { model } : run())
 
 // PREVIEW
+
+const isPreviewField = Schema.is(Schema.Literals(PREVIEW_FIELDS))
 
 /** The saved page as the preview endpoint takes it: only the monitors' history comes back used. */
 export const previewDraftOf = (model: Model): Option.Option<StatusPagePreviewParams> =>
@@ -346,15 +399,11 @@ const schedulePreview = (model: Model): Return => {
 
 // PANEL
 
-/** Closing a component hands focus back to its row; the sheet hands it back on its own. */
+/** A component closes once its unsaved edits are dealt with; the sheet hands focus back on its own. */
 const closePanel = (model: Model): Return => {
-	const panel = model.panel
-	if (panel === null) return { model }
-	return panel._tag === "Component"
-		? {
-				model: { ...model, panel: null, componentForm: emptyComponentForm },
-				commands: [FocusEditorElement({ id: componentRowId(panel.componentId) })],
-			}
+	if (model.panel === null) return { model }
+	return model.panel._tag === "Component"
+		? leaveComponent(model, { _tag: "Close" })
 		: { model: { ...model, panel: null } }
 }
 
@@ -404,23 +453,42 @@ const updatePanelSheet = (model: Model, message: Dialog.Message): Return => {
 	}
 }
 
-/** A click in the live page opens what it landed on where it is edited. */
-const selectFromPreview = (model: Model, kind: "component" | "incident", id: string): Return => {
+/**
+ * A click in the live page or a Settings preview opens what it landed on where it is edited; a
+ * click under Monitors opens the component in place, and one on the header or footer reveals its
+ * field.
+ */
+const selectFromPreview = (model: Model, kind: PreviewSelection["kind"], id: string): Return => {
 	const navigate = (url: string) => PageOutMessage.RequestedNavigation({ url, isReplace: false })
 	if (model.pageId === null) return { model }
+	const here = resolveView(model.search)
+	const isOnMonitors = here.tab === "settings" && here.section === "monitors"
 	const pageId = model.pageId
-	if (kind === "component")
+	if (kind === "field") {
+		if (!isPreviewField(id)) return { model }
+		// The header and footer are page settings: open their section, at the field.
+		const target = PREVIEW_FIELD_TARGETS[id]
+		if (here.tab === "settings" && here.section === target.section)
+			return { model, commands: [RevealEditorField({ id: target.id })] }
+		return {
+			model: { ...model, revealFieldId: target.id },
+			outMessage: navigate(statusPageHref(pageId, "settings", target.section)),
+		}
+	}
+	// A group's name is edited on its components: a click on it opens its first one.
+	if (kind === "component" || kind === "group")
 		return Option.match(
 			Arr.findFirst(componentsOf(model), (row) => row.id === id),
 			{
 				onNone: () => ({ model }),
 				onSome: (component) => {
-					const selected = selectComponent(model, component.id)
-					return {
-						...selected,
-						model: { ...selected.model, revealComponentId: component.id },
-						outMessage: navigate(statusPageHref(pageId, "settings", "monitors")),
-					}
+					const opened = leaveComponent(model, {
+						_tag: "Open",
+						componentId: component.id,
+						isRevealed: true,
+					})
+					if (isOnMonitors) return opened
+					return { ...opened, outMessage: navigate(statusPageHref(pageId, "settings", "monitors")) }
 				},
 			},
 		)
@@ -452,6 +520,18 @@ const updatePageMenu = (model: Model, message: Menu.Message): Return => {
 		outMessage: PageOutMessage.RequestedNavigation({ url, isReplace: false }),
 	})
 	switch (result.outMessage.value) {
+		case OPEN_PUBLIC_VALUE:
+			return Option.match(pageOf(next), {
+				onNone: () => ({ model: next, commands }),
+				onSome: (page): Return => {
+					const link = publicPageLink(page, pageUrlOf(next, page))
+					return link._tag === "Open"
+						? { model: next, commands: [...commands, OpenPublicPage({ url: link.url })] }
+						: { model: next, commands }
+				},
+			})
+		case OPEN_PREVIEW_VALUE:
+			return navigate(statusPageViewHref(model.pageId))
 		case "break-glass":
 			return navigate(
 				`${statusPageHref(model.pageId, "settings", "advanced")}#status-page-settings-break-glass`,
@@ -518,6 +598,7 @@ const step = (model: Model, message: Message, context: PageContext): Return =>
 				whenJson(context, "Supersede"),
 			),
 		GotPageMenuMessage: ({ message: child }) => updatePageMenu(model, child),
+		CompletedOpenPublicPage: () => ({ model }),
 		// A reveal happens once: a later remount of the same row (back from another section) stays put.
 		CompletedFocus: () => ({ model: { ...model, revealComponentId: null } }),
 		// Preview and selection
@@ -543,28 +624,31 @@ const step = (model: Model, message: Message, context: PageContext): Return =>
 						}),
 					}),
 		ReceivedPreviewSelection: ({ kind, id }) => selectFromPreview(model, kind, id),
-		// A second click on the open component closes it; its fields saved on blur.
+		// A second click on the open component closes it.
 		ClickedComponent: ({ componentId }) =>
-			model.panel?._tag === "Component" && model.panel.componentId === componentId
-				? closePanel(model)
-				: selectComponent(model, componentId),
+			leaveComponent(
+				model,
+				model.panel?._tag === "Component" && model.panel.componentId === componentId
+					? { _tag: "Close" }
+					: { _tag: "Open", componentId, isRevealed: false },
+			),
 		ClickedIncident: ({ incidentId }) => selectIncident(model, incidentId),
 		GotPanelSheetMessage: ({ message: child }) => updatePanelSheet(model, child),
-		// Escape skips the field's blur, so a component panel saves its typed edits before it closes.
-		PressedEscape: () =>
-			model.panel?._tag === "Component" ? chain(model, commitComponent, closePanel) : closePanel(model),
+		PressedEscape: () => closePanel(model),
 		// Components
 		ChangedComponentField: ({ field, value }) => changeComponent(model, field, value),
-		CommittedComponent: () => commitComponent(model),
-		PickedComponentField: ({ field, value }) =>
-			commitComponent(changeComponent(model, field, value).model),
-		ToggledComponentUptime: () =>
-			commitComponent({
-				...model,
-				componentForm: { ...model.componentForm, showUptime: !model.componentForm.showUptime },
-			}),
+		ToggledComponentUptime: () => toggleComponentUptime(model),
+		GotGroupPickerMessage: ({ message: child }) => groupPickerStep(model, child),
+		ClickedSaveMonitors: () => saveMonitors(model),
+		ClickedDiscardMonitors: () => discardMonitors(model),
 		CompletedSaveComponent: ({ result }) => savedComponent(model, result, context),
-		ClickedMoveComponent: ({ componentId, offset }) => moveComponent(model, componentId, offset),
+		ClickedConfirmDiscardComponent: () => confirmDiscardComponent(model),
+		GotDiscardComponentDialogMessage: ({ message: child }) =>
+			discardComponentDialog(model, Dialog.update(model.discardComponentDialog, child)),
+		DroppedComponent: ({ componentId, index }) => moveComponent(model, componentId, index),
+		PressedMoveComponent: ({ componentId, offset }) => nudgeComponent(model, componentId, offset),
+		DroppedGroup: ({ group, index }) => moveGroup(model, group, index),
+		PressedMoveGroup: ({ group, offset }) => nudgeGroup(model, group, offset),
 		CompletedReorder: ({ result }) => reordered(model, result, context),
 		ClickedDeleteComponent: ({ componentId }) => askDeleteComponent(model, componentId),
 		ClickedConfirmDeleteComponent: () => confirmDeleteComponent(model),
@@ -573,7 +657,7 @@ const step = (model: Model, message: Message, context: PageContext): Return =>
 			whenIdle(model.isDeletingComponent, model, () =>
 				deleteComponentDialog(model, Dialog.update(model.deleteComponentDialog, child)),
 			),
-		ClickedAddComponent: () => openAdd(model),
+		ClickedAddComponent: () => leaveComponent(model, { _tag: "Add" }),
 		GotAddPickerMessage: ({ message: child }) => addPickerStep(model, child),
 		CompletedCreateMonitor: ({ session, result }) => addMonitorCreated(model, session, result),
 		CompletedTrackMonitorCreated: () => ({ model }),
@@ -641,18 +725,45 @@ const step = (model: Model, message: Message, context: PageContext): Return =>
 		// Settings
 		ChangedSetting: ({ field, value }) => changeSetting(model, field, value),
 		ToggledPoweredBy: () => togglePoweredBy(model),
+		ClickedPickBrandingImage: ({ field }) => pickBrandingImage(model, field),
+		CompletedPickBrandingImage: () => ({ model }),
+		DraggedOverBrandingImage: ({ field }) => ({ model: { ...model, brandingDrag: field } }),
+		LeftBrandingImage: () => ({ model: { ...model, brandingDrag: null } }),
+		ClickedEditBrandingImage: ({ field }) => editBrandingImage(model, field),
+		GotBrandingDialogMessage: ({ message: child }) =>
+			brandingDialog(model, Dialog.update(model.brandingDialog, child)),
+		ChangedBrandingLink: ({ value }) => ({ model: { ...model, brandingLink: value } }),
+		SubmittedBrandingLink: () => submitBrandingLink(model),
+		PickedBrandingImage: ({ field, files }) => takeBrandingImage(model, field, files),
+		CompletedReadBrandingImage: ({ field, read, dataUrl }) =>
+			readBrandingImage(model, field, read, dataUrl),
+		ClickedRemoveBrandingImage: ({ field }) => removeBrandingImage(model, field),
 		PickedThemePreset: ({ preset }) =>
 			changeTheme(model, { preset, ...STATUS_PAGE_PRESET_DEFAULTS[preset] }),
 		PickedThemeAppearance: ({ appearance }) => changeTheme(model, { appearance }),
 		ChangedThemeColor: ({ field, value }) => changeTheme(model, { [field]: value }),
+		CompletedMountColorPicker: () => ({ model }),
 		PickedThemeRadius: ({ radius }) => changeTheme(model, { radius }),
 		PickedThemeFont: ({ font }) => changeTheme(model, { font }),
 		PickedPreviewScheme: ({ scheme }) => ({ model: { ...model, previewScheme: scheme } }),
 		PickedPreviewWidth: ({ width }) => ({ model: { ...model, previewWidth: width } }),
 		PickedPreviewState: ({ state }) => ({ model: { ...model, previewState: state } }),
-		ClickedDiscardSettings: () => ({ model: { ...model, settingsEdits: null, settingsFailure: null } }),
+		ClickedDiscardSettings: () => ({
+			model: {
+				...model,
+				settingsEdits: null,
+				settingsFailure: null,
+				brandingRead: model.brandingRead + 1,
+			},
+		}),
 		ClickedSaveSettings: () => saveSettings(model),
-		CompletedSaveSettings: ({ result }) => savedSettings(model, result),
+		// Basic settings' Save goes on to Who can view once the fields saved; a failure stops there.
+		CompletedSaveSettings: ({ result }) => {
+			const saved = savedSettings({ ...model, savesAccessNext: false }, result)
+			if (!model.savesAccessNext || Result.isFailure(result)) return saved
+			const access = saveAccess(saved.model)
+			return { ...access, outMessage: access.outMessage ?? saved.outMessage }
+		},
 		ClickedPublish: () => publish(model),
 		CompletedPublish: ({ result }) => published(model, result, context),
 		ClickedRotateToken: () => askBreakGlass(model, "rotate"),
@@ -668,11 +779,16 @@ const step = (model: Model, message: Message, context: PageContext): Return =>
 		ClickedDismissToken: () => ({ model: { ...model, revealedToken: null } }),
 		// Access
 		PickedVisibility: ({ visibility }) => pickVisibility(model, visibility),
-		ClickedChangePassword: () => openPassword(model),
 		ChangedPassword: ({ value }) => changePassword(model, value),
-		ClickedCancelPassword: () => cancelPassword(model),
-		SubmittedPassword: () => submitPassword(model),
-		ClickedRemovePassword: () => removePassword(model),
+		ClickedDiscardAccess: () => discardAccess(model),
+		ClickedSaveAccess: () => saveAccess(model),
+		ClickedDiscardBasic: () => discardAccess({ ...model, settingsEdits: null, settingsFailure: null }),
+		ClickedSaveBasic: () => {
+			const settings = saveSettings(model)
+			return settings.model.isSavingSettings
+				? { ...settings, model: { ...settings.model, savesAccessNext: true } }
+				: settings
+		},
 		CompletedAccessChange: ({ action, result }) => changedAccess(model, action, result),
 		// Custom domain
 		CompletedFetchCustomDomain: ({ key, result }) => ({

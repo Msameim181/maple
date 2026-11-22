@@ -7,6 +7,7 @@ import { StatusPageComponentId, StatusPageId, UptimeMonitorId } from "@maple/pri
 import {
 	DEFAULT_STATUS_PAGE_THEME,
 	STATUS_PAGE_BREAK_GLASS_PREFIX,
+	STATUS_PAGE_MAX_IMAGE_BYTES,
 	sha256Base64Url,
 	type StatusPageTheme,
 } from "@maple/domain/status-page"
@@ -139,6 +140,32 @@ describe("StatusPagesService", () => {
 		}).pipe(Effect.provide(makeLayer(testDb)))
 	})
 
+	it.effect("stores an uploaded logo and refuses a data URL that is not an image or too large", () => {
+		const testDb = createTestDb(trackedDbs)
+		return Effect.gen(function* () {
+			const service = yield* StatusPagesService
+			const page = yield* service.create(ORG, {
+				name: "Acme",
+				slug: "uploads",
+				faviconUrl: "data:image/png;base64,iVBORw0KGgo=",
+				createdBy: USER,
+			})
+			assert.strictEqual(page.faviconUrl, "data:image/png;base64,iVBORw0KGgo=")
+
+			const html = yield* Effect.flip(
+				service.update(ORG, page.id, { logoUrl: "data:text/html;base64,PHNjcmlwdD4=" }),
+			)
+			assert.strictEqual(html._tag, "@maple/http/errors/StatusPageValidationError")
+			assert.include(html.message, "Logo URL")
+			const huge = yield* Effect.flip(
+				service.update(ORG, page.id, {
+					logoDarkUrl: `data:image/png;base64,${Str.repeat(STATUS_PAGE_MAX_IMAGE_BYTES * 2)("A")}`,
+				}),
+			)
+			assert.include(huge.message, "Dark mode logo URL")
+		}).pipe(Effect.provide(makeLayer(testDb)))
+	})
+
 	it.effect("stores a forced theme with lower-cased colours and refuses unreadable text", () => {
 		const testDb = createTestDb(trackedDbs)
 		return Effect.gen(function* () {
@@ -190,21 +217,48 @@ describe("StatusPagesService", () => {
 		}).pipe(Effect.provide(makeLayer(testDb)))
 	})
 
-	it.effect("refuses a slug another org already uses, on create and on rename", () => {
-		const testDb = createTestDb(trackedDbs)
-		return Effect.gen(function* () {
-			const service = yield* StatusPagesService
-			yield* createPage("taken", OTHER_ORG)
-			const onCreate = yield* Effect.flip(createPage("taken"))
-			assert.strictEqual(onCreate._tag, "@maple/http/errors/StatusPageSlugTakenError")
-			const mine = yield* createPage("mine")
-			const onRename = yield* Effect.flip(service.update(ORG, mine.id, { slug: "taken" }))
-			assert.strictEqual(onRename._tag, "@maple/http/errors/StatusPageSlugTakenError")
-			// Keeping your own slug is not a conflict.
-			const same = yield* service.update(ORG, mine.id, { slug: "mine" })
-			assert.strictEqual(same.slug, "mine")
-		}).pipe(Effect.provide(makeLayer(testDb)))
-	})
+	it.effect(
+		"refuses a slug the org already uses, on create and on rename, and allows it in another org",
+		() => {
+			const testDb = createTestDb(trackedDbs)
+			return Effect.gen(function* () {
+				const service = yield* StatusPagesService
+				const elsewhere = yield* createPage("shared", OTHER_ORG)
+				const here = yield* createPage("shared")
+				assert.strictEqual(here.slug, elsewhere.slug)
+				yield* createPage("taken")
+				const onCreate = yield* Effect.flip(createPage("taken"))
+				assert.strictEqual(onCreate._tag, "@maple/http/errors/StatusPageSlugTakenError")
+				const mine = yield* createPage("mine")
+				const onRename = yield* Effect.flip(service.update(ORG, mine.id, { slug: "taken" }))
+				assert.strictEqual(onRename._tag, "@maple/http/errors/StatusPageSlugTakenError")
+				// Keeping your own slug is not a conflict.
+				const same = yield* service.update(ORG, mine.id, { slug: "mine" })
+				assert.strictEqual(same.slug, "mine")
+			}).pipe(Effect.provide(makeLayer(testDb)))
+		},
+	)
+
+	it.effect(
+		"keeps a slug still served at the bare /s/<slug> reserved in every org until it is renamed",
+		() => {
+			const testDb = createTestDb(trackedDbs)
+			return Effect.gen(function* () {
+				const service = yield* StatusPagesService
+				const old = yield* createPage("legacy", OTHER_ORG)
+				yield* Effect.promise(() =>
+					executeSql(testDb, `UPDATE status_pages SET legacy_slug_route = true WHERE id = $1`, [
+						old.id,
+					]),
+				)
+				const reserved = yield* Effect.flip(createPage("legacy"))
+				assert.strictEqual(reserved._tag, "@maple/http/errors/StatusPageSlugTakenError")
+				yield* service.update(OTHER_ORG, old.id, { slug: "legacy-renamed" })
+				const mine = yield* createPage("legacy")
+				assert.strictEqual(mine.slug, "legacy")
+			}).pipe(Effect.provide(makeLayer(testDb)))
+		},
+	)
 
 	it.effect("queues edge cleanup for a renamed slug and a deleted page", () => {
 		const testDb = createTestDb(trackedDbs)
@@ -1181,9 +1235,9 @@ describe("StatusPagesService", () => {
 			const testDb = createTestDb(trackedDbs)
 			return Effect.gen(function* () {
 				const { service, page, config } = yield* seeded(testDb)
-				yield* createPage("taken-elsewhere", OTHER_ORG)
+				yield* createPage("taken-here")
 				const taken = yield* Effect.flip(
-					service.applyConfig(ORG, page.id, { ...config, slug: "taken-elsewhere" }, USER),
+					service.applyConfig(ORG, page.id, { ...config, slug: "taken-here" }, USER),
 				)
 				assert.strictEqual(taken._tag, "@maple/http/errors/StatusPageSlugTakenError")
 				assert.deepStrictEqual(yield* cleanupSlugs(testDb), [])

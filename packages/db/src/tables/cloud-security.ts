@@ -3,6 +3,7 @@ import {
 	CloudFindingSeverity,
 	CloudFindingSource,
 	CloudFindingStatus,
+	CloudSecurityFeed,
 	CloudServiceState,
 } from "@maple/domain/cloud-security"
 import { AwsAccountId, AwsConnectionId, AwsRegion, OrgId } from "@maple/primitives"
@@ -70,7 +71,7 @@ export const CloudSecurityServiceStates = PG.table("cloud_security_service_state
 		orgId: PG.column(PG.brand(PG.text, OrgId), { name: "org_id" }),
 		connectionId: PG.column(PG.brand(PG.text, AwsConnectionId), { name: "connection_id" }),
 		region: PG.brand(PG.text, AwsRegion),
-		source: PG.brand(PG.text, CloudFindingSource),
+		source: PG.brand(PG.text, CloudSecurityFeed),
 		state: PG.brand(PG.text, CloudServiceState),
 		/** The newest `provider_updated_at` stored; the next poll reads from here. Null: never read. */
 		cursorAt: PG.column(PG.nullable(PG.timestamptzMillis), { name: "cursor_at" }),
@@ -78,6 +79,8 @@ export const CloudSecurityServiceStates = PG.table("cloud_security_service_state
 		windowMs: PG.column(PG.nullable(PG.int8), { name: "window_ms" }),
 		lastError: PG.column(PG.nullable(PG.text), { name: "last_error" }),
 		checkedAt: PG.column(PG.timestamptzMillis, { name: "checked_at" }),
+		/** The last finding event EventBridge delivered for this feed; null while only polled. */
+		pushedAt: PG.column(PG.nullable(PG.timestamptzMillis), { name: "pushed_at" }),
 	},
 	primaryKey: ["orgId", "connectionId", "region", "source"],
 	indexes: [PG.index("cloud_security_service_states_org_idx", ["orgId"])],

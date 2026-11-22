@@ -197,7 +197,7 @@ const planetscaleFilterSearchFields = {
 	branchContains: StringParam,
 }
 
-// Tab sets of the account, settings (plus retired settings tabs), issue and investigation navs
+// Tab sets of the account, settings, issue and investigation navs
 export const accountTabValues = [
 	"profile",
 	"emails",
@@ -224,17 +224,6 @@ export const settingsTabValues = [
 	"data-sources",
 	"setup-health",
 	"automation",
-] as const
-export const legacySettingsTabValues = [
-	"organization",
-	"api-keys",
-	"ai-provider",
-	"setup-audit",
-	"notifications",
-	"connectors",
-	"integrations",
-	"escalations",
-	"developer",
 ] as const
 
 export const ISSUE_TABS = ["overview", "occurrences", "activity"] as const
@@ -309,8 +298,7 @@ export const ServiceMapSearch = Schema.Struct({
 	...TimeRangeSearchFields,
 })
 
-export const SettingsSearch = Schema.Struct({
-	tab: Schema.optional(Schema.Literals([...settingsTabValues, ...legacySettingsTabValues])),
+const settingsSearchFields = {
 	checkout: Schema.optional(Schema.Literal("complete")),
 	range: StringParam,
 	since: StringParam,
@@ -328,7 +316,22 @@ export const SettingsSearch = Schema.Struct({
 	// Data sources deep links from `/integrations`: one source, or the connect form of a kind.
 	source: StringParam,
 	connect: Schema.optional(Schema.Literals(DATA_SOURCE_KINDS)),
+}
+
+export const SettingsTab = Schema.Literals(settingsTabValues)
+
+/**
+ * `/settings/<tab>`: `tab` is the path segment; `legacyTab` is a retired `?tab=` link, which
+ * `routeRedirect` moves to its path.
+ */
+export const SettingsSearch = Schema.Struct({
+	tab: Schema.optional(SettingsTab),
+	legacyTab: StringParam,
+	...settingsSearchFields,
 })
+
+/** The query string of `/settings`: `tab` here is only ever an old link's. */
+export const SettingsQuery = Schema.Struct({ tab: StringParam, ...settingsSearchFields })
 
 export const SignInSearch = Schema.Struct({
 	redirect_url: StringParam,
@@ -413,6 +416,15 @@ export const StatusPageSearch = Schema.Struct({
 	section: StringParam,
 })
 
+/** How `/status-pages/new` sets the page up: a coding agent over the MCP, or the builder. */
+export const StatusPageSetupMethod = Schema.Literals(["agent", "manual"])
+export type StatusPageSetupMethod = typeof StatusPageSetupMethod.Type
+
+/** `/status-pages/new`: none is the choice between the two `setup` methods. */
+export const StatusPageNewSearch = Schema.Struct({
+	setup: Schema.optional(StatusPageSetupMethod),
+})
+
 export const CodeReviewCiSearch = Schema.Struct(CodeReviewCiSearchFields)
 
 export const CodeReviewTeamSearch = Schema.Struct(CodeReviewTeamSearchFields)
@@ -429,7 +441,12 @@ export const DashboardSearch = Schema.StructWithRest(
 	[variableSearchRest],
 )
 
-// Sources: new and detail (`SOURCE_TABS`)
+// Sources: list, new and detail (`SOURCE_TABS`)
+export const SourcesSearch = Schema.Struct({
+	/** Prefills the list's search, e.g. an integration's name from its hub row. */
+	q: StringParam,
+})
+
 export const SourcesNewSearch = Schema.Struct({
 	platform: Schema.optional(PushSourcePlatform),
 	/** A data integration's connect step. A plain string: OAuth callbacks return here, so an unknown id falls back to the picker. */
@@ -1157,6 +1174,27 @@ export const SecurityAuditLogSearch = Schema.Struct({
 	actor: StringParam,
 })
 export type SecurityAuditLogSearch = typeof SecurityAuditLogSearch.Type
+
+/** The Security hub's Cloud findings filters; each absent one shows everything (status: active). */
+export const SecurityCloudSearch = Schema.Struct({
+	status: StringParam,
+	severity: StringParam,
+	source: StringParam,
+	account: StringParam,
+	region: StringParam,
+	/** Matched against a finding's title, type and resource id. */
+	q: StringParam,
+})
+export type SecurityCloudSearch = typeof SecurityCloudSearch.Type
+
+/** One cloud finding: its connection, region, service and the service's id for it. */
+export const SecurityCloudFindingSearch = Schema.Struct({
+	connection: StringParam,
+	region: StringParam,
+	source: StringParam,
+	id: StringParam,
+})
+export type SecurityCloudFindingSearch = typeof SecurityCloudFindingSearch.Type
 
 /**
  * `/security/detections/new`: `detectionId` edits that detection. The rest prefill a new one: a

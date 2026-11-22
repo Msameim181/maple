@@ -48,7 +48,17 @@ A component's status is the worst of three inputs:
 
 The banner at the top of the page shows the worst component status.
 
-Each uptime bar is one UTC day of the monitor's checks. A day with checks taken while the monitor was down shows as down. A day with failed checks that never added up to the monitor's **Down after** count shows as degraded. A day without checks shows as empty. The uptime percentage is the share of checks taken while the monitor was up.
+Each uptime bar is one UTC day of the component, coloured by what happened that day:
+
+| That day                                                                                        | Bar         |
+| ----------------------------------------------------------------------------------------------- | ----------- |
+| A Major or Critical incident on the component, or the monitor down for 1% of its checks or more | Outage      |
+| A Minor incident, any shorter downtime, or 5% of checks or more failing without going down      | Degraded    |
+| Maintenance on the component, with no other incident on it that day                             | Maintenance |
+| Checks with no downtime (a few scattered failed checks included)                                | Operational |
+| No checks and no incident                                                                       | No data     |
+
+A day's tooltip gives the exact count of failed checks and names the incident or maintenance. Maintenance replaces what the checks say, since downtime it announced was planned. The uptime percentage is the share of checks taken while the monitor was up.
 
 When no publish has reached the page for 5 minutes, or a page with monitored components has had no new check result for 5 minutes, it shows "Live checks are delayed" with the time of the last known state, rather than looking green.
 
@@ -120,11 +130,12 @@ Set the password first, under **New password** and **Save password**: 8 to 256 c
 A page can answer on a subdomain you control, such as `status.acme.com`, with a certificate Maple issues and renews. You need the engineer or admin role.
 
 1. Open **Settings → Custom domain**, enter the **Hostname** and click **Add domain**.
-2. Add the records from the **DNS records to add** table at your DNS provider:
+2. Add both records from the **DNS records to add** table at your DNS provider:
     - A `CNAME` from your hostname to the target Maple shows. It points the domain at Maple and is always needed.
-    - A `TXT` record that proves you own the domain. It is optional once the CNAME is in place.
-    - `TXT` records for the certificate, only when the table lists them.
-3. Wait for the badge to change from **Waiting for DNS** to **Issuing certificate** and then **Active**. Maple checks every minute for the first hour, then every ten minutes. **Check now** checks at once and retries a failed certificate.
+    - A `TXT` record named `_maple-challenge.<your hostname>`. It proves you own the domain, and Maple sets the domain up only after it finds this record. You can remove it once the domain is active.
+3. Wait for the badge to change from **Waiting for DNS** to **Issuing certificate** and then **Active**. Maple checks every minute for the first hour, then every ten minutes. **Check now** checks at once and retries a failed certificate. While the certificate is issued the table may list more `TXT` records: one marked optional, and records for the certificate, which you add only when they are listed.
+
+The `TXT` value is specific to your organization and this page, so the record works for no one else, and a `CNAME` that points at Maple is not enough for anyone to serve a page on your domain. If Maple says a hostname is held by another status page that has not proved it owns the domain, the message gives the `TXT` record to add: publish it, then add the domain again, and it becomes yours. Domains that were added before this record was required keep working and need no change.
 
 Once the domain is active, the page, its feeds and its JSON answer there, and feed links, the Slack command and the dashboard's links use it. **Needs attention** means the domain stopped; the panel says what went wrong. **Remove** stops serving the page on the domain within a minute; the page stays up at its Maple address.
 
@@ -160,8 +171,11 @@ A password-protected page serves these only to a visitor who entered the passwor
 On the [MCP server](/docs/reference/mcp):
 
 - `get_status_page` lists every page, or with `page` (slug, name or id) shows one as visitors see it, drafts included. `include_config=true` adds the page's config document.
-- `post_status_page_update` opens an incident on `page` with `title` and `message`, or maintenance when you pass `starts_at` and `ends_at`. With `incident`, it posts the next update and moves it to `status`. `impact` and `components` are optional. New posts are drafts unless `publish=true`.
-- `apply_status_page_config` replaces a page's settings, theme and components with an edited config document. It refuses the write if the config changed since you read it (`if_version`).
+- `manage_status_page action=post_update` opens an incident on `page` with `title` and `message`, or maintenance when you pass `starts_at` and `ends_at`. With `incident`, it posts the next update and moves it to `status`. `impact` and `components` are optional. New posts are drafts unless `publish=true`.
+- `manage_status_page action=create` creates a page from a `name` (and optional `slug` and `description`). It starts as a draft with no components.
+- `manage_status_page action=apply_config` replaces a page's settings, theme and components with an edited config document. It refuses the write if the config changed since you read it (`if_version`).
+- `manage_status_page action=set_domain` serves a page on your own subdomain (`domain`) and returns the DNS records to add. Call it again with the same domain to check them now; `remove=true` removes it.
+- `manage_status_page action=publish` makes a draft page public. It goes live within a minute.
 
 In the [REST API](/docs/reference/api), pages live under `/v2/status_pages` (scopes `status_pages:read` and `status_pages:write`) and incidents under `/v2/status_page_incidents` (scopes `status_page_incidents:read` and `status_page_incidents:write`):
 
@@ -181,11 +195,11 @@ In the [REST API](/docs/reference/api), pages live under `/v2/status_pages` (sco
 | `GET`, `PATCH`, `DELETE /v2/status_page_incidents/{id}`    | Read, edit or delete one                                                         |
 | `POST /v2/status_page_incidents/{id}/updates`              | Post an update; `resolved` or `completed` closes it                              |
 
-Writes to a page need the engineer role; the password and break-glass endpoints, and any change to `visibility`, need an admin. The custom domain is not part of the config document. There is no Terraform or Pulumi resource for status pages.
+Writes to a page need the engineer role; the password and break-glass endpoints, and any change to `visibility`, need an admin. The custom domain is not part of the config document. To declare a page in code, use [`Maple.StatusPage`](/docs/iac/alchemy-resources#maplestatuspage) in Alchemy or [`maple_status_page`](/docs/iac/terraform-resources#maple_status_page) in Terraform; there is no Pulumi resource.
 
 ## Limits
 
-- **Address** (slug): 3 to 48 lowercase letters, digits or inner hyphens, unique across Maple.
+- **Address** (slug): 3 to 48 lowercase letters, digits or inner hyphens, unique within your organization.
 - Components: at most 200 per page.
 - An incident update message: up to 20,000 characters. A break-glass message: up to 5,000 characters, with a title of up to 200.
 - Page links: up to 2,048 characters, `https` only.

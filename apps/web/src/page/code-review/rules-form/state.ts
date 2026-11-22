@@ -29,9 +29,11 @@ export const BUILT_IN = {
 	minInlineSeverity: "warn",
 	reviewDrafts: false,
 	reviewExternalContributors: false,
+	mapleToolAccess: true,
 	feedbackScope: "organization",
 	blockOnContractBreaks: false,
 	postMergeCheck: true,
+	autoApprove: false,
 } as const
 
 export const Mode = Schema.Literals(["organization", "repository"])
@@ -46,11 +48,13 @@ export const FormState = Schema.Struct({
 	minInlineSeverity: Schema.String,
 	reviewDrafts: Schema.String,
 	reviewExternalContributors: Schema.String,
+	mapleToolAccess: Schema.String,
 	dailyLimit: Schema.String,
 	automaticReviewLimit: Schema.String,
 	feedbackScope: Schema.String,
 	blockOnContractBreaks: Schema.String,
 	postMergeCheck: Schema.String,
+	autoApprove: Schema.String,
 })
 export type FormState = typeof FormState.Type
 
@@ -80,6 +84,7 @@ export const stateFromConfig = (mode: Mode, config: PrReviewRepositoryConfig): F
 			inherits,
 			BUILT_IN.reviewExternalContributors,
 		),
+		mapleToolAccess: toggleFromConfig(config.mapleToolAccess, inherits, BUILT_IN.mapleToolAccess),
 		dailyLimit: config.dailyLimit === undefined ? "" : String(config.dailyLimit),
 		automaticReviewLimit:
 			config.automaticReviewLimit === undefined ? "" : String(config.automaticReviewLimit),
@@ -90,6 +95,7 @@ export const stateFromConfig = (mode: Mode, config: PrReviewRepositoryConfig): F
 			BUILT_IN.blockOnContractBreaks,
 		),
 		postMergeCheck: toggleFromConfig(config.postMergeCheck, inherits, BUILT_IN.postMergeCheck),
+		autoApprove: toggleFromConfig(config.autoApprove, inherits, BUILT_IN.autoApprove),
 	}
 }
 
@@ -104,11 +110,13 @@ export const sameState = (a: FormState, b: FormState) =>
 	a.minInlineSeverity === b.minInlineSeverity &&
 	a.reviewDrafts === b.reviewDrafts &&
 	a.reviewExternalContributors === b.reviewExternalContributors &&
+	a.mapleToolAccess === b.mapleToolAccess &&
 	a.dailyLimit === b.dailyLimit &&
 	a.automaticReviewLimit === b.automaticReviewLimit &&
 	a.feedbackScope === b.feedbackScope &&
 	a.blockOnContractBreaks === b.blockOnContractBreaks &&
 	a.postMergeCheck === b.postMergeCheck &&
+	a.autoApprove === b.autoApprove &&
 	sameCategories(a.categories, b.categories)
 
 const parseIgnorePaths = (text: string) =>
@@ -171,8 +179,10 @@ export const configFromState = (mode: Mode, state: FormState): PrReviewRepositor
 		org,
 		BUILT_IN.reviewExternalContributors,
 	)
+	const mapleTools = toggleToConfig(state.mapleToolAccess, org, BUILT_IN.mapleToolAccess)
 	const block = toggleToConfig(state.blockOnContractBreaks, org, BUILT_IN.blockOnContractBreaks)
 	const postMerge = toggleToConfig(state.postMergeCheck, org, BUILT_IN.postMergeCheck)
+	const autoApprove = toggleToConfig(state.autoApprove, org, BUILT_IN.autoApprove)
 	return new PrReviewRepositoryConfig({
 		...(instructions === "" ? undefined : { instructions }),
 		...(ignorePaths.length === 0 ? undefined : { ignorePaths }),
@@ -180,10 +190,12 @@ export const configFromState = (mode: Mode, state: FormState): PrReviewRepositor
 		...(severity === undefined ? undefined : { minInlineSeverity: severity }),
 		...(drafts === undefined ? undefined : { reviewDrafts: drafts }),
 		...(external === undefined ? undefined : { reviewExternalContributors: external }),
+		...(mapleTools === undefined ? undefined : { mapleToolAccess: mapleTools }),
 		...(limit === "" ? undefined : { dailyLimit: Number(limit) }),
 		...(perPullRequest === "" ? undefined : { automaticReviewLimit: Number(perPullRequest) }),
 		...(feedback === undefined ? undefined : { feedbackScope: feedback }),
 		...(block === undefined ? undefined : { blockOnContractBreaks: block }),
 		...(postMerge === undefined ? undefined : { postMergeCheck: postMerge }),
+		...(autoApprove === undefined ? undefined : { autoApprove }),
 	})
 }

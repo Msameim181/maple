@@ -71,6 +71,32 @@ const SEEDS: ReadonlyArray<Seed> = [
 		raw: { insertId: "abc123", protoPayload: { serviceName: "iam.googleapis.com" } },
 	},
 	{
+		provider: "github",
+		account: "acme",
+		minutesAgo: 18,
+		action: "branch_protection_rule.deleted",
+		category: "configuration",
+		actor: { type: "user", id: "583231", name: "octocat", email: null },
+		target: { type: "branch_protection_rule", id: "9001", name: "acme/api: main" },
+		raw: { action: "deleted", rule: { id: 9001, name: "main" } },
+	},
+	{
+		provider: "aws",
+		account: "123456789012",
+		minutesAgo: 27,
+		action: "iam:CreateAccessKey",
+		category: "credential",
+		actor: {
+			type: "user",
+			id: "arn:aws:sts::123456789012:assumed-role/AWSReservedSSO_Admin_4f1/grace@acme.test",
+			name: "grace@acme.test",
+			email: null,
+		},
+		target: { type: "AWS::IAM::User", id: "arn:aws:iam::123456789012:user/deploy-bot" },
+		originIp: "203.0.113.90",
+		raw: { eventSource: "iam.amazonaws.com", eventName: "CreateAccessKey" },
+	},
+	{
 		minutesAgo: 4,
 		action: "alert_rule.updated",
 		category: "configuration",
@@ -190,7 +216,7 @@ export const auditEventsOf = (nowMs: number, hasMore = true): AuditTrailListResp
 
 export const noAuditEvents: AuditTrailListResponse = { events: [], nextCursor: null }
 
-/** Maple and a Vercel team sending, Google Cloud connected with its log forwarding off. */
+/** Maple, a Vercel team, an AWS account, a GitHub organization and a Fleet server sending, Google Cloud connected with its log forwarding off. */
 export const auditSourcesOf = (nowMs: number): AuditTrailSourcesResponse => ({
 	windowDays: 30,
 	sources: [
@@ -218,6 +244,30 @@ export const auditSourcesOf = (nowMs: number): AuditTrailSourcesResponse => ({
 			events: 0,
 			lastEventAt: null,
 		},
+		{
+			provider: "aws",
+			state: "receiving",
+			account: "123456789012",
+			problem: null,
+			events: 61,
+			lastEventAt: nowMs - 27 * MINUTE,
+		},
+		{
+			provider: "github",
+			state: "receiving",
+			account: "acme",
+			problem: null,
+			events: 9,
+			lastEventAt: nowMs - 18 * MINUTE,
+		},
+		{
+			provider: "fleet",
+			state: "receiving",
+			account: "Acme (fleet.acme.dev)",
+			problem: null,
+			events: 12,
+			lastEventAt: nowMs - 9 * MINUTE,
+		},
 	],
 })
 
@@ -236,6 +286,22 @@ export const noAuditSources: AuditTrailSourcesResponse = {
 		},
 		{
 			provider: "gcp",
+			state: "not_connected",
+			account: null,
+			problem: null,
+			events: 0,
+			lastEventAt: null,
+		},
+		{
+			provider: "aws",
+			state: "not_connected",
+			account: null,
+			problem: null,
+			events: 0,
+			lastEventAt: null,
+		},
+		{
+			provider: "github",
 			state: "not_connected",
 			account: null,
 			problem: null,

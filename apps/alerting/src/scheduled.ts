@@ -40,6 +40,9 @@ import { RailwayMetricsService } from "@maple/backend/services/integrations/Rail
 import { SearchConsoleImportService } from "@maple/backend/services/integrations/SearchConsoleImportService"
 import { AwsConnectionService } from "@maple/backend/services/integrations/AwsConnectionService"
 import { CostSyncService } from "@maple/backend/services/cost/CostSyncService"
+import { AwsSecurityFindingsService } from "@maple/backend/services/cloud-security/AwsSecurityFindingsService"
+import { FleetAuditService } from "@maple/backend/services/integrations/FleetAuditService"
+import { FleetFindingsService } from "@maple/backend/services/integrations/FleetFindingsService"
 import { SecretResealService } from "@maple/backend/services/secrets/SecretResealService"
 import { SupabaseConnectionService } from "@maple/backend/services/integrations/SupabaseConnectionService"
 import { SupabaseInsightsService } from "@maple/backend/services/integrations/SupabaseInsightsService"
@@ -122,6 +125,9 @@ export const layerTick = (
 		SearchConsoleImportService.layer,
 		AwsConnectionService.layer,
 		CostSyncService.layer,
+		AwsSecurityFindingsService.layer,
+		FleetAuditService.layer,
+		FleetFindingsService.layer,
 		SecretResealService.layer,
 		SupabaseConnectionService.layer,
 		SupabaseLogsService.layer,
@@ -467,6 +473,47 @@ const costSyncTick = makeTick(
 			: undefined,
 )
 
+const awsSecurityTick = makeTick(
+	AwsSecurityFindingsService.use((security) => security.pollAll),
+	"aws_security",
+	(result) =>
+		result.connections > 0
+			? {
+					connections: result.connections,
+					failedConnections: result.failedConnections,
+					reads: result.reads,
+					findings: result.findings,
+				}
+			: undefined,
+)
+
+const fleetTick = makeTick(
+	FleetAuditService.use((fleet) => fleet.pollAll),
+	"fleet",
+	(result) =>
+		result.connections > 0
+			? {
+					connections: result.connections,
+					failedConnections: result.failedConnections,
+					events: result.events,
+				}
+			: undefined,
+)
+
+const fleetFindingsTick = makeTick(
+	FleetFindingsService.use((fleet) => fleet.syncDue),
+	"fleet_findings",
+	(result) =>
+		result.connections > 0
+			? {
+					connections: result.connections,
+					failedConnections: result.failedConnections,
+					policies: result.policies,
+					vulnerabilities: result.vulnerabilities,
+				}
+			: undefined,
+)
+
 const vercelTick = makeTick(
 	VercelIntegrationService.use((vercel) => vercel.pollAllOrgs),
 	"vercel",
@@ -618,11 +665,14 @@ const scheduledTicks = {
 	alertLongQuery: schedulerTick("long_query", "scheduler_long_query"),
 	anomaly: anomalyTick,
 	awsConnections: awsConnectionsTick,
+	awsSecurity: awsSecurityTick,
 	cloudflareAnalytics: cloudflareAnalyticsTick,
 	costSync: costSyncTick,
 	digest: digestTick,
 	error: errorTick,
 	escalation: escalationTick,
+	fleet: fleetTick,
+	fleetFindings: fleetFindingsTick,
 	fixVerification: fixVerificationTick,
 	gcpMetrics: gcpMetricsTick,
 	maintenanceWindows: maintenanceWindowsTick,
@@ -684,6 +734,9 @@ const LANE_TICKS = {
 	maintenance_windows: ["maintenanceWindows"],
 	search_console: ["searchConsole"],
 	cost_sync: ["costSync"],
+	aws_security: ["awsSecurity"],
+	fleet: ["fleet"],
+	fleet_findings: ["fleetFindings"],
 	vercel: ["vercel"],
 } as const satisfies Record<TickLane, ReadonlyArray<ScheduledTickName>>
 

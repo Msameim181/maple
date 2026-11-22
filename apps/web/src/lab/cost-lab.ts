@@ -9,6 +9,7 @@ import {
 	VercelCostSourceAdded,
 	VercelCostSourceRemoved,
 	VercelCostStatus,
+	GcpCostStatus,
 } from "@maple/domain/http"
 import { VcsInstallationId } from "@maple/domain/vcs"
 import * as Policy from "@maple/domain/policy"
@@ -23,6 +24,8 @@ import {
 	AddGithubCostSource,
 	AddPlanetScaleCostSource,
 	AddVercelCostSource,
+	AddGcpCostSource,
+	FetchGcpCostStatus,
 	BreakdownInput,
 	FacetsInput,
 	FetchCostBreakdown,
@@ -37,6 +40,7 @@ import {
 	RemoveGithubCostSource,
 	RemoveAnthropicCostKey,
 	RemoveCloudflareCostToken,
+	RemoveMorphCostKey,
 	RemoveOpenAiCostKey,
 	RemoveOpenRouterCostKey,
 	RemovePlanetScaleCostSource,
@@ -44,11 +48,13 @@ import {
 	ResolveWindow,
 	SaveAnthropicCostKey,
 	SaveCloudflareCostToken,
+	SaveMorphCostKey,
 	SaveOpenAiCostKey,
 	SaveOpenRouterCostKey,
 	TimeseriesInput,
 	WindowInput,
 } from "../page/cost/command"
+import * as FeatureRequest from "../page/kit/feature-request"
 import { Message as CostMessage } from "../page/cost/message"
 import { Model as CostModel, type Search } from "../page/cost/model"
 import { CredentialProvider } from "../page/cost/providers"
@@ -93,6 +99,10 @@ export const LabState = Schema.Literals([
 	"cloudflare",
 	"by-resource",
 	"add-source",
+	"add-source-added",
+	"add-source-search",
+	"add-source-no-match",
+	"request-provider",
 	"add-openrouter",
 	"key-refused",
 	"replace-key",
@@ -106,6 +116,8 @@ export const LabState = Schema.Literals([
 	"add-anthropic",
 	"add-openai",
 	"openai-no-spend",
+	"add-morph",
+	"morph-not-admin",
 	"add-github",
 	"github-refused",
 	"github-none",
@@ -120,6 +132,11 @@ export const LabState = Schema.Literals([
 	"planetscale-reconnect",
 	"planetscale-not-connected",
 	"planetscale-refused",
+	"add-gcp",
+	"gcp-filled",
+	"gcp-pick",
+	"gcp-not-connected",
+	"gcp-refused",
 	"remove-planetscale",
 	"member",
 	"member-onramp",
@@ -176,6 +193,9 @@ const startsEmpty = (state: LabState): boolean =>
 	state === "onramp" ||
 	state === "member-onramp" ||
 	state === "add-source" ||
+	state === "add-source-search" ||
+	state === "add-source-no-match" ||
+	state === "request-provider" ||
 	state === "add-openrouter" ||
 	state === "key-refused" ||
 	state === "add-cloudflare" ||
@@ -184,6 +204,8 @@ const startsEmpty = (state: LabState): boolean =>
 	state === "add-anthropic" ||
 	state === "add-openai" ||
 	state === "openai-no-spend" ||
+	state === "add-morph" ||
+	state === "morph-not-admin" ||
 	state === "github-none" ||
 	state === "github-reading" ||
 	state === "github-unread" ||
@@ -193,13 +215,38 @@ const startsEmpty = (state: LabState): boolean =>
 	state === "add-planetscale" ||
 	state === "planetscale-reconnect" ||
 	state === "planetscale-not-connected" ||
-	state === "planetscale-refused"
+	state === "planetscale-refused" ||
+	state === "add-gcp" ||
+	state === "gcp-filled" ||
+	state === "gcp-pick" ||
+	state === "gcp-not-connected" ||
+	state === "gcp-refused"
 
 /** What the reader did before the state's screenshot: the clicks that open its dialog. */
 const openingOf = (state: LabState): ReadonlyArray<CostMessage> => {
 	switch (state) {
 		case "add-source":
+		case "add-source-added":
 			return [CostMessage.ClickedAddSource()]
+		case "add-source-search":
+		case "add-source-no-match":
+			return [
+				CostMessage.ClickedAddSource(),
+				CostMessage.ChangedProviderSearch({
+					value: state === "add-source-search" ? "api" : "mainframe",
+				}),
+			]
+		case "request-provider":
+			return [
+				CostMessage.ClickedAddSource(),
+				CostMessage.ChangedProviderSearch({ value: "Hetzner" }),
+				CostMessage.ClickedRequestProvider(),
+				CostMessage.GotRequestMessage({
+					message: FeatureRequest.Message.ChangedNote({
+						value: "Cost per server and per project.",
+					}),
+				}),
+			]
 		case "add-openrouter":
 			return [CostMessage.ClickedAddSource(), CostMessage.PickedProvider({ provider: "openrouter" })]
 		case "key-refused":
@@ -223,6 +270,10 @@ const openingOf = (state: LabState): ReadonlyArray<CostMessage> => {
 			return [CostMessage.ClickedAddSource(), CostMessage.PickedProvider({ provider: "openai" })]
 		case "openai-no-spend":
 			return submissionOf("openai", "sk-admin-0123456789abcdefghij0123456789")
+		case "add-morph":
+			return [CostMessage.ClickedAddSource(), CostMessage.PickedProvider({ provider: "morph" })]
+		case "morph-not-admin":
+			return submissionOf("morph", "sk-0123456789abcdefghij0123456789")
 		case "add-github":
 		case "github-none":
 		case "github-reading":
@@ -265,6 +316,22 @@ const openingOf = (state: LabState): ReadonlyArray<CostMessage> => {
 			]
 		case "remove-planetscale":
 			return removalOf("planetscale")
+		case "add-gcp":
+		case "gcp-pick":
+		case "gcp-not-connected":
+			return [CostMessage.ClickedAddSource(), CostMessage.ClickedAddGcp()]
+		case "gcp-filled":
+		case "gcp-refused":
+			return [
+				CostMessage.ClickedAddSource(),
+				CostMessage.ClickedAddGcp(),
+				CostMessage.GotGcpTableDraftMessage({
+					message: Field.Message.ChangedValue({
+						value: state === "gcp-refused" ? "acme-billing.billing_export.costs" : LAB_GCP_TABLE,
+					}),
+				}),
+				...(state === "gcp-refused" ? [CostMessage.SubmittedGcpExport()] : []),
+			]
 		// Without Clerk the page starts with every permission: the member states take them away.
 		case "member":
 		case "member-onramp":
@@ -333,6 +400,12 @@ const noSpendKey = {
 		"This OpenAI organization has no API spend in the last 180 days, so there is nothing to read yet.",
 }
 
+const notAdminKey = {
+	...toLoadFailure("refused"),
+	message:
+		"This key cannot read the organization's spend. Use a key of a Morph organization, owned by one of its admins. Keys of personal accounts cannot read spend.",
+}
+
 /** The days a preset spans, for the fixture's window; a custom range reads as the default. */
 const DAYS = new Map([
 	["1w", 7],
@@ -390,6 +463,38 @@ const failure = toLoadFailure("The warehouse did not answer in time")
 
 const argsOf = <A, I>(input: Schema.Codec<A, I>) =>
 	Schema.decodeUnknownOption(Schema.Struct({ key: Schema.String, input }))
+/** A detailed export table, as BigQuery's console copies its id. */
+const LAB_GCP_TABLE = "acme-billing.billing_export.gcp_billing_export_resource_v1_01A2B3_C4D5E6_F7A8B9"
+
+const labGcpConnector = (
+	scopeId: string,
+	number: string,
+	metricsEnabled = true,
+): (typeof GcpCostStatus.Encoded)["connectors"][number] => ({
+	id: `0${number}8f2b3c-4d5e-4f70-8192-a3b4c5d6e7f8`,
+	scopeType: "project",
+	scopeId,
+	projectId: scopeId,
+	metricsEnabled,
+	readerEmail: `maple-0${number}8f2b3c4d5e4f708192a3b4@${scopeId}.iam.gserviceaccount.com`,
+})
+
+/** The org's GCP connections as the state has them: none, one, or several to pick from. */
+const gcpStatusOf = (state: LabState): GcpCostStatus =>
+	Schema.decodeSync(GcpCostStatus)({
+		connectors:
+			state === "gcp-not-connected"
+				? []
+				: state === "gcp-pick"
+					? [
+							labGcpConnector("acme-prod", "1"),
+							labGcpConnector("acme-staging", "2", false),
+							labGcpConnector("acme-data", "3"),
+						]
+					: [labGcpConnector("acme-prod", "1")],
+		exports: [],
+	})
+
 const keyArgs = Schema.decodeUnknownOption(Schema.Struct({ key: Schema.String }))
 const windowArgs = argsOf(WindowInput)
 const timeseriesArgs = argsOf(TimeseriesInput)
@@ -524,10 +629,26 @@ const answerOf = (world: World, search: Search, command: CostCommand): Option.Op
 					result: state === "openai-no-spend" ? Result.fail(noSpendKey) : Result.succeed(undefined),
 				}),
 			)
+		case SaveMorphCostKey.name:
+			return Option.some(
+				CostMessage.CompletedSaveCredential({
+					provider: "morph",
+					result:
+						state === "morph-not-admin" ? Result.fail(notAdminKey) : Result.succeed(undefined),
+				}),
+			)
+		case FeatureRequest.SendFeatureRequest.name:
+			return Option.some(
+				CostMessage.GotRequestMessage({
+					message: FeatureRequest.Message.CompletedSend({ result: Result.succeed(undefined) }),
+				}),
+			)
 		case RemoveAnthropicCostKey.name:
 			return Option.some(removedAnswer("anthropic"))
 		case RemoveOpenAiCostKey.name:
 			return Option.some(removedAnswer("openai"))
+		case RemoveMorphCostKey.name:
+			return Option.some(removedAnswer("morph"))
 		case RemoveOpenRouterCostKey.name:
 			return Option.some(removedAnswer("openrouter"))
 		case RemoveCloudflareCostToken.name:
@@ -605,6 +726,20 @@ const answerOf = (world: World, search: Search, command: CostCommand): Option.Op
 			return Option.some(
 				CostMessage.CompletedRemovePlanetScale({
 					result: Result.succeed(new PlanetScaleCostSourceRemoved({ removed: true })),
+				}),
+			)
+		case FetchGcpCostStatus.name:
+			return Option.map(keyArgs(command.args), ({ key }) =>
+				CostMessage.CompletedLoadGcpStatus({ key, result: Result.succeed(gcpStatusOf(state)) }),
+			)
+		case AddGcpCostSource.name:
+			return Option.some(
+				CostMessage.CompletedAddGcp({
+					result: Result.fail({
+						...toLoadFailure("refused"),
+						message:
+							"That is not a Cloud Billing export table. Copy its id from BigQuery: project.dataset.gcp_billing_export_v1_XXXXXX_XXXXXX_XXXXXX.",
+					}),
 				}),
 			)
 		case RemoveVercelCostSource.name:
@@ -759,7 +894,7 @@ export const update = (model: Model, message: Message): Return =>
 		},
 	})
 
-export const breadcrumbs = [{ label: "Lab", href: "/lab" }, { label: "Cost" }] as const
+export const breadcrumbs = [{ label: "Lab", href: "/lab" }, { label: "Cloud cost" }] as const
 
 export const view = (model: Model, h: HtmlBuilder<Message>): Html =>
 	h.submodel({

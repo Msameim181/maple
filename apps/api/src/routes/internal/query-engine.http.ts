@@ -7,6 +7,9 @@ import {
 	CurrentTenant,
 	MapleInternalApi,
 	RawSqlExecuteResponse,
+	PromqlDiscoverResponse,
+	PromqlExecuteResponse,
+	QueryEngineValidationError,
 	SpanHierarchyResponse,
 	ProfileSampleTypesResponse,
 	ProfileStacksResponse,
@@ -157,11 +160,13 @@ import {
 import type { QueryEngineDirectError } from "@maple/query-engine/runtime"
 import { makeRunAuditedRawSql } from "@maple/backend/services/warehouse/audited-raw-sql"
 import { WarehouseQueryService } from "@maple/backend/services/warehouse/WarehouseQueryService"
+import { PromqlQueryService } from "@maple/backend/services/promql/PromqlQueryService"
 import {
 	alignServiceApiBucketSeconds,
 	CH,
 	formatWarehouseDateTime,
 	parseSpanEvents,
+	parseWarehouseDateTime,
 } from "@maple/query-engine"
 import { QueryEngineExecuteBatchResponse } from "@maple/domain/query-engine"
 
@@ -189,7 +194,6 @@ import { makeSearchConsoleReads } from "@maple/backend/queries/search-console-re
 import { makeCostReads } from "@maple/backend/queries/cost-reads"
 import { makeProfileReads } from "@maple/backend/queries/profile-reads"
 import { Database } from "@maple/backend/platform/DatabaseLive"
-import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/OrganizationFeatureFlagsService"
 import { runQueryEngineBatch } from "@/routes/query-engine-batch"
 import { RuntimeAdvisoryCatalog } from "@maple/backend/services/security/RuntimeAdvisoryCatalog"
 import { RuntimeReleaseCatalog } from "@maple/backend/services/security/RuntimeReleaseCatalog"
@@ -374,6 +378,7 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 	Effect.gen(function* () {
 		const queryEngine = yield* QueryEngineService
 		const warehouse = yield* WarehouseQueryService
+		const promql = yield* PromqlQueryService
 		const runtimeReleases = yield* RuntimeReleaseCatalog
 		const runtimeAdvisories = yield* RuntimeAdvisoryCatalog
 		const reads = makeDashboardReads({ warehouse, queryEngine })
@@ -381,8 +386,7 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 		const serve = makeServeRows(runQuery, runQueryFirst)
 		const searchConsole = makeSearchConsoleReads({ warehouse, queryEngine })
 		const database = yield* Database
-		const featureFlags = yield* OrganizationFeatureFlagsService
-		const cost = makeCostReads({ warehouse, queryEngine, database, featureFlags })
+		const cost = makeCostReads({ warehouse, queryEngine, database })
 		const profiles = makeProfileReads({ warehouse, queryEngine })
 
 		const dbEdgesWithinBudget = <A, P, E extends QueryEngineDirectError, R>(
@@ -1453,6 +1457,7 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 								durationMs: row.durationMs,
 								ok: row.status !== "Error",
 								statusCode: row.httpStatus > 0 ? row.httpStatus : null,
+								error: row.status === "Error" && row.error !== "" ? row.error : null,
 								phases:
 									row.timed === 1
 										? {
@@ -2528,7 +2533,6 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 					"searchConsoleLandingPages",
 					serveData(searchConsole.landingPages, SearchConsoleLandingPagesResponse),
 				)
-				// Cloud cost: each read refuses an org outside the `cloudCost` rollout before it reads.
 				.handle("costTotals", ({ payload }) =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
@@ -2715,6 +2719,98 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 				.handle(
 					"productEventTraceSamples",
 					serve.rows(Queries.productEventTraceSamples, ProductEventTraceSamplesResponse),
+				)
+				.handle("executePromql", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const result = yield* mapExecError(
+							promql.widget(tenant, {
+								query: payload.query,
+								startTime: payload.startTime,
+								endTime: payload.endTime,
+								...(payload.legendFormat === undefined
+									? undefined
+									: { legendFormat: payload.legendFormat }),
+								...(payload.minStepSeconds === undefined
+									? undefined
+									: { minStepSeconds: payload.minStepSeconds }),
+								...(payload.maxDataPoints === undefined
+									? undefined
+									: { maxDataPoints: payload.maxDataPoints }),
+								...(payload.displayType === undefined
+									? undefined
+									: { displayType: payload.displayType }),
+							}),
+							"promql query failed",
+						).pipe(
+							// A query that does not parse or cannot run is the author's to fix: a 400 with the reason.
+							Effect.catchTags({
+								"@maple/backend/promql/PromqlBadQueryError": (error) =>
+									Effect.fail(
+										new QueryEngineValidationError({
+											message: `Invalid PromQL: ${error.message}`,
+											details:
+												error.position === undefined
+													? []
+													: [`position ${error.position}`],
+										}),
+									),
+								"@maple/backend/promql/PromqlExecutionError": (error) =>
+									Effect.fail(
+										new QueryEngineValidationError({
+											message: error.message,
+											details: [],
+										}),
+									),
+							}),
+						)
+						return new PromqlExecuteResponse({
+							data: result.rows,
+							meta: {
+								resultType: result.resultType,
+								seriesCount: result.seriesCount,
+								stepSeconds: result.stepSeconds,
+								...(result.warnings.length === 0 ? undefined : { warnings: result.warnings }),
+							},
+						})
+					}),
+				)
+				// The PromQL editor's autocomplete: label names, or one label's values (`__name__`: metrics).
+				.handle("discoverPromql", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const query = {
+							startMs: parseWarehouseDateTime(payload.startTime),
+							endMs: parseWarehouseDateTime(payload.endTime),
+							matches: payload.match === undefined ? [] : [payload.match],
+							limit: payload.limit ?? 500,
+						}
+						const data = yield* mapExecError(
+							(payload.label === undefined
+								? promql.labelNames(tenant, query)
+								: promql.labelValues(tenant, { ...query, name: payload.label })
+							).pipe(Effect.map((answer) => answer.data)),
+							"promql discovery failed",
+						).pipe(
+							Effect.catchTags({
+								"@maple/backend/promql/PromqlBadQueryError": (error) =>
+									Effect.fail(
+										new QueryEngineValidationError({
+											message: `Invalid PromQL: ${error.message}`,
+											details: [],
+										}),
+									),
+								"@maple/backend/promql/PromqlExecutionError": (error) =>
+									Effect.fail(
+										new QueryEngineValidationError({
+											message: error.message,
+											details: [],
+										}),
+									),
+							}),
+						)
+						return new PromqlDiscoverResponse({ data })
+					}),
 				)
 				.handle("executeRawSql", ({ payload }) =>
 					Effect.gen(function* () {

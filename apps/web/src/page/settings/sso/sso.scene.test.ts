@@ -112,8 +112,11 @@ describe("sso tab", () => {
 			{ update, view },
 			given(model),
 			expectView(text("Only admins can change SSO and SCIM settings.")).toExist(),
-			expectView(role("button", { name: "Add domain" })).not.toExist(),
-			expectView(role("button", { name: "Edit" })).not.toExist(),
+			expectView(role("button", { name: "Add domain" })).toBeDisabled(),
+			expectView(role("button", { name: "Edit" })).toBeDisabled(),
+			expectView(
+				role("group", { name: "Only org admins can manage single sign-on and SCIM provisioning." }),
+			).toExist(),
 		)
 		expect(names(update(model, Message.ClickedConfirmEnforce()))).toEqual([])
 		expect(names(update(model, Message.ClickedSetUpScim()))).toEqual([])
@@ -277,7 +280,7 @@ describe("sso tab", () => {
 		expect(names(update(signed, Message.SubmittedConnection()))).toEqual(["SaveSsoConnection"])
 	})
 
-	test("an org that left Enterprise can still relax SSO and pause or remove SCIM, but not set anything up", () => {
+	test("an org that left Enterprise can still relax SSO, pause or remove SCIM, and replace its credentials", () => {
 		const model = loaded(
 			doc({
 				ssoEntitled: false,
@@ -297,8 +300,54 @@ describe("sso tab", () => {
 			given(model),
 			expectView(role("switch", { name: "Require SSO" })).toBeEnabled(),
 			expectView(role("button", { name: "Pause" })).toExist(),
-			expectView(role("button", { name: "Edit" })).not.toExist(),
-			expectView(role("button", { name: "Rotate token" })).not.toExist(),
+			expectView(role("button", { name: "Edit" })).toBeEnabled(),
+			expectView(role("button", { name: "Rotate token" })).toBeEnabled(),
+			// Setting things up still needs the add-on.
+			expectView(role("button", { name: "Add domain" })).not.toExist(),
+			expectView(role("button", { name: "Add member" })).not.toExist(),
+		)
+		const editing = update(model, Message.ClickedEditConnection()).model
+		scene(
+			{ update, view },
+			given(editing),
+			dialogMounted,
+			expectView(
+				text(/you can replace the certificate, the IdP metadata or the client secret/),
+			).toExist(),
+		)
+		expect(update(model, Message.ClickedConfirmRotate()).commands?.[0]).toMatchObject({
+			name: "IssueScimToken",
+			args: { kind: "rotate" },
+		})
+	})
+
+	test("a member sees the state the API sends them: no endpoint, groups or break-glass list", () => {
+		const model = loaded(
+			doc({
+				domains: [verifiedDomain],
+				connection: {
+					...connection,
+					enforced: true,
+					acsUrl: null,
+					spEntityId: null,
+					spMetadataUrl: null,
+					idpMetadataUrl: null,
+				},
+				directory: { enabled: true, paused: false, createdAt: CREATED },
+			}),
+			false,
+		)
+		scene(
+			{ update, view },
+			given(model),
+			expectView(text("Required")).toExist(),
+			expectView(text("SCIM 2.0")).toExist(),
+			expectView(text("Active")).toExist(),
+			expectView(text("Endpoint URL")).not.toExist(),
+			expectView(text("ACS URL")).not.toExist(),
+			expectView(text("Break-glass access")).not.toExist(),
+			expectView(text("Role mapping")).not.toExist(),
+			expectView(role("button", { name: "Rotate token" })).toBeDisabled(),
 		)
 	})
 
@@ -315,7 +364,7 @@ describe("sso tab", () => {
 			{ update, view: withViewInputs(ssoView, { isKnownMember: false })() },
 			given(loaded(doc({ domains: [verifiedDomain], connection }), false)),
 			expectView(text("Only admins can change SSO and SCIM settings.")).not.toExist(),
-			expectView(role("button", { name: "Edit" })).not.toExist(),
+			expectView(role("button", { name: "Edit" })).toBeDisabled(),
 		)
 	})
 
