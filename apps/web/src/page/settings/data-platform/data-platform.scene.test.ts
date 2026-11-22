@@ -2,12 +2,13 @@ import {
 	OrgClickHouseApplySchemaStarted,
 	OrgClickHouseApplySchemaStatus,
 	OrgClickHouseSettingsResponse,
+	OrgRetentionResponse,
 } from "@maple/domain/http"
 import { Result, Schema, Array as Arr } from "effect"
 import { describe, expect, test } from "vitest"
 import { PageOutMessage } from "../../contract"
 import { Message, type Model } from "./model"
-import { init, isRunActive, update } from "./update"
+import { init, isRetentionHidden, isRunActive, update } from "./update"
 
 const names = (commands: ReadonlyArray<{ readonly name: string }> | undefined) =>
 	Arr.map(commands ?? [], ({ name }) => name)
@@ -98,5 +99,74 @@ describe("data platform tab", () => {
 		const late = answer(done.model, 2, "running")
 		expect(late.outMessage).toBeUndefined()
 		expect(isRunActive(late.model)).toBe(false)
+	})
+
+	const retention = (maxAgeDays: number | null) =>
+		Schema.decodeSync(OrgRetentionResponse)({
+			maxAgeDays,
+			maxBytes: null,
+			instanceMaxDays: null,
+			instanceMaxBytes: null,
+			lastSweepAt: null,
+			lastSweepDropped: null,
+		})
+
+	test("retention loads on open, Save sends the typed days, and blank clears the limit", () => {
+		expect(names(init().commands)).toEqual(expect.arrayContaining(["FetchOrgRetention", "FetchOrgStorage"]))
+		const read = update(init().model, Message.CompletedFetchRetention({ result: Result.succeed(retention(30)) })).model
+		const typed = update(read, Message.ChangedRetentionDays({ value: "14" })).model
+		expect(update(typed, Message.ClickedSaveRetention()).commands?.[0]).toMatchObject({
+			name: "SaveOrgRetention",
+			args: { maxAgeDays: 14, maxBytes: null },
+		})
+		const blank = update(read, Message.ChangedRetentionDays({ value: " " })).model
+		expect(update(blank, Message.ClickedSaveRetention()).commands?.[0]).toMatchObject({
+			args: { maxAgeDays: null },
+		})
+	})
+
+	test("Save sends the typed max storage in bytes, blank clears it, and a bad value does not save", () => {
+		const read = update(init().model, Message.CompletedFetchRetention({ result: Result.succeed(retention(null)) })).model
+		const typed = update(read, Message.ChangedMaxGb({ value: "5" })).model
+		expect(update(typed, Message.ClickedSaveRetention()).commands?.[0]).toMatchObject({
+			args: { maxAgeDays: null, maxBytes: 5_000_000_000 },
+		})
+		const half = update(read, Message.ChangedMaxGb({ value: "0.5" })).model
+		expect(update(half, Message.ClickedSaveRetention()).commands?.[0]).toMatchObject({
+			args: { maxBytes: 500_000_000 },
+		})
+		const bad = update(read, Message.ChangedMaxGb({ value: "-1" })).model
+		expect(update(bad, Message.ClickedSaveRetention()).commands).toBeUndefined()
+	})
+
+	test("an invalid days value does not save, and a saved value replaces the draft", () => {
+		const bad = update(init().model, Message.ChangedRetentionDays({ value: "0" })).model
+		expect(update(bad, Message.ClickedSaveRetention()).commands).toBeUndefined()
+		const saving = update(
+			update(init().model, Message.ChangedRetentionDays({ value: "7" })).model,
+			Message.ClickedSaveRetention(),
+		).model
+		const done = update(saving, Message.CompletedSaveRetention({ result: Result.succeed(retention(7)) }))
+		expect(done.model.retentionDraft).toBeNull()
+		expect(done.model.isSavingRetention).toBe(false)
+	})
+
+	test("the panel is hidden once the API says the caller may not manage the warehouse", () => {
+		expect(isRetentionHidden(init().model)).toBe(false)
+		const forbidden = update(
+			init().model,
+			Message.CompletedFetchRetention({
+				result: Result.fail({
+					_tag: "@maple/http/errors/OrgClickHouseSettingsForbiddenError",
+					type: "api_error",
+					code: "clickhouse_settings_forbidden",
+					title: "Permission required",
+					message: "Only org admins can manage the data warehouse",
+					retryable: false,
+					recovery: "request_access",
+				} as never),
+			}),
+		).model
+		expect(isRetentionHidden(forbidden)).toBe(true)
 	})
 })

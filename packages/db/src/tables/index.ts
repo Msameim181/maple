@@ -68,6 +68,7 @@ import { OAuthConnections, OAuthAuthStates } from "./oauth-connections"
 import { OrgOnboardingState } from "./onboarding"
 import { OrgClickHouseSchemaApplyRuns } from "./org-clickhouse-schema-apply-runs"
 import { OrgClickHouseSettings } from "./org-clickhouse-settings"
+import { OrgRetentionSettings } from "./org-retention-settings"
 import { OrgIngestAttributeMappings } from "./org-ingest-attribute-mappings"
 import { OrgIngestRules, OrgIngestRuleSettings, OrgIngestRuleStats } from "./org-ingest-rules"
 import { OrgIngestKeys } from "./org-ingest-keys"
@@ -177,6 +178,7 @@ export * from "./oauth-connections"
 export * from "./onboarding"
 export * from "./org-clickhouse-schema-apply-runs"
 export * from "./org-clickhouse-settings"
+export * from "./org-retention-settings"
 export * from "./org-ingest-attribute-mappings"
 export * from "./org-ingest-rules"
 export * from "./org-ingest-keys"
@@ -283,6 +285,7 @@ export const allTables: ReadonlyArray<PgSchemaTable<string, ColumnDefs>> = [
 	OrgOnboardingState,
 	OrgClickHouseSchemaApplyRuns,
 	OrgClickHouseSettings,
+	OrgRetentionSettings,
 	OrgIngestAttributeMappings,
 	OrgIngestRules,
 	OrgIngestRuleSettings,

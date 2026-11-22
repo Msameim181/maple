@@ -3,6 +3,8 @@ import {
 	OrgClickHouseApplySchemaStatus,
 	OrgClickHouseSchemaDiffResponse,
 	OrgClickHouseSettingsResponse,
+	OrgRetentionResponse,
+	OrgStorageResponse,
 } from "@maple/domain/http"
 import { Schema } from "effect"
 import { AsyncData } from "foldkit"
@@ -37,6 +39,13 @@ export const Model = Schema.Struct({
 	applyStatusSent: Schema.Number,
 	applyStatusAnswered: Schema.Number,
 	usage: AsyncData.Schema(Totals, LoadFailure).schema,
+	retention: AsyncData.Schema(OrgRetentionResponse, LoadFailure).schema,
+	storage: AsyncData.Schema(OrgStorageResponse, LoadFailure).schema,
+	/** The days field as typed, `null` while it shows the saved value. */
+	retentionDraft: Schema.NullOr(Schema.String),
+	/** The max-storage field (GB) as typed, `null` while it shows the saved value. */
+	maxGbDraft: Schema.NullOr(Schema.String),
+	isSavingRetention: Schema.Boolean,
 	/** The connection edits, `null` while the form shows the saved values. */
 	draft: Schema.NullOr(ConnectionDraft),
 	/** After a save, the saved values it started from: the edits stay until the refetch moves. */
@@ -60,6 +69,12 @@ export const Message = defineMessageUnion({
 	CompletedFetchDiff: done(OrgClickHouseSchemaDiffResponse),
 	CompletedFetchApplyStatus: { sequence: Schema.Number, ...done(OrgClickHouseApplySchemaStatus) },
 	CompletedFetchUsage: done(Totals),
+	CompletedFetchRetention: done(OrgRetentionResponse),
+	CompletedFetchStorage: done(OrgStorageResponse),
+	ChangedRetentionDays: { value: Schema.String },
+	ChangedMaxGb: { value: Schema.String },
+	ClickedSaveRetention: {},
+	CompletedSaveRetention: done(OrgRetentionResponse),
 	ChangedConnection: { field: ConnectionField, value: Schema.String },
 	ChangedPassword: { value: Schema.String },
 	ClickedSave: {},

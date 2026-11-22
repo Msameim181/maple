@@ -30,6 +30,10 @@ const notConfigured = () =>
 export interface ClickHouseAdminApi {
 	/** Runs one statement as the ClickHouse admin; no database is selected. */
 	readonly exec: (sql: string) => Effect.Effect<void, DirectoryPersistenceError>
+	/** Runs one read statement and returns its rows (JSONEachRow). */
+	readonly query: (
+		sql: string,
+	) => Effect.Effect<ReadonlyArray<Record<string, unknown>>, DirectoryPersistenceError>
 }
 
 /** DDL against the self-hosted ClickHouse with the admin credentials, over its HTTP interface. */
@@ -40,7 +44,7 @@ export class ClickHouseAdmin extends Context.Service<ClickHouseAdmin, ClickHouse
 			const env = yield* Env
 			const httpClient = yield* HttpClient.HttpClient
 
-			const exec = Effect.fn("ClickHouseAdmin.exec")(function* (sql: string) {
+			const send = Effect.fnUntraced(function* (sql: string) {
 				if (
 					Option.isNone(env.MAPLE_SELFHOST_CLICKHOUSE_URL) ||
 					Option.isNone(env.MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER)
@@ -78,9 +82,26 @@ export class ClickHouseAdmin extends Context.Service<ClickHouseAdmin, ClickHouse
 						message: `ClickHouse refused the statement (${status}): ${Str.slice(0, 300)(text)}`,
 					})
 				}
+				return text
 			})
 
-			return { exec } satisfies ClickHouseAdminApi
+			const exec = Effect.fn("ClickHouseAdmin.exec")(function* (sql: string) {
+				yield* send(sql)
+			})
+
+			const query = Effect.fn("ClickHouseAdmin.query")(function* (sql: string) {
+				const text = yield* send(`${sql} FORMAT JSONEachRow`)
+				return yield* Effect.try({
+					try: () =>
+						text
+							.split("\n")
+							.filter((line) => line.length > 0)
+							.map((line) => JSON.parse(line) as Record<string, unknown>),
+					catch: () => new DirectoryPersistenceError({ message: "ClickHouse returned unreadable rows" }),
+				})
+			})
+
+			return { exec, query } satisfies ClickHouseAdminApi
 		}),
 	},
 ) {

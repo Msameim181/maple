@@ -94,6 +94,10 @@ Checked on a copy of a running stack with data: all new database migrations appl
 
 Rotate an organization's ingest keys from **Settings, Ingestion** (admins).
 
+## Disk full
+
+If the ClickHouse disk fills up, run `scripts/retention-emergency.sh status`, then `truncate-system-logs` and `free --target-free-percent 15` from `deploy/docker`. It works with the rest of the stack down. The commands, safety checks and the full-disk fallback are in [Data retention](/docs/self-hosting/multi-tenant/data-retention#disk-full-emergency). Setting `MAPLE_CLICKHOUSE_MIN_FREE_PERCENT` makes the hourly sweep do the same automatically.
+
 ## Keycloak admin account
 
 The first admin (`KEYCLOAK_ADMIN_USER` / `KEYCLOAK_ADMIN_PASSWORD`) is a **temporary** account, meant for bootstrapping. Its password also sits in `.env`. Replace it:

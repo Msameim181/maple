@@ -2,6 +2,7 @@ import { HttpApiBuilder } from "effect/http-api"
 import { CurrentTenant, MapleInternalApi } from "@maple/domain/http"
 import { Effect } from "effect"
 import { recordHttpAudit } from "@maple/backend/services/audit/AuditLogService"
+import { RetentionService } from "@maple/backend/services/org/RetentionService"
 import { OrgClickHouseSettingsService } from "@maple/backend/services/org/OrgClickHouseSettingsService"
 
 export const HttpOrgClickHouseSettingsLive = HttpApiBuilder.group(
@@ -10,6 +11,7 @@ export const HttpOrgClickHouseSettingsLive = HttpApiBuilder.group(
 	(handlers) =>
 		Effect.gen(function* () {
 			const service = yield* OrgClickHouseSettingsService
+			const retention = yield* RetentionService
 
 			return handlers
 				.handle("get", () =>
@@ -59,6 +61,24 @@ export const HttpOrgClickHouseSettingsLive = HttpApiBuilder.group(
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
 						return yield* service.collectorConfig(tenant.orgId, tenant.roles)
+					}),
+				)
+				.handle("getRetention", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						return yield* retention.get(tenant.orgId, tenant.roles)
+					}),
+				)
+				.handle("setRetention", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						return yield* retention.set(tenant.orgId, tenant.userId, tenant.roles, payload)
+					}),
+				)
+				.handle("getStorage", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						return yield* retention.storage(tenant.orgId, tenant.roles)
 					}),
 				)
 				.handle("delete", () =>

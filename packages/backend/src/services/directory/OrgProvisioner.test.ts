@@ -88,6 +88,7 @@ const makeHarness = (testDb: TestDb) => {
 	)
 	const admin = Layer.succeed(ClickHouseAdmin)({
 		exec: (sql) => Effect.sync(() => void statements.push(sql)),
+		query: () => Effect.succeed([]),
 	})
 	// The real deletion service needs every integration's secrets, so this stands in for its purge of
 	// the org-scoped directory rows; the provisioner removes the directory org row itself.

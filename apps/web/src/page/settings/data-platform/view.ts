@@ -3,6 +3,8 @@ import type {
 	OrgClickHouseApplySchemaStatus,
 	OrgClickHouseSchemaDiffResponse,
 	OrgClickHouseSettingsResponse,
+	OrgRetentionResponse,
+	OrgStorageResponse,
 } from "@maple/domain/http"
 import { EMPTY_VALUE, formatNumber, formatStorageBytes } from "@maple/ui/lib/format"
 import { TONE_TEXT } from "@maple/ui/lib/tone"
@@ -36,7 +38,7 @@ import { relativeTime } from "../../kit/relative-time"
 import { statRail, statRailItem } from "../../kit/stat-rail"
 import { settingsSection, settingsSections } from "../../kit/settings-section"
 import { type ConnectionField, Message, type Model, type Totals } from "./model"
-import { draftOf, isRunActive } from "./update"
+import { BYTES_PER_GB, draftOf, isRetentionHidden, isRunActive, maxBytesOf, retentionDaysOf } from "./update"
 import { statusDot } from "@maple/views/ui/status-dot"
 import { typography, typographyClass } from "@maple/views/ui/typography"
 import { hstack, vstack } from "@maple/views/ui/stack"
@@ -724,6 +726,207 @@ const usageSection = (h: H, model: Model): Html => {
 	)
 }
 
+const RETENTION_PRESETS = [7, 14, 30, 90] as const
+const MAX_GB_PRESETS = [1, 5, 10, 50] as const
+
+const storageTable = (h: H, storage: OrgStorageResponse): Html =>
+	vstack(h, { gap: "0" }, [
+		...(storage.tables.length === 0
+			? [
+					typography(h, { size: "sm", tone: "muted", className: "px-4 py-3" }, [
+						"No data stored yet.",
+					]),
+				]
+			: Arr.map(storage.tables, (table) =>
+					hstack(
+						h,
+						{ align: "center", justify: "between", gap: "4", className: "border-b px-4 py-2 text-xs" },
+						[
+							typography(h, { size: "xs", mono: true, as: "span" }, [table.table]),
+							hstack(h, { gap: "4", className: "tabular-nums text-muted-foreground" }, [
+								h.span([], [`${formatNumber(table.rows)} rows`]),
+								h.span([], [`${table.partitions} ${table.partitions === 1 ? "partition" : "partitions"}`]),
+								typography(h, { size: "xs", as: "span" }, [formatStorageBytes(table.bytes)]),
+							]),
+						],
+					),
+				)),
+		hstack(h, { align: "center", justify: "between", className: "px-4 py-2 text-xs font-medium" }, [
+			h.span([], ["Total"]),
+			typography(h, { size: "xs", weight: "medium", numeric: true, as: "span" }, [formatStorageBytes(storage.totalBytes)]),
+		]),
+	])
+
+const usageBar = (h: H, used: number, cap: number): Html =>
+	vstack(h, { gap: "1" }, [
+		h.div(
+			[h.Class("bg-muted h-2 w-full overflow-hidden rounded-full")],
+			[
+				h.div(
+					[
+						h.Class(used > cap ? "bg-destructive h-full" : "bg-primary h-full"),
+						h.Style({ width: `${Math.min(100, (used / cap) * 100)}%` }),
+					],
+					[],
+				),
+			],
+		),
+		typography(h, { size: "xs", tone: "muted" }, [
+			`${formatStorageBytes(used)} of ${formatStorageBytes(cap)} used`,
+		]),
+	])
+
+const retentionPanel = (
+	h: H,
+	model: Model,
+	retention: OrgRetentionResponse,
+	storage: OrgStorageResponse | null,
+	inputs: Inputs,
+): Html => {
+	const days = retentionDaysOf(model)
+	const maxBytes = maxBytesOf(model)
+	const gbText =
+		model.maxGbDraft ?? (retention.maxBytes === null ? "" : String(retention.maxBytes / BYTES_PER_GB))
+	// The server ceiling applies to an org with no cap of its own.
+	const effectiveCap = retention.maxBytes ?? retention.instanceMaxBytes
+	const text =
+		model.retentionDraft ?? (retention.maxAgeDays === null ? "" : String(retention.maxAgeDays))
+	return panel(h, { className: "overflow-hidden" }, [
+		vstack(h, { gap: "3", className: "p-4" }, [
+			textField(h, {
+				name: "retention-days",
+				label: "Keep data for (days)",
+				type: "number",
+				placeholder: "Default retention",
+				value: text,
+				isDisabled: model.isSavingRetention,
+				description:
+					retention.instanceMaxDays === null
+						? "Raw logs, traces and metrics older than this are dropped. Blank keeps each table's built-in limit (30 to 90 days); a value above it has no effect."
+						: `Raw logs, traces and metrics older than this are dropped. This server caps it at ${retention.instanceMaxDays} days.`,
+				onInput: (value) => Message.ChangedRetentionDays({ value }),
+			}),
+			hstack(
+				h,
+				{ gap: "2", align: "center" },
+				Arr.map(RETENTION_PRESETS, (preset) =>
+					button(
+						h,
+						{
+							variant: "outline",
+							size: "sm",
+							isDisabled: model.isSavingRetention,
+							attributes: [h.OnClick(Message.ChangedRetentionDays({ value: String(preset) }))],
+						},
+						[`${preset}d`],
+					),
+				),
+			),
+			textField(h, {
+				name: "retention-max-gb",
+				label: "Max storage (GB)",
+				type: "number",
+				placeholder: "No cap",
+				value: gbText,
+				isDisabled: model.isSavingRetention,
+				description:
+					(retention.instanceMaxBytes === null
+						? ""
+						: `This server caps it at ${formatStorageBytes(retention.instanceMaxBytes)}. `) +
+					"Approximate: checked on each sweep, which drops the oldest whole days of raw data until the database is under the cap. Today's data is never dropped.",
+				onInput: (value) => Message.ChangedMaxGb({ value }),
+			}),
+			hstack(
+				h,
+				{ gap: "2", align: "center" },
+				Arr.map(MAX_GB_PRESETS, (preset) =>
+					button(
+						h,
+						{
+							variant: "outline",
+							size: "sm",
+							isDisabled: model.isSavingRetention,
+							attributes: [h.OnClick(Message.ChangedMaxGb({ value: String(preset) }))],
+						},
+						[`${preset} GB`],
+					),
+				),
+			),
+			...(effectiveCap !== null && storage !== null ? [usageBar(h, storage.totalBytes, effectiveCap)] : []),
+		]),
+		hstack(
+			h,
+			{
+				align: "center",
+				justify: "between",
+				wrap: true,
+				className: "bg-surface-sunken gap-x-4 gap-y-2 border-t px-4 py-3",
+			},
+			[
+				typography(
+					h,
+					{ size: "xs", tone: "muted" },
+					retention.lastSweepAt === null
+						? ["No sweep has run yet."]
+						: [
+								"Last sweep ",
+								relativeTime(h, {
+									value: retention.lastSweepAt,
+									nowMs: inputs.nowMs,
+									timeZone: inputs.timeZone,
+								}),
+								`, dropped ${retention.lastSweepDropped ?? 0} daily ${retention.lastSweepDropped === 1 ? "partition" : "partitions"}.`,
+							],
+				),
+				button(
+					h,
+					{
+						size: "sm",
+						isLoading: model.isSavingRetention,
+						isDisabled: model.isSavingRetention || days === "invalid" || maxBytes === "invalid",
+						attributes: [h.OnClick(Message.ClickedSaveRetention())],
+					},
+					["Save retention"],
+				),
+			],
+		),
+	])
+}
+
+const retentionSection = (h: H, model: Model, inputs: Inputs): Html =>
+	settingsSection(
+		h,
+		{
+			id: "data-platform-retention-heading",
+			title: "Retention & storage",
+			description: ["How long this organization keeps raw telemetry, and what it uses on disk."],
+			framed: false,
+		},
+		[
+			vstack(h, { gap: "4" }, [
+				AsyncData.matchData(model.retention, {
+					onEmpty: () => skeleton(h, "h-48 w-full rounded-md"),
+					onFailure: (failure) => errorState(h, { failure, title: "Couldn't load retention" }),
+					onData: (data) =>
+						retentionPanel(
+							h,
+							model,
+							data,
+							AsyncData.getOrElse(model.storage, () => null),
+							inputs,
+						),
+				}),
+				panel(h, { className: "overflow-hidden" }, [
+					AsyncData.matchData(model.storage, {
+						onEmpty: () => skeleton(h, "h-40 w-full"),
+						onFailure: (failure) => errorState(h, { failure, title: "Couldn't load storage" }),
+						onData: (data) => storageTable(h, data),
+					}),
+				]),
+			]),
+		],
+	)
+
 export const view = Submodel.defineView<Model, Message, Inputs>((model, inputs, h) => {
 	const settings = AsyncData.getOrElse(model.settings, () => null)
 	return settingsSections(h, [
@@ -745,5 +948,6 @@ export const view = Submodel.defineView<Model, Message, Inputs>((model, inputs, 
 		),
 		...(settings?.configured === true ? [schemaSection(h, model, settings, inputs)] : []),
 		usageSection(h, model),
+		...(isRetentionHidden(model) ? [] : [retentionSection(h, model, inputs)]),
 	])
 })
