@@ -26,7 +26,8 @@ const harness = (instanceMax?: string) => {
 		query: (sql) =>
 			Effect.sync(() => {
 				queried.push(sql)
-				if (!sql.includes("table = 'traces'")) return []
+				// system.parts.partition reads `2026-10-01` for toDate(); only partition_id is `20261001`.
+				if (!sql.includes("table = 'traces'") || !sql.includes("partition_id AS partition")) return []
 				return [
 					{ partition: "20261001", bytes: "100" },
 					{ partition: "20261115", bytes: "50" },

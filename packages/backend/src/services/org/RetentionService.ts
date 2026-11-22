@@ -24,7 +24,7 @@ import { ClickHouseAdmin, orgDatabaseName } from "@maple/backend/services/direct
 
 const toIso = Schema.decodeSync(IsoDateTimeString)
 const DAY_MS = 86_400_000
-/** Daily partitions (`toDate(...)`) have ids like `20261101`; anything else is never dropped. */
+/** Daily partitions (`toDate(...)`) have partition_id like `20261101` (`partition` reads `2026-11-01`, which `DROP PARTITION ID` rejects); anything else is never dropped. */
 const DAILY_PARTITION = /^\d{8}$/u
 /** The table allowlist: raw tables only, never input. */
 const SWEEP_TABLES = Object.keys(RETENTION_TABLE_TTL_DAYS) as ReadonlyArray<keyof typeof RETENTION_TABLE_TTL_DAYS>
@@ -159,7 +159,7 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 				Effect.gen(function* () {
 					const name = yield* dbNameFor(orgId)
 					const rows = yield* admin.query(
-						`SELECT table, sum(rows) AS rows, sum(bytes_on_disk) AS bytes, uniqExact(partition) AS partitions, min(partition) AS oldest FROM system.parts WHERE database = '${name}' AND active GROUP BY table ORDER BY bytes DESC`,
+						`SELECT table, sum(rows) AS rows, sum(bytes_on_disk) AS bytes, uniqExact(partition_id) AS partitions, min(partition_id) AS oldest FROM system.parts WHERE database = '${name}' AND active GROUP BY table ORDER BY bytes DESC`,
 					)
 					const tables = Arr.map(rows, (row) => {
 						const oldest = String(row.oldest ?? "")
@@ -202,7 +202,7 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 						const days = Math.min(maxAgeDays, RETENTION_TABLE_TTL_DAYS[table])
 						const cutoff = new Date(nowMs - days * DAY_MS).toISOString().slice(0, 10).replaceAll("-", "")
 						const parts = yield* admin.query(
-							`SELECT partition, sum(bytes_on_disk) AS bytes FROM system.parts WHERE database = '${name}' AND table = '${table}' AND active GROUP BY partition`,
+							`SELECT partition_id AS partition, sum(bytes_on_disk) AS bytes FROM system.parts WHERE database = '${name}' AND table = '${table}' AND active GROUP BY partition_id`,
 						)
 						for (const part of parts) {
 							const partition = String(part.partition)
