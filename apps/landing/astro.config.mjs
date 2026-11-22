@@ -67,11 +67,14 @@ const telemetryEnv = {
 // maple.dev by default. The GitHub Pages build for a fork sets ASTRO_SITE / ASTRO_BASE
 // (e.g. https://user.github.io and /maple), see .github/workflows/selfhost-docs.yml.
 const SITE = process.env.ASTRO_SITE?.trim() || "https://maple.dev"
+const BASE = process.env.ASTRO_BASE?.trim() || "/"
+// What the sitemap and SEO checks treat as the site root: the site plus its sub-path, if any.
+const SITE_ROOT = BASE === "/" ? SITE : SITE + BASE.replace(/\/+$/, "")
 const DIST = new URL("./dist/", import.meta.url).pathname
 
 export default defineConfig({
 	site: SITE,
-	base: process.env.ASTRO_BASE?.trim() || "/",
+	base: BASE,
 	trailingSlash: "ignore",
 	redirects: {
 		// The monthly release became individual entries.
@@ -143,11 +146,11 @@ export default defineConfig({
 			},
 			// Only pages that are their own canonical: a locale URL that falls back to
 			// English, and every 404, points elsewhere or is not for the index.
-			filter: (page) => sitemapIncludes(DIST, SITE, page),
-			serialize: (item) => sitemapEntry(DIST, SITE, item),
+			filter: (page) => sitemapIncludes(DIST, SITE_ROOT, page),
+			serialize: (item) => sitemapEntry(DIST, SITE_ROOT, item),
 		}),
 		// After the sitemap: it also checks that the sitemap still lists the home page.
-		buildSeo({ site: SITE }),
+		buildSeo({ site: SITE_ROOT }),
 	],
 	vite: {
 		plugins: [
