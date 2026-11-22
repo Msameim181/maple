@@ -1,7 +1,7 @@
 import {
 	searchConsoleSiteLabel,
 	type SearchConsoleIntegrationStatus,
-	type SearchConsoleSiteChoice,
+	SearchConsoleSiteChoice,
 	type SearchConsoleSiteStatus,
 } from "@maple/domain/http"
 import { AsyncData } from "foldkit"
@@ -13,7 +13,6 @@ import { choiceCard, choiceCheckClass } from "@maple/views/ui/choice-card"
 import { badge } from "@maple/views/ui/display"
 import { errorState } from "@maple/views/ui/error-state"
 import { icon } from "@maple/views/ui/icon"
-import { itemContent, mediaCard } from "@maple/views/ui/item"
 import { skeletonBlock } from "@maple/views/ui/skeleton"
 import { typography } from "@maple/views/ui/typography"
 import { hstack, vstack } from "@maple/views/ui/stack"
@@ -24,19 +23,26 @@ import {
 	integrationEmptyFooter,
 	integrationEmptyHint,
 	integrationEmptyMedia,
-	integrationIconPlate,
 } from "../kit/integration-empty"
 import { Message } from "./message"
 import { canManage, type Model } from "./model"
-import { isDirty, permissionLabel, selectionOf, unavailableSaved } from "./search-console"
-import { disconnectDialog } from "./view-disconnect"
+import { gatedControl } from "../kit/session-grants"
+import {
+	isDirty,
+	permissionLabel,
+	SearchConsoleMessage,
+	selectionOf,
+	unavailableSaved,
+} from "./search-console"
+import { connectedIntegrationCard, integrationStatusCard } from "./view-integration-card"
 import { providerBrand } from "../kit/providers"
+
+/** A Search Console message, as the hub carries it. */
+const toHub = (message: SearchConsoleMessage): Message => Message.GotSearchConsoleMessage({ message })
 
 type H = HtmlBuilder<Message>
 
 const BRAND = providerBrand("google-search-console")
-
-const ADMIN_ONLY = "Only org admins and engineers can change the Google Search Console connection."
 
 /**
  * From the click until the status re-read after Google's popup lands: the popup is out, or the
@@ -78,20 +84,18 @@ const notConnected = (h: H, model: Model, status: SearchConsoleIntegrationStatus
 							? "Checking the connection with Google."
 							: "Your Search Console properties will appear here after you connect a Google account.",
 			]),
-			button(
-				h,
-				{
-					isDisabled: !status.configured || !canManage(model) || model.disconnect.isPending,
-					isLoading: connecting,
-					attributes: [h.OnClick(Message.ClickedConnect())],
-				},
-				connecting ? ["Connecting to Google"] : [icon(h, "GoogleIcon"), "Connect Google"],
+			gatedControl(h, model, "integrations:manage", (isLocked) =>
+				button(
+					h,
+					{
+						isDisabled: !status.configured || isLocked || model.disconnect.isPending,
+						isLoading: connecting,
+						attributes: [h.OnClick(Message.ClickedConnect())],
+					},
+					connecting ? ["Connecting to Google"] : [icon(h, "GoogleIcon"), "Connect Google"],
+				),
 			),
-			integrationEmptyFooter(h, [
-				canManage(model)
-					? "Maple asks for read-only access to your Search Console data."
-					: ADMIN_ONLY,
-			]),
+			integrationEmptyFooter(h, ["Maple asks for read-only access to your Search Console data."]),
 		]),
 	])
 }
@@ -121,7 +125,7 @@ const siteOption = (
 			isChecked,
 			isDisabled: isLocked || !site.selectable,
 			label,
-			onChange: Message.ToggledSearchConsoleSite({ siteUrl: site.siteUrl }),
+			onChange: toHub(SearchConsoleMessage.ToggledSite({ siteUrl: site.siteUrl })),
 			className: "items-center gap-3 px-3 py-2.5",
 		},
 		[
@@ -146,6 +150,30 @@ const unavailableNote = (h: H, siteUrls: ReadonlyArray<string>): Html =>
 			", ",
 		)}.`,
 	])
+
+/**
+ * What a viewer who cannot manage sees: the imported properties, from the status, or that there
+ * are none yet. Google's own list is a manager's read.
+ */
+const importedList = (
+	h: H,
+	status: SearchConsoleIntegrationStatus,
+	list: (sites: ReadonlyArray<SearchConsoleSiteChoice>) => Html,
+): Html => {
+	const imported = Arr.map(
+		Arr.filter(status.sites, (site) => site.enabled),
+		(site) =>
+			new SearchConsoleSiteChoice({
+				siteUrl: site.siteUrl,
+				permissionLevel: site.permissionLevel,
+				selectable: true,
+				enabled: true,
+			}),
+	)
+	return imported.length === 0
+		? typography(h, { size: "xs", tone: "muted", as: "p" }, ["No properties are imported yet."])
+		: list(imported)
+}
 
 const sitePicker = (h: H, model: Model, status: SearchConsoleIntegrationStatus): Html => {
 	const card = model.searchConsoleCard
@@ -174,35 +202,35 @@ const sitePicker = (h: H, model: Model, status: SearchConsoleIntegrationStatus):
 		])
 	return vstack(h, { gap: "3" }, [
 		heading(h, { level: 4, variant: "subsection" }, ["Properties to import"]),
-		AsyncData.match(card.sites.data, {
-			onIdle: () => skeletonBlock(h, { height: "32" }),
-			onLoading: () => skeletonBlock(h, { height: "32" }),
-			onFailure: (failure) =>
-				errorState(h, {
-					failure,
-					title: "Couldn't load your Search Console properties",
-					onRetry: Message.ClickedRetrySearchConsoleSites(),
-				}),
-			onStale: ({ data }) => list(data.sites),
-			onRefreshing: (data) => list(data.sites),
-			onSuccess: (data) => list(data.sites),
-		}),
-		...(canManage(model)
-			? [
-					hstack(h, { gap: "2" }, [
-						button(
-							h,
-							{
-								size: "sm",
-								isDisabled: !isDirty(card, status) || card.isSaving,
-								isLoading: card.isSaving,
-								attributes: [h.OnClick(Message.ClickedSaveSearchConsoleSites())],
-							},
-							["Save properties"],
-						),
-					]),
-				]
-			: []),
+		canManage(model)
+			? AsyncData.match(card.sites.data, {
+					onIdle: () => skeletonBlock(h, { height: "32" }),
+					onLoading: () => skeletonBlock(h, { height: "32" }),
+					onFailure: (failure) =>
+						errorState(h, {
+							failure,
+							title: "Couldn't load your Search Console properties",
+							onRetry: toHub(SearchConsoleMessage.ClickedRetrySites()),
+						}),
+					onStale: ({ data }) => list(data.sites),
+					onRefreshing: (data) => list(data.sites),
+					onSuccess: (data) => list(data.sites),
+				})
+			: importedList(h, status, list),
+		hstack(h, { gap: "2" }, [
+			gatedControl(h, model, "integrations:manage", (isLocked) =>
+				button(
+					h,
+					{
+						size: "sm",
+						isDisabled: isLocked || !isDirty(card, status) || card.isSaving,
+						isLoading: card.isSaving,
+						attributes: [h.OnClick(toHub(SearchConsoleMessage.ClickedSave()))],
+					},
+					["Save properties"],
+				),
+			),
+		]),
 	])
 }
 
@@ -210,73 +238,61 @@ const connected = (h: H, model: Model, status: SearchConsoleIntegrationStatus): 
 	const reconnecting =
 		model.connect.isStarting || model.connect.active?.provider === "google-search-console"
 	const busy = reconnecting || model.disconnect.isPending
-	return mediaCard(h, integrationIconPlate(h, BRAND), [
-		itemContent(
-			h,
-			[
-				vstack(h, { gap: "1" }, [
-					hstack(h, { gap: "2" }, [
-						heading(h, { level: 3, variant: "section" }, ["Google Search Console"]),
-						status.revoked
-							? badge(h, { variant: "warn" }, ["Revoked"])
-							: badge(h, { variant: "ok" }, ["Connected"]),
-					]),
-					typography(h, { size: "xs", tone: "muted", as: "p" }, [
-						status.revoked
-							? "Google rejected Maple's access, so Search Console data no longer imports. Reconnect to resume."
-							: status.accountEmail === null
-								? "Choose the properties Maple imports each day."
-								: `Connected as ${status.accountEmail}. Choose the properties Maple imports each day.`,
-					]),
-				]),
-				...(status.revoked ? [] : [sitePicker(h, model, status)]),
-				canManage(model)
-					? hstack(h, { gap: "2", align: "stretch", wrap: true }, [
-							button(
-								h,
-								{
-									size: "sm",
-									variant: status.revoked ? "default" : "outline",
-									isDisabled: busy || !status.configured,
-									isLoading: reconnecting,
-									attributes: [h.OnClick(Message.ClickedConnect())],
-								},
-								["Reconnect"],
-							),
-							button(
-								h,
-								{
-									size: "sm",
-									variant: "outline",
-									isDisabled: busy,
-									isLoading: model.disconnect.isPending,
-									attributes: [h.OnClick(Message.ClickedDisconnect())],
-								},
-								["Disconnect"],
-							),
-						])
-					: typography(h, { size: "2xs", tone: "muted", as: "p" }, [ADMIN_ONLY]),
-				disconnectDialog(h, model, "google-search-console"),
-			],
-			"gap-4",
-		),
-	])
+	return connectedIntegrationCard(h, model, {
+		integration: "google-search-console",
+		brand: BRAND,
+		title: "Google Search Console",
+		badge: status.revoked
+			? badge(h, { variant: "warn" }, ["Revoked"])
+			: badge(h, { variant: "ok" }, ["Connected"]),
+		titleWraps: false,
+		summary: [
+			status.revoked
+				? "Google rejected Maple's access, so Search Console data no longer imports. Reconnect to resume."
+				: status.accountEmail === null
+					? "Choose the properties Maple imports each day."
+					: `Connected as ${status.accountEmail}. Choose the properties Maple imports each day.`,
+		],
+		summaryLayout: "stacked",
+		body: status.revoked ? [] : [sitePicker(h, model, status)],
+		actions: hstack(h, { gap: "2", align: "stretch", wrap: true }, [
+			gatedControl(h, model, "integrations:manage", (isLocked) =>
+				button(
+					h,
+					{
+						size: "sm",
+						variant: status.revoked ? "default" : "outline",
+						isDisabled: isLocked || busy || !status.configured,
+						isLoading: reconnecting,
+						attributes: [h.OnClick(Message.ClickedConnect())],
+					},
+					["Reconnect"],
+				),
+			),
+			gatedControl(h, model, "integrations:manage", (isLocked) =>
+				button(
+					h,
+					{
+						size: "sm",
+						variant: "outline",
+						isDisabled: isLocked || busy,
+						isLoading: model.disconnect.isPending,
+						attributes: [h.OnClick(Message.ClickedDisconnect())],
+					},
+					["Disconnect"],
+				),
+			),
+		]),
+		contentGap: "gap-4",
+	})
 }
 
 const byState = (h: H, model: Model, data: SearchConsoleIntegrationStatus): Html =>
 	data.connected ? connected(h, model, data) : notConnected(h, model, data)
 
 export const searchConsoleCard = (h: H, model: Model): Html =>
-	AsyncData.match(model.statuses.searchConsole.data, {
-		onIdle: () => skeletonBlock(h, { height: "32" }),
-		onLoading: () => skeletonBlock(h, { height: "32" }),
-		onFailure: (failure) =>
-			errorState(h, {
-				failure,
-				title: "Couldn't load the Google Search Console integration",
-				onRetry: Message.ClickedRetryStatus({ name: "searchConsole" }),
-			}),
-		onStale: ({ data }) => byState(h, model, data),
-		onRefreshing: (data) => byState(h, model, data),
-		onSuccess: (data) => byState(h, model, data),
+	integrationStatusCard(h, model.statuses.searchConsole, {
+		name: "searchConsole",
+		failureTitle: "Couldn't load the Google Search Console integration",
+		render: (data) => byState(h, model, data),
 	})

@@ -20,10 +20,10 @@ import {
 	queryFirstRow,
 	type TestDb,
 } from "@maple/backend/testing/test-pglite"
-import { AutumnClient } from "@maple/backend/services/billing/autumn-http"
 import { OrgClickHouseSettingsService } from "@maple/backend/services/org/OrgClickHouseSettingsService"
-import { OrganizationRegionService } from "@maple/backend/services/org/OrganizationRegionService"
-import { OrganizationService } from "@maple/backend/services/org/OrganizationService"
+import { AuditLogService } from "@maple/backend/services/audit/AuditLogService"
+import { DeleteOrganizationResponse } from "@maple/domain/http"
+import { OrganizationDeletionService } from "@maple/backend/services/org/OrganizationDeletionService"
 import { DirectoryService } from "./DirectoryService"
 import { EmailService } from "@maple/backend/platform/EmailService"
 import { MembershipRevocationService } from "@maple/backend/services/auth/MembershipRevocationService"
@@ -89,11 +89,16 @@ const makeHarness = (testDb: TestDb) => {
 	const admin = Layer.succeed(ClickHouseAdmin)({
 		exec: (sql) => Effect.sync(() => void statements.push(sql)),
 	})
-	const organizations = Layer.effect(OrganizationService, OrganizationService.make).pipe(
-		Layer.provide(
-			Layer.mergeAll(AutumnClient.layer, OrganizationRegionService.servesAll, FetchHttpClient.layer),
-		),
-	)
+	// The real deletion service needs every integration's secrets, so this stands in for its purge of
+	// the org-scoped directory rows; the provisioner removes the directory org row itself.
+	const organizations = Layer.succeed(OrganizationDeletionService)({
+		delete: (orgId) =>
+			Effect.promise(async () => {
+				await executeSql(testDb, "DELETE FROM directory_members WHERE org_id = $1", [orgId])
+				await executeSql(testDb, "DELETE FROM directory_invitations WHERE org_id = $1", [orgId])
+				return new DeleteOrganizationResponse({ deleted: true })
+			}),
+	})
 	const provisioner = Layer.effect(OrgProvisioner, OrgProvisioner.make).pipe(
 		Layer.provide(Layer.mergeAll(admin, OrgClickHouseSettingsService.layer, organizations)),
 	)
@@ -104,7 +109,12 @@ const makeHarness = (testDb: TestDb) => {
 	})
 	const noEmail = Layer.succeed(EmailService)({ isConfigured: false, send: () => Effect.void })
 	const directory = Layer.effect(DirectoryService, DirectoryService.make).pipe(
-		Layer.provide(Layer.mergeAll(provisioner, noOidc, noEmail, MembershipRevocationService.layer)),
+		Layer.provide(Layer.mergeAll(
+				provisioner,
+				noOidc,
+				noEmail,
+				MembershipRevocationService.layer.pipe(Layer.provide(AuditLogService.layerMemory)),
+			)),
 	)
 	const layer = Layer.mergeAll(directory, OrgClickHouseSettingsService.layer).pipe(
 		Layer.provide(

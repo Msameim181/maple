@@ -15,8 +15,7 @@ mod rules_gateway;
 mod sources;
 mod task_protection;
 
-use std::collections::HashSet;
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -42,15 +41,17 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::DateTime;
 use dashmap::DashMap;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use hmac::{Hmac, Mac};
 use maple_ingest::ai_session;
+use maple_ingest::audit_trail;
 use maple_ingest::aws::CredentialsProvider as AwsCredentialsProvider;
 use maple_ingest::aws_metric_stream;
 use maple_ingest::clickhouse_insert_mappings::SCHEMA_VERSION as CLICKHOUSE_SCHEMA_VERSION;
 use maple_ingest::decode_budget::{self, DecodeMemory, DecodeReservation, OtlpSignal};
-use maple_ingest::decompress::{gunzip_bounded, gunzip_declared, gunzip_len_bounded, GunzipError};
+use maple_ingest::decompress::{
+    gunzip_bounded, gunzip_declared, gunzip_len_bounded, snappy_declared_len, unsnap_declared,
+    GunzipError, SnappyError,
+};
 use maple_ingest::gcp_logging;
 use maple_ingest::gcp_push_auth::{GooglePushAuth, PushAuthError};
 use maple_ingest::host_identity;
@@ -62,17 +63,25 @@ use maple_ingest::otel::{
     record_stage_error, rejection_loses_data, resolve_config_internal_span, ResourceConfig,
 };
 use maple_ingest::otlp_json;
+use maple_ingest::profiles;
+use maple_ingest::prometheus_remote_write;
 use maple_ingest::r2::{replay_object_key, ReplayBlobStore};
+use maple_ingest::row_budget::{self, ForwardBody, RowEstimate, ROW_PIECE_BYTES};
 use maple_ingest::session_analytics::{
     derive_referrer_host, sanitize_product_event, sanitize_session_event, sanitize_session_meta,
     BillableSessionStarts,
 };
 use maple_ingest::telemetry::{
-    AttributeMappingRule, ClickHouseBreakerConfig, ClickHouseTarget, ClickHouseTargetProvider,
-    DatasourceNames, ExportDestination, HttpClient, MappingOperation, MappingSourceContext,
-    PipelineError, SamplingPolicy, TelemetryPipeline, TelemetrySignal, TinybirdConfig,
+    AcceptStats, AttributeMappingRule, ClickHouseBreakerConfig, ClickHouseTarget,
+    ClickHouseTargetProvider, DatasourceNames, ExportDestination, HttpClient, MappingOperation,
+    MappingSourceContext, PipelineError, PlannedFailure, RowBatchesError, RowSource,
+    SamplingPolicy, TelemetryPipeline, TelemetrySignal, TinybirdConfig,
 };
 use maple_ingest::usage_metrics::{billable_gb, usage_cardinality_view, UsageMetrics};
+use maple_ingest::vercel_ai_gateway_drain;
+use maple_ingest::vercel_event_drains::{self, EventDrain};
+use maple_ingest::vercel_logs;
+use maple_ingest::vercel_traces;
 use maple_ingest::wal_store::WalSegmentStore;
 use moka::future::Cache;
 use opentelemetry::trace::TracerProvider as _;
@@ -83,6 +92,9 @@ use opentelemetry_otlp::{
 };
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::collector::profiles::v1development::{
+    ExportProfilesPartialSuccess, ExportProfilesServiceRequest, ExportProfilesServiceResponse,
+};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::{any_value, AnyValue, InstrumentationScope, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
@@ -177,6 +189,11 @@ struct AppConfig {
     /// Ceiling on what decoding one OTLP payload may allocate, estimated before
     /// decoding (`decode_budget`); past it the request is a 413.
     max_decode_heap_bytes: u64,
+    /// `INGEST_MAX_ROW_EXPANSION`: how many times its metered bytes a request's rows
+    /// may come to; past it the request is a 413. 0 turns the ceiling off.
+    max_row_expansion: u64,
+    /// Row bytes a request's rows are built and written in at a time (`ROW_PIECE_BYTES`).
+    row_piece_bytes: u64,
     /// Process-wide memory for request bodies being decoded, shared by every
     /// request; past it a request is shed with a retryable 503.
     decode_memory_bytes: u64,
@@ -201,6 +218,9 @@ struct AppConfig {
     org_routing_cache_ttl_secs: u64,
     /// `INGEST_RULES_ENABLED` (default on): apply customer drop/redact rules. Off reads nothing and costs nothing.
     ingest_rules_enabled: bool,
+    /// `INGEST_AUDIT_TRAIL_ENABLED` (default off): keep provider audit events in
+    /// the audit trail instead of as logs. See `stores_audit_trail`.
+    audit_trail_enabled: bool,
     /// `INGEST_RULES_CACHE_TTL_SECS`: how long an org's compiled rules are reused.
     ingest_rules_cache_ttl_secs: u64,
     /// Ceiling on the total decompressed rrweb payload a single replay session
@@ -237,6 +257,24 @@ struct AppConfig {
     /// `INGEST_BLOCKED_KEYS`: keys refused at origin whatever header spelling carries them.
     blocked_ingest_keys: Arc<HashSet<String>>,
 }
+
+/// Decode memory one request holds at every ceiling at once: its body, the
+/// inflated body and its decode heap, a KiB per part for rounding, and room for
+/// a piece of its rows twice over.
+fn largest_decode_request_bytes(
+    max_request_body_bytes: usize,
+    max_decoded_body_bytes: usize,
+    max_decode_heap_bytes: u64,
+) -> u64 {
+    (max_request_body_bytes as u64)
+        .saturating_add(max_decoded_body_bytes as u64)
+        .saturating_add(max_decode_heap_bytes)
+        .saturating_add(3 * 1024)
+        .saturating_add(2 * ROW_PIECE_BYTES)
+}
+
+/// The default `INGEST_MAX_ROW_EXPANSION`.
+const DEFAULT_MAX_ROW_EXPANSION: u64 = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WriteMode {
@@ -299,6 +337,12 @@ enum KeyStoreBackend {
 }
 
 impl AppConfig {
+    /// Whether provider audit events go to the audit trail. Off, or on a gateway
+    /// that only forwards and so has no such table, they stay logs.
+    fn stores_audit_trail(&self) -> bool {
+        self.audit_trail_enabled && self.write_mode.uses_tinybird()
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "one branch per environment variable, read in the order the deployment docs list \
@@ -459,6 +503,8 @@ impl AppConfig {
                 .unwrap_or_else(|_| "session_events".to_owned()),
             datasource_product_events: std::env::var("INGEST_TINYBIRD_DATASOURCE_PRODUCT_EVENTS")
                 .unwrap_or_else(|_| "product_events".to_owned()),
+            datasource_profiles: std::env::var("INGEST_TINYBIRD_DATASOURCE_PROFILES")
+                .unwrap_or_else(|_| profiles::DATASOURCE.to_owned()),
         };
         if write_mode.uses_tinybird() {
             tinybird.validate()?;
@@ -489,12 +535,20 @@ impl AppConfig {
             std::env::var("INGEST_MAX_DECODE_HEAP_BYTES").ok(),
             768 * 1024 * 1024,
         )?;
-        // Holds one request at every ceiling at once, inside the 1536 MiB task; raised
-        // to that if set lower (plus a KiB per part for rounding), so it always admits one.
-        let largest_request = (max_request_body_bytes as u64)
-            .saturating_add(max_decoded_body_bytes as u64)
-            .saturating_add(max_decode_heap_bytes)
-            .saturating_add(3 * 1024);
+        // A row repeats its resource, scope and metric strings, so a request can store
+        // far more than it is metered on. Real telemetry stores 3 to 13 times its
+        // decoded size, and up to 200 times with a JVM command line on every row.
+        let max_row_expansion = parse_u64(
+            "INGEST_MAX_ROW_EXPANSION",
+            std::env::var("INGEST_MAX_ROW_EXPANSION").ok(),
+            DEFAULT_MAX_ROW_EXPANSION,
+        )?;
+        // Raised to at least one request at every ceiling, so one always gets through.
+        let largest_request = largest_decode_request_bytes(
+            max_request_body_bytes,
+            max_decoded_body_bytes,
+            max_decode_heap_bytes,
+        );
         let decode_memory_bytes = parse_u64(
             "INGEST_DECODE_MEMORY_BYTES",
             std::env::var("INGEST_DECODE_MEMORY_BYTES").ok(),
@@ -549,12 +603,11 @@ impl AppConfig {
         let clickhouse_secret_keyring = match &key_store_backend {
             // The Postgres key store decrypts BYO-ClickHouse credentials from
             // org_clickhouse_settings, so it needs the encryption keys.
-            KeyStoreBackend::Postgres { .. } => {
-                let primary = std::env::var("MAPLE_INGEST_KEY_ENCRYPTION_KEY")
-                    .map_err(|_| "MAPLE_INGEST_KEY_ENCRYPTION_KEY is required".to_owned())?;
-                let decrypt_only = std::env::var("MAPLE_INGEST_KEY_DECRYPTION_KEYS").ok();
-                Some(SecretKeyring::parse(&primary, decrypt_only.as_deref())?)
-            }
+            KeyStoreBackend::Postgres { .. } => Some(SecretKeyring::from_env_values(
+                std::env::var(CH_PASSWORD_SLOT_KEYS_ENV).ok().as_deref(),
+                std::env::var("MAPLE_INGEST_KEY_ENCRYPTION_KEY").ok().as_deref(),
+                std::env::var("MAPLE_INGEST_KEY_DECRYPTION_KEYS").ok().as_deref(),
+            )?),
             KeyStoreBackend::Static { .. } => None,
         };
 
@@ -623,6 +676,14 @@ impl AppConfig {
             "INGEST_RULES_ENABLED",
             std::env::var("INGEST_RULES_ENABLED").ok(),
             true,
+        )?;
+        // Off by default. Turn it on once the table exists and every running task
+        // is a build that reads the audit trail's WAL frames: an older build that
+        // recovers one drops the rest of that segment.
+        let audit_trail_enabled = parse_bool(
+            "INGEST_AUDIT_TRAIL_ENABLED",
+            std::env::var("INGEST_AUDIT_TRAIL_ENABLED").ok(),
+            false,
         )?;
         let ingest_rules_cache_ttl_secs = parse_u64(
             "INGEST_RULES_CACHE_TTL_SECS",
@@ -768,6 +829,8 @@ impl AppConfig {
             max_request_body_bytes,
             max_decoded_body_bytes,
             max_decode_heap_bytes,
+            max_row_expansion,
+            row_piece_bytes: ROW_PIECE_BYTES,
             decode_memory_bytes,
             org_max_in_flight,
             rate_limit_fleet_size,
@@ -785,6 +848,7 @@ impl AppConfig {
             ingest_key_cache_ttl_secs,
             org_routing_cache_ttl_secs,
             ingest_rules_enabled,
+            audit_trail_enabled,
             ingest_rules_cache_ttl_secs,
             replay_max_session_bytes,
             replay_blob_store,
@@ -902,6 +966,18 @@ impl moka::Expiry<String, Duration> for SourceUseExpiry {
     ) -> Option<Duration> {
         Some(*interval)
     }
+
+    /// An insert over an expired, not yet evicted entry is an update. moka's default keeps the
+    /// old remaining time, which is none once expired, so the entry would never expire again.
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        interval: &Duration,
+        _updated_at: Instant,
+        _duration_until_expiry: Option<Duration>,
+    ) -> Option<Duration> {
+        Some(*interval)
+    }
 }
 
 /// A cached answer for one `maple_source_id` claim. The pause window is kept
@@ -917,6 +993,8 @@ enum SourceClaim {
 struct VerifiedClaims {
     active: Vec<String>,
     paused: Vec<String>,
+    /// The store could not be asked: a claim in neither list may still be the org's.
+    unresolved: bool,
 }
 
 fn source_claims_cache(ttl: Duration) -> Cache<(String, String), SourceClaim> {
@@ -1015,6 +1093,15 @@ struct AttributeMappingResolver {
     store: Arc<dyn KeyStore>,
     cache: Cache<String, Arc<Vec<AttributeMappingRule>>>,
 }
+
+/// Each org's Vercel project names by project id, for `vercel_traces::restate`.
+struct VercelProjectNameResolver {
+    store: Arc<dyn KeyStore>,
+    cache: Cache<String, Arc<HashMap<String, String>>>,
+}
+
+/// Short enough that a project the API's hourly poller discovers is named soon after.
+const VERCEL_PROJECT_NAMES_TTL: Duration = Duration::from_mins(5);
 
 struct ClickHouseTargetResolver {
     store: Arc<dyn KeyStore>,
@@ -1123,6 +1210,14 @@ trait KeyStore: Send + Sync {
         &self,
         org_id: &str,
     ) -> Result<Vec<AttributeMappingRow>, String>;
+
+    /// `(project_id, name)` of the org's Vercel projects.
+    async fn fetch_vercel_project_names(
+        &self,
+        _org_id: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        Ok(Vec::new())
+    }
 
     /// The org's enabled ingest rules in `position` order, and its hash salt.
     async fn fetch_ingest_rules(&self, org_id: &str) -> Result<IngestRuleRows, String>;
@@ -1416,6 +1511,9 @@ const BROWSER_SESSIONS_FEATURE_ID: &str = "browser_sessions";
 /// server-side one; only the transport differs).
 const PRODUCT_EVENTS_FEATURE_ID: &str = "product_events";
 
+/// The Autumn feature profiles bill as, in GB of decoded OTLP profiles like the byte signals.
+const PROFILES_FEATURE_ID: &str = "profiles";
+
 /// What a DENIED Autumn entitlement means for the batch in flight.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OnDenied {
@@ -1560,6 +1658,7 @@ struct AppState {
     gcp_inflight_limiter: OrgInFlightLimiter,
     sampling_resolver: SamplingPolicyResolver,
     attribute_mapping_resolver: AttributeMappingResolver,
+    vercel_project_name_resolver: VercelProjectNameResolver,
     /// Each org's compiled ingest rules; inert unless `INGEST_RULES_ENABLED`.
     ingest_rule_resolver: IngestRuleResolver,
     /// Per-rule counts awaiting the next flush to `org_ingest_rule_stats`.
@@ -1708,6 +1807,8 @@ enum GcpPushOutcome {
     SourcePaused,
     /// The org's ingest rules need more scanning than one entry may use; redelivery would too.
     RulesScanBudget,
+    /// An audit log entry, stored in the audit trail instead of the logs.
+    AuditEvent,
 }
 
 #[derive(Clone, Copy)]
@@ -1770,6 +1871,39 @@ impl Signal {
     }
 }
 
+/// What a request body holds: an OTLP export, or a sender's own format that is
+/// mapped onto OTLP.
+#[derive(Clone, Copy)]
+enum Ingress {
+    Otlp(Signal),
+    VercelLogDrain,
+    VercelAiGatewayDrain,
+    VercelEventDrain(EventDrain),
+    /// Prometheus remote write 1.0, mapped to OTLP metrics.
+    PrometheusRemoteWrite,
+}
+
+impl Ingress {
+    fn signal(self) -> Signal {
+        match self {
+            Self::Otlp(signal) => signal,
+            Self::PrometheusRemoteWrite => Signal::Metrics,
+            Self::VercelLogDrain | Self::VercelEventDrain(_) => Signal::Logs,
+            Self::VercelAiGatewayDrain => Signal::Traces,
+        }
+    }
+
+    fn route(self) -> String {
+        match self {
+            Self::Otlp(signal) => format!("/v1/{}", signal.path()),
+            Self::VercelLogDrain => "/v1/logpush/vercel".to_owned(),
+            Self::VercelAiGatewayDrain => "/v1/vercel/ai-gateway".to_owned(),
+            Self::VercelEventDrain(drain) => drain.route().to_owned(),
+            Self::PrometheusRemoteWrite => prometheus_remote_write::ROUTE.to_owned(),
+        }
+    }
+}
+
 enum DecodedPayload {
     Traces(ExportTraceServiceRequest),
     Logs(ExportLogsServiceRequest),
@@ -1809,18 +1943,47 @@ impl DecodedPayload {
         }
     }
 
-    fn encode(&self, payload_format: PayloadFormat) -> Result<Vec<u8>, ApiError> {
-        match (self, payload_format) {
-            (Self::Traces(request), PayloadFormat::Protobuf) => Ok(request.encode_to_vec()),
-            (Self::Logs(request), PayloadFormat::Protobuf) => Ok(request.encode_to_vec()),
-            (Self::Metrics(request), PayloadFormat::Protobuf) => Ok(request.encode_to_vec()),
-            (Self::Traces(request), PayloadFormat::Json) => serde_json::to_vec(request)
-                .map_err(|_| ApiError::service_unavailable("Failed to serialize traces payload")),
-            (Self::Logs(request), PayloadFormat::Json) => serde_json::to_vec(request)
-                .map_err(|_| ApiError::service_unavailable("Failed to serialize logs payload")),
-            (Self::Metrics(request), PayloadFormat::Json) => serde_json::to_vec(request)
-                .map_err(|_| ApiError::service_unavailable("Failed to serialize metrics payload")),
+    /// The rows this payload would be stored as, unsampled: what a collector it is
+    /// forwarded to writes.
+    fn rows(&self, org_id: &str) -> RowEstimate {
+        match self {
+            Self::Traces(request) => {
+                row_budget::trace_rows(org_id, request, &SamplingPolicy::default(), &[])
+            }
+            Self::Logs(request) => row_budget::log_rows(request),
+            Self::Metrics(request) => row_budget::metric_rows(request),
         }
+    }
+
+    /// The body this payload is forwarded as, costed so it is reserved before it is built.
+    fn forward_body(
+        &self,
+        payload_format: PayloadFormat,
+        gzip: bool,
+    ) -> Result<ForwardBody, ApiError> {
+        let json = matches!(payload_format, PayloadFormat::Json);
+        match self {
+            Self::Traces(request) => ForwardBody::of(request, json, gzip),
+            Self::Logs(request) => ForwardBody::of(request, json, gzip),
+            Self::Metrics(request) => ForwardBody::of(request, json, gzip),
+        }
+        .map_err(|_| self.serialize_failed())
+    }
+
+    fn encode(&self, body: &ForwardBody) -> Result<Vec<u8>, ApiError> {
+        match self {
+            Self::Traces(request) => body.build(request),
+            Self::Logs(request) => body.build(request),
+            Self::Metrics(request) => body.build(request),
+        }
+        .map_err(|_| self.serialize_failed())
+    }
+
+    fn serialize_failed(&self) -> ApiError {
+        ApiError::service_unavailable(format!(
+            "Failed to serialize {} payload",
+            self.signal().path()
+        ))
     }
 }
 
@@ -2038,6 +2201,18 @@ static INGEST_PAYLOAD_TOO_LARGE: FailureKind = FailureKind {
     retry_after_seconds: None,
 };
 
+/// A request whose rows come to far more than it is metered on, because each
+/// repeats a long resource, scope or metric string.
+static INGEST_ROW_EXPANSION: FailureKind = FailureKind {
+    tag: "@maple/ingest/RowExpansion",
+    code: "ingest_row_expansion",
+    title: "Batch repeats its shared attributes too many times",
+    recovery: "fix_request",
+    retryable: false,
+    error_kind: "row_expansion",
+    retry_after_seconds: None,
+};
+
 static INGEST_RATE_LIMITED: FailureKind = FailureKind {
     tag: "@maple/ingest/RateLimited",
     code: "ingest_rate_limited",
@@ -2177,6 +2352,18 @@ static INGEST_QUEUE_UNAVAILABLE: FailureKind = FailureKind {
     retryable: true,
     error_kind: "queue_unavailable",
     retry_after_seconds: Some(5),
+};
+
+/// A batch whose rows are more than the org's queue (or its WAL lane or channel)
+/// could ever hold at once, refused before any of it is written.
+static INGEST_ROWS_EXCEED_QUEUE: FailureKind = FailureKind {
+    tag: "@maple/ingest/RowsExceedQueue",
+    code: "ingest_rows_exceed_queue",
+    title: "Batch is larger than the ingest queue can hold",
+    recovery: "fix_request",
+    retryable: false,
+    error_kind: "rows_exceed_queue",
+    retry_after_seconds: None,
 };
 
 /// The decoded payload could not be encoded for the warehouse. This is a
@@ -2502,6 +2689,12 @@ fn api_error_from_pipeline(error: &PipelineError) -> ApiError {
             "Maple could not encode this batch for storage. Resending the same payload will fail again — contact support with this request's trace id.",
         )
         .with_detail(detail.clone()),
+        PipelineError::TooLarge(detail) => ApiError::tagged(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &INGEST_ROWS_EXCEED_QUEUE,
+            "This batch's stored rows are larger than the ingest queue can hold at once. No data was written; send it in smaller batches.",
+        )
+        .with_detail(detail.clone()),
     }
 }
 
@@ -2519,11 +2712,9 @@ fn collector_unavailable(message: &'static str, detail: impl Into<String>) -> Ap
 
 /// Resolve the deployment environment in maple's canonical priority order.
 /// MAPLE_ENVIRONMENT is what apps/api/alchemy.run.ts and friends set via
-/// resolveDeploymentEnvironment(stage); RAILWAY_ENVIRONMENT_NAME is Railway's
-/// free runtime label; DEPLOYMENT_ENV is a manual override of last resort.
+/// resolveDeploymentEnvironment(stage); DEPLOYMENT_ENV is a manual override of last resort.
 fn resolve_deployment_env() -> String {
     std::env::var("MAPLE_ENVIRONMENT")
-        .or_else(|_| std::env::var("RAILWAY_ENVIRONMENT_NAME"))
         .or_else(|_| std::env::var("DEPLOYMENT_ENV"))
         .unwrap_or_else(|_| "development".to_owned())
 }
@@ -3139,6 +3330,13 @@ async fn main() {
             store: Arc::clone(&store),
             cache: attribute_mapping_cache,
         },
+        vercel_project_name_resolver: VercelProjectNameResolver {
+            store: Arc::clone(&store),
+            cache: Cache::builder()
+                .time_to_live(VERCEL_PROJECT_NAMES_TTL)
+                .max_capacity(10_000)
+                .build(),
+        },
         ingest_rule_resolver: IngestRuleResolver::new(
             Arc::clone(&store),
             config.ingest_rules_enabled,
@@ -3189,25 +3387,7 @@ async fn main() {
 
     let grpc_state = Arc::clone(&state);
     let request_timeout = config.request_timeout;
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/ready", get(ready))
-        .route("/v1/traces", post(handle_traces))
-        .route("/v1/logs", post(handle_logs))
-        .route("/v1/metrics", post(handle_metrics))
-        .route("/v1/sessionReplays/meta", post(handle_replay_meta))
-        .route("/v1/sessionReplays/blob", post(handle_replay_blob))
-        .route("/v1/sessionEvents", post(handle_session_events))
-        .route("/v1/events", post(handle_product_events))
-        .route(
-            "/v1/logpush/cloudflare/http_requests/{connector_id}",
-            post(handle_cloudflare_logpush_http_requests),
-        )
-        .route("/v1/logpush/gcp/{connector_id}", post(handle_gcp_logpush))
-        .route(
-            "/v1/firehose/aws/{connection_id}",
-            post(handle_aws_firehose),
-        )
+    let app = ingest_routes()
         .layer(cors)
         .layer(DefaultBodyLimit::max(config.max_request_body_bytes))
         .with_state(state);
@@ -3480,10 +3660,11 @@ async fn grpc_admission(
     response
 }
 
-/// An export `grpc_admission` decoded, with its size as received.
+/// An export `grpc_admission` decoded, with its size as received and the decode
+/// memory it holds.
 struct GrpcExport {
     decoded: DecodedPayload,
-    decoded_bytes: usize,
+    received: Received,
 }
 
 /// Carries a `GrpcExport` through the request extensions, which must be `Clone`,
@@ -3554,7 +3735,18 @@ async fn decode_grpc_export(
         payload,
         decoded_bytes,
         memory,
-    } = decode_otlp_body(state, message, gzip, signal, PayloadFormat::Protobuf)
+        prometheus: _,
+    } = decode_otlp_body(
+        state,
+        message,
+        if gzip {
+            BodyEncoding::Gzip
+        } else {
+            BodyEncoding::Identity
+        },
+        Ingress::Otlp(signal),
+        PayloadFormat::Protobuf,
+    )
         .await
         .map_err(|DecodeRefusal { error, .. }| match error.status {
             StatusCode::PAYLOAD_TOO_LARGE => tonic::Status::resource_exhausted(error.message),
@@ -3564,7 +3756,10 @@ async fn decode_grpc_export(
     Ok((
         GrpcExport {
             decoded: payload,
-            decoded_bytes,
+            received: Received {
+                bytes: decoded_bytes,
+                decode_heap: memory.held_bytes(),
+            },
         },
         memory,
     ))
@@ -3794,19 +3989,13 @@ async fn serve_grpc_export<T>(
         .extensions_mut()
         .remove::<GrpcExportSlot>()
         .and_then(|slot| slot.take());
-    let (mut decoded, decoded_bytes) = match export {
-        Some(export) => (export.decoded, export.decoded_bytes),
-        None => (empty(request.into_inner()), 0),
+    let (mut decoded, received) = match export {
+        Some(export) => (export.decoded, export.received),
+        None => (empty(request.into_inner()), Received::unbudgeted(0)),
     };
     let (admission, claims) = admit_grpc_claims(state, admission, &mut decoded, &resolved).await;
     accept_grpc_decoded(
-        state,
-        signal,
-        decoded,
-        &resolved,
-        admission,
-        decoded_bytes,
-        &claims,
+        state, signal, decoded, &resolved, admission, received, &claims,
     )
     .await
 }
@@ -3834,7 +4023,7 @@ async fn admit_grpc_claims(
 
 /// Accept a decoded export, already authenticated and entitlement-gated by
 /// `grpc_admission`.
-/// `decoded_bytes` is the export's size as received; only the share the claims and
+/// `received` is the export's size as received; only the share the claims and
 /// ingest rules leave is metered.
 async fn accept_grpc_decoded(
     state: &AppState,
@@ -3842,7 +4031,7 @@ async fn accept_grpc_decoded(
     mut decoded: DecodedPayload,
     resolved: &ResolvedIngestKey,
     admission: KeyAdmission,
-    decoded_bytes: usize,
+    received: Received,
     claims: &ClaimOutcome,
 ) -> Result<(), tonic::Status> {
     // The sentinel token is a PUBLIC constant, so anything it carries is never
@@ -3871,6 +4060,7 @@ async fn accept_grpc_decoded(
         &mut decoded,
         resolved,
         &mut retained,
+        received,
     )
     .await;
 
@@ -3890,7 +4080,7 @@ async fn accept_grpc_decoded(
             state
                 .resolver
                 .note_claimed_source_use(&claims.claimed_sources);
-            let decoded_bytes = retained.metered_bytes(decoded_bytes);
+            let decoded_bytes = retained.metered_bytes(received.bytes);
             if resolved.org_id != SENTINEL_ORG_ID && decoded_bytes > 0 {
                 if let Some(usage) = &state.usage_metrics {
                     usage.record(
@@ -3976,6 +4166,36 @@ async fn ready(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// Every HTTP route the gateway serves, before its layers and state.
+fn ingest_routes() -> Router<Arc<AppState>> {
+    with_profiles_routes(Router::new())
+        .route("/health", get(health))
+        .route("/ready", get(ready))
+        .route("/v1/traces", post(handle_traces))
+        .route("/v1/logs", post(handle_logs))
+        .route("/v1/metrics", post(handle_metrics))
+        .route(
+            prometheus_remote_write::ROUTE,
+            post(handle_prometheus_write),
+        )
+        .route("/v1/sessionReplays/meta", post(handle_replay_meta))
+        .route("/v1/sessionReplays/blob", post(handle_replay_blob))
+        .route("/v1/sessionEvents", post(handle_session_events))
+        .route("/v1/events", post(handle_product_events))
+        .route(
+            "/v1/logpush/cloudflare/http_requests/{connector_id}",
+            post(handle_cloudflare_logpush_http_requests),
+        )
+        .route("/v1/logpush/gcp/{connector_id}", post(handle_gcp_logpush))
+        .route("/v1/logpush/vercel", post(handle_vercel_logpush))
+        .route("/v1/vercel/ai-gateway", post(handle_vercel_ai_gateway))
+        .route("/v1/vercel/{drain}", post(handle_vercel_event_drain))
+        .route(
+            "/v1/firehose/aws/{connection_id}",
+            post(handle_aws_firehose),
+        )
+}
+
 // The request entry points (`handle_*`, `handle_*_inner`, `accept_grpc_decoded`)
 // are deliberately not `#[hotpath::measure]`d: wrapping their futures pushed the
 // fully-inlined request state machine over the 2 MB tokio worker stack
@@ -3988,7 +4208,7 @@ async fn handle_traces(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_signal(state, headers, body, Signal::Traces).await
+    handle_signal(state, headers, body, Ingress::Otlp(Signal::Traces)).await
 }
 
 async fn handle_logs(
@@ -3996,7 +4216,7 @@ async fn handle_logs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_signal(state, headers, body, Signal::Logs).await
+    handle_signal(state, headers, body, Ingress::Otlp(Signal::Logs)).await
 }
 
 async fn handle_metrics(
@@ -4004,7 +4224,347 @@ async fn handle_metrics(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    handle_signal(state, headers, body, Signal::Metrics).await
+    handle_signal(state, headers, body, Ingress::Otlp(Signal::Metrics)).await
+}
+
+/// Prometheus remote write, authenticated by the org's ingest key like OTLP,
+/// which Prometheus sends as a bearer token or as the basic-auth password.
+async fn handle_prometheus_write(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_signal(state, headers, body, Ingress::PrometheusRemoteWrite).await
+}
+
+/// A Vercel log drain, authenticated by the org's ingest key like OTLP.
+async fn handle_vercel_logpush(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_signal(state, headers, body, Ingress::VercelLogDrain).await
+}
+
+/// A Vercel AI Gateway drain, authenticated by the org's ingest key like OTLP.
+async fn handle_vercel_ai_gateway(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    handle_signal(state, headers, body, Ingress::VercelAiGatewayDrain).await
+}
+
+/// A Vercel Speed Insights, Web Analytics or Audit Log drain, authenticated by
+/// the org's ingest key like OTLP.
+async fn handle_vercel_event_drain(
+    State(state): State<Arc<AppState>>,
+    Path(drain): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(drain) = EventDrain::from_path(&drain) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if drain == EventDrain::AuditLog && state.config.stores_audit_trail() {
+        return handle_vercel_audit_trail(state, headers, body).await;
+    }
+    handle_signal(state, headers, body, Ingress::VercelEventDrain(drain)).await
+}
+
+/// Vercel's Audit Log drain as rows of `audit_trail_events`.
+async fn handle_vercel_audit_trail(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    metrics::request_started();
+    let _guard = InFlightGuard;
+    let span = tracing::info_span!(
+        "ingest_vercel_audit_trail",
+        otel.name = "POST /v1/vercel/audit-log",
+        otel.kind = "server",
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+        "maple.ingest.reject_reason" = tracing::field::Empty,
+        "http.request.method" = "POST",
+        "http.route" = "/v1/vercel/audit-log",
+        "http.request.body.size" = body.len(),
+        "http.response.status_code" = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
+        "maple.signal" = "audit_trail",
+        "maple.org_id" = tracing::field::Empty,
+        "maple.audit_trail.events" = tracing::field::Empty,
+        "maple.audit_trail.skipped" = tracing::field::Empty,
+    );
+    let span_handle = span.clone();
+    let start = Instant::now();
+    let result = handle_vercel_audit_trail_inner(&state, &headers, &body)
+        .instrument(span)
+        .await;
+    let duration = start.elapsed().as_secs_f64();
+    let signal = TelemetrySignal::AuditTrail.as_str();
+    match result {
+        Ok(count) => {
+            span_handle.record("http.response.status_code", 200u16);
+            span_handle.record("otel.status_code", "Ok");
+            metrics::request_completed(signal, "ok", "none", duration);
+            (StatusCode::OK, axum::Json(AcceptedBody { accepted: count })).into_response()
+        }
+        Err(error) => {
+            let status = error.status.as_u16();
+            span_handle.record("http.response.status_code", status);
+            span_handle.record("error.type", error.error_kind());
+            // A drain Vercel keeps retrying has to move an error rate, like any other ingest route.
+            metrics::request_completed(signal, "error", error.error_kind(), duration);
+            record_rejection_reason(
+                &span_handle,
+                status,
+                error.error_kind(),
+                error.message.as_str(),
+            );
+            error.into_response()
+        }
+    }
+}
+
+/// Audit deliveries one org may make each second, across the fleet. Well above
+/// what the people of a team or a cloud organization do; past it the sender is
+/// told to retry, so a burst is delayed and not lost.
+const AUDIT_TRAIL_VERCEL_ORG_RPS: u32 = 10;
+const AUDIT_TRAIL_GCP_ORG_RPS: u32 = 100;
+
+/// The most a Vercel audit delivery may be once inflated. A batch of audit
+/// events is kilobytes; the telemetry ceiling is for bodies that are metered.
+const AUDIT_TRAIL_MAX_DECODED_BYTES: usize = 4 * 1024 * 1024;
+
+/// The most events one Vercel audit delivery may carry. Every event becomes a
+/// row of fixed columns however short it is, so the byte ceiling alone does not
+/// bound what a delivery stores or holds in memory.
+const AUDIT_TRAIL_MAX_EVENTS: usize = 10_000;
+
+/// Refuses an org's audit delivery past `rps`. The rows are not metered, so
+/// this is what bounds how many a sender can store.
+async fn audit_trail_rate_gate(
+    state: &AppState,
+    org_id: &str,
+    provider: &'static str,
+    rps: u32,
+) -> Result<(), ApiError> {
+    let key = format!("audit_trail:{provider}:{org_id}");
+    if state.key_rate_limiter.try_acquire(&key, rps).await {
+        return Ok(());
+    }
+    metrics::org_throttled(org_id, "audit_trail_rate");
+    warn!(org_id, provider, "Audit event rate limit exceeded");
+    Err(ApiError::too_many_requests(
+        "Audit event rate limit exceeded",
+    ))
+}
+
+async fn handle_vercel_audit_trail_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> Result<usize, ApiError> {
+    let Some(resolved_key) = resolve_replay_key(state, headers, &[SourceSignal::Logs]).await?
+    else {
+        return Ok(0);
+    };
+    let org_id = resolved_key.org_id.clone();
+    Span::current().record("maple.org_id", org_id.as_str());
+
+    // The drain Maple creates sends the org's private key and names the Vercel
+    // connection's source. Anything else posting here could write the org an
+    // audit event of its own invention: a source token, the public key (it
+    // ships in browser bundles), or a private key naming no integration source.
+    let unknown_sender = || {
+        ApiError::unauthorized(
+            "Audit events are accepted only from the drain Maple creates on the Vercel team",
+        )
+    };
+    if !matches!(resolved_key.key_type, IngestKeyType::Private)
+        || !resolved_key.accepts_source_claims()
+    {
+        return Err(unknown_sender());
+    }
+    let claim = headers
+        .get(SOURCE_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|claim| !claim.is_empty() && claim.len() <= MAX_PUBLIC_ID_LEN)
+        .ok_or_else(unknown_sender)?;
+    let verified = state
+        .resolver
+        .verify_source_claims(&org_id, vec![claim.to_owned()])
+        .await;
+    // Paused, the delivery is acked and dropped like the source's logs are.
+    if verified.paused.iter().any(|paused| paused == claim) {
+        metrics::source_paused_drop(&org_id, TelemetrySignal::AuditTrail.as_str());
+        Span::current().record("maple.ingest.reject_reason", "source_paused");
+        return Ok(0);
+    }
+    if !verified.active.iter().any(|active| active == claim) {
+        // The store being down says nothing about the sender: Vercel retries a 503.
+        if verified.unresolved {
+            return Err(ApiError::service_unavailable(
+                "Ingest authentication unavailable",
+            ));
+        }
+        return Err(unknown_sender());
+    }
+
+    audit_trail_rate_gate(state, &org_id, "vercel", AUDIT_TRAIL_VERCEL_ORG_RPS).await?;
+    let _org_inflight_permit =
+        state
+            .org_inflight_limiter
+            .try_acquire(&org_id)
+            .ok_or_else(|| {
+                warn!(org_id = %org_id, "Per-org in-flight ingest limit exceeded");
+                ApiError::too_many_requests("Per-org ingest limit exceeded")
+            })?;
+    let pipeline = native_rows_pipeline_for(
+        state,
+        ExportDestination::Tinybird,
+        "Audit event storage is not configured",
+    )?;
+
+    let gzip = match headers
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("" | "identity") => false,
+        Some("gzip") => true,
+        Some(_) => {
+            return Err(ApiError::unsupported_media_type(
+                "Unsupported content-encoding",
+            ))
+        }
+    };
+    let (rows, skipped) =
+        decode_vercel_audit_drain(state, body.clone(), gzip, org_id.clone()).await?;
+    Span::current().record("maple.audit_trail.events", rows.len());
+    Span::current().record("maple.audit_trail.skipped", skipped);
+    if skipped > 0 {
+        warn!(org_id = %org_id, skipped, "Vercel audit drain events without an action were skipped");
+    }
+    let count = store_audit_trail_rows(pipeline, &org_id, rows).await?;
+    // The delivery is the integration's, not the key's default source: its health reads this.
+    let claimed: Vec<String> = sources::source_uuid_from_public_id(claim)
+        .into_iter()
+        .collect();
+    state.resolver.note_claimed_source_use(&claimed);
+    Ok(count)
+}
+
+/// A Vercel audit delivery as rows, and how many of its events were skipped.
+/// Inflated and parsed on the blocking pool inside the process-wide decode
+/// memory budget, like an OTLP body: a small gzip can inflate into a body that
+/// parses into gigabytes.
+async fn decode_vercel_audit_drain(
+    state: &AppState,
+    body: Bytes,
+    gzip: bool,
+    org_id: String,
+) -> Result<(Vec<Vec<u8>>, usize), ApiError> {
+    let mut reservation = state.decode_memory.reservation();
+    let heap_budget = state.config.max_decode_heap_bytes;
+    let max_decoded = state
+        .config
+        .max_decoded_body_bytes
+        .min(AUDIT_TRAIL_MAX_DECODED_BYTES);
+    tokio::task::spawn_blocking(move || {
+        let busy = || {
+            ApiError::tagged(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &INGEST_DECODE_BUSY,
+                "Ingest gateway is busy decoding other requests; retry shortly",
+            )
+        };
+        let too_large = || ApiError::payload_too_large("Audit delivery too large");
+        if body.len() > max_decoded {
+            return Err(too_large());
+        }
+        if !reservation.try_add(body.len() as u64) {
+            return Err(busy());
+        }
+        let payload = if gzip {
+            let invalid = || ApiError::bad_request("Invalid gzip body");
+            let declared = decode_budget::gzip_declared_len(&body).ok_or_else(invalid)?;
+            let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+            if declared > max_decoded {
+                return Err(too_large());
+            }
+            if !reservation.try_add(declared as u64) {
+                return Err(busy());
+            }
+            let inflated = gunzip_declared(&body, declared).map_err(|error| match error {
+                GunzipError::Invalid(_) => invalid(),
+                GunzipError::TooLarge => too_large(),
+            })?;
+            drop(body);
+            Bytes::from(inflated)
+        } else {
+            body
+        };
+        let estimate = decode_budget::json_cost(&payload, heap_budget)
+            .map_err(|decode_budget::OverBudget| over_decode_budget(heap_budget))?;
+        if !reservation.try_add(estimate) {
+            return Err(busy());
+        }
+        let parsed = vercel_logs::parse(&payload).map_err(|e| {
+            ApiError::bad_request(format!("Invalid Vercel Audit Log drain payload: {e}"))
+        })?;
+        if parsed.entries.len() > AUDIT_TRAIL_MAX_EVENTS {
+            return Err(too_large());
+        }
+        let now_ms = audit_trail::now_ms();
+        let rows: Vec<Vec<u8>> = parsed
+            .entries
+            .iter()
+            .filter_map(|event| audit_trail::vercel_event(event, now_ms))
+            .map(|event| event.to_row(&org_id, now_ms))
+            .collect();
+        let skipped = parsed.entries.len() - rows.len() + parsed.malformed_lines;
+        Ok((rows, skipped))
+    })
+    .await
+    .unwrap_or_else(|join_error| {
+        error!(error = %join_error, "Audit delivery decode task failed");
+        Err(ApiError::service_unavailable(
+            "Ingest gateway failed to decode the request",
+        ))
+    })
+}
+
+/// Audit rows to the managed warehouse: the table is pinned there, whatever
+/// warehouse the org reads its telemetry from. Not metered: an audit event is
+/// evidence, not usage.
+async fn store_audit_trail_rows(
+    pipeline: &TelemetryPipeline,
+    org_id: &str,
+    rows: Vec<Vec<u8>>,
+) -> Result<usize, ApiError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let count = rows.len();
+    pipeline
+        .accept_rows_to(
+            org_id,
+            audit_trail::DATASOURCE.to_owned(),
+            rows,
+            TelemetrySignal::AuditTrail,
+            ExportDestination::Tinybird,
+        )
+        .await
+        .map_err(|e| {
+            warn!(org_id = %org_id, error = %e, "audit trail enqueue rejected");
+            api_error_from_pipeline(&e)
+        })?;
+    Ok(count)
 }
 
 // Session replay ingest
@@ -4929,6 +5489,725 @@ async fn handle_product_events_inner(
     Ok(count)
 }
 
+/// The OTLP profiles export: under `/v1development/` while the signal is in
+/// development, and under `/v1/` where the spec moves it at release candidate.
+const PROFILES_ROUTES: [&str; 2] = ["/v1development/profiles", "/v1/profiles"];
+
+fn with_profiles_routes(router: Router<Arc<AppState>>) -> Router<Arc<AppState>> {
+    PROFILES_ROUTES.into_iter().fold(router, |router, path| {
+        router.route(path, post(handle_profiles))
+    })
+}
+
+async fn handle_profiles(
+    State(state): State<Arc<AppState>>,
+    matched_path: MatchedPath,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let start = Instant::now();
+    metrics::request_started();
+    let _guard = InFlightGuard;
+    let route = matched_path.as_str();
+    let otel_name = format!("POST {route}");
+    let span = tracing::info_span!(
+        "ingest_profiles",
+        otel.name = %otel_name,
+        otel.kind = "server",
+        otel.status_code = tracing::field::Empty,
+        otel.status_description = tracing::field::Empty,
+        "maple.ingest.reject_reason" = tracing::field::Empty,
+        "http.request.method" = "POST",
+        "http.route" = %route,
+        "http.request.body.size" = body.len(),
+        "http.response.status_code" = tracing::field::Empty,
+        "error.type" = tracing::field::Empty,
+        "maple.signal" = "profiles",
+        "maple.org_id" = tracing::field::Empty,
+        "maple.ingest.clickhouse_ready" = tracing::field::Empty,
+        "maple.ingest.destination" = tracing::field::Empty,
+        "maple.ingest.payload_format" = tracing::field::Empty,
+        "maple.ingest.content_encoding" = tracing::field::Empty,
+        "maple.ingest.decoded_bytes" = tracing::field::Empty,
+        "maple.ingest.item_count" = tracing::field::Empty,
+        "maple.ingest.native_rows" = tracing::field::Empty,
+        "maple.ingest.rules.count" = tracing::field::Empty,
+        "maple.ingest.rules.redacted_values" = tracing::field::Empty,
+        "maple.profiles.dropped" = tracing::field::Empty,
+        "maple.sdk" = tracing::field::Empty,
+        "user_agent.original" = tracing::field::Empty,
+    );
+    record_client_identity(&span, &headers);
+    let span_handle = span.clone();
+    let result = handle_profiles_inner(&state, &headers, body)
+        .instrument(span)
+        .await;
+    let duration = start.elapsed().as_secs_f64();
+    let signal = TelemetrySignal::Profiles.as_str();
+    match result {
+        Ok(accepted) => {
+            span_handle.record("http.response.status_code", 200u16);
+            span_handle.record("otel.status_code", "Ok");
+            metrics::request_completed(signal, "ok", "none", duration);
+            profiles_export_response(&headers, accepted)
+        }
+        Err(error) => {
+            let status = error.status.as_u16();
+            span_handle.record("http.response.status_code", status);
+            span_handle.record("error.type", error.error_kind());
+            metrics::request_completed(signal, "error", error.error_kind(), duration);
+            record_rejection_reason(
+                &span_handle,
+                status,
+                error.error_kind(),
+                error.message.as_str(),
+            );
+            error.into_response()
+        }
+    }
+}
+
+/// What an accepted export stored, and what it left out: rows past the row
+/// ceiling, and the profiles they belonged to, which OTLP counts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct ProfilesAccepted {
+    stored_rows: usize,
+    dropped_rows: usize,
+    rejected_profiles: usize,
+}
+
+/// The `ExportProfilesServiceResponse`, in the encoding the request used: empty for
+/// a full success, a partial success when rows were left out.
+fn profiles_export_response(headers: &HeaderMap, accepted: ProfilesAccepted) -> Response {
+    let json = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.to_ascii_lowercase().contains("json"));
+    let partial_success = (accepted.rejected_profiles > 0).then(|| ExportProfilesPartialSuccess {
+        rejected_profiles: i64::try_from(accepted.rejected_profiles).unwrap_or(i64::MAX),
+        error_message: format!(
+            "{} profile rows were larger than one export batch and were not stored",
+            accepted.dropped_rows
+        ),
+    });
+    if json {
+        let body = partial_success.map_or_else(
+            || "{}".to_owned(),
+            |partial| {
+                serde_json::json!({
+                    "partialSuccess": {
+                        "rejectedProfiles": partial.rejected_profiles,
+                        "errorMessage": partial.error_message,
+                    }
+                })
+                .to_string()
+            },
+        );
+        (StatusCode::OK, [(CONTENT_TYPE, "application/json")], body).into_response()
+    } else {
+        let body = ExportProfilesServiceResponse { partial_success }.encode_to_vec();
+        (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "application/x-protobuf")],
+            body,
+        )
+            .into_response()
+    }
+}
+
+/// What the gateway stamps on a profile's resource: the same attributes
+/// `enrich_resource_attributes` gives a log's, less a sender's own source claim.
+/// The source's resource overrides, applied to the export before the org's rules run, and
+/// the gateway's own stamps, applied by the flatten after them.
+fn profile_resource_stamps(
+    resolved_key: &ResolvedIngestKey,
+) -> (profiles::ResourceOverrides, profiles::ResourceStamps) {
+    let mut overrides = profiles::ResourceOverrides::default();
+    let mut stamps = profiles::ResourceStamps {
+        reserved: &["org_id", "maple_org_id", SOURCE_ID_ATTRIBUTE],
+        ..Default::default()
+    };
+    let attributes = resolved_key
+        .source
+        .iter()
+        .flat_map(|source| &source.resource_attributes)
+        .filter(|attribute| !sources::is_protected_attribute(&attribute.key));
+    for attribute in attributes {
+        let pair = (attribute.key.clone(), attribute.value.clone());
+        match attribute.mode {
+            OverrideMode::Set => overrides.set.push(pair),
+            OverrideMode::Default => overrides.defaults.push(pair),
+        }
+    }
+    // Last, so the maple_* stamps win over any override.
+    let mut stamp = |key: &str, value: &str| stamps.set.push((key.to_owned(), value.to_owned()));
+    stamp("maple_org_id", &resolved_key.org_id);
+    stamp("maple_ingest_key_type", resolved_key.key_type.as_str());
+    stamp("maple_ingest_source", INGEST_SOURCE);
+    if let Some(source_id) = resolved_key.source_public_id() {
+        stamp(SOURCE_ID_ATTRIBUTE, source_id);
+    }
+    (overrides, stamps)
+}
+
+/// `POST /v1development/profiles`, and `/v1/profiles` where the spec moves it: an
+/// OTLP profiles export, flattened to rows of `profiles` by `maple_ingest::profiles`.
+/// Gated on the org's `profiles` plan feature and billed per GB decoded, like the byte signals.
+async fn handle_profiles_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<ProfilesAccepted, ApiError> {
+    let Some(resolved_key) = resolve_replay_key(state, headers, &[SourceSignal::Profiles]).await?
+    else {
+        return Ok(ProfilesAccepted::default());
+    };
+    let org_id = resolved_key.org_id.clone();
+    Span::current().record("maple.org_id", org_id.as_str());
+    Span::current().record(
+        "maple.ingest.clickhouse_ready",
+        resolved_key.clickhouse_ready,
+    );
+    // Pinned to managed storage, like the audit trail: an org's own ClickHouse is
+    // not required to have the table, so its rows are never sent there.
+    let destination = ExportDestination::Tinybird;
+    Span::current().record("maple.ingest.destination", destination.as_str());
+
+    // A sender on another wire layout would decode into the wrong fields.
+    let version = headers
+        .get(profiles::VERSION_HEADER)
+        .map(|value| value.to_str().unwrap_or_default());
+    if !profiles::is_supported_version(version) {
+        return Err(ApiError::bad_request(
+            "Unsupported OTLP profiles development version; this gateway reads version 1",
+        ));
+    }
+
+    let _org_inflight_permit =
+        state
+            .org_inflight_limiter
+            .try_acquire(&org_id)
+            .ok_or_else(|| {
+                warn!(org_id = %org_id, "Per-org in-flight ingest limit exceeded");
+                ApiError::too_many_requests("Per-org ingest limit exceeded")
+            })?;
+    if body.len() > state.config.max_request_body_bytes {
+        return Err(ApiError::payload_too_large("Request body too large"));
+    }
+    let pipeline =
+        native_rows_pipeline_for(state, destination, "Profile storage is not configured")?;
+    // Before the body is read: an org without the feature, or past its cap, gets a 402.
+    if org_id != SENTINEL_ORG_ID {
+        if let Some(error) = entitlement_rejection(state, &org_id, PROFILES_FEATURE_ID).await {
+            return Err(error);
+        }
+    }
+
+    let (payload_format, gzip) = profiles_body_encoding(headers)?;
+    let rules = profile_redaction_rules(state, &org_id).await?;
+    Span::current().record("maple.ingest.payload_format", payload_format.label());
+    Span::current().record(
+        "maple.ingest.content_encoding",
+        if gzip { "gzip" } else { "identity" },
+    );
+
+    let FlattenedProfiles {
+        rows,
+        profile_count,
+        dropped_rows,
+        rejected_profiles,
+        decoded_bytes,
+        memory: _decode_memory,
+    } = decode_profiles(
+        state,
+        body,
+        gzip,
+        payload_format,
+        profile_resource_stamps(&resolved_key),
+        rules,
+    )
+    .await
+    .inspect_err(|error| {
+        warn!(
+            org_id = %org_id,
+            format = payload_format.label(),
+            reason = %error.message,
+            "Profiles export refused while decoding"
+        );
+        // A body that does not decode, or would store too much, is an export the org lost.
+        let signal = TelemetrySignal::Profiles.as_str();
+        if error.status == StatusCode::BAD_REQUEST {
+            metrics::org_data_loss(&org_id, signal, "decode");
+        } else if [INGEST_ROW_EXPANSION.error_kind, INGEST_RULES_SCAN_BUDGET.error_kind]
+            .contains(&error.error_kind())
+        {
+            metrics::org_data_loss(&org_id, signal, error.error_kind());
+        }
+    })?;
+    let count = rows.len();
+    Span::current().record("maple.ingest.decoded_bytes", decoded_bytes);
+    Span::current().record("maple.ingest.item_count", profile_count);
+    Span::current().record("maple.ingest.native_rows", count);
+    if dropped_rows > 0 {
+        Span::current().record("maple.profiles.dropped", dropped_rows);
+        warn!(
+            org_id = %org_id,
+            dropped = dropped_rows,
+            "dropped profile rows larger than one export batch"
+        );
+    }
+    let accepted = ProfilesAccepted {
+        stored_rows: count,
+        dropped_rows,
+        rejected_profiles,
+    };
+    if rows.is_empty() {
+        return Ok(accepted);
+    }
+
+    commit_profile_rows(state, pipeline, &org_id, rows, destination).await?;
+    // Recorded once the rows are durable, as the byte signals are. An export refused part way
+    // (only a WAL write failing, since the whole export is reserved first) bills nothing: its
+    // resend bills the whole export, so billing the stored part too would count it twice.
+    if let Some(usage) = &state.usage_metrics {
+        let signal = TelemetrySignal::Profiles.as_str();
+        usage.record(&org_id, signal, decoded_bytes as u64, count as u64);
+    }
+    if org_id != SENTINEL_ORG_ID && decoded_bytes > 0 {
+        if let Some(tracker) = &state.autumn_tracker {
+            tracker.track(&org_id, PROFILES_FEATURE_ID, billable_gb(decoded_bytes as u64));
+        }
+    }
+    state.resolver.note_source_use(&resolved_key, false);
+    Ok(accepted)
+}
+
+/// Commits `rows` as one frame per export batch, not per request: the rows repeat
+/// every stack in full, so an export is many times its wire size. The whole export
+/// is reserved before its first frame, so a full queue refuses it with nothing stored.
+async fn commit_profile_rows(
+    state: &AppState,
+    pipeline: &TelemetryPipeline,
+    org_id: &str,
+    rows: Vec<Vec<u8>>,
+    destination: ExportDestination,
+) -> Result<(), ApiError> {
+    let signal = TelemetrySignal::Profiles;
+    let count = rows.len();
+    let batches = chunk_rows(rows, state.config.tinybird.batch_max_bytes);
+    let datasource = &state.config.tinybird.datasource_profiles;
+    let committed = pipeline
+        .accept_row_batches_to(org_id, datasource, batches, signal, destination)
+        .await;
+    let stored = committed
+        .as_ref()
+        .map_or_else(|refused| refused.committed_rows, |_| count);
+    metrics::native_rows(signal.as_str(), stored as u64);
+    committed.map(drop).map_err(|refused| {
+        warn!(
+            org_id = %org_id,
+            error = %refused.error,
+            committed_rows = refused.committed_rows,
+            "profiles enqueue rejected"
+        );
+        profiles_commit_error(&refused, count)
+    })
+}
+
+/// How a profiles export's body is encoded, and whether it is gzipped. Protobuf
+/// unless the content type says JSON, as on the other OTLP routes.
+fn profiles_body_encoding(headers: &HeaderMap) -> Result<(PayloadFormat, bool), ApiError> {
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/x-protobuf")
+        .to_ascii_lowercase();
+    let payload_format = detect_payload_format(&content_type)?;
+    let gzip = match headers
+        .get(CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("" | "identity") => false,
+        Some("gzip") => true,
+        Some(_) => {
+            return Err(ApiError::unsupported_media_type(
+                "Unsupported content-encoding",
+            ))
+        }
+    };
+    Ok((payload_format, gzip))
+}
+
+/// A refused commit as the sender is told of it. The pipeline's own text says
+/// nothing was written, which is only so when the first frame was the one refused.
+fn profiles_commit_error(refused: &RowBatchesError, rows: usize) -> ApiError {
+    let error = api_error_from_pipeline(&refused.error);
+    if refused.committed_rows == 0 {
+        return error;
+    }
+    ApiError {
+        message: format!(
+            "Maple stored {} of this export's {rows} profile rows before its ingest queue \
+             refused the rest. Resending the export stores those rows a second time.",
+            refused.committed_rows
+        ),
+        ..error
+    }
+}
+
+/// The most one profile row may serialize to: an export batch less its newline,
+/// so every frame `chunk_rows` makes fits a batch. Never past `MAX_ROW_BYTES`.
+fn profile_row_max_bytes(batch_max_bytes: usize) -> usize {
+    profiles::MAX_ROW_BYTES
+        .min(batch_max_bytes)
+        .saturating_sub(1)
+}
+
+/// `rows` in runs of at most `max_bytes`, in order. A longer row would be a run of
+/// its own, but `profile_row_max_bytes` drops those before they get here.
+fn chunk_rows(rows: Vec<Vec<u8>>, max_bytes: usize) -> Vec<Vec<Vec<u8>>> {
+    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut chunk_bytes = 0_usize;
+    for row in rows {
+        let row_bytes = row.len() + 1;
+        match chunks.last_mut() {
+            Some(chunk) if chunk_bytes + row_bytes <= max_bytes => {
+                chunk_bytes += row_bytes;
+                chunk.push(row);
+            }
+            _ => {
+                chunk_bytes = row_bytes;
+                chunks.push(vec![row]);
+            }
+        }
+    }
+    chunks
+}
+
+/// A profiles export as rows, and the decode memory they hold until dropped.
+struct FlattenedProfiles {
+    rows: Vec<Vec<u8>>,
+    profile_count: usize,
+    /// Rows left out for being larger than one export batch.
+    dropped_rows: usize,
+    /// Profiles that lost a row that way.
+    rejected_profiles: usize,
+    decoded_bytes: usize,
+    memory: DecodeReservation,
+}
+
+/// Inflates, decodes and flattens a profiles export on the blocking pool, inside
+/// the decode memory budget like an OTLP body. The flatten reserves too: its rows
+/// repeat per sample what the export's dictionary holds once. The decoded export
+/// and its rows share one decode heap ceiling, so a request under every ceiling
+/// always fits an idle gateway: a 503 here is contention, never the request's size.
+async fn decode_profiles(
+    state: &AppState,
+    body: Bytes,
+    gzip: bool,
+    payload_format: PayloadFormat,
+    (overrides, stamps): (profiles::ResourceOverrides, profiles::ResourceStamps),
+    rules: Option<Arc<rules_gateway::OrgRules>>,
+) -> Result<FlattenedProfiles, ApiError> {
+    let span = Span::current();
+    let mut reservation = state.decode_memory.reservation();
+    let (max_decoded, heap_budget) = (
+        state.config.max_decoded_body_bytes,
+        state.config.max_decode_heap_bytes,
+    );
+    let max_row_bytes = profile_row_max_bytes(state.config.tinybird.batch_max_bytes);
+    let max_row_expansion = state.config.max_row_expansion;
+    tokio::task::spawn_blocking(move || {
+        let busy = profiles_decode_busy;
+        if !reservation.try_add(body.len() as u64) {
+            return Err(busy());
+        }
+        let payload = if gzip {
+            let invalid = || ApiError::bad_request("Invalid gzip body");
+            let declared = decode_budget::gzip_declared_len(&body).ok_or_else(invalid)?;
+            let declared = usize::try_from(declared).unwrap_or(usize::MAX);
+            if declared > max_decoded {
+                return Err(too_large_decoded());
+            }
+            if !reservation.try_add(declared as u64) {
+                return Err(busy());
+            }
+            let inflated = gunzip_declared(&body, declared).map_err(|error| match error {
+                GunzipError::Invalid(_) => invalid(),
+                GunzipError::TooLarge => too_large_decoded(),
+            })?;
+            drop(body);
+            Bytes::from(inflated)
+        } else {
+            body
+        };
+        let estimate = match payload_format {
+            PayloadFormat::Protobuf => {
+                decode_budget::protobuf_cost(OtlpSignal::Profiles, &payload, heap_budget)
+            }
+            PayloadFormat::Json => decode_budget::json_cost(&payload, heap_budget),
+        }
+        .map_err(|decode_budget::OverBudget| over_decode_budget(heap_budget))?;
+        if !reservation.try_add(estimate) {
+            return Err(busy());
+        }
+        let mut request = match payload_format {
+            PayloadFormat::Protobuf => ExportProfilesServiceRequest::decode(payload.as_ref())
+                .map_err(|e| invalid_payload("profiles", "protobuf", e))?,
+            PayloadFormat::Json => profiles::decode_json(&payload)
+                .map_err(|e| invalid_payload("profiles", "JSON", e))?,
+        };
+        // What the source's overrides add and the rules inline from the string table: under the
+        // decode heap ceiling with the decoded export, and held with it until the rows are built.
+        let mut grown = ExportGrowth::new(estimate, heap_budget);
+        if !profiles::apply_resource_overrides(&mut request, &overrides, |bytes| {
+            grown.charge(bytes, &mut reservation)
+        }) {
+            return Err(grown.refusal());
+        }
+        if let Some(rules) = &rules {
+            redact_profile_export(&span, rules, &mut request, |bytes| {
+                grown.charge(bytes, &mut reservation)
+            })
+            .map_err(|error| match error {
+                ingest_rules::ProfileRedactError::OverMemoryBudget => grown.refusal(),
+                ingest_rules::ProfileRedactError::ScanBudgetExceeded => ApiError::tagged(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &INGEST_RULES_SCAN_BUDGET,
+                    "This export needs more ingest rule scanning than one request may use; send smaller exports",
+                ),
+            })?;
+        }
+        // Only the decoded form is left; the buffers went with the payload.
+        let decoded_bytes = payload.len();
+        drop(payload);
+        let decoded_heap = estimate.saturating_add(grown.bytes);
+        reservation.shrink_to(decoded_heap);
+        let limits = ProfileLimits {
+            decoded_heap,
+            heap_ceiling: heap_budget,
+            max_row_bytes,
+            row_expansion: max_row_expansion,
+            max_stored_bytes: (max_row_expansion > 0)
+                .then(|| (decoded_bytes as u64).saturating_mul(max_row_expansion)),
+        };
+        let flattened =
+            flatten_profiles(&request, &stamps, limits, payload_format, &mut reservation)?;
+        drop(request);
+        // The rows, and the copy of them the WAL frame is built from.
+        let row_bytes: usize = flattened.rows.iter().map(Vec::len).sum();
+        if limits
+            .max_stored_bytes
+            .is_some_and(|allowed| row_bytes as u64 > allowed)
+        {
+            return Err(profiles_row_expansion(max_row_expansion));
+        }
+        reservation.shrink_to(2 * row_bytes as u64);
+        Ok(FlattenedProfiles {
+            rows: flattened.rows,
+            profile_count: flattened.profile_count,
+            dropped_rows: flattened.dropped_rows,
+            rejected_profiles: flattened.rejected_profiles,
+            decoded_bytes,
+            memory: reservation,
+        })
+    })
+    .await
+    .unwrap_or_else(|join_error| {
+        error!(error = %join_error, "Profiles decode task failed");
+        Err(ApiError::service_unavailable(
+            "Ingest gateway failed to decode the request",
+        ))
+    })
+}
+
+/// The org's ingest rules when one of them redacts: a profile gets every redact rule (see
+/// `ingest_rules::redact_profiles`). A lookup with nothing to fall back on refuses the export
+/// rather than storing it unredacted, as on the OTLP paths.
+async fn profile_redaction_rules(
+    state: &AppState,
+    org_id: &str,
+) -> Result<Option<Arc<rules_gateway::OrgRules>>, ApiError> {
+    let resolver = &state.ingest_rule_resolver;
+    if !resolver.enabled() || org_id == SENTINEL_ORG_ID {
+        return Ok(None);
+    }
+    let rules = resolver.resolve_rules(org_id).await.map_err(|unavailable| {
+        let message = match unavailable {
+            rules_gateway::RulesUnavailable::Store => "Ingest rules could not be loaded; retry shortly",
+            rules_gateway::RulesUnavailable::RegexBudget => {
+                "This organization's ingest rule regexes are too large to compile together; simplify or remove some"
+            }
+        };
+        ApiError::tagged(StatusCode::SERVICE_UNAVAILABLE, &INGEST_RULES_UNAVAILABLE, message)
+    })?;
+    Ok(rules.compiled.redacts().then_some(rules))
+}
+
+/// Redacts a decoded export with the org's rules, before anything of it is flattened or stored.
+/// `charge` is asked for each copy of string-table text the pass makes.
+fn redact_profile_export(
+    span: &Span,
+    rules: &rules_gateway::OrgRules,
+    request: &mut ExportProfilesServiceRequest,
+    charge: impl FnMut(u64) -> bool,
+) -> Result<(), ingest_rules::ProfileRedactError> {
+    let mut stats = RuleStats::default();
+    ingest_rules::redact_profiles(&rules.compiled, request, &mut stats, charge)?;
+    span.record("maple.ingest.rules.count", rules.compiled.len());
+    span.record("maple.ingest.rules.redacted_values", stats.total.redacted_values);
+    Ok(())
+}
+
+fn profiles_decode_busy() -> ApiError {
+    ApiError::tagged(
+        StatusCode::SERVICE_UNAVAILABLE,
+        &INGEST_DECODE_BUSY,
+        "Ingest gateway is busy decoding other requests; retry shortly",
+    )
+}
+
+/// Memory a decoded export grows by before it is flattened: the source's overrides and the text
+/// the org's rules inline. Counted exactly against the decode heap ceiling, and reserved from the
+/// process-wide budget in steps, so many small copies are not each rounded up to a KiB there.
+struct ExportGrowth {
+    estimate: u64,
+    heap_ceiling: u64,
+    bytes: u64,
+    reserved: u64,
+    over_ceiling: bool,
+}
+
+impl ExportGrowth {
+    const STEP: u64 = 64 * 1024;
+
+    const fn new(estimate: u64, heap_ceiling: u64) -> Self {
+        Self {
+            estimate,
+            heap_ceiling,
+            bytes: 0,
+            reserved: 0,
+            over_ceiling: false,
+        }
+    }
+
+    fn charge(&mut self, bytes: u64, reservation: &mut DecodeReservation) -> bool {
+        self.bytes = self.bytes.saturating_add(bytes);
+        self.over_ceiling = self.estimate.saturating_add(self.bytes) > self.heap_ceiling;
+        if self.over_ceiling {
+            return false;
+        }
+        if self.bytes > self.reserved {
+            let ask = (self.bytes - self.reserved).max(Self::STEP);
+            if !reservation.try_add(ask) {
+                return false;
+            }
+            self.reserved = self.reserved.saturating_add(ask);
+        }
+        true
+    }
+
+    /// Past the ceiling no retry fits: 413. Refused by the process-wide budget: the retryable 503.
+    fn refusal(&self) -> ApiError {
+        if self.over_ceiling {
+            over_decode_budget(self.heap_ceiling)
+        } else {
+            profiles_decode_busy()
+        }
+    }
+}
+
+/// Refuses an export whose rows would store more than `INGEST_MAX_ROW_EXPANSION`
+/// times its decoded size: each row repeats a whole stack, so a few KiB of
+/// dictionary could otherwise store hundreds of MiB.
+fn profiles_row_expansion(ceiling: u64) -> ApiError {
+    ApiError::tagged(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        &INGEST_ROW_EXPANSION,
+        format!(
+            "This export would be stored as more than {ceiling} times its size, because every \
+             row repeats its whole stack; send fewer distinct stacks, links or attributes per \
+             export"
+        ),
+    )
+}
+
+/// What bounds one export's flatten: the decode heap its decoded form was
+/// estimated to take, the ceiling that and its rows share, the row ceiling, and
+/// the most its rows may store (`None` when `INGEST_MAX_ROW_EXPANSION` is 0).
+#[derive(Clone, Copy)]
+struct ProfileLimits {
+    decoded_heap: u64,
+    heap_ceiling: u64,
+    max_row_bytes: usize,
+    row_expansion: u64,
+    max_stored_bytes: Option<u64>,
+}
+
+/// The least a profiles flatten may charge before the stored-bytes ceiling stops it
+/// early, so a tiny export is not refused for the meter's step size.
+const PROFILES_MIN_CHARGE_BYTES: u64 = 1024 * 1024;
+
+/// Flattens a decoded export, reserving its rows' memory first against the request's
+/// own ceiling and then the process-wide budget. Past the ceiling is a 413, since
+/// no retry fits it; refused by the process-wide budget is the retryable 503.
+fn flatten_profiles(
+    request: &ExportProfilesServiceRequest,
+    stamps: &profiles::ResourceStamps,
+    limits: ProfileLimits,
+    payload_format: PayloadFormat,
+    reservation: &mut DecodeReservation,
+) -> Result<profiles::Flattened, ApiError> {
+    // In whole KiB, as the reservation counts them.
+    let kib = |bytes: u64| bytes.div_ceil(1024).saturating_mul(1024);
+    let mut heap_bytes = kib(limits.decoded_heap);
+    let mut over_ceiling = false;
+    // The flatten charges each row twice (the row and its frame copy) plus what builds
+    // it, in steps, so it stops once well past the stored-bytes ceiling; the exact
+    // check after it decides.
+    let charge_limit = limits
+        .max_stored_bytes
+        .map(|stored| stored.saturating_mul(4).max(PROFILES_MIN_CHARGE_BYTES));
+    let mut charged = 0u64;
+    let mut over_expansion = false;
+    let mut reserve = |bytes: u64| {
+        charged = charged.saturating_add(bytes);
+        over_expansion = charge_limit.is_some_and(|limit| charged > limit);
+        heap_bytes = heap_bytes.saturating_add(kib(bytes));
+        over_ceiling = heap_bytes > limits.heap_ceiling;
+        !over_expansion && !over_ceiling && reservation.try_add(bytes)
+    };
+    let now_nano = current_time_unix_nano();
+    profiles::flatten(
+        request,
+        stamps,
+        now_nano,
+        &mut profiles::random_profile_id,
+        limits.max_row_bytes,
+        &mut reserve,
+    )
+    .map_err(|error| match error {
+        profiles::FlattenError::OverBudget if over_expansion => {
+            profiles_row_expansion(limits.row_expansion)
+        }
+        profiles::FlattenError::OverBudget if over_ceiling => {
+            over_decode_budget(limits.heap_ceiling)
+        }
+        profiles::FlattenError::OverBudget => profiles_decode_busy(),
+        profiles::FlattenError::InvalidId { .. } => {
+            invalid_payload("profiles", payload_format.label(), error)
+        }
+        profiles::FlattenError::Encode(detail) => ApiError::tagged(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &INGEST_ENCODE_FAILED,
+            "Maple could not encode these profiles for storage.",
+        )
+        .with_detail(detail),
+    })
+}
+
 /// Bounded gunzip of a replay chunk into text. Invalid UTF-8 reads as the
 /// same error `read_to_string` raised, so the rejection fingerprint holds.
 fn gunzip_replay_text(body: &[u8], max_decoded: usize) -> Result<String, GunzipError> {
@@ -5103,14 +6382,52 @@ async fn handle_replay_blob_inner(
         GunzipError::Invalid(e) => replay_gunzip_rejection(headers, &body, &e),
         GunzipError::TooLarge => ApiError::payload_too_large("decompressed replay chunk too large"),
     };
-    let (events_json, byte_size) = if state.replay_blob_store.is_some() {
-        let byte_size = gunzip_len_bounded(&body, max_decoded).map_err(gunzip_rejection)?;
-        (None, byte_size)
-    } else {
-        let events_json = gunzip_replay_text(&body, max_decoded).map_err(gunzip_rejection)?;
-        let byte_size = events_json.len() as u64;
-        (Some(events_json), byte_size)
-    };
+    // Inflating is CPU work bounded only by that ceiling, so it runs on the
+    // blocking pool: on a one-core host the async workers are a single thread.
+    // It reserves what it inflates from the shared decode memory, like an OTLP
+    // body, so a burst of chunks is shed and not inflated all at once.
+    let stored_as_blob = state.replay_blob_store.is_some();
+    let compressed = body.clone();
+    let mut reservation = state.decode_memory.reservation();
+    let decoded = tokio::task::spawn_blocking(move || {
+        // The size the chunk declares is what gets reserved, so it is also where
+        // the inflate stops: a trailer that understates the stream buys nothing.
+        let declared = decode_budget::gzip_declared_len(&compressed)
+            .map_or(0, |declared| usize::try_from(declared).unwrap_or(usize::MAX))
+            .min(max_decoded);
+        if !reservation.try_add((compressed.len() + declared) as u64) {
+            return Err(None);
+        }
+        if stored_as_blob {
+            // Nothing of a blob chunk outlives the count.
+            gunzip_len_bounded(&compressed, declared)
+                .map(|byte_size| (None, byte_size, None))
+                .map_err(Some)
+        } else {
+            gunzip_replay_text(&compressed, declared)
+                .map(|events_json| {
+                    let byte_size = events_json.len() as u64;
+                    reservation.shrink_to(byte_size);
+                    (Some(events_json), byte_size, Some(reservation))
+                })
+                .map_err(Some)
+        }
+    })
+    .await
+    .map_err(|join_error| {
+        error!(error = %join_error, "Replay chunk decode task failed");
+        ApiError::service_unavailable("Ingest gateway failed to decode the request")
+    })?;
+    // An inline chunk's text stays reserved until this handler has stored it.
+    let (events_json, byte_size, _inline_text_reservation) =
+        decoded.map_err(|rejection| match rejection {
+            Some(error) => gunzip_rejection(error),
+            None => ApiError::tagged(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &INGEST_DECODE_BUSY,
+                "Ingest gateway is busy decoding other requests; retry shortly",
+            ),
+        })?;
 
     // Accept the chunk that crosses the ceiling so the recording truncates on a
     // chunk boundary; `is_exhausted` rejects everything after it.
@@ -5276,15 +6593,16 @@ async fn handle_signal(
     state: Arc<AppState>,
     headers: HeaderMap,
     body: Bytes,
-    signal: Signal,
+    ingress: Ingress,
 ) -> Response {
     let start = Instant::now();
     let body_bytes = body.len();
+    let signal = ingress.signal();
 
     metrics::request_started();
     let _guard = InFlightGuard;
 
-    let route = format!("/v1/{}", signal.path());
+    let route = ingress.route();
     let otel_name = format!("POST {route}");
     let span = tracing::info_span!(
         "ingest",
@@ -5318,7 +6636,7 @@ async fn handle_signal(
     record_client_identity(&span, &headers);
     let span_handle = span.clone();
 
-    let result = handle_signal_inner(&state, &headers, body, signal)
+    let result = handle_signal_inner(&state, &headers, body, ingress)
         .instrument(span)
         .await;
     let duration = start.elapsed();
@@ -5329,6 +6647,9 @@ async fn handle_signal(
             span_handle.record("http.response.status_code", status_code);
             span_handle.record("otel.status_code", "Ok");
             metrics::request_completed(signal.path(), "ok", "none", duration.as_secs_f64());
+            if matches!(ingress, Ingress::PrometheusRemoteWrite) {
+                metrics::prometheus_request("ok", "none");
+            }
             // Usage and billing are emitted together, from one value, behind one
             // guard — they must never drift. `signal.path()` is both the Autumn
             // feature id and the metric's `signal` dimension. A paused key reports 0 bytes.
@@ -5349,6 +6670,9 @@ async fn handle_signal(
             span_handle.record("error.type", error_kind);
             record_rejection_reason(&span_handle, status, error_kind, error.reason().as_str());
             metrics::request_completed(signal.path(), "error", error_kind, duration.as_secs_f64());
+            if matches!(ingress, Ingress::PrometheusRemoteWrite) {
+                metrics::prometheus_request("error", error_kind);
+            }
             error.into_response()
         }
     }
@@ -5455,9 +6779,14 @@ async fn handle_signal_inner(
     state: &AppState,
     headers: &HeaderMap,
     body: Bytes,
-    signal: Signal,
+    ingress: Ingress,
 ) -> Result<(Response, usize, String, usize), (ApiError, &'static str)> {
-    let ingest_key = extract_ingest_key(headers).ok_or_else(|| {
+    let signal = ingress.signal();
+    let ingest_key = match ingress {
+        Ingress::PrometheusRemoteWrite => extract_prometheus_ingest_key(headers),
+        _ => extract_ingest_key(headers),
+    }
+    .ok_or_else(|| {
         warn!("Missing ingest key");
         (ApiError::unauthorized("Missing ingest key"), "auth")
     })?;
@@ -5579,10 +6908,30 @@ async fn handle_signal_inner(
         .unwrap_or("application/x-protobuf")
         .to_ascii_lowercase();
 
-    let payload_format = detect_payload_format(&content_type).map_err(|e| {
-        warn!(content_type = %content_type, "Unsupported content type");
-        (e, "unsupported_media")
-    })?;
+    // A drain's JSON is mapped to OTLP and sent on as protobuf, whatever
+    // content type it was labelled with.
+    let payload_format = match ingress {
+        Ingress::Otlp(_) => detect_payload_format(&content_type).map_err(|e| {
+            warn!(content_type = %content_type, "Unsupported content type");
+            (e, "unsupported_media")
+        })?,
+        Ingress::VercelLogDrain | Ingress::VercelAiGatewayDrain | Ingress::VercelEventDrain(_) => {
+            PayloadFormat::Protobuf
+        }
+        Ingress::PrometheusRemoteWrite => {
+            if prometheus_remote_write::is_v2_content_type(&content_type) {
+                warn!(content_type = %content_type, "Prometheus remote write 2.0 refused");
+                return Err((
+                    ApiError::unsupported_media_type(
+                        "Prometheus remote write 2.0 is not supported yet; send version 1.0 \
+                         (prometheus.WriteRequest)",
+                    ),
+                    "unsupported_media",
+                ));
+            }
+            PayloadFormat::Protobuf
+        }
+    };
     Span::current().record("maple.ingest.payload_format", payload_format.label());
 
     let content_encoding = headers
@@ -5606,10 +6955,21 @@ async fn handle_signal_inner(
         }
     }
 
-    let gzip = match content_encoding.as_deref() {
-        None => false,
-        Some("gzip") => true,
-        Some(_) => {
+    // A remote write body is always a snappy block, named in the header or not.
+    let encoding = match (ingress, content_encoding.as_deref()) {
+        (Ingress::PrometheusRemoteWrite, None | Some("snappy")) => BodyEncoding::Snappy,
+        (Ingress::PrometheusRemoteWrite, Some(_)) => {
+            metrics::org_data_loss(&resolved_key.org_id, signal.path(), "decode");
+            return Err((
+                ApiError::unsupported_media_type(
+                    "Unsupported content-encoding (Prometheus remote write is snappy)",
+                ),
+                "decode",
+            ));
+        }
+        (_, None) => BodyEncoding::Identity,
+        (_, Some("gzip")) => BodyEncoding::Gzip,
+        (_, Some(_)) => {
             metrics::org_data_loss(&resolved_key.org_id, signal.path(), "decode");
             return Err((
                 ApiError::unsupported_media_type("Unsupported content-encoding"),
@@ -5621,8 +6981,9 @@ async fn handle_signal_inner(
     let DecodedBody {
         payload: mut decoded,
         decoded_bytes,
-        memory: _decode_memory,
-    } = decode_otlp_body(state, body, gzip, signal, payload_format)
+        memory: decode_memory,
+        prometheus,
+    } = decode_otlp_body(state, body, encoding, ingress, payload_format)
         .await
         .map_err(|DecodeRefusal { error, stage }| {
             warn!(
@@ -5645,6 +7006,7 @@ async fn handle_signal_inner(
     debug!(decoded_bytes, "Payload decoded");
     metrics::decoded_body_bytes(signal.path(), decoded_bytes as u64);
 
+    apply_header_source_claim(&mut decoded, headers, &resolved_key);
     let mut claims = verify_claims_and_enrich(state, &mut decoded, &resolved_key).await;
     if claims.all_paused {
         // Like a paused token source: success to the sender, nothing written or billed.
@@ -5655,6 +7017,27 @@ async fn handle_signal_inner(
             0,
         ));
     }
+    match ingress {
+        Ingress::VercelLogDrain => stamp_drain_source(&mut decoded, vercel_logs::INGEST_SOURCE),
+        Ingress::VercelAiGatewayDrain => {
+            stamp_drain_source(&mut decoded, vercel_ai_gateway_drain::INGEST_SOURCE);
+        }
+        Ingress::VercelEventDrain(drain) => stamp_drain_source(&mut decoded, drain.ingest_source()),
+        Ingress::PrometheusRemoteWrite => {
+            stamp_drain_source(&mut decoded, prometheus_remote_write::INGEST_SOURCE);
+        }
+        Ingress::Otlp(_) => {
+            if let DecodedPayload::Traces(request) = &mut decoded {
+                if vercel_traces::has_runtime_resources(request) {
+                    let names = state
+                        .vercel_project_name_resolver
+                        .resolve(&resolved_key.org_id)
+                        .await;
+                    vercel_traces::restate(request, &names);
+                }
+            }
+        }
+    }
     let kept_claim = claims.kept_claim;
     let item_count = decoded.item_count();
 
@@ -5662,24 +7045,46 @@ async fn handle_signal_inner(
     debug!(item_count, "Payload enriched");
     metrics::items_accepted(signal.path(), item_count as u64);
 
+    if let Some(stats) = prometheus {
+        metrics::prometheus_samples(stats.samples_accepted, &stats.dropped());
+        debug!(?stats, "Prometheus remote write mapped to OTLP metrics");
+        if item_count == 0 {
+            // Metadata only, or every sample dropped: success, nothing written or billed.
+            return Ok((
+                StatusCode::OK.into_response(),
+                0,
+                resolved_key.org_id.clone(),
+                0,
+            ));
+        }
+    }
+    // The collector is sent OTLP: gzip stays, a remote write's snappy does not.
+    let forward_encoding = content_encoding
+        .as_deref()
+        .filter(|_| !matches!(ingress, Ingress::PrometheusRemoteWrite));
+
     let response_result = process_decoded_payload(
         state,
         signal,
         payload_format,
-        content_encoding.as_deref(),
+        forward_encoding,
         &mut decoded,
         &resolved_key,
         &mut claims.retained,
+        Received {
+            bytes: decoded_bytes,
+            decode_heap: decode_memory.held_bytes(),
+        },
     )
     .await;
     // Only the share left after paused-source drops and ingest rules is metered.
     let decoded_bytes = claims.metered_bytes(decoded_bytes);
     let item_count = claims.retained.metered_items(item_count);
 
-    // A scan-budget refusal keeps its own kind: it loses the sender's data, unlike a forward failure.
+    // A refusal before anything was written keeps its own kind, unlike a forward failure.
     let response = response_result.map_err(|error| {
-        let kind = error.error_kind();
-        (error, if kind == INGEST_RULES_SCAN_BUDGET.error_kind { kind } else { "forward" })
+        let kind = process_error_kind(&error);
+        (error, kind)
     })?;
     // A collector refusal that left nothing stored is not key use, and 0 bytes to meter.
     let stored = batch_was_stored(
@@ -5903,6 +7308,7 @@ async fn handle_cloudflare_logpush_inner(
                 &mut decoded,
                 &resolved_key,
                 &mut retained,
+                Received::unbudgeted(decoded_payload.len()),
             )
             .await
             {
@@ -6054,6 +7460,18 @@ async fn handle_gcp_logpush(
                     span_handle.record("otel.status_code", "Ok");
                     span_handle.record("maple.ingest.reject_reason", "source_paused");
                     metrics::request_completed("logs", "ok", "none", duration);
+                }
+                GcpPushOutcome::AuditEvent => {
+                    span_handle.record("otel.status_code", "Ok");
+                    span_handle.record("maple.ingest.item_count", 1);
+                    span_handle.record("maple.signal", TelemetrySignal::AuditTrail.as_str());
+                    metrics::request_completed(
+                        TelemetrySignal::AuditTrail.as_str(),
+                        "ok",
+                        "none",
+                        duration,
+                    );
+                    metrics::gcp_entry();
                 }
                 GcpPushOutcome::RulesScanBudget => {
                     // Acked, but the entry is gone: an `Error`, like a decode failure.
@@ -6249,6 +7667,37 @@ async fn handle_gcp_logpush_inner(
         return Ok((StatusCode::OK.into_response(), GcpPushOutcome::NotALogEntry));
     };
 
+    // An Admin Activity or Policy Denied entry is an audit event, not a log:
+    // it goes to the audit trail, unmetered, ahead of the plan check on logs
+    // and of the org's ingest rules, which are about what it keeps of its logs.
+    if state.config.stores_audit_trail() {
+        let now_ms = audit_trail::now_ms();
+        if let Some(event) = audit_trail::gcp_entry(&entry, now_ms) {
+            // Refused, Pub/Sub redelivers with backoff: delayed, not lost.
+            audit_trail_rate_gate(state, org_id, "gcp", AUDIT_TRAIL_GCP_ORG_RPS)
+                .await
+                .map_err(|error| (error, "throttle"))?;
+            let pipeline = native_rows_pipeline_for(
+                state,
+                ExportDestination::Tinybird,
+                "Audit event storage is not configured",
+            )
+            .map_err(|error| (error, "forward"))?;
+            if let Err(error) =
+                store_audit_trail_rows(pipeline, org_id, vec![event.to_row(org_id, now_ms)]).await
+            {
+                state
+                    .gcp_resolver
+                    .record_health(connector_id, Some(gcp_logging::ENTRY_NOT_STORED))
+                    .await;
+                return Err((error, "forward"));
+            }
+            state.gcp_resolver.record_health(connector_id, None).await;
+            state.resolver.note_source_use(&resolved.key, false);
+            return Ok((StatusCode::OK.into_response(), GcpPushOutcome::AuditEvent));
+        }
+    }
+
     if let Some(error) = entitlement_rejection(state, org_id, Signal::Logs.path()).await {
         state
             .gcp_resolver
@@ -6274,6 +7723,7 @@ async fn handle_gcp_logpush_inner(
         &mut DecodedPayload::Logs(request),
         &resolved.key,
         &mut retained,
+        Received::unbudgeted(body.len()),
     )
     .await
     {
@@ -6636,6 +8086,7 @@ async fn store_delivery(
             &mut decoded,
             key,
             &mut retained,
+            Received::unbudgeted(received_bytes),
         )
         .await
         {
@@ -7001,6 +8452,10 @@ fn json_value_to_attribute(key: &str, value: &JsonValue) -> Option<KeyValue> {
     Some(string_attribute(key, &string_value))
 }
 
+/// Longer than any key Maple issues. A longer value is not a key, and is
+/// refused here so it is never hashed, looked up or held in the unknown-key cache.
+const MAX_INGEST_KEY_LEN: usize = 256;
+
 fn extract_ingest_key(headers: &HeaderMap) -> Option<String> {
     if let Some(value) = headers
         .get(AUTHORIZATION)
@@ -7009,7 +8464,7 @@ fn extract_ingest_key(headers: &HeaderMap) -> Option<String> {
         if value.len() > 7 && value[..7].eq_ignore_ascii_case("Bearer ") {
             let token = value[7..].trim();
             if !token.is_empty() {
-                return Some(token.to_owned());
+                return (token.len() <= MAX_INGEST_KEY_LEN).then(|| token.to_owned());
             }
         }
     }
@@ -7018,8 +8473,28 @@ fn extract_ingest_key(headers: &HeaderMap) -> Option<String> {
         .get("x-maple-ingest-key")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && value.len() <= MAX_INGEST_KEY_LEN)
         .map(str::to_owned)
+}
+
+/// A basic-auth header this long is not a username and an ingest key.
+const MAX_BASIC_AUTH_LEN: usize = 1024;
+
+/// The ingest key of a Prometheus remote write: a bearer token or the
+/// `x-maple-ingest-key` header like OTLP, or the basic-auth password, for a
+/// `remote_write` configured with `basic_auth`. The username is ignored.
+fn extract_prometheus_ingest_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(key) = extract_ingest_key(headers) {
+        return Some(key);
+    }
+    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    if value.len() > MAX_BASIC_AUTH_LEN || !value.get(..6)?.eq_ignore_ascii_case("Basic ") {
+        return None;
+    }
+    let decoded = STANDARD.decode(value[6..].trim()).ok()?;
+    let (_username, password) = std::str::from_utf8(&decoded).ok()?.split_once(':')?;
+    let password = password.trim();
+    (!password.is_empty() && password.len() <= MAX_INGEST_KEY_LEN).then(|| password.to_owned())
 }
 
 #[derive(Clone, Copy)]
@@ -7078,25 +8553,6 @@ fn decode_payload(
     }
 }
 
-#[hotpath::measure]
-fn encode_payload(payload: &[u8], content_encoding: Option<&str>) -> Result<Vec<u8>, ApiError> {
-    match content_encoding {
-        None => Ok(payload.to_vec()),
-        Some("gzip") => {
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder
-                .write_all(payload)
-                .map_err(|_| ApiError::service_unavailable("Failed to encode gzip payload"))?;
-            encoder
-                .finish()
-                .map_err(|_| ApiError::service_unavailable("Failed to encode gzip payload"))
-        }
-        Some(_) => Err(ApiError::unsupported_media_type(
-            "Unsupported content-encoding",
-        )),
-    }
-}
-
 /// What decoding `payload` would allocate, refused past `heap_budget` before any
 /// of it is allocated.
 fn otlp_decode_cost(
@@ -7111,12 +8567,14 @@ fn otlp_decode_cost(
         }
         PayloadFormat::Json => decode_budget::json_cost(payload, heap_budget),
     }
-    .map_err(|decode_budget::OverBudget| {
-        ApiError::payload_too_large(format!(
-            "Request decodes past the {} MiB the gateway allows one request; send smaller batches",
-            heap_budget / (1024 * 1024)
-        ))
-    })
+    .map_err(|decode_budget::OverBudget| over_decode_budget(heap_budget))
+}
+
+fn over_decode_budget(heap_budget: u64) -> ApiError {
+    ApiError::payload_too_large(format!(
+        "Request decodes past the {} MiB the gateway allows one request; send smaller batches",
+        heap_budget / (1024 * 1024)
+    ))
 }
 
 /// Why `decode_otlp_body` refused a body, and the stage that refused it, named as
@@ -7131,6 +8589,27 @@ struct DecodedBody {
     payload: DecodedPayload,
     decoded_bytes: usize,
     memory: DecodeReservation,
+    /// What a Prometheus remote write body held, for that ingress only.
+    prometheus: Option<prometheus_remote_write::Stats>,
+}
+
+/// How a request body is compressed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BodyEncoding {
+    Identity,
+    Gzip,
+    /// A snappy block, as Prometheus remote write sends.
+    Snappy,
+}
+
+impl BodyEncoding {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Gzip => "gzip",
+            Self::Snappy => "snappy",
+        }
+    }
 }
 
 static INGEST_DECODE_BUSY: FailureKind = FailureKind {
@@ -7149,10 +8628,11 @@ static INGEST_DECODE_BUSY: FailureKind = FailureKind {
 async fn decode_otlp_body(
     state: &AppState,
     body: Bytes,
-    gzip: bool,
-    signal: Signal,
+    encoding: BodyEncoding,
+    ingress: Ingress,
     payload_format: PayloadFormat,
 ) -> Result<DecodedBody, DecodeRefusal> {
+    let signal = ingress.signal();
     let mut reservation = state.decode_memory.reservation();
     let (max_decoded, heap_budget) = (
         state.config.max_decoded_body_bytes,
@@ -7171,18 +8651,25 @@ async fn decode_otlp_body(
                 "Ingest gateway is busy decoding other requests; retry shortly",
             )
         };
-        let encoding = if gzip { "gzip" } else { "identity" };
-        let decode_span = parent.in_scope(|| decode_internal_span(encoding, body.len()));
+        let decode_span = parent.in_scope(|| decode_internal_span(encoding.label(), body.len()));
         let payload = {
             let _guard = decode_span.enter();
             // The body is already buffered; counting it sheds the rest of a burst.
             if !reservation.try_add(body.len() as u64) {
                 return Err(refuse(&decode_span, busy(), "decode_busy"));
             }
-            let payload = if gzip {
-                let invalid = || ApiError::bad_request("Invalid gzip body");
-                let declared = decode_budget::gzip_declared_len(&body)
-                    .ok_or_else(|| refuse(&decode_span, invalid(), "decode"))?;
+            let payload = if encoding == BodyEncoding::Identity {
+                body
+            } else {
+                let invalid =
+                    || ApiError::bad_request(format!("Invalid {} body", encoding.label()));
+                // The size the body declares, checked and reserved before it is inflated.
+                let declared = if encoding == BodyEncoding::Gzip {
+                    decode_budget::gzip_declared_len(&body)
+                } else {
+                    snappy_declared_len(&body)
+                }
+                .ok_or_else(|| refuse(&decode_span, invalid(), "decode"))?;
                 let declared = usize::try_from(declared).unwrap_or(usize::MAX);
                 if declared > max_decoded {
                     return Err(refuse(&decode_span, too_large_decoded(), "payload_too_large"));
@@ -7190,16 +8677,23 @@ async fn decode_otlp_body(
                 if !reservation.try_add(declared as u64) {
                     return Err(refuse(&decode_span, busy(), "decode_busy"));
                 }
-                let inflated = gunzip_declared(&body, declared).map_err(|error| match error {
-                    GunzipError::Invalid(_) => refuse(&decode_span, invalid(), "decode"),
-                    GunzipError::TooLarge => {
-                        refuse(&decode_span, too_large_decoded(), "payload_too_large")
-                    }
-                })?;
+                let inflated = if encoding == BodyEncoding::Gzip {
+                    gunzip_declared(&body, declared).map_err(|error| match error {
+                        GunzipError::Invalid(_) => refuse(&decode_span, invalid(), "decode"),
+                        GunzipError::TooLarge => {
+                            refuse(&decode_span, too_large_decoded(), "payload_too_large")
+                        }
+                    })
+                } else {
+                    unsnap_declared(&body, declared).map_err(|error| match error {
+                        SnappyError::Invalid => refuse(&decode_span, invalid(), "decode"),
+                        SnappyError::TooLarge => {
+                            refuse(&decode_span, too_large_decoded(), "payload_too_large")
+                        }
+                    })
+                }?;
                 drop(body);
                 Bytes::from(inflated)
-            } else {
-                body
             };
             decode_span.record("maple.ingest.decoded_bytes", payload.len());
             payload
@@ -7207,23 +8701,66 @@ async fn decode_otlp_body(
         let parse_span =
             parent.in_scope(|| parse_internal_span(payload_format.label(), signal.path()));
         let _guard = parse_span.enter();
-        let estimate = otlp_decode_cost(signal, payload_format, &payload, heap_budget)
-            .map_err(|error| refuse(&parse_span, error, "payload_too_large"))?;
+        let mut retained = None;
+        // A drain's body is JSON whatever `payload_format` it is forwarded as.
+        let estimate = match ingress {
+            Ingress::Otlp(_) => otlp_decode_cost(signal, payload_format, &payload, heap_budget),
+            Ingress::VercelLogDrain
+            | Ingress::VercelAiGatewayDrain
+            | Ingress::VercelEventDrain(_) => decode_budget::json_cost(&payload, heap_budget)
+                .map_err(|decode_budget::OverBudget| over_decode_budget(heap_budget)),
+            Ingress::PrometheusRemoteWrite => {
+                prometheus_remote_write::decode_cost(&payload, heap_budget)
+                    .map(|cost| {
+                        // Less than the peak: the decoded request is gone once mapped.
+                        retained = Some(cost.retained);
+                        cost.peak
+                    })
+                    .map_err(|decode_budget::OverBudget| over_decode_budget(heap_budget))
+            }
+        }
+        .map_err(|error| refuse(&parse_span, error, "payload_too_large"))?;
         parse_span.record("maple.ingest.decode_heap_estimate", estimate);
         if !reservation.try_add(estimate) {
             return Err(refuse(&parse_span, busy(), "decode_busy"));
         }
-        let decoded = decode_otlp_payload(signal, payload_format, &payload)
-            .map_err(|error| refuse(&parse_span, error, "enrich"))?;
+        let mut prometheus = None;
+        let decoded = match ingress {
+            Ingress::Otlp(_) => decode_otlp_payload(signal, payload_format, &payload),
+            Ingress::VercelLogDrain => decode_vercel_logs(&payload),
+            Ingress::VercelAiGatewayDrain => decode_vercel_ai_gateway(&payload),
+            Ingress::VercelEventDrain(drain) => decode_vercel_event_drain(drain, &payload),
+            Ingress::PrometheusRemoteWrite => {
+                decode_prometheus_remote_write(&payload).map(|(decoded, stats)| {
+                    prometheus = Some(stats);
+                    decoded
+                })
+            }
+        }
+        .map_err(|error| refuse(&parse_span, error, "enrich"))?;
         parse_span.record("maple.ingest.item_count", decoded.item_count());
+        // A remote write is metered as the OTLP it becomes. On the wire a series carries
+        // its labels once and every stored point carries them, so the wire size would
+        // let a series with many samples store far more than it is billed for.
+        let decoded_bytes = match (&decoded, ingress) {
+            (DecodedPayload::Metrics(request), Ingress::PrometheusRemoteWrite) => {
+                request.encoded_len()
+            }
+            _ => payload.len(),
+        };
+        // Everything after decoding is sized for a body of at most `max_decoded` bytes,
+        // so a write may not fan out into more OTLP than an OTLP request may carry.
+        if matches!(ingress, Ingress::PrometheusRemoteWrite) && decoded_bytes > max_decoded {
+            return Err(refuse(&parse_span, too_large_mapped(), "payload_too_large"));
+        }
         // Only the decoded form outlives this closure; the buffers go with it.
-        let decoded_bytes = payload.len();
         drop(payload);
-        reservation.shrink_to(estimate);
+        reservation.shrink_to(retained.unwrap_or(estimate));
         Ok(DecodedBody {
             payload: decoded,
             decoded_bytes,
             memory: reservation,
+            prometheus,
         })
     })
     .await
@@ -7238,6 +8775,13 @@ async fn decode_otlp_body(
 
 fn too_large_decoded() -> ApiError {
     ApiError::payload_too_large("Decompressed request body too large")
+}
+
+fn too_large_mapped() -> ApiError {
+    ApiError::payload_too_large(
+        "This remote write holds more metric data than one request may carry; send fewer \
+         samples per request",
+    )
 }
 
 #[hotpath::measure]
@@ -7276,6 +8820,135 @@ fn decode_otlp_payload(
             let request: ExportMetricsServiceRequest =
                 decode_otlp_json(payload, "metrics", "resourceMetrics")?;
             Ok(DecodedPayload::Metrics(request))
+        }
+    }
+}
+
+fn decode_prometheus_remote_write(
+    payload: &[u8],
+) -> Result<(DecodedPayload, prometheus_remote_write::Stats), ApiError> {
+    let (request, stats) = prometheus_remote_write::decode(payload).map_err(|_| {
+        ApiError::bad_request(
+            "Invalid Prometheus remote write payload (expected a prometheus.WriteRequest)",
+        )
+    })?;
+    Ok((DecodedPayload::Metrics(request), stats))
+}
+
+fn decode_vercel_logs(payload: &[u8]) -> Result<DecodedPayload, ApiError> {
+    let parsed = vercel_logs::parse(payload)
+        .map_err(|e| ApiError::bad_request(format!("Invalid Vercel log drain payload: {e}")))?;
+    if parsed.malformed_lines > 0 {
+        warn!(
+            malformed_lines = parsed.malformed_lines,
+            "Vercel log drain delivery had lines that are not JSON; skipped them"
+        );
+    }
+    Ok(DecodedPayload::Logs(vercel_logs::build_logs_request(
+        &parsed.entries,
+        current_time_unix_nano(),
+    )))
+}
+
+fn decode_vercel_ai_gateway(payload: &[u8]) -> Result<DecodedPayload, ApiError> {
+    let parsed = vercel_logs::parse(payload).map_err(|e| {
+        ApiError::bad_request(format!("Invalid Vercel AI Gateway drain payload: {e}"))
+    })?;
+    if parsed.malformed_lines > 0 {
+        warn!(
+            malformed_lines = parsed.malformed_lines,
+            "Vercel AI Gateway drain delivery had lines that are not JSON; skipped them"
+        );
+    }
+    Ok(DecodedPayload::Traces(
+        vercel_ai_gateway_drain::build_traces_request(&parsed.entries),
+    ))
+}
+
+fn decode_vercel_event_drain(
+    drain: EventDrain,
+    payload: &[u8],
+) -> Result<DecodedPayload, ApiError> {
+    let label = drain.label();
+    let parsed = vercel_logs::parse(payload)
+        .map_err(|e| ApiError::bad_request(format!("Invalid Vercel {label} drain payload: {e}")))?;
+    if parsed.malformed_lines > 0 {
+        warn!(
+            malformed_lines = parsed.malformed_lines,
+            drain = label,
+            "Vercel drain delivery had lines that are not JSON; skipped them"
+        );
+    }
+    Ok(DecodedPayload::Logs(
+        vercel_event_drains::build_logs_request(drain, &parsed.entries, current_time_unix_nano()),
+    ))
+}
+
+/// The drain's source replaces the OTLP gateway's that enrichment stamps.
+fn stamp_drain_source(decoded: &mut DecodedPayload, source: &str) {
+    let resources: Vec<&mut Option<Resource>> = match decoded {
+        DecodedPayload::Logs(request) => request
+            .resource_logs
+            .iter_mut()
+            .map(|resource_log| &mut resource_log.resource)
+            .collect(),
+        DecodedPayload::Traces(request) => request
+            .resource_spans
+            .iter_mut()
+            .map(|resource_span| &mut resource_span.resource)
+            .collect(),
+        DecodedPayload::Metrics(request) => request
+            .resource_metrics
+            .iter_mut()
+            .map(|resource_metric| &mut resource_metric.resource)
+            .collect(),
+    };
+    for resource in resources.into_iter().flatten() {
+        upsert_string_attribute(&mut resource.attributes, "maple_ingest_source", source);
+    }
+}
+
+/// Names the sender's source for senders that cannot set resource attributes (Vercel drains).
+const SOURCE_ID_HEADER: &str = "x-maple-source-id";
+
+/// Copies the `x-maple-source-id` header onto every resource without a `maple_source_id`
+/// of its own, so it is verified and stamped exactly like an attribute claim.
+fn apply_header_source_claim(
+    decoded: &mut DecodedPayload,
+    headers: &HeaderMap,
+    resolved_key: &ResolvedIngestKey,
+) {
+    if !resolved_key.accepts_source_claims() {
+        return;
+    }
+    let Some(claim) = headers
+        .get(SOURCE_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|claim| !claim.is_empty() && claim.len() <= MAX_PUBLIC_ID_LEN)
+    else {
+        return;
+    };
+    let resources: Vec<&mut Resource> = match decoded {
+        DecodedPayload::Traces(request) => request
+            .resource_spans
+            .iter_mut()
+            .map(|r| r.resource.get_or_insert_with(Resource::default))
+            .collect(),
+        DecodedPayload::Logs(request) => request
+            .resource_logs
+            .iter_mut()
+            .map(|r| r.resource.get_or_insert_with(Resource::default))
+            .collect(),
+        DecodedPayload::Metrics(request) => request
+            .resource_metrics
+            .iter_mut()
+            .map(|r| r.resource.get_or_insert_with(Resource::default))
+            .collect(),
+    };
+    for resource in resources {
+        if source_id_claim(&resource.attributes).is_none() {
+            upsert_string_attribute(&mut resource.attributes, SOURCE_ID_ATTRIBUTE, claim);
         }
     }
 }
@@ -7933,7 +9606,141 @@ fn record_rule_stats(state: &AppState, signal: Signal, applied: Option<&RulesApp
     }
 }
 
+/// What a request cost before its rows are built: the bytes it is metered on and
+/// the decode memory it still holds.
+#[derive(Clone, Copy)]
+struct Received {
+    bytes: usize,
+    decode_heap: u64,
+}
+
+impl Received {
+    /// A connector's batch, built by the gateway outside the decode budget.
+    const fn unbudgeted(bytes: usize) -> Self {
+        Self {
+            bytes,
+            decode_heap: 0,
+        }
+    }
+}
+
+/// What the stage after decoding is admitted on.
+#[derive(Clone, Copy)]
+struct RowStage {
+    /// The bytes the request is billed for, after drops.
+    metered_bytes: usize,
+    decode_heap: u64,
+    /// Whether the rows are built here; a forward-only request only encodes a body.
+    native: bool,
+    /// What building the body forwarded to a collector allocates.
+    forward_bytes: u64,
+}
+
+/// Admits the stage after decoding, before any of it runs: refuses a request whose
+/// rows come to far more than it is metered on, then reserves the largest piece its
+/// rows are built in (`piece_heap`, held while every piece is written in turn) and
+/// its forward body. Nothing is written yet, so a refusal leaves nothing.
+fn admit_rows(
+    state: &AppState,
+    signal: Signal,
+    org_id: &str,
+    rows: &RowEstimate,
+    piece_heap: u64,
+    stage: RowStage,
+    memory: &mut DecodeReservation,
+) -> Result<(), ApiError> {
+    let refuse = |error: ApiError| {
+        warn!(
+            signal = signal.path(),
+            org_id,
+            rows = rows.rows,
+            row_bytes = rows.row_bytes(),
+            metered_bytes = stage.metered_bytes,
+            reason = %error.message,
+            "Payload refused before its rows were built"
+        );
+        record_stage_error(
+            &Span::current(),
+            error.error_kind(),
+            &error.message,
+            error.status.is_server_error(),
+        );
+        error
+    };
+    let ceiling = state.config.max_row_expansion;
+    let allowed = (stage.metered_bytes as u64).saturating_mul(ceiling);
+    if ceiling > 0 && rows.row_bytes() > allowed {
+        // Counted per refusal, as a scan-budget refusal is: the batch is not stored.
+        metrics::org_data_loss(org_id, signal.path(), INGEST_ROW_EXPANSION.error_kind);
+        return Err(refuse(ApiError::tagged(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            &INGEST_ROW_EXPANSION,
+            format!(
+                "This batch would be stored as more than {ceiling} times its size, because every \
+                 row repeats its resource, scope and metric attributes; shorten them or send \
+                 fewer items per resource"
+            ),
+        )));
+    }
+    let rows_heap = if stage.native { piece_heap } else { 0 };
+    let room = state
+        .decode_memory
+        .total_bytes()
+        .saturating_sub(stage.decode_heap);
+    // Only a single row larger than the whole budget gets here: pieces are small.
+    if rows_heap > room {
+        metrics::org_data_loss(org_id, signal.path(), INGEST_PAYLOAD_TOO_LARGE.error_kind);
+        return Err(refuse(ApiError::payload_too_large(format!(
+            "One item needs {} MiB to store, more than the gateway allows one request; send \
+             smaller items",
+            rows_heap / (1024 * 1024)
+        ))));
+    }
+    // The forward body is reserved whole. Within the decode limits it always fits an
+    // otherwise idle budget, so this refusal is for a gateway configured too small.
+    let needed = rows_heap.saturating_add(stage.forward_bytes);
+    if needed > room {
+        metrics::org_data_loss(org_id, signal.path(), INGEST_PAYLOAD_TOO_LARGE.error_kind);
+        return Err(refuse(ApiError::payload_too_large(format!(
+            "This batch needs {} MiB to forward and store, more than the gateway allows one \
+             request; send smaller batches",
+            needed / (1024 * 1024)
+        ))));
+    }
+    if !memory.try_add(needed) {
+        return Err(refuse(ApiError::tagged(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &INGEST_DECODE_BUSY,
+            "Ingest gateway is busy storing other requests; retry shortly",
+        )));
+    }
+    Ok(())
+}
+
+/// The `error.type` of a `process_decoded_payload` refusal: its own kind where the
+/// refusal has one, `forward` for the rest.
+fn process_error_kind(error: &ApiError) -> &'static str {
+    let kind = error.error_kind();
+    let own = [
+        &INGEST_RULES_SCAN_BUDGET,
+        &INGEST_ROW_EXPANSION,
+        &INGEST_PAYLOAD_TOO_LARGE,
+        &INGEST_DECODE_BUSY,
+        &INGEST_ROWS_EXCEED_QUEUE,
+    ];
+    if own.iter().any(|failure| failure.error_kind == kind) {
+        kind
+    } else {
+        "forward"
+    }
+}
+
 #[hotpath::measure]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one request's signal, wire format, payload, key and what it is metered on; a \
+              struct would only be built and taken apart again at each of five call sites"
+)]
 async fn process_decoded_payload(
     state: &AppState,
     signal: Signal,
@@ -7942,6 +9749,7 @@ async fn process_decoded_payload(
     decoded: &mut DecodedPayload,
     resolved_key: &ResolvedIngestKey,
     retained: &mut Retained,
+    received: Received,
 ) -> Result<Response, ApiError> {
     // Before the native/forward split: the WAL, S3 shipping and the collector never see raw values.
     let applied = apply_ingest_rules(state, decoded, &resolved_key.org_id, retained).await?;
@@ -7953,19 +9761,63 @@ async fn process_decoded_payload(
     let destination = native_destination_for(resolved_key);
     Span::current().record("maple.ingest.destination", destination.as_str());
 
-    if uses_native_pipeline_for(state.config.write_mode, destination) {
-        accept_native_decoded_payload(state, signal, decoded, resolved_key, destination)
-            .instrument(accept_internal_span(signal.path(), destination.as_str()))
-            .await?;
+    let native = uses_native_pipeline_for(state.config.write_mode, destination);
+    let forward = uses_forward_path_for(state.config.write_mode, destination);
+    let forward_gzip = match content_encoding {
+        Some("gzip") => true,
+        Some(_) if forward => {
+            return Err(ApiError::unsupported_media_type(
+                "Unsupported content-encoding",
+            ));
+        }
+        _ => false,
+    };
+    let forward_body = if forward {
+        Some(decoded.forward_body(payload_format, forward_gzip)?)
+    } else {
+        None
+    };
+    let stage = RowStage {
+        metered_bytes: retained.metered_bytes(received.bytes),
+        decode_heap: received.decode_heap,
+        native,
+        forward_bytes: forward_body.map_or(0, |body| body.heap_bytes()),
+    };
+    // Held until the rows are in the WAL and the forward body is sent.
+    let mut memory = state.decode_memory.reservation();
+
+    if native {
+        accept_native_decoded_payload(
+            state,
+            signal,
+            decoded,
+            resolved_key,
+            destination,
+            stage,
+            &mut memory,
+        )
+        .instrument(accept_internal_span(signal.path(), destination.as_str()))
+        .await?;
         if destination == ExportDestination::ClickHouse {
             record_rule_stats(state, signal, applied.as_ref());
             return Ok(StatusCode::OK.into_response());
         }
+    } else if forward {
+        // The collector builds the same rows, so the same ceiling applies.
+        let rows = decoded.rows(&resolved_key.org_id);
+        admit_rows(
+            state,
+            signal,
+            &resolved_key.org_id,
+            &rows,
+            0,
+            stage,
+            &mut memory,
+        )?;
     }
 
-    if uses_forward_path_for(state.config.write_mode, destination) {
-        let outbound_payload = decoded.encode(payload_format)?;
-        let outbound_body = encode_payload(&outbound_payload, content_encoding)?;
+    if let Some(forward_body) = forward_body {
+        let outbound_body = decoded.encode(&forward_body)?;
         let outbound_bytes = outbound_body.len();
         let forward_span = forward_client_span("collector", outbound_bytes, signal.path());
         let response = forward_to_collector(
@@ -7996,12 +9848,11 @@ async fn accept_native_decoded_payload(
     decoded: &DecodedPayload,
     resolved_key: &ResolvedIngestKey,
     destination: ExportDestination,
+    stage: RowStage,
+    memory: &mut DecodeReservation,
 ) -> Result<(), ApiError> {
-    let pipeline = state
-        .telemetry_pipeline
-        .as_ref()
-        .ok_or_else(|| ApiError::service_unavailable("Telemetry pipeline is not configured"))?;
     let native_start = Instant::now();
+    let org_id = resolved_key.org_id.as_str();
     let stats = match decoded {
         DecodedPayload::Traces(request) => {
             // Both lookups are 30s-TTL cached; the span exists so a TTL miss that
@@ -8010,13 +9861,10 @@ async fn accept_native_decoded_payload(
             let config_span = resolve_config_internal_span();
             let config_span_handle = config_span.clone();
             let (policy, attribute_mappings) = async {
-                let policy = state
-                    .sampling_resolver
-                    .resolve_policy(&resolved_key.org_id)
-                    .await;
+                let policy = state.sampling_resolver.resolve_policy(org_id).await;
                 let attribute_mappings = state
                     .attribute_mapping_resolver
-                    .resolve_mappings(&resolved_key.org_id)
+                    .resolve_mappings(org_id)
                     .await;
                 (policy, attribute_mappings)
             }
@@ -8027,43 +9875,22 @@ async fn accept_native_decoded_payload(
                 "maple.ingest.attribute_mapping_count",
                 attribute_mappings.len(),
             );
-            pipeline
-                .accept_traces_to(
-                    &resolved_key.org_id,
-                    request,
-                    &policy,
-                    attribute_mappings.as_slice(),
-                    destination,
-                )
-                .await
+            let source = RowSource::Traces {
+                request,
+                policy: &policy,
+                mappings: attribute_mappings.as_slice(),
+            };
+            accept_row_source(state, signal, org_id, source, destination, stage, memory).await?
         }
         DecodedPayload::Logs(request) => {
-            pipeline
-                .accept_logs_to(&resolved_key.org_id, request, destination)
-                .await
+            let source = RowSource::Logs(request);
+            accept_row_source(state, signal, org_id, source, destination, stage, memory).await?
         }
         DecodedPayload::Metrics(request) => {
-            pipeline
-                .accept_metrics_to(&resolved_key.org_id, request, destination)
-                .await
+            let source = RowSource::Metrics(request);
+            accept_row_source(state, signal, org_id, source, destination, stage, memory).await?
         }
-    }
-    .map_err(|error| {
-        let api_error = api_error_from_pipeline(&error);
-        error!(
-            error = %error,
-            signal = signal.path(),
-            org_id = %resolved_key.org_id,
-            "Native telemetry pipeline rejected payload"
-        );
-        record_stage_error(
-            &Span::current(),
-            error.kind(),
-            &error.to_string(),
-            error.is_server_fault(),
-        );
-        api_error
-    })?;
+    };
     metrics::native_accept_duration(signal.path(), native_start.elapsed().as_secs_f64());
     metrics::native_rows(signal.path(), stats.rows as u64);
     if stats.dropped > 0 {
@@ -8072,6 +9899,89 @@ async fn accept_native_decoded_payload(
     Span::current().record("maple.ingest.native_rows", stats.rows as u64);
     Span::current().record("maple.ingest.sampled_dropped", stats.dropped as u64);
     Ok(())
+}
+
+/// Plans a request's rows in pieces, admits it on its largest piece, then builds and
+/// commits the pieces in order from one up-front queue reservation. Only a WAL write
+/// or sync failure, or a dropped request, can stop it after a piece is written.
+async fn accept_row_source(
+    state: &AppState,
+    signal: Signal,
+    org_id: &str,
+    source: RowSource<'_>,
+    destination: ExportDestination,
+    stage: RowStage,
+    memory: &mut DecodeReservation,
+) -> Result<AcceptStats, ApiError> {
+    let pipeline = state
+        .telemetry_pipeline
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("Telemetry pipeline is not configured"))?;
+    let plan = source.plan(org_id, state.config.row_piece_bytes);
+    Span::current().record("maple.ingest.row_pieces", plan.pieces.len());
+    admit_rows(
+        state,
+        signal,
+        org_id,
+        &plan.total,
+        plan.largest_piece_heap(),
+        stage,
+        memory,
+    )?;
+    pipeline
+        .accept_planned(org_id, source, destination, &plan)
+        .await
+        .map_err(|failure| {
+            let PlannedFailure {
+                error,
+                pieces_written,
+                ..
+            } = &failure;
+            let stored_any = failure.stored_any();
+            let mut api_error = api_error_from_pipeline(error);
+            error!(
+                error = %failure,
+                signal = signal.path(),
+                org_id,
+                "Native telemetry pipeline rejected payload"
+            );
+            if stored_any {
+                api_error.message =
+                    partial_write_message(error, *pieces_written, plan.pieces.len());
+            }
+            match error {
+                // Resending fails the same way: the batch is lost, or the unwritten part of it.
+                PipelineError::Encode(_) if stored_any => {
+                    metrics::org_data_loss(org_id, signal.path(), "encode_partial");
+                }
+                PipelineError::Encode(_) | PipelineError::TooLarge(_) => {
+                    metrics::org_data_loss(org_id, signal.path(), error.kind());
+                }
+                _ => {}
+            }
+            record_stage_error(
+                &Span::current(),
+                error.kind(),
+                &error.to_string(),
+                error.is_server_fault(),
+            );
+            api_error
+        })
+}
+
+/// The answer to a request that failed after some of its pieces were durable: those
+/// are exported, so it must not say nothing was written.
+fn partial_write_message(error: &PipelineError, written: usize, pieces: usize) -> String {
+    let stored = if written == 0 {
+        format!("Part of the first of the {pieces} pieces this batch was stored in was written and will be exported.")
+    } else {
+        format!("At least {written} of the {pieces} pieces this batch was stored in were written and will be exported.")
+    };
+    if matches!(error, PipelineError::Encode(_)) {
+        format!("Maple could not encode the rest of this batch for storage. {stored} Resending fails the same way; contact support with this request's trace id.")
+    } else {
+        format!("Maple could not durably queue the rest of this batch. {stored} Resend it after the suggested delay; the written part is stored again.")
+    }
 }
 
 impl OrgRoutingResolver {
@@ -8163,6 +10073,7 @@ impl IngestKeyResolver {
                     org_id,
                     error, "Source claim lookup failed; replacing the claims"
                 );
+                verified.unresolved = true;
                 return verified;
             }
         };
@@ -8826,6 +10737,34 @@ fn parse_attribute_mapping_row(row: AttributeMappingRow) -> Option<AttributeMapp
     })
 }
 
+/// Mapping rules an org's spans get, and the bytes of their keys in all. Each rule can
+/// copy a value into every span, so the count bounds how much a span grows.
+const MAX_ATTRIBUTE_MAPPINGS: usize = 64;
+const MAX_ATTRIBUTE_MAPPING_BYTES: usize = 16 * 1024;
+
+/// The rules in order, up to the first that would pass either cap.
+fn cap_attribute_mappings(
+    org_id: &str,
+    rules: impl Iterator<Item = AttributeMappingRule>,
+) -> Vec<AttributeMappingRule> {
+    let mut kept = Vec::new();
+    let mut bytes = 0usize;
+    for rule in rules {
+        let size = rule.source_key.len() + rule.target_key.len();
+        if kept.len() == MAX_ATTRIBUTE_MAPPINGS || bytes + size > MAX_ATTRIBUTE_MAPPING_BYTES {
+            warn!(
+                org_id,
+                kept = kept.len(),
+                "Attribute mappings past the gateway's cap are not applied"
+            );
+            break;
+        }
+        bytes += size;
+        kept.push(rule);
+    }
+    kept
+}
+
 impl AttributeMappingResolver {
     #[hotpath::measure]
     async fn resolve_mappings(&self, org_id: &str) -> Arc<Vec<AttributeMappingRule>> {
@@ -8834,11 +10773,10 @@ impl AttributeMappingResolver {
         }
 
         let rules = match self.store.fetch_attribute_mappings(org_id).await {
-            Ok(rows) => Arc::new(
-                rows.into_iter()
-                    .filter_map(parse_attribute_mapping_row)
-                    .collect::<Vec<_>>(),
-            ),
+            Ok(rows) => Arc::new(cap_attribute_mappings(
+                org_id,
+                rows.into_iter().filter_map(parse_attribute_mapping_row),
+            )),
             Err(error) => {
                 warn!(
                     org_id,
@@ -8852,6 +10790,32 @@ impl AttributeMappingResolver {
             .insert(org_id.to_owned(), Arc::clone(&rules))
             .await;
         rules
+    }
+}
+
+impl VercelProjectNameResolver {
+    /// A failed lookup is not cached, and names nothing: the spans keep Vercel's service.
+    async fn resolve(&self, org_id: &str) -> Arc<HashMap<String, String>> {
+        if let Some(names) = self.cache.get(org_id).await {
+            return names;
+        }
+        match self.store.fetch_vercel_project_names(org_id).await {
+            Ok(rows) => {
+                let names = Arc::new(rows.into_iter().collect::<HashMap<_, _>>());
+                self.cache
+                    .insert(org_id.to_owned(), Arc::clone(&names))
+                    .await;
+                names
+            }
+            Err(error) => {
+                warn!(
+                    org_id,
+                    error = %error,
+                    "Vercel project name lookup failed; keeping Vercel's runtime service name"
+                );
+                Arc::default()
+            }
+        }
     }
 }
 
@@ -8986,9 +10950,9 @@ impl ClickHouseTargetProvider for ClickHouseTargetResolver {
         ) {
             (Some(ciphertext), Some(iv), Some(tag)) => {
                 let keyring = self.keyring.as_ref().ok_or_else(|| {
-                    "MAPLE_INGEST_KEY_ENCRYPTION_KEY is required to decrypt ClickHouse credentials".to_owned()
+                    "MAPLE_INGEST_CH_PASSWORD_SLOT_KEYS or MAPLE_INGEST_KEY_ENCRYPTION_KEY is required to decrypt ClickHouse credentials".to_owned()
                 })?;
-                keyring.open_clickhouse_password(org_id, ciphertext, iv, tag)?
+                keyring.open_clickhouse_password(org_id, &row.ch_url, ciphertext, iv, tag)?
             }
             (None, None, None) => String::new(),
             _ => {
@@ -9025,7 +10989,7 @@ impl ClickHouseTargetProvider for ClickHouseTargetResolver {
 }
 
 /// PlanetScale Postgres-backed KeyStore. A pooled direct connection (PSBouncer
-/// 6432, no Hyperdrive — Railway dials PlanetScale). Uses `$N` placeholders,
+/// 6432, no Hyperdrive — the ECS fleet dials PlanetScale). Uses `$N` placeholders,
 /// native booleans, and `to_timestamp()` for the epoch-ms connector timestamps
 /// (those columns are `timestamptz`). A 60s in-process cache and HMAC
 /// fingerprinting sit upstream.
@@ -9454,7 +11418,8 @@ impl KeyStore for PostgresKeyStore {
         let rows = client
             .query(
                 "SELECT source_context, source_key, target_key, operation \
-                 FROM org_ingest_attribute_mappings WHERE org_id = $1 AND enabled = true",
+                 FROM org_ingest_attribute_mappings WHERE org_id = $1 AND enabled = true \
+                 ORDER BY created_at, id",
                 &[&org_id],
             )
             .instrument(postgres_client_span(
@@ -9473,6 +11438,30 @@ impl KeyStore for PostgresKeyStore {
                 target_key: row.get("target_key"),
                 operation: row.get("operation"),
             })
+            .collect())
+    }
+
+    async fn fetch_vercel_project_names(
+        &self,
+        org_id: &str,
+    ) -> Result<Vec<(String, String)>, String> {
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT project_id, name FROM vercel_projects WHERE org_id = $1",
+                &[&org_id],
+            )
+            .instrument(postgres_client_span(
+                "fetch_vercel_project_names",
+                "SELECT",
+                "vercel_projects",
+                &self.target,
+            ))
+            .await
+            .map_err(|error| format!("postgres fetch_vercel_project_names failed: {error}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("project_id"), row.get("name")))
             .collect())
     }
 
@@ -10122,6 +12111,11 @@ fn secret_aad(parts: &[&str]) -> Vec<u8> {
 
 /// The slot name of the BYO ClickHouse password: its subkey label and first AAD part.
 const CLICKHOUSE_PASSWORD_SLOT: &str = "org_clickhouse_settings.ch_password";
+/// The ClickHouse password slot's subkeys, `<keyId>:<base64 subkey>` comma-separated, primary
+/// first. Derived at deploy (`packages/infra/src/secret-slot-keys.ts`) so the task holds no master key.
+const CH_PASSWORD_SLOT_KEYS_ENV: &str = "MAPLE_INGEST_CH_PASSWORD_SLOT_KEYS";
+/// Separates row from destination in the v3 AAD, as `DESTINATION_AAD_MARKER` in `SecretBox.ts`.
+const DESTINATION_AAD_MARKER: &str = "destination";
 
 #[derive(Clone)]
 struct SecretKey {
@@ -10138,6 +12132,61 @@ struct SecretKeyring {
 }
 
 impl SecretKeyring {
+    /// Slot keys when the deploy set them; else the master keys (self-hosted, local dev,
+    /// and a task definition from before slot keys). Neither set refuses to start.
+    fn from_env_values(
+        slot_keys: Option<&str>,
+        primary: Option<&str>,
+        decrypt_only: Option<&str>,
+    ) -> Result<Self, String> {
+        if let Some(slot_keys) = slot_keys.filter(|raw| !raw.trim().is_empty()) {
+            return Self::parse_slot_keys(slot_keys);
+        }
+        let primary = primary.ok_or_else(|| {
+            format!("{CH_PASSWORD_SLOT_KEYS_ENV} or MAPLE_INGEST_KEY_ENCRYPTION_KEY is required")
+        })?;
+        Self::parse(primary, decrypt_only)
+    }
+
+    /// Parses `MAPLE_INGEST_CH_PASSWORD_SLOT_KEYS`. These keys open the ClickHouse password slot
+    /// only: no other slot's subkey can be derived from them.
+    fn parse_slot_keys(raw: &str) -> Result<Self, String> {
+        let malformed = || {
+            format!(
+                "{CH_PASSWORD_SLOT_KEYS_ENV} must be comma-separated <keyId>:<base64 32-byte key> entries"
+            )
+        };
+        let mut keys: Vec<SecretKey> = Vec::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (id, subkey) = entry.split_once(':').ok_or_else(malformed)?;
+            let id_is_valid = URL_SAFE_NO_PAD
+                .decode(id)
+                .is_ok_and(|decoded| decoded.len() == 6);
+            if !id_is_valid {
+                return Err(malformed());
+            }
+            let subkey: [u8; 32] = STANDARD
+                .decode(subkey)
+                .ok()
+                .and_then(|decoded| decoded.try_into().ok())
+                .ok_or_else(malformed)?;
+            if keys.iter().all(|known| known.id != id) {
+                keys.push(SecretKey {
+                    id: id.to_owned(),
+                    clickhouse_password_subkey: subkey,
+                });
+            }
+        }
+        if keys.is_empty() {
+            return Err(malformed());
+        }
+        Ok(Self { keys })
+    }
+
     fn parse(primary: &str, decrypt_only: Option<&str>) -> Result<Self, String> {
         let mut keys = vec![SecretKey::new(parse_base64_aes256_gcm_key(primary)?)?];
         for raw in decrypt_only.unwrap_or_default().split(',') {
@@ -10160,19 +12209,22 @@ impl SecretKeyring {
         Ok(Self { keys })
     }
 
-    /// Opens `org_clickhouse_settings.ch_password_*` for `org_id`. Only the
-    /// `v2.<keyId>.<base64>` envelope, which is bound to the org, is accepted.
+    /// Opens `org_clickhouse_settings.ch_password_*` for `org_id`. Only `v3.<keyId>.<base64>`,
+    /// bound to the org and to `ch_url` exactly as stored, is accepted: a row pointed at
+    /// another host does not open.
     fn open_clickhouse_password(
         &self,
         org_id: &str,
+        ch_url: &str,
         ciphertext: &str,
         iv: &str,
         tag: &str,
     ) -> Result<String, String> {
         let parts: Vec<&str> = ciphertext.split('.').collect();
-        let ["v2", key_id, sealed] = parts.as_slice() else {
-            return Err("Stored value is not in the v2 envelope".to_owned());
+        let ["v3", key_id, sealed] = parts.as_slice() else {
+            return Err("Stored value is not bound to its destination".to_owned());
         };
+        let aad = secret_aad(&[CLICKHOUSE_PASSWORD_SLOT, org_id, DESTINATION_AAD_MARKER, ch_url]);
         let key = self
             .keys
             .iter()
@@ -10183,7 +12235,7 @@ impl SecretKeyring {
             iv,
             tag,
             &key.clickhouse_password_subkey,
-            &secret_aad(&[CLICKHOUSE_PASSWORD_SLOT, org_id]),
+            &aad,
         )
     }
 }
@@ -10533,6 +12585,9 @@ mod tests {
     }
 
     use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
     // `AtomicBool` is only used by the test fakes below; keeping it out of the
     // top-level import avoids an unused-import warning in non-test bin builds.
     use opentelemetry_proto::tonic::metrics::v1::metric;
@@ -10544,6 +12599,29 @@ mod tests {
             GunzipError::Invalid(e) => e,
             GunzipError::TooLarge => std::io::Error::other("unreachable under usize::MAX"),
         })
+    }
+
+    /// A source's use is recorded again after every interval, not once per process: the
+    /// second record lands on an expired entry, which moka treats as an update.
+    #[tokio::test]
+    async fn source_use_is_recorded_again_after_each_interval() {
+        let recent = recent_key_uses_cache();
+        let interval = Duration::from_millis(40);
+        let mut recorded = 0;
+        for _ in 0..4 {
+            if !recent.contains_key("source") {
+                if recent
+                    .entry("source".to_owned())
+                    .or_insert(interval)
+                    .await
+                    .is_fresh()
+                {
+                    recorded += 1;
+                }
+            }
+            tokio::time::sleep(interval * 2).await;
+        }
+        assert_eq!(recorded, 4);
     }
 
     #[tokio::test]
@@ -10886,6 +12964,22 @@ mod tests {
     }
 
     #[test]
+    fn extract_ingest_key_ignores_a_value_longer_than_any_key() {
+        let oversized = format!("maple_pk_{}", "a".repeat(MAX_INGEST_KEY_LEN));
+        let mut bearer = HeaderMap::new();
+        bearer.insert(AUTHORIZATION, format!("Bearer {oversized}").parse().unwrap());
+        assert_eq!(extract_ingest_key(&bearer), None);
+        let mut named = HeaderMap::new();
+        named.insert("x-maple-ingest-key", oversized.parse().unwrap());
+        assert_eq!(extract_ingest_key(&named), None);
+
+        let longest = "k".repeat(MAX_INGEST_KEY_LEN);
+        let mut accepted = HeaderMap::new();
+        accepted.insert("x-maple-ingest-key", longest.parse().unwrap());
+        assert_eq!(extract_ingest_key(&accepted), Some(longest));
+    }
+
+    #[test]
     fn extract_ingest_key_returns_sentinel_literal_unchanged() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Bearer MAPLE_TEST".parse().unwrap());
@@ -10957,6 +13051,113 @@ mod tests {
             source: None,
             default_source: None,
         }
+    }
+
+    #[test]
+    fn vercel_ai_gateway_requests_reach_agent_sessions_as_gateway_calls() {
+        let mut decoded = decode_vercel_ai_gateway(
+            br#"[{"eventType":"request","generationId":"gen_1","gatewayTimestamp":1794307651806,"requestDurationMs":1315,"responseStatusCode":200,"provider":"openai","model":"openai/gpt-4o-mini","modelType":"language","inputTokens":107,"outputTokens":33,"cost":"0.00022785","costCurrency":"USD"}]"#,
+        )
+        .expect("a drain delivery decodes");
+        enrich_decoded_payload(&mut decoded, &test_key(), &[]);
+        stamp_drain_source(&mut decoded, vercel_ai_gateway_drain::INGEST_SOURCE);
+        let DecodedPayload::Traces(request) = decoded else {
+            panic!("an AI Gateway delivery decodes to traces");
+        };
+        let resource_spans = &request.resource_spans[0];
+        let string_value = |attributes: &[KeyValue], key: &str| {
+            attributes
+                .iter()
+                .find(|attribute| attribute.key == key)
+                .and_then(|attribute| match attribute.value.clone()?.value? {
+                    any_value::Value::StringValue(value) => Some(value),
+                    _ => None,
+                })
+        };
+        let resource = &resource_spans.resource.as_ref().unwrap().attributes;
+        assert_eq!(
+            string_value(resource, "maple_ingest_source").as_deref(),
+            Some(vercel_ai_gateway_drain::INGEST_SOURCE)
+        );
+        let span = &resource_spans.scope_spans[0].spans[0];
+        assert_eq!(
+            string_value(&span.attributes, ai_session::VENDOR_ID_ATTR).as_deref(),
+            Some("vercel_ai_gateway")
+        );
+        assert_eq!(
+            string_value(&span.attributes, "gen_ai.usage.cost").as_deref(),
+            Some("0.00022785")
+        );
+    }
+
+    #[test]
+    fn vercel_logs_keep_the_drain_source_through_enrichment() {
+        let mut decoded = decode_vercel_logs(br#"{"projectId":"prj_1"}"#)
+            .expect("a drain delivery decodes");
+        // The handler's order: enrichment, then the drain's own source.
+        enrich_decoded_payload(&mut decoded, &test_key(), &[]);
+        stamp_drain_source(&mut decoded, vercel_logs::INGEST_SOURCE);
+        let DecodedPayload::Logs(request) = decoded else {
+            panic!("a drain delivery decodes to logs");
+        };
+        let attributes = &request.resource_logs[0]
+            .resource
+            .as_ref()
+            .unwrap()
+            .attributes;
+        let value = |key: &str| {
+            attributes
+                .iter()
+                .find(|attribute| attribute.key == key)
+                .and_then(|attribute| attribute.value.clone()?.value)
+        };
+        assert_eq!(
+            value("maple_ingest_source"),
+            Some(any_value::Value::StringValue(
+                vercel_logs::INGEST_SOURCE.to_owned()
+            ))
+        );
+        assert_eq!(
+            value("maple_org_id"),
+            Some(any_value::Value::StringValue("org_real".to_owned()))
+        );
+    }
+
+    #[test]
+    fn vercel_event_drains_reach_logs_under_their_own_source() {
+        let mut decoded = decode_vercel_event_drain(
+            EventDrain::AuditLog,
+            br#"[{"schema":"vercel.audit_log.v1","id":"evt_1","teamId":"team_1","action":"drain-created","timestamp":1694723400000,"actor":{"type":"user","id":"usr_1","name":"Test User"}}]"#,
+        )
+        .expect("a drain delivery decodes");
+        enrich_decoded_payload(&mut decoded, &test_key(), &[]);
+        stamp_drain_source(&mut decoded, EventDrain::AuditLog.ingest_source());
+        let DecodedPayload::Logs(request) = decoded else {
+            panic!("an Audit Log delivery decodes to logs");
+        };
+        let resource_logs = &request.resource_logs[0];
+        let attributes = &resource_logs.resource.as_ref().unwrap().attributes;
+        let value = |key: &str| {
+            attributes
+                .iter()
+                .find(|attribute| attribute.key == key)
+                .and_then(|attribute| attribute.value.clone()?.value)
+        };
+        let string = |value: &str| Some(any_value::Value::StringValue(value.to_owned()));
+        assert_eq!(
+            value("maple_ingest_source"),
+            string("vercel_audit_log_drain")
+        );
+        assert_eq!(value("service.name"), string("vercel-audit-log"));
+        assert_eq!(value("maple_org_id"), string("org_real"));
+        assert_eq!(
+            resource_logs.scope_logs[0].log_records[0]
+                .body
+                .clone()
+                .unwrap()
+                .value,
+            string("drain-created by Test User")
+        );
     }
 
     fn decode_json(signal: Signal, payload: &str) -> Result<DecodedPayload, ApiError> {
@@ -11315,7 +13516,7 @@ mod tests {
 
     #[test]
     fn country_is_empty_unless_the_proxy_is_trusted() {
-        // The gateway is reachable directly on its Railway origin, so an
+        // The gateway is reachable directly on its load balancer origin, so an
         // untrusted deployment must ignore the header entirely rather than let
         // a client label its own traffic.
         assert_eq!(derive_country(&geo_headers("DE"), false), "");
@@ -11887,6 +14088,7 @@ mod tests {
             datasource_session_replay_events: "session_replay_events".to_owned(),
             datasource_session_events: "session_events".to_owned(),
             datasource_product_events: "product_events".to_owned(),
+            datasource_profiles: "profiles".to_owned(),
         }
     }
 
@@ -11981,6 +14183,8 @@ mod tests {
                 max_request_body_bytes: 1024 * 1024,
                 max_decoded_body_bytes: 8 * 1024 * 1024,
                 max_decode_heap_bytes: 64 * 1024 * 1024,
+                max_row_expansion: DEFAULT_MAX_ROW_EXPANSION,
+                row_piece_bytes: ROW_PIECE_BYTES,
                 decode_memory_bytes: 128 * 1024 * 1024,
                 org_max_in_flight: 100,
                 rate_limit_fleet_size: 1,
@@ -12000,6 +14204,7 @@ mod tests {
                 ingest_key_cache_ttl_secs: 60,
                 org_routing_cache_ttl_secs: 5,
                 ingest_rules_enabled: false,
+                audit_trail_enabled: false,
                 ingest_rules_cache_ttl_secs: 30,
                 replay_max_session_bytes: 1024 * 1024 * 1024,
                 replay_blob_store: None,
@@ -12048,6 +14253,13 @@ mod tests {
                 store: Arc::clone(&key_store),
                 cache: Cache::builder()
                     .time_to_live(Duration::from_secs(30))
+                    .max_capacity(16)
+                    .build(),
+            },
+            vercel_project_name_resolver: VercelProjectNameResolver {
+                store: Arc::clone(&key_store),
+                cache: Cache::builder()
+                    .time_to_live(VERCEL_PROJECT_NAMES_TTL)
                     .max_capacity(16)
                     .build(),
             },
@@ -12545,6 +14757,1400 @@ mod tests {
         let _ = std::fs::remove_dir_all(&queue_dir);
     }
 
+    const VERCEL_AUDIT_DELIVERY: &str = concat!(
+        r#"{"id":"evt_1","teamId":"team_1","action":"project.created","timestamp":1700000000000,"actor":{"type":"user","id":"usr_1"}}"#,
+        "\n",
+        r#"{"id":"evt_2","teamId":"team_1","timestamp":1700000000000}"#,
+        "\n",
+    );
+
+    /// The Vercel connection's source in the fixtures, as its uuid and as the
+    /// public id a drain names in `x-maple-source-id`.
+    const AUDIT_SOURCE_UUID: &str = "0f8e6c1a-2b3d-4e5f-8a9b-0c1d2e3f4a5b";
+    const AUDIT_SOURCE_ID: &str = "src_aXunrkWtzvXSkw9Z2smcft";
+
+    /// What the fake Tinybird is sent: `(datasource, NDJSON rows)`.
+    type TinybirdImports = tokio::sync::mpsc::UnboundedReceiver<(String, String)>;
+
+    async fn fake_tinybird_import(
+        State(tx): State<tokio::sync::mpsc::UnboundedSender<(String, String)>>,
+        Query(query): Query<HashMap<String, String>>,
+        body: Bytes,
+    ) -> StatusCode {
+        let rows = gunzip_bounded(&body, usize::MAX).unwrap_or_else(|_| body.to_vec());
+        drop(tx.send((
+            query.get("name").cloned().unwrap_or_default(),
+            String::from_utf8(rows).expect("Tinybird should receive UTF-8 NDJSON"),
+        )));
+        StatusCode::OK
+    }
+
+    /// Turns the audit trail on, as the hosted gateway has it, with a pipeline
+    /// that writes to a fake Tinybird the test can read.
+    async fn store_audit_trail(
+        state: &mut AppState,
+        queue_dir: &std::path::Path,
+    ) -> TinybirdImports {
+        let imports =
+            store_in_fake_tinybird(state, test_tinybird_config(queue_dir.join("audit-trail")))
+                .await;
+        state.config.audit_trail_enabled = true;
+        imports
+    }
+
+    /// Makes `state` a gateway that writes to managed storage: a pipeline on
+    /// `config` whose Tinybird is a fake the test can read.
+    async fn store_in_fake_tinybird(
+        state: &mut AppState,
+        config: TinybirdConfig,
+    ) -> TinybirdImports {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/v0/events", post(fake_tinybird_import))
+            .with_state(tx);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let pipeline = TelemetryPipeline::new(
+            TinybirdConfig {
+                endpoint,
+                token: "token".to_owned(),
+                ..config
+            },
+            Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("the fake Tinybird pipeline should start");
+        state.config.write_mode = WriteMode::Tinybird;
+        state.telemetry_pipeline = Some(pipeline);
+        rx
+    }
+
+    /// An org with a private key and a Vercel connection whose source is
+    /// `AUDIT_SOURCE_ID`, on a gateway that stores the audit trail.
+    async fn audit_trail_test_state(
+        raw_key: &str,
+        org_id: &str,
+        queue_dir: PathBuf,
+    ) -> (AppState, Arc<FakeKeyStore>, TinybirdImports) {
+        let store = Arc::new(FakeKeyStore::default());
+        store.insert_private(
+            raw_key,
+            KeyRow {
+                org_id: org_id.to_owned(),
+                self_managed: false,
+                clickhouse_ready: false,
+            },
+        );
+        store.insert_source_row(org_id, AUDIT_SOURCE_UUID, "integration");
+        let mut state = test_app_state(
+            Arc::clone(&store),
+            queue_dir.clone(),
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(30),
+        )
+        .await;
+        let imports = store_audit_trail(&mut state, &queue_dir).await;
+        (state, store, imports)
+    }
+
+    /// The headers of the drain Maple creates: the key and the connection's source.
+    fn vercel_drain_headers(raw_key: &str, source_id: &str) -> HeaderMap {
+        let mut headers = bearer_headers(raw_key);
+        headers.insert(SOURCE_ID_HEADER, source_id.parse().unwrap());
+        headers
+    }
+
+    async fn vercel_audit_delivery(
+        state: &AppState,
+        headers: &HeaderMap,
+    ) -> Result<usize, ApiError> {
+        handle_vercel_audit_trail_inner(
+            state,
+            headers,
+            &Bytes::from_static(VERCEL_AUDIT_DELIVERY.as_bytes()),
+        )
+        .await
+    }
+
+    async fn nothing_reaches_the_audit_trail(imports: &mut TinybirdImports) -> bool {
+        tokio::time::timeout(Duration::from_millis(200), imports.recv())
+            .await
+            .is_err()
+    }
+
+    /// A real export of the Maple SDK's Node profiler: 498 samples, each of them a
+    /// row, since every one is on a span or a stack of its own.
+    const PROFILES_SDK_EXPORT: &[u8] = include_bytes!("testdata/profiles-sdk-node.json");
+    const PROFILES_SDK_ROWS: usize = 498;
+
+    /// A gateway that takes profiles and writes them to a fake Tinybird with room
+    /// for an export's rows.
+    async fn profiles_test_state(
+        store: Arc<FakeKeyStore>,
+        queue_dir: PathBuf,
+    ) -> (AppState, TinybirdImports) {
+        profiles_test_state_with_org_queue(store, queue_dir, 64 * 1024 * 1024).await
+    }
+
+    /// `profiles_test_state` whose pipeline holds `org_queue_max_bytes` per org.
+    async fn profiles_test_state_with_org_queue(
+        store: Arc<FakeKeyStore>,
+        queue_dir: PathBuf,
+        org_queue_max_bytes: u64,
+    ) -> (AppState, TinybirdImports) {
+        let mut state = test_app_state(
+            store,
+            queue_dir.clone(),
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(30),
+        )
+        .await;
+        let config = TinybirdConfig {
+            queue_max_bytes: 64 * 1024 * 1024,
+            org_queue_max_bytes,
+            ..test_tinybird_config(queue_dir.join("profiles"))
+        };
+        let imports = store_in_fake_tinybird(&mut state, config).await;
+        (state, imports)
+    }
+
+    fn private_key_store(raw_key: &str, org_id: &str, clickhouse_ready: bool) -> Arc<FakeKeyStore> {
+        let store = Arc::new(FakeKeyStore::default());
+        store.insert_private(
+            raw_key,
+            KeyRow {
+                org_id: org_id.to_owned(),
+                self_managed: clickhouse_ready,
+                clickhouse_ready,
+            },
+        );
+        store
+    }
+
+    fn profiles_headers(raw_key: &str, content_type: &'static str) -> HeaderMap {
+        let mut headers = bearer_headers(raw_key);
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        headers
+    }
+
+    async fn send_sdk_profiles(state: &AppState, raw_key: &str) -> Result<usize, ApiError> {
+        handle_profiles_inner(
+            state,
+            &profiles_headers(raw_key, "application/json"),
+            Bytes::from_static(PROFILES_SDK_EXPORT),
+        )
+        .await
+        .map(|accepted| accepted.stored_rows)
+    }
+
+    /// The next `count` rows the fake Tinybird is sent, which must be profiles.
+    async fn imported_profile_rows(
+        imports: &mut TinybirdImports,
+        count: usize,
+    ) -> Vec<serde_json::Value> {
+        let mut rows = Vec::new();
+        while rows.len() < count {
+            let (datasource, body) = tokio::time::timeout(Duration::from_secs(5), imports.recv())
+                .await
+                .expect("the rows should reach Tinybird")
+                .expect("the Tinybird channel should stay open");
+            assert_eq!(datasource, "profiles");
+            rows.extend(
+                body.lines()
+                    .filter(|line| !line.is_empty())
+                    .map(|line| serde_json::from_str(line).expect("each line is a row")),
+            );
+        }
+        rows
+    }
+
+    async fn no_profiles_are_stored(imports: &mut TinybirdImports) -> bool {
+        tokio::time::timeout(Duration::from_millis(200), imports.recv())
+            .await
+            .is_err()
+    }
+
+    #[tokio::test]
+    async fn a_profiles_export_reaches_the_profiles_datasource_on_either_route() {
+        let queue_dir = unique_main_test_dir("profiles-export");
+        let key = "maple_sk_test_profiles";
+        let store = private_key_store(key, "org_profiles", false);
+        let (state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+        let base = serve_profiles_routes(Arc::new(state)).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+
+        // OTLP/JSON, as the Maple SDK sends it, on the development path.
+        let response = client
+            .post(format!("{base}/v1development/profiles"))
+            .bearer_auth(key)
+            .header(CONTENT_TYPE, "application/json")
+            .header(profiles::VERSION_HEADER, "1")
+            .body(PROFILES_SDK_EXPORT)
+            .send()
+            .await
+            .expect("the gateway answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "{}");
+        let rows = imported_profile_rows(&mut imports, PROFILES_SDK_ROWS).await;
+        assert_eq!(rows.len(), PROFILES_SDK_ROWS);
+
+        // The keys are the ones the insert mapping selects, on every row.
+        let mapping = maple_ingest::clickhouse_insert_mappings::mapping_for("profiles")
+            .expect("the profiles mapping");
+        let mut selects: Vec<&str> = mapping
+            .selects
+            .iter()
+            .copied()
+            .filter(|select| *select != maple_ingest::clickhouse_insert_mappings::ORG_PLACEHOLDER)
+            .collect();
+        selects.sort_unstable();
+        for row in &rows {
+            let mut keys: Vec<&str> = row
+                .as_object()
+                .expect("a row is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(keys, selects);
+            // The managed table reads its `OrgId` from here.
+            assert_eq!(row["resource_attributes"]["maple_org_id"], "org_profiles");
+            assert_eq!(row["service_name"], "checkout-api");
+            assert_eq!(row["sample_type"], "cpu");
+        }
+        let total: i64 = rows.iter().filter_map(|row| row["value"].as_i64()).sum();
+        assert_eq!(total, 1_105_584_000);
+        let first = &rows[0];
+        assert_eq!(first["timestamp"], "2026-11-15 12:30:07.512875000");
+        assert_eq!(
+            first["resource_attributes"]["maple_ingest_key_type"],
+            "private"
+        );
+        assert_eq!(first["frames"].as_array().map(Vec::len), Some(16));
+
+        // The same export as gzipped protobuf, on the path the spec moves to.
+        let request = profiles::decode_json(PROFILES_SDK_EXPORT).expect("the export decodes");
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&request.encode_to_vec()).unwrap();
+        let response = client
+            .post(format!("{base}/v1/profiles"))
+            .bearer_auth(key)
+            .header(CONTENT_TYPE, "application/x-protobuf")
+            .header(CONTENT_ENCODING, "gzip")
+            .body(encoder.finish().unwrap())
+            .send()
+            .await
+            .expect("the gateway answers");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().len(), 0);
+        assert_eq!(
+            imported_profile_rows(&mut imports, PROFILES_SDK_ROWS).await,
+            rows
+        );
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[tokio::test]
+    async fn a_profiles_export_in_another_development_version_is_refused() {
+        let queue_dir = unique_main_test_dir("profiles-version");
+        let key = "maple_sk_test_profiles_version";
+        let store = private_key_store(key, "org_profiles_version", false);
+        let (state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+        let send = |version: &'static str| {
+            let state = &state;
+            async move {
+                let mut headers = profiles_headers(key, "application/json");
+                headers.insert(profiles::VERSION_HEADER, HeaderValue::from_static(version));
+                handle_profiles_inner(state, &headers, Bytes::from_static(PROFILES_SDK_EXPORT))
+                    .await
+                    .map(|accepted| accepted.stored_rows)
+            }
+        };
+
+        let refused = send("2")
+            .await
+            .expect_err("version 2 is another wire layout");
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        assert!(no_profiles_are_stored(&mut imports).await);
+
+        assert_eq!(
+            send("1").await.expect("version 1 is read"),
+            PROFILES_SDK_ROWS
+        );
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[tokio::test]
+    async fn a_source_token_sends_profiles_only_when_its_signals_allow_them() {
+        let queue_dir = unique_main_test_dir("profiles-source-signals");
+        let store = Arc::new(FakeKeyStore::default());
+        let token = |allowed: Option<&str>, attributes: &str| {
+            source_row(
+                "org_profiles_token",
+                source_config(allowed, None, attributes),
+            )
+        };
+        let traces_only = "maple_src_profiles_traces_and_logs_only_00000";
+        let profiles_only = "maple_src_profiles_profiles_only_00000000000";
+        let unscoped = "maple_src_profiles_every_signal_000000000000";
+        store.insert_source(traces_only, token(Some(r#"["traces","logs"]"#), "[]"));
+        store.insert_source(
+            profiles_only,
+            token(
+                Some(r#"["profiles"]"#),
+                r#"[{"key":"service.name","value":"billing","mode":"set"},
+                    {"key":"service.version","value":"0.0.0","mode":"default"}]"#,
+            ),
+        );
+        store.insert_source(unscoped, token(None, "[]"));
+        let (state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+
+        let denied = send_sdk_profiles(&state, traces_only)
+            .await
+            .expect_err("a token for other signals is refused");
+        assert_eq!(denied.status, StatusCode::FORBIDDEN);
+        assert!(no_profiles_are_stored(&mut imports).await);
+
+        assert_eq!(
+            send_sdk_profiles(&state, profiles_only)
+                .await
+                .expect("a profiles token is admitted"),
+            PROFILES_SDK_ROWS
+        );
+        let rows = imported_profile_rows(&mut imports, PROFILES_SDK_ROWS).await;
+        let attributes = &rows[0]["resource_attributes"];
+        assert_eq!(attributes["maple_org_id"], "org_profiles_token");
+        assert_eq!(attributes["maple_ingest_key_type"], "source");
+        assert_eq!(
+            attributes[SOURCE_ID_ATTRIBUTE],
+            sources::public_source_id(SOURCE_UUID).expect("a source id")
+        );
+        // The token's overrides apply before the row's columns are read.
+        assert_eq!(rows[0]["service_name"], "billing");
+        assert_eq!(rows[0]["service_version"], "1.4.0");
+
+        assert_eq!(
+            send_sdk_profiles(&state, unscoped)
+                .await
+                .expect("an unscoped token sends every signal"),
+            PROFILES_SDK_ROWS
+        );
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_profiles_body_is_the_senders_error() {
+        let queue_dir = unique_main_test_dir("profiles-malformed");
+        let key = "maple_sk_test_profiles_malformed";
+        let store = private_key_store(key, "org_profiles_malformed", false);
+        let (state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+        // A sample on a link whose trace id is three bytes long.
+        let short_id = br#"{"resourceProfiles":[{"scopeProfiles":[{"profiles":[{"samples":[{"stackIndex":1,"linkIndex":1,"values":["1"]}]}]}]}],"dictionary":{"stringTable":["","main"],"functionTable":[{},{"nameStrindex":1}],"locationTable":[{},{"lines":[{"functionIndex":1}]}],"stackTable":[{},{"locationIndices":[1]}],"linkTable":[{},{"traceId":"abcd"}]}}"#;
+        let cases: [(
+            &'static str,
+            Option<&'static str>,
+            &'static [u8],
+            StatusCode,
+        ); 8] = [
+            (
+                "application/x-protobuf",
+                None,
+                &[0x0f],
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "application/x-protobuf",
+                None,
+                PROFILES_SDK_EXPORT,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "application/json",
+                None,
+                br#"{"resourceProfiles":"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "application/json",
+                None,
+                br#"{"dictionary":{"stringTable":"nope"}}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            ("application/json", None, short_id, StatusCode::BAD_REQUEST),
+            (
+                "application/json",
+                Some("gzip"),
+                b"not gzip",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "application/json",
+                Some("br"),
+                b"{}",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+            (
+                "text/plain",
+                None,
+                b"{}",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ];
+        for (content_type, encoding, body, status) in cases {
+            let mut headers = profiles_headers(key, content_type);
+            if let Some(encoding) = encoding {
+                headers.insert(CONTENT_ENCODING, HeaderValue::from_static(encoding));
+            }
+            let refused = handle_profiles_inner(&state, &headers, Bytes::from_static(body))
+                .await
+                .expect_err("a malformed body is refused");
+            assert_eq!(refused.status, status, "{content_type} {encoding:?}");
+        }
+        assert!(no_profiles_are_stored(&mut imports).await);
+
+        // An export with nothing in it is accepted and stores nothing.
+        let empty = handle_profiles_inner(
+            &state,
+            &profiles_headers(key, "application/json"),
+            Bytes::from_static(b"{}"),
+        )
+        .await;
+        assert_eq!(
+            empty.expect("an empty export is not an error"),
+            ProfilesAccepted::default()
+        );
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // The `profiles` table is not required on an org's own ClickHouse, so its rows
+    // go to managed storage whatever warehouse the org's other telemetry is in.
+    #[tokio::test]
+    async fn profiles_of_an_org_on_its_own_clickhouse_go_to_managed_storage() {
+        let queue_dir = unique_main_test_dir("profiles-own-clickhouse");
+        let key = "maple_sk_test_profiles_byo";
+        let store = private_key_store(key, "org_profiles_byo", true);
+        let (state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+
+        assert_eq!(
+            send_sdk_profiles(&state, key)
+                .await
+                .expect("the export is accepted"),
+            PROFILES_SDK_ROWS
+        );
+        let rows = imported_profile_rows(&mut imports, PROFILES_SDK_ROWS).await;
+        assert_eq!(
+            rows[0]["resource_attributes"]["maple_org_id"],
+            "org_profiles_byo"
+        );
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // A gateway that only forwards, or only writes to an org's own ClickHouse, has
+    // nowhere to put profiles.
+    #[tokio::test]
+    async fn a_gateway_without_managed_storage_refuses_profiles() {
+        let queue_dir = unique_main_test_dir("profiles-no-managed-storage");
+        let key = "maple_sk_test_profiles_forward";
+        let state = test_app_state(
+            private_key_store(key, "org_profiles_forward", true),
+            queue_dir.clone(),
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(30),
+        )
+        .await;
+
+        let refused = send_sdk_profiles(&state, key)
+            .await
+            .expect_err("there is no managed storage to write to");
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    /// Both routes of a gateway on `state`, and the base URL they are served on.
+    async fn serve_profiles_routes(state: Arc<AppState>) -> String {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let app = with_profiles_routes(Router::new()).with_state(state);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        base
+    }
+
+    // Profiles are a plan feature: checked before the body is read, billed in GB once stored.
+    #[tokio::test]
+    async fn profiles_are_gated_and_billed_on_the_profiles_feature() {
+        let queue_dir = unique_main_test_dir("profiles-billing");
+        let key = "maple_sk_test_profiles_billing";
+        let store = private_key_store(key, "org_profiles_billing", false);
+        let (state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+        let (state, mut rx) = with_fake_autumn(state).await;
+
+        assert_eq!(
+            send_sdk_profiles(&state, key).await.expect("an allowed org stores profiles"),
+            PROFILES_SDK_ROWS
+        );
+        assert_eq!(
+            imported_profile_rows(&mut imports, PROFILES_SDK_ROWS).await.len(),
+            PROFILES_SDK_ROWS
+        );
+        let calls = drain_autumn_calls(&mut rx).await;
+        assert!(checks(&calls)
+            .iter()
+            .any(|call| call.feature_id() == PROFILES_FEATURE_ID));
+        let billed = tracked(&calls);
+        assert_eq!(billed.len(), 1, "{billed:?}");
+        assert_eq!(billed[0].0, PROFILES_FEATURE_ID);
+        let expected = billable_gb(PROFILES_SDK_EXPORT.len() as u64);
+        assert!((billed[0].1 - expected).abs() < 1e-12, "{billed:?}");
+
+        // An org Autumn denies is refused before anything is decoded or stored.
+        let denied_dir = unique_main_test_dir("profiles-billing-denied");
+        let store = private_key_store(key, "org_profiles_denied", false);
+        let (state, mut imports) = profiles_test_state(store, denied_dir.clone()).await;
+        let state = with_autumn_denying(state, "org_profiles_denied").await;
+        let refused = send_sdk_profiles(&state, key)
+            .await
+            .expect_err("a denied org is refused");
+        assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(state.decode_memory.reserved_bytes(), 0);
+        assert!(no_profiles_are_stored(&mut imports).await);
+        drop(std::fs::remove_dir_all(&queue_dir));
+        drop(std::fs::remove_dir_all(&denied_dir));
+    }
+
+    // A refused commit bills nothing, whatever it stored before the refusal: the resend bills the
+    // whole export, once. Any commit error returns before usage is recorded.
+    #[tokio::test]
+    async fn a_refused_profiles_commit_bills_nothing_and_its_resend_bills_once() {
+        let key = "maple_sk_test_profiles_refused_billing";
+        let refused_dir = unique_main_test_dir("profiles-refused-billing");
+        let store = private_key_store(key, "org_profiles_refused_billing", false);
+        // The org's queue cannot hold the export, so the commit is refused.
+        let (state, mut imports) =
+            profiles_test_state_with_org_queue(store, refused_dir.clone(), 100 * 1024).await;
+        let (state, mut rx) = with_fake_autumn(state).await;
+        let refused = send_sdk_profiles(&state, key)
+            .await
+            .expect_err("the export is past the org's queue");
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(no_profiles_are_stored(&mut imports).await);
+        assert!(tracked(&drain_autumn_calls(&mut rx).await).is_empty());
+
+        // The resend to a gateway with room is stored and billed whole, once.
+        let resent_dir = unique_main_test_dir("profiles-resent-billing");
+        let store = private_key_store(key, "org_profiles_refused_billing", false);
+        let (state, mut imports) = profiles_test_state(store, resent_dir.clone()).await;
+        let (state, mut rx) = with_fake_autumn(state).await;
+        assert_eq!(
+            send_sdk_profiles(&state, key).await.expect("the resend is stored"),
+            PROFILES_SDK_ROWS
+        );
+        assert_eq!(
+            imported_profile_rows(&mut imports, PROFILES_SDK_ROWS).await.len(),
+            PROFILES_SDK_ROWS
+        );
+        let calls = drain_autumn_calls(&mut rx).await;
+        let billed = tracked(&calls);
+        assert_eq!(billed.len(), 1, "{billed:?}");
+        let expected = billable_gb(PROFILES_SDK_EXPORT.len() as u64);
+        assert!((billed[0].1 - expected).abs() < 1e-12, "{billed:?}");
+        drop(std::fs::remove_dir_all(&refused_dir));
+        drop(std::fs::remove_dir_all(&resent_dir));
+    }
+
+    // The spec's development path and the path it moves to both take an export.
+    #[tokio::test]
+    async fn both_profiles_routes_take_an_export() {
+        let queue_dir = unique_main_test_dir("profiles-routes");
+        let key = "maple_sk_test_profiles_routes";
+        let store = private_key_store(key, "org_profiles_routes", false);
+        let (state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+        let base = serve_profiles_routes(Arc::new(state)).await;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        for route in PROFILES_ROUTES {
+            let response = client
+                .post(format!("{base}{route}"))
+                .bearer_auth(key)
+                .header(CONTENT_TYPE, "application/json")
+                .body(PROFILES_SDK_EXPORT)
+                .send()
+                .await
+                .expect("the gateway answers");
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            let rows = imported_profile_rows(&mut imports, PROFILES_SDK_ROWS).await;
+            assert_eq!(rows.len(), PROFILES_SDK_ROWS);
+        }
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    /// A protobuf export of `samples` samples on one short stack, each on a link of
+    /// its own and so a row of its own: small on the wire, many times that as rows.
+    fn profiles_export_of_many_rows(samples: i32) -> ExportProfilesServiceRequest {
+        let mut request = profiles::decode_json(
+            br#"{"resourceProfiles":[{"scopeProfiles":[{"profiles":[{}]}]}],"dictionary":{"stringTable":["","main"],"functionTable":[{},{"nameStrindex":1}],"locationTable":[{},{"lines":[{"functionIndex":1}]}],"stackTable":[{},{"locationIndices":[1]}]}}"#,
+        )
+        .expect("the export decodes");
+        let sample = |link_index| opentelemetry_proto::tonic::profiles::v1development::Sample {
+            stack_index: 1,
+            link_index,
+            values: vec![1],
+            ..Default::default()
+        };
+        request.resource_profiles[0].scope_profiles[0].profiles[0].samples =
+            (0..samples).map(sample).collect();
+        request
+    }
+
+    // The decoded export and its rows share the one decode heap ceiling, so the
+    // process-wide memory, sized for one request at every ceiling, always holds them.
+    #[tokio::test]
+    async fn a_profiles_export_that_can_never_fit_is_too_large_and_only_contention_is_busy() {
+        let queue_dir = unique_main_test_dir("profiles-never-fits");
+        let key = "maple_sk_test_profiles_never_fits";
+        let store = private_key_store(key, "org_profiles_never_fits", false);
+        let (mut state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+        // Large enough that its decode outgrows the row-piece room the sizing adds.
+        let body = Bytes::from(profiles_export_of_many_rows(80_000).encode_to_vec());
+        let estimate = decode_budget::protobuf_cost(OtlpSignal::Profiles, &body, u64::MAX)
+            .expect("an unbounded estimate");
+        // Under every ceiling: the body, and a decode that takes half the heap.
+        assert!(body.len() <= state.config.max_request_body_bytes);
+        state.config.max_decoded_body_bytes = state.config.max_request_body_bytes;
+        state.config.max_decode_heap_bytes = 2 * estimate;
+        // Process-wide memory as the config sizes it, with nothing to spare. The body,
+        // the decode and a heap ceiling of rows on top of them would not fit in it.
+        state.decode_memory = DecodeMemory::new(largest_decode_request_bytes(
+            state.config.max_request_body_bytes,
+            state.config.max_decoded_body_bytes,
+            state.config.max_decode_heap_bytes,
+        ));
+        let rows_on_top = body.len() as u64 + estimate + state.config.max_decode_heap_bytes;
+        assert!(rows_on_top > state.decode_memory.total_bytes());
+        let headers = profiles_headers(key, "application/x-protobuf");
+
+        // An idle gateway, twice: the answer never depends on what a retry finds.
+        for _ in 0..2 {
+            let refused = handle_profiles_inner(&state, &headers, body.clone())
+                .await
+                .expect_err("the rows do not fit one request's decode heap");
+            assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+            assert!(!refused.kind.retryable);
+            assert_eq!(state.decode_memory.reserved_bytes(), 0);
+        }
+        assert!(no_profiles_are_stored(&mut imports).await);
+
+        // The same gateway with its decode memory held by other requests is busy.
+        let mut others = state.decode_memory.reservation();
+        assert!(others.try_add(state.decode_memory.total_bytes() - 1024));
+        let busy = send_sdk_profiles(&state, key)
+            .await
+            .expect_err("there is no decode memory left");
+        assert_eq!(busy.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.error_kind(), "decode_busy");
+        assert!(busy.kind.retryable);
+        drop(others);
+        assert_eq!(
+            send_sdk_profiles(&state, key)
+                .await
+                .expect("an export that fits is accepted once memory is free"),
+            PROFILES_SDK_ROWS
+        );
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    /// An export of `small` one-frame rows, one row of a stack at the depth cap whose
+    /// frames are `name_len` characters each, then five more one-frame rows.
+    fn profiles_export_with_one_large_row(small: usize, name_len: usize) -> Bytes {
+        fn sample(stack: usize, link: usize) -> serde_json::Value {
+            serde_json::json!({ "stackIndex": stack, "linkIndex": link, "values": ["1"] })
+        }
+        let mut samples: Vec<serde_json::Value> = (0..small).map(|link| sample(1, link)).collect();
+        samples.push(sample(2, 0));
+        samples.extend((small..small + 5).map(|link| sample(1, link)));
+        let request = serde_json::json!({
+            "resourceProfiles": [{ "scopeProfiles": [{ "profiles": [{ "samples": samples }] }] }],
+            "dictionary": {
+                "stringTable": ["", "main", "x".repeat(name_len)],
+                "functionTable": [{}, { "nameStrindex": 1 }, { "nameStrindex": 2 }],
+                "locationTable": [
+                    {},
+                    { "lines": [{ "functionIndex": 1 }] },
+                    { "lines": [{ "functionIndex": 2 }] },
+                ],
+                "stackTable": [
+                    {},
+                    { "locationIndices": [1] },
+                    { "locationIndices": vec![2; profiles::MAX_STACK_DEPTH] },
+                ],
+            },
+        });
+        Bytes::from(serde_json::to_vec(&request).expect("the export encodes"))
+    }
+
+    // A profile carries the same resource as the org's traces and logs, so every redact rule
+    // runs on it, whatever signals it names and ignoring conditions written for spans.
+    #[tokio::test]
+    async fn a_profiles_export_is_redacted_by_every_redact_rule() {
+        let queue_dir = unique_main_test_dir("profiles-redacted");
+        let key = "maple_sk_test_profiles_redacted";
+        let org = "org_profiles_redacted";
+        let store = private_key_store(key, org, false);
+        store.set_ingest_rules(
+            org,
+            &[
+                serde_json::json!({
+                    "signals": ["logs"],
+                    "conditions": [],
+                    "action": { "_tag": "redact", "keys": [], "detectors": ["email"], "patterns": [],
+                        "scopes": ["attributes", "resource"], "method": "mask" }
+                }),
+                serde_json::json!({
+                    "signals": ["traces"],
+                    "conditions": [{ "field": "name", "op": "eq", "value": "GET /never" }],
+                    "action": { "_tag": "redact", "keys": ["deploy.secret"], "detectors": [],
+                        "patterns": [], "scopes": ["resource"], "method": "remove" }
+                }),
+            ],
+        );
+        let (state, mut imports) = profiles_test_state(Arc::clone(&store), queue_dir.clone()).await;
+        let state = with_ingest_rules(state, &store);
+        let request = serde_json::json!({
+            "resourceProfiles": [{
+                "resource": { "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "checkout" } },
+                    { "key": "owner", "value": { "stringValue": "jane@example.com" } },
+                    { "key": "deploy.secret", "value": { "stringValue": "s3cr3t" } },
+                ] },
+                "scopeProfiles": [{ "profiles": [{ "samples": [
+                    { "stackIndex": 1, "attributeIndices": [1, 2], "values": ["1"] },
+                ] }] }],
+            }],
+            "dictionary": {
+                "stringTable": ["", "main", "customer", "contact", "eve@example.com"],
+                "functionTable": [{}, { "nameStrindex": 1 }],
+                "locationTable": [{}, { "lines": [{ "functionIndex": 1 }] }],
+                "stackTable": [{}, { "locationIndices": [1] }],
+                "attributeTable": [
+                    {},
+                    { "keyStrindex": 2, "value": { "stringValue": "bob@example.com" } },
+                    // A value held in the string table is scanned like an inline one.
+                    { "keyStrindex": 3, "value": { "stringValueStrindex": 4 } },
+                ],
+            },
+        });
+        let body = Bytes::from(serde_json::to_vec(&request).expect("the export encodes"));
+
+        let headers = profiles_headers(key, "application/json");
+        let accepted = handle_profiles_inner(&state, &headers, body)
+            .await
+            .expect("the export is accepted");
+        assert_eq!(accepted.stored_rows, 1);
+        let rows = imported_profile_rows(&mut imports, 1).await;
+        let resource = &rows[0]["resource_attributes"];
+        assert_eq!(resource["service.name"], "checkout");
+        assert_eq!(resource["owner"], "[REDACTED:email]");
+        assert!(resource.get("deploy.secret").is_none(), "{resource}");
+        assert_eq!(rows[0]["sample_attributes"]["customer"], "[REDACTED:email]");
+        assert_eq!(rows[0]["sample_attributes"]["contact"], "[REDACTED:email]");
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // Many tiny inlined copies are reserved from the process-wide budget in steps, not each
+    // rounded up to a KiB: 40,000 one-byte copies would otherwise ask for about 39 MiB.
+    #[tokio::test]
+    async fn many_tiny_inlined_copies_fit_the_decode_memory_they_use() {
+        const ENTRIES: usize = 20_000;
+        let queue_dir = unique_main_test_dir("profiles-redact-tiny");
+        let key = "maple_sk_test_profiles_redact_tiny";
+        let org = "org_profiles_redact_tiny";
+        let store = private_key_store(key, org, false);
+        store.set_ingest_rules(org, &[mask_emails_rule()]);
+        let (state, mut imports) = profiles_test_state(Arc::clone(&store), queue_dir.clone()).await;
+        let mut state = with_ingest_rules(state, &store);
+        let mut table = vec![serde_json::json!({})];
+        table.extend(
+            (0..ENTRIES).map(|_| serde_json::json!({ "keyStrindex": 2, "value": { "stringValueStrindex": 3 } })),
+        );
+        let request = serde_json::json!({
+            "resourceProfiles": [{ "scopeProfiles": [{ "profiles": [{ "samples": [
+                { "stackIndex": 1, "attributeIndices": [1], "values": ["1"] },
+            ] }] }] }],
+            "dictionary": {
+                "stringTable": ["", "main", "k", "v"],
+                "functionTable": [{}, { "nameStrindex": 1 }],
+                "locationTable": [{}, { "lines": [{ "functionIndex": 1 }] }],
+                "stackTable": [{}, { "locationIndices": [1] }],
+                "attributeTable": table,
+            },
+        });
+        let body = Bytes::from(serde_json::to_vec(&request).expect("the export encodes"));
+        let estimate = decode_budget::json_cost(&body, u64::MAX).expect("an unbounded estimate");
+        // The export, its decode and 16 MiB to spare: room for the copies, not for a KiB each.
+        state.decode_memory = DecodeMemory::new(body.len() as u64 + estimate + 16 * 1024 * 1024);
+        let headers = profiles_headers(key, "application/json");
+
+        let accepted = handle_profiles_inner(&state, &headers, body)
+            .await
+            .expect("an idle gateway holds the copies");
+        assert_eq!(accepted.stored_rows, 1);
+        assert_eq!(imported_profile_rows(&mut imports, 1).await.len(), 1);
+        assert_eq!(state.decode_memory.reserved_bytes(), 0);
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // A source's overrides land on the resource before the org's rules run, as on traces and
+    // logs, so a rule redacts an override's value too. A key at string-table index 0 reads as
+    // empty in redaction and in the stored row alike, whatever the sender put there.
+    #[tokio::test]
+    async fn profiles_are_redacted_after_the_source_overrides_land() {
+        let queue_dir = unique_main_test_dir("profiles-overrides-redacted");
+        let org = "org_profiles_overrides_redacted";
+        let token = "maple_src_profiles_overrides_redacted_000000";
+        let store = Arc::new(FakeKeyStore::default());
+        store.insert_source(
+            token,
+            source_row(
+                org,
+                source_config(
+                    None,
+                    None,
+                    r#"[{"key":"team.secret","value":"s3cr3t","mode":"set"},
+                        {"key":"owner","value":"ops@example.com","mode":"set"},
+                        {"key":"region.secret","value":"eu","mode":"default"}]"#,
+                ),
+            ),
+        );
+        store.set_ingest_rules(
+            org,
+            &[
+                serde_json::json!({
+                    "signals": ["traces"], "conditions": [],
+                    "action": { "_tag": "redact", "keys": ["*.secret", "password"], "detectors": [],
+                        "patterns": [], "scopes": ["resource"], "method": "remove" }
+                }),
+                serde_json::json!({
+                    "signals": ["logs"], "conditions": [],
+                    "action": { "_tag": "redact", "keys": [], "detectors": ["email"], "patterns": [],
+                        "scopes": ["resource"], "method": "mask" }
+                }),
+            ],
+        );
+        let (state, mut imports) = profiles_test_state(Arc::clone(&store), queue_dir.clone()).await;
+        let state = with_ingest_rules(state, &store);
+        let request = serde_json::json!({
+            "resourceProfiles": [{
+                "resource": { "attributes": [
+                    { "key": "service.name", "value": { "stringValue": "checkout" } },
+                    { "keyStrindex": 0, "value": { "stringValue": "hunter2" } },
+                ] },
+                "scopeProfiles": [{ "profiles": [{ "samples": [
+                    { "stackIndex": 1, "values": ["1"] },
+                ] }] }],
+            }],
+            "dictionary": {
+                "stringTable": ["password", "main"],
+                "functionTable": [{}, { "nameStrindex": 1 }],
+                "locationTable": [{}, { "lines": [{ "functionIndex": 1 }] }],
+                "stackTable": [{}, { "locationIndices": [1] }],
+            },
+        });
+        let body = Bytes::from(serde_json::to_vec(&request).expect("the export encodes"));
+        let headers = profiles_headers(token, "application/json");
+
+        let accepted = handle_profiles_inner(&state, &headers, body)
+            .await
+            .expect("the export is accepted");
+        assert_eq!(accepted.stored_rows, 1);
+        let rows = imported_profile_rows(&mut imports, 1).await;
+        let resource = rows[0]["resource_attributes"]
+            .as_object()
+            .expect("resource attributes are a map");
+        assert_eq!(resource["service.name"], "checkout");
+        // A `set` override a remove rule names is gone, a `default` one too.
+        assert!(!resource.contains_key("team.secret"), "{resource:?}");
+        assert!(!resource.contains_key("region.secret"), "{resource:?}");
+        // A `set` override a mask rule matches is masked.
+        assert_eq!(resource["owner"], "[REDACTED:email]");
+        // Index 0 is the empty key, never the sender's "password".
+        assert!(!resource.contains_key("password"), "{resource:?}");
+        assert!(resource.values().all(|value| value != "hunter2"), "{resource:?}");
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // Inlining one shared string into every entry that names it is the sender's bytes many
+    // times over, so the copies are charged to the decode heap before they are made.
+    #[tokio::test]
+    async fn redacting_a_profiles_export_charges_the_text_it_inlines() {
+        const ENTRIES: usize = 10_000;
+        let queue_dir = unique_main_test_dir("profiles-redact-inline");
+        let key = "maple_sk_test_profiles_redact_inline";
+        let org = "org_profiles_redact_inline";
+        let store = private_key_store(key, org, false);
+        store.set_ingest_rules(org, &[mask_emails_rule()]);
+        let (state, mut imports) = profiles_test_state(Arc::clone(&store), queue_dir.clone()).await;
+        let mut state = with_ingest_rules(state, &store);
+        state.config.max_decode_heap_bytes = 64 * 1024 * 1024;
+        let mut table = vec![serde_json::json!({})];
+        table.extend(
+            (0..ENTRIES).map(|_| serde_json::json!({ "keyStrindex": 2, "value": { "stringValueStrindex": 3 } })),
+        );
+        let request = serde_json::json!({
+            "resourceProfiles": [{ "scopeProfiles": [{ "profiles": [{ "samples": [
+                { "stackIndex": 1, "attributeIndices": [1], "values": ["1"] },
+            ] }] }] }],
+            "dictionary": {
+                "stringTable": ["", "main", "k", "x".repeat(64 * 1024)],
+                "functionTable": [{}, { "nameStrindex": 1 }],
+                "locationTable": [{}, { "lines": [{ "functionIndex": 1 }] }],
+                "stackTable": [{}, { "locationIndices": [1] }],
+                "attributeTable": table,
+            },
+        });
+        let body = Bytes::from(serde_json::to_vec(&request).expect("the export encodes"));
+        assert!(body.len() <= state.config.max_request_body_bytes);
+        let headers = profiles_headers(key, "application/json");
+
+        let refused = handle_profiles_inner(&state, &headers, body)
+            .await
+            .expect_err("the inlined copies are past the decode heap ceiling");
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!refused.kind.retryable);
+        assert_eq!(state.decode_memory.reserved_bytes(), 0);
+        assert!(no_profiles_are_stored(&mut imports).await);
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // A profiles export is reserved whole before its first frame, as a planned OTLP
+    // request is: one past the org's queue stores nothing, so a resend never doubles rows.
+    #[tokio::test]
+    async fn a_profiles_export_past_the_org_queue_is_refused_before_any_frame() {
+        const SMALL_ROWS: usize = 100;
+        let queue_dir = unique_main_test_dir("profiles-whole-commit");
+        let key = "maple_sk_test_profiles_whole";
+        let store = private_key_store(key, "org_profiles_whole", false);
+        // The org's queue holds half an export batch: the small rows' frame alone
+        // would fit, the export with its large row never does.
+        let (mut state, mut imports) =
+            profiles_test_state_with_org_queue(store, queue_dir.clone(), 100 * 1024).await;
+        state.config.tinybird.batch_max_bytes = 200 * 1024;
+        let headers = profiles_headers(key, "application/json");
+
+        let refused = handle_profiles_inner(
+            &state,
+            &headers,
+            profiles_export_with_one_large_row(SMALL_ROWS, 700),
+        )
+        .await
+        .expect_err("the export is past the org's queue");
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(refused.error_kind(), INGEST_ROWS_EXCEED_QUEUE.error_kind);
+        assert!(
+            refused.message.contains("No data was written"),
+            "{}",
+            refused.message
+        );
+        assert!(no_profiles_are_stored(&mut imports).await);
+
+        // Nothing stays reserved: an export that fits is stored whole afterwards.
+        let accepted = handle_profiles_inner(
+            &state,
+            &headers,
+            profiles_export_with_one_large_row(SMALL_ROWS, 1),
+        )
+        .await
+        .expect("an export under the org's queue is accepted");
+        assert_eq!(accepted.stored_rows, SMALL_ROWS + 6);
+        assert_eq!(
+            imported_profile_rows(&mut imports, SMALL_ROWS + 6).await.len(),
+            SMALL_ROWS + 6
+        );
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // Each row repeats a whole stack, so stored bytes are held to
+    // `INGEST_MAX_ROW_EXPANSION` times the decoded export, like the OTLP signals.
+    // The SDK's JSON export stores about 8 to 10 times its size.
+    #[tokio::test]
+    async fn a_profiles_export_past_the_row_expansion_ceiling_is_refused() {
+        let queue_dir = unique_main_test_dir("profiles-row-expansion");
+        let key = "maple_sk_test_profiles_expansion";
+        let store = private_key_store(key, "org_profiles_expansion", false);
+        let (mut state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+
+        state.config.max_row_expansion = 4;
+        let refused = send_sdk_profiles(&state, key)
+            .await
+            .expect_err("the rows store more than 4 times the export");
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(refused.error_kind(), INGEST_ROW_EXPANSION.error_kind);
+        assert!(!refused.kind.retryable);
+        assert_eq!(state.decode_memory.reserved_bytes(), 0);
+        assert!(no_profiles_are_stored(&mut imports).await);
+
+        // Under the ceiling, and with it off, the same export is stored.
+        for ceiling in [16, 0] {
+            state.config.max_row_expansion = ceiling;
+            assert_eq!(
+                send_sdk_profiles(&state, key)
+                    .await
+                    .expect("the export fits"),
+                PROFILES_SDK_ROWS
+            );
+            assert_eq!(
+                imported_profile_rows(&mut imports, PROFILES_SDK_ROWS)
+                    .await
+                    .len(),
+                PROFILES_SDK_ROWS
+            );
+        }
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // The sender learns what was left out, in the encoding it sent.
+    #[tokio::test]
+    async fn an_export_that_lost_rows_answers_with_a_partial_success() {
+        let accepted = ProfilesAccepted {
+            stored_rows: 8,
+            dropped_rows: 3,
+            rejected_profiles: 2,
+        };
+        let body = |content_type: &'static str, accepted| async move {
+            let mut headers = HeaderMap::new();
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+            let response = profiles_export_response(&headers, accepted);
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        };
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&body("application/json", accepted).await).unwrap();
+        assert_eq!(json["partialSuccess"]["rejectedProfiles"], 2);
+        assert!(json["partialSuccess"]["errorMessage"]
+            .as_str()
+            .unwrap()
+            .starts_with("3 profile rows"));
+
+        let protobuf =
+            ExportProfilesServiceResponse::decode(body("application/x-protobuf", accepted).await)
+                .unwrap();
+        assert_eq!(protobuf.partial_success.unwrap().rejected_profiles, 2);
+
+        // A full success stays the empty response.
+        let full = ProfilesAccepted {
+            stored_rows: 8,
+            ..Default::default()
+        };
+        assert_eq!(&body("application/json", full).await[..], b"{}");
+        assert!(body("application/x-protobuf", full).await.is_empty());
+    }
+
+    // A row larger than one export batch is left out and the rest of the export stored.
+    #[tokio::test]
+    async fn a_profile_row_larger_than_an_export_batch_is_dropped_not_committed() {
+        let queue_dir = unique_main_test_dir("profiles-row-ceiling");
+        let key = "maple_sk_test_profiles_row_ceiling";
+        let store = private_key_store(key, "org_profiles_row_ceiling", false);
+        let (mut state, mut imports) = profiles_test_state(store, queue_dir.clone()).await;
+        state.config.tinybird.batch_max_bytes = 64 * 1024;
+
+        let stored = handle_profiles_inner(
+            &state,
+            &profiles_headers(key, "application/json"),
+            profiles_export_with_one_large_row(3, 700),
+        )
+        .await
+        .expect("the rows that fit are accepted");
+        assert_eq!(
+            stored,
+            ProfilesAccepted {
+                stored_rows: 8,
+                dropped_rows: 1,
+                rejected_profiles: 1,
+            }
+        );
+        let rows = imported_profile_rows(&mut imports, 8).await;
+        assert_eq!(rows.len(), 8);
+        for row in &rows {
+            assert_eq!(row["frames"], serde_json::json!(["main"]));
+        }
+        assert!(no_profiles_are_stored(&mut imports).await);
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[test]
+    fn a_profile_row_never_outgrows_an_export_batch() {
+        assert_eq!(
+            profile_row_max_bytes(4 * 1024 * 1024),
+            profiles::MAX_ROW_BYTES - 1
+        );
+        assert_eq!(
+            profile_row_max_bytes(64 * 1024 * 1024),
+            profiles::MAX_ROW_BYTES - 1
+        );
+        assert_eq!(profile_row_max_bytes(1024), 1023);
+    }
+
+    #[test]
+    fn profile_rows_are_committed_in_runs_no_longer_than_an_export_batch() {
+        let row = |len: usize| vec![b'x'; len];
+        let lens = |chunks: Vec<Vec<Vec<u8>>>| -> Vec<Vec<usize>> {
+            chunks
+                .into_iter()
+                .map(|chunk| chunk.iter().map(Vec::len).collect())
+                .collect()
+        };
+        // Each row counts its newline: 4 + 5 fits in 10, a third row does not.
+        assert_eq!(
+            lens(chunk_rows(
+                vec![row(3), row(4), row(3), row(20), row(1)],
+                10
+            )),
+            vec![vec![3, 4], vec![3], vec![20], vec![1]]
+        );
+        assert_eq!(lens(chunk_rows(Vec::new(), 10)), Vec::<Vec<usize>>::new());
+    }
+
+    #[tokio::test]
+    async fn vercel_audit_drain_stores_each_event_that_names_an_action() {
+        let queue_dir = unique_main_test_dir("vercel-audit-trail");
+        let (state, _store, mut imports) =
+            audit_trail_test_state("maple_sk_test_audit", "org_audit", queue_dir.clone()).await;
+
+        let accepted = vercel_audit_delivery(
+            &state,
+            &vercel_drain_headers("maple_sk_test_audit", AUDIT_SOURCE_ID),
+        )
+        .await
+        .expect("the drain's delivery should be accepted");
+
+        // The second event names no action: there is nothing to say happened.
+        assert_eq!(accepted, 1);
+        let (datasource, rows) = tokio::time::timeout(Duration::from_secs(2), imports.recv())
+            .await
+            .expect("the event should reach Tinybird")
+            .expect("the Tinybird channel should stay open");
+        assert_eq!(datasource, "audit_trail_events");
+        let row: serde_json::Value = serde_json::from_str(rows.trim()).expect("one NDJSON row");
+        assert_eq!(
+            (
+                row["OrgId"].as_str(),
+                row["ProviderEventId"].as_str(),
+                row["Action"].as_str()
+            ),
+            (Some("org_audit"), Some("evt_1"), Some("project.created"))
+        );
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // The integration's health reads its own source's last use; the key's default
+    // source has nothing to say about whether the audit drain delivers.
+    #[tokio::test]
+    async fn vercel_audit_drain_records_use_of_the_integrations_source() {
+        let queue_dir = unique_main_test_dir("vercel-audit-trail-source-use");
+        let (state, store, _imports) =
+            audit_trail_test_state("maple_sk_test_use", "org_use", queue_dir.clone()).await;
+
+        vercel_audit_delivery(
+            &state,
+            &vercel_drain_headers("maple_sk_test_use", AUDIT_SOURCE_ID),
+        )
+        .await
+        .expect("the drain's delivery should be accepted");
+
+        for _ in 0..50 {
+            if !store.source_uses.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *store.source_uses.lock().unwrap(),
+            vec![AUDIT_SOURCE_UUID.to_owned()]
+        );
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // The drain Maple creates sends the private key and names the connection's
+    // source. Any other sender could write the org an audit event it made up.
+    #[tokio::test]
+    async fn vercel_audit_drain_refuses_a_sender_that_is_not_the_orgs_drain() {
+        let queue_dir = unique_main_test_dir("vercel-audit-trail-senders");
+        let (state, store, mut imports) =
+            audit_trail_test_state("maple_sk_test_senders", "org_senders", queue_dir.clone()).await;
+        // The public key ships in browser bundles.
+        let public_hash = hash_ingest_key("maple_pk_test_senders", "test-hmac-key").unwrap();
+        store.keys.lock().unwrap().insert(
+            (public_hash, "public_key_hash"),
+            KeyRow {
+                org_id: "org_senders".to_owned(),
+                self_managed: false,
+                clickhouse_ready: false,
+            },
+        );
+        // A log shipper's token: allowed to send logs, and nothing else.
+        let token = "maple_src_audit_senders_0000000000000000000000";
+        store.insert_source(
+            token,
+            source_row(
+                "org_senders",
+                source_config(Some(r#"["logs"]"#), None, "[]"),
+            ),
+        );
+        // Another org's integration source, named by this org's key.
+        let foreign = "5b8f2c1e-7a55-4c0e-9a3b-0d2c7e5b9a11";
+        store.insert_source_row("org_other", foreign, "integration");
+        let foreign_id = sources::public_source_id(foreign).expect("a uuid has a public id");
+
+        for (sender, headers) in [
+            (
+                "the public key",
+                vercel_drain_headers("maple_pk_test_senders", AUDIT_SOURCE_ID),
+            ),
+            (
+                "a source token",
+                vercel_drain_headers(token, AUDIT_SOURCE_ID),
+            ),
+            (
+                "the private key naming no source",
+                bearer_headers("maple_sk_test_senders"),
+            ),
+            (
+                "the private key naming another org's source",
+                vercel_drain_headers("maple_sk_test_senders", &foreign_id),
+            ),
+        ] {
+            let refused = vercel_audit_delivery(&state, &headers)
+                .await
+                .expect_err(sender);
+            assert_eq!(refused.status, StatusCode::UNAUTHORIZED, "{sender}");
+        }
+        assert!(nothing_reaches_the_audit_trail(&mut imports).await);
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[tokio::test]
+    async fn vercel_audit_drain_acks_and_drops_while_the_integration_is_paused() {
+        let queue_dir = unique_main_test_dir("vercel-audit-trail-paused");
+        let (state, store, mut imports) =
+            audit_trail_test_state("maple_sk_test_paused", "org_paused", queue_dir.clone()).await;
+        store.pause_source(AUDIT_SOURCE_UUID, current_time_millis() - 1000, None);
+
+        let accepted = vercel_audit_delivery(
+            &state,
+            &vercel_drain_headers("maple_sk_test_paused", AUDIT_SOURCE_ID),
+        )
+        .await
+        .expect("a paused source's delivery is acked");
+
+        assert_eq!(accepted, 0);
+        assert!(nothing_reaches_the_audit_trail(&mut imports).await);
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // A store that cannot be asked has not said the sender is unknown: the drain
+    // must read as retryable, not as misconfigured.
+    #[tokio::test]
+    async fn vercel_audit_drain_asks_for_a_retry_while_its_source_cannot_be_checked() {
+        let queue_dir = unique_main_test_dir("vercel-audit-trail-store-down");
+        let (state, store, mut imports) =
+            audit_trail_test_state("maple_sk_test_down", "org_down", queue_dir.clone()).await;
+        let headers = vercel_drain_headers("maple_sk_test_down", AUDIT_SOURCE_ID);
+        store.source_errors.store(true, Ordering::Relaxed);
+
+        let refused = vercel_audit_delivery(&state, &headers)
+            .await
+            .expect_err("an unchecked source must not be stored");
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(nothing_reaches_the_audit_trail(&mut imports).await);
+
+        // The store back, the same delivery is taken.
+        store.source_errors.store(false, Ordering::Relaxed);
+        assert_eq!(vercel_audit_delivery(&state, &headers).await.ok(), Some(1));
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // A few hundred bytes of gzip can inflate into a body that parses into
+    // gigabytes; an audit delivery has no reason to be large.
+    #[tokio::test]
+    async fn vercel_audit_drain_refuses_a_delivery_that_inflates_past_its_limit() {
+        let queue_dir = unique_main_test_dir("vercel-audit-trail-bomb");
+        let (state, _store, mut imports) =
+            audit_trail_test_state("maple_sk_test_bomb", "org_bomb", queue_dir.clone()).await;
+        let mut headers = vercel_drain_headers("maple_sk_test_bomb", AUDIT_SOURCE_ID);
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        let body = gzip_bytes("[],".repeat(AUDIT_TRAIL_MAX_DECODED_BYTES / 2));
+
+        let refused = handle_vercel_audit_trail_inner(&state, &headers, &body)
+            .await
+            .expect_err("a delivery past the limit must be refused");
+
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(nothing_reaches_the_audit_trail(&mut imports).await);
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // Every event is a stored row whatever its size, so a small body of many
+    // events is refused on its count.
+    #[tokio::test]
+    async fn vercel_audit_drain_refuses_a_delivery_of_more_events_than_any_drain_sends() {
+        let queue_dir = unique_main_test_dir("vercel-audit-trail-count");
+        let (state, _store, mut imports) =
+            audit_trail_test_state("maple_sk_test_count", "org_count", queue_dir.clone()).await;
+        let headers = vercel_drain_headers("maple_sk_test_count", AUDIT_SOURCE_ID);
+        let body = Bytes::from("{\"action\":\"a\"}\n".repeat(AUDIT_TRAIL_MAX_EVENTS + 1));
+        assert!(body.len() < AUDIT_TRAIL_MAX_DECODED_BYTES);
+
+        let refused = handle_vercel_audit_trail_inner(&state, &headers, &body)
+            .await
+            .expect_err("a delivery past the event limit must be refused");
+
+        assert_eq!(refused.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(nothing_reaches_the_audit_trail(&mut imports).await);
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    // Audit rows are not metered, so the rate is what bounds a sender.
+    #[tokio::test]
+    async fn an_orgs_audit_deliveries_are_refused_past_their_rate() {
+        let queue_dir = unique_main_test_dir("audit-trail-rate");
+        let (state, _store, _imports) =
+            audit_trail_test_state("maple_sk_test_rate", "org_rate", queue_dir.clone()).await;
+
+        assert!(audit_trail_rate_gate(&state, "org_rate", "gcp", 1)
+            .await
+            .is_ok());
+        let refused = audit_trail_rate_gate(&state, "org_rate", "gcp", 1)
+            .await
+            .expect_err("a second delivery inside the second is past a rate of one");
+        assert_eq!(refused.status, StatusCode::TOO_MANY_REQUESTS);
+        // Another org, and the same org's other provider, have their own allowance.
+        assert!(audit_trail_rate_gate(&state, "org_other", "gcp", 1)
+            .await
+            .is_ok());
+        assert!(audit_trail_rate_gate(&state, "org_rate", "vercel", 1)
+            .await
+            .is_ok());
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
     #[tokio::test]
     async fn custom_session_events_are_metered_as_product_events_but_gated_on_browser_sessions() {
         let queue_dir = unique_main_test_dir("session-events-custom-meter");
@@ -12731,6 +16337,33 @@ mod tests {
         )
         .await
         .expect("a normal chunk is still accepted");
+
+        // A trailer that understates the stream does not get more inflated than it reserved.
+        let mut understated = gzip_bytes(&"a".repeat(64 * 1024)).to_vec();
+        let trailer = understated.len() - 4;
+        understated[trailer..].copy_from_slice(&8_u32.to_le_bytes());
+        let error = handle_replay_blob_inner(
+            &state,
+            &replay_blob_headers(raw_key, "sess_bomb", 3),
+            Bytes::from(understated),
+        )
+        .await
+        .expect_err("a chunk inflating past its declared size must be refused");
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+
+        // A chunk the shared decode memory cannot hold right now is shed, not inflated.
+        let mut others = state.decode_memory.reservation();
+        assert!(others.try_add(state.decode_memory.total_bytes()));
+        let shed = handle_replay_blob_inner(
+            &state,
+            &replay_blob_headers(raw_key, "sess_bomb", 2),
+            gzip_bytes(r#"[{"type":2,"timestamp":2}]"#),
+        )
+        .await
+        .expect_err("a chunk must be shed while decode memory is full");
+        assert_eq!(shed.status, StatusCode::SERVICE_UNAVAILABLE);
+        drop(others);
+        assert_eq!(state.decode_memory.reserved_bytes(), 0);
         assert!(rx.recv().await.is_some(), "the normal chunk is stored");
 
         drop(std::fs::remove_dir_all(&queue_dir));
@@ -12838,7 +16471,7 @@ mod tests {
 
         let mut headers = test_headers(raw_key);
         headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
-        let (error, error_kind) = handle_signal_inner(&state, &headers, bomb(), Signal::Logs)
+        let (error, error_kind) = handle_signal_inner(&state, &headers, bomb(), Ingress::Otlp(Signal::Logs))
             .await
             .expect_err("OTLP must refuse a gzip bomb");
         assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -12891,7 +16524,7 @@ mod tests {
             ("gzip protobuf", gzip_headers, gzip_bytes(&protobuf)),
             ("json", json_headers, Bytes::from(json)),
         ] {
-            let (error, error_kind) = handle_signal_inner(&state, &headers, body, Signal::Logs)
+            let (error, error_kind) = handle_signal_inner(&state, &headers, body, Ingress::Otlp(Signal::Logs))
                 .await
                 .expect_err(case);
             assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE, "{case}");
@@ -12904,7 +16537,7 @@ mod tests {
             &state,
             &test_headers(raw_key),
             Bytes::from(many_empty_attributes(100).encode_to_vec()),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect("a batch within the budget is accepted");
@@ -12941,7 +16574,7 @@ mod tests {
         let mut others = memory.reservation();
         assert!(others.try_add(memory.total_bytes()));
         let (error, error_kind) =
-            handle_signal_inner(&state, &test_headers(raw_key), batch(), Signal::Logs)
+            handle_signal_inner(&state, &test_headers(raw_key), batch(), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect_err("no memory is free");
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -12951,7 +16584,7 @@ mod tests {
 
         drop(others);
         let (response, item_count, _, _) =
-            handle_signal_inner(&state, &test_headers(raw_key), batch(), Signal::Logs)
+            handle_signal_inner(&state, &test_headers(raw_key), batch(), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect("accepted once memory frees up");
         assert_eq!((response.status(), item_count), (StatusCode::OK, 1));
@@ -12978,7 +16611,7 @@ mod tests {
         underdeclared[at..].copy_from_slice(&1_u32.to_le_bytes());
         for (case, body) in [("over", overdeclared), ("under", underdeclared)] {
             let (error, error_kind) =
-                handle_signal_inner(&state, &headers, Bytes::from(body), Signal::Logs)
+                handle_signal_inner(&state, &headers, Bytes::from(body), Ingress::Otlp(Signal::Logs))
                     .await
                     .expect_err(case);
             assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE, "{case}");
@@ -12988,11 +16621,770 @@ mod tests {
         let mut two_members = gzip.to_vec();
         two_members.extend_from_slice(&gzip);
         let (error, error_kind) =
-            handle_signal_inner(&state, &headers, Bytes::from(two_members), Signal::Logs)
+            handle_signal_inner(&state, &headers, Bytes::from(two_members), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect_err("two members");
         assert_eq!((error.status, error_kind), (StatusCode::BAD_REQUEST, "decode"));
         assert_eq!(state.decode_memory.reserved_bytes(), 0);
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    /// A gateway that stores natively, with a pipeline that exports to a fake
+    /// Tinybird the test can read and queues large enough for a refused shape.
+    async fn native_test_state(
+        raw_key: &str,
+        org_id: &str,
+        queue_dir: &std::path::Path,
+    ) -> (AppState, TinybirdImports) {
+        native_test_state_capped(raw_key, org_id, queue_dir, 1024 * 1024 * 1024).await
+    }
+
+    /// `native_test_state` with each org's queue capped at `org_queue_max_bytes`.
+    async fn native_test_state_capped(
+        raw_key: &str,
+        org_id: &str,
+        queue_dir: &std::path::Path,
+        org_queue_max_bytes: u64,
+    ) -> (AppState, TinybirdImports) {
+        let store = Arc::new(FakeKeyStore::default());
+        store.insert_private(
+            raw_key,
+            KeyRow {
+                org_id: org_id.to_owned(),
+                self_managed: false,
+                clickhouse_ready: false,
+            },
+        );
+        let mut state = test_app_state(
+            store,
+            queue_dir.to_path_buf(),
+            "http://127.0.0.1:1".to_owned(),
+            Duration::from_secs(30),
+        )
+        .await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new()
+            .route("/v0/events", post(fake_tinybird_import))
+            .with_state(tx);
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let pipeline = TelemetryPipeline::new(
+            TinybirdConfig {
+                endpoint,
+                token: "token".to_owned(),
+                queue_max_bytes: 1024 * 1024 * 1024,
+                org_queue_max_bytes,
+                // A request reserves a slot per frame up front, as many as its pieces.
+                queue_channel_capacity: 1_000,
+                batch_max_rows: 100_000,
+                ..test_tinybird_config(queue_dir.join("native"))
+            },
+            Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("the native pipeline should start");
+        state.config.write_mode = WriteMode::Tinybird;
+        state.telemetry_pipeline = Some(pipeline);
+        (state, rx)
+    }
+
+    /// The rows the fake Tinybird has been sent, per datasource, once `rows` arrived.
+    async fn exported_rows(
+        imports: &mut TinybirdImports,
+        rows: usize,
+    ) -> Vec<(String, serde_json::Value)> {
+        let mut exported = Vec::new();
+        while exported.len() < rows {
+            let (datasource, ndjson) = tokio::time::timeout(Duration::from_secs(5), imports.recv())
+                .await
+                .expect("rows are exported")
+                .expect("the fake Tinybird is running");
+            for line in ndjson.lines().filter(|line| !line.is_empty()) {
+                exported.push((datasource.clone(), serde_json::from_str(line).unwrap()));
+            }
+        }
+        exported
+    }
+
+    async fn nothing_is_exported(imports: &mut TinybirdImports) -> bool {
+        tokio::time::timeout(Duration::from_millis(200), imports.recv())
+            .await
+            .is_err()
+    }
+
+    const SHARED_STRING: usize = 64 * 1024;
+
+    /// `points` empty data points under one metric with a long description: a few
+    /// hundred bytes compressed, and the description again on every row.
+    fn repeated_description(points: usize) -> ExportMetricsServiceRequest {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+        };
+        ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "m".to_owned(),
+                        description: "d".repeat(SHARED_STRING),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint::default(); points],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// `spans` empty spans under a resource with one long attribute.
+    fn repeated_resource_attribute(spans: usize) -> ExportTraceServiceRequest {
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span as OtlpSpan};
+        ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: Some(Resource {
+                    attributes: vec![KeyValue {
+                        key: "process.command_line".to_owned(),
+                        key_strindex: 0,
+                        value: Some(AnyValue {
+                            value: Some(any_value::Value::StringValue("c".repeat(SHARED_STRING))),
+                        }),
+                    }],
+                    dropped_attributes_count: 0,
+                    entity_refs: Vec::new(),
+                }),
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![OtlpSpan::default(); spans],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        }
+    }
+
+    /// `records` empty log records under a scope with a long name.
+    fn repeated_scope_name(records: usize) -> ExportLogsServiceRequest {
+        let mut request = test_log_request("");
+        let scope_logs = &mut request.resource_logs[0].scope_logs[0];
+        scope_logs.scope = Some(InstrumentationScope {
+            name: "s".repeat(SHARED_STRING),
+            ..Default::default()
+        });
+        scope_logs.log_records = vec![LogRecord::default(); records];
+        request
+    }
+
+    /// Sends `points` empty data points under a long description, as protobuf.
+    async fn send_repeated_description(
+        state: &AppState,
+        raw_key: &str,
+        points: usize,
+    ) -> Result<(Response, usize, String, usize), (ApiError, &'static str)> {
+        handle_signal_inner(
+            state,
+            &test_headers(raw_key),
+            Bytes::from(repeated_description(points).encode_to_vec()),
+            Ingress::Otlp(Signal::Metrics),
+        )
+        .await
+    }
+
+    /// Each signal's request that repeats one shared string on thousands of rows.
+    fn repeating_requests() -> [(Signal, Vec<u8>); 3] {
+        [
+            (Signal::Metrics, repeated_description(8_000).encode_to_vec()),
+            (
+                Signal::Traces,
+                repeated_resource_attribute(8_000).encode_to_vec(),
+            ),
+            (Signal::Logs, repeated_scope_name(8_000).encode_to_vec()),
+        ]
+    }
+
+    fn gzip_headers(raw_key: &str) -> HeaderMap {
+        let mut headers = test_headers(raw_key);
+        headers.insert(CONTENT_ENCODING, "gzip".parse().unwrap());
+        headers
+    }
+
+    #[tokio::test]
+    async fn a_request_that_repeats_a_shared_string_is_refused_before_anything_is_stored() {
+        let queue_dir = unique_main_test_dir("row-expansion");
+        let raw_key = "maple_sk_test_row_expansion";
+        let (state, mut imports) =
+            native_test_state(raw_key, "org_row_expansion", &queue_dir).await;
+        let pipeline = state.telemetry_pipeline.clone().unwrap();
+        let counted = metrics::data_loss_count("row_expansion");
+
+        for (signal, protobuf) in repeating_requests() {
+            let body = gzip_bytes(&protobuf);
+            assert!(body.len() < 2 * 1024, "{}: tiny on the wire", signal.path());
+            let (error, error_kind) =
+                handle_signal_inner(&state, &gzip_headers(raw_key), body, Ingress::Otlp(signal))
+                    .await
+                    .expect_err(signal.path());
+            // The same refusal whichever signal carries the repeated string.
+            assert_eq!(
+                error.status,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{}",
+                signal.path()
+            );
+            assert_eq!(
+                error.kind.tag,
+                "@maple/ingest/RowExpansion",
+                "{}",
+                signal.path()
+            );
+            assert_eq!(error_kind, "row_expansion", "{}", signal.path());
+            assert_eq!(
+                pipeline.wal_backlog_bytes(),
+                0,
+                "{}: no row committed",
+                signal.path()
+            );
+            assert_eq!(state.decode_memory.reserved_bytes(), 0, "{}", signal.path());
+        }
+        assert!(
+            metrics::data_loss_count("row_expansion") >= counted + 3,
+            "each refusal is counted as lost data"
+        );
+        assert!(nothing_is_exported(&mut imports).await);
+
+        // Over gRPC the refusal is one an exporter does not retry.
+        let status = accept_grpc_decoded(
+            &state,
+            Signal::Metrics,
+            DecodedPayload::Metrics(repeated_description(8_000)),
+            &state
+                .resolver
+                .resolve_ingest_key(raw_key)
+                .await
+                .unwrap()
+                .unwrap(),
+            KeyAdmission::Ingest,
+            Received::unbudgeted(repeated_description(8_000).encoded_len()),
+            &ClaimOutcome::default(),
+        )
+        .await
+        .expect_err("refused over gRPC too");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(pipeline.wal_backlog_bytes(), 0);
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[tokio::test]
+    async fn a_request_that_repeats_a_shared_string_is_not_forwarded() {
+        let (forward_url, mut forward_rx) = spawn_forward_collector().await;
+        let queue_dir = unique_main_test_dir("row-expansion-forward");
+        let store = Arc::new(FakeKeyStore::default());
+        let raw_key = "maple_sk_test_row_expansion_forward";
+        store.insert_private(
+            raw_key,
+            KeyRow {
+                org_id: "org_row_expansion_forward".to_owned(),
+                self_managed: false,
+                clickhouse_ready: false,
+            },
+        );
+        let state = test_app_state(
+            store,
+            queue_dir.clone(),
+            forward_url,
+            Duration::from_millis(5),
+        )
+        .await;
+
+        let (error, error_kind) = handle_signal_inner(
+            &state,
+            &test_headers(raw_key),
+            Bytes::from(repeated_scope_name(8_000).encode_to_vec()),
+            Ingress::Otlp(Signal::Logs),
+        )
+        .await
+        .expect_err("the collector would store the same rows");
+        assert_eq!(
+            (error.status, error_kind),
+            (StatusCode::PAYLOAD_TOO_LARGE, "row_expansion")
+        );
+        assert!(
+            forward_rx.try_recv().is_err(),
+            "nothing refused is forwarded"
+        );
+        assert_eq!(state.decode_memory.reserved_bytes(), 0);
+
+        // The same records without the long scope name are forwarded as ever.
+        let mut ordinary = repeated_scope_name(8_000);
+        ordinary.resource_logs[0].scope_logs[0].scope = None;
+        let body = ordinary.encode_to_vec();
+        let (response, item_count, _, metered) = handle_signal_inner(
+            &state,
+            &test_headers(raw_key),
+            Bytes::from(body.clone()),
+            Ingress::Otlp(Signal::Logs),
+        )
+        .await
+        .expect("an ordinary batch is forwarded");
+        assert_eq!(
+            (response.status(), item_count, metered),
+            (StatusCode::OK, 8_000, body.len())
+        );
+        assert!(
+            forward_rx.try_recv().is_ok(),
+            "the batch reached the collector"
+        );
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    /// The rules an org's spans get are its first, in a stable order, up to both caps.
+    #[test]
+    fn attribute_mappings_past_the_caps_are_not_applied() {
+        let rule = |index: usize, key_len: usize| AttributeMappingRule {
+            source_context: MappingSourceContext::Span,
+            source_key: format!("s{index}"),
+            target_key: format!("t{index}").repeat(key_len),
+            operation: MappingOperation::Copy,
+        };
+        let kept = cap_attribute_mappings("org", (0..100).map(|index| rule(index, 1)));
+        assert_eq!(kept.len(), MAX_ATTRIBUTE_MAPPINGS);
+        assert_eq!(kept[0].source_key, "s0");
+        assert_eq!(kept[MAX_ATTRIBUTE_MAPPINGS - 1].source_key, "s63");
+
+        // Four rules of 6 KiB keys pass the byte cap at the third.
+        let kept = cap_attribute_mappings("org", (0..4).map(|index| rule(index, 3 * 1024)));
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_row_expansion_ceiling_is_a_setting() {
+        let queue_dir = unique_main_test_dir("row-expansion-setting");
+        let raw_key = "maple_sk_test_row_expansion_setting";
+        let (mut state, mut imports) =
+            native_test_state(raw_key, "org_row_expansion_setting", &queue_dir).await;
+        // 500 rows of a 64 KiB description: about 480 times the request's size.
+        let body_len = repeated_description(500).encoded_len();
+
+        state.config.max_row_expansion = 400;
+        let (error, error_kind) = send_repeated_description(&state, raw_key, 500)
+            .await
+            .expect_err("past the ceiling");
+        assert_eq!(
+            (error.status, error_kind),
+            (StatusCode::PAYLOAD_TOO_LARGE, "row_expansion")
+        );
+        assert!(nothing_is_exported(&mut imports).await);
+
+        // Under the default ceiling, and with the ceiling off, it is stored whole.
+        for ceiling in [DEFAULT_MAX_ROW_EXPANSION, 0] {
+            state.config.max_row_expansion = ceiling;
+            let (response, item_count, _, metered) =
+                send_repeated_description(&state, raw_key, 500)
+                    .await
+                    .expect("within the ceiling");
+            assert_eq!(
+                (response.status(), item_count, metered),
+                (StatusCode::OK, 1, body_len),
+                "ceiling {ceiling}"
+            );
+            assert_eq!(exported_rows(&mut imports, 500).await.len(), 500);
+        }
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[tokio::test]
+    async fn rows_larger_than_the_shared_memory_are_stored_a_piece_at_a_time() {
+        let queue_dir = unique_main_test_dir("row-memory");
+        let raw_key = "maple_sk_test_row_memory";
+        let (mut state, mut imports) =
+            native_test_state(raw_key, "org_row_memory", &queue_dir).await;
+        let pipeline = state.telemetry_pipeline.clone().unwrap();
+        // Only the memory bounds what these store.
+        state.config.max_row_expansion = 0;
+        let memory = state.decode_memory.clone();
+        let send = |points: usize| send_repeated_description(&state, raw_key, points);
+
+        // While other requests hold all but less than a piece, it is shed before any
+        // row is written, with a retryable 503.
+        let mut others = memory.reservation();
+        assert!(others.try_add(memory.total_bytes() - 4 * 1024 * 1024));
+        let (error, error_kind) = send(1_000).await.expect_err("no room for a piece");
+        assert_eq!(
+            (error.status, error_kind),
+            (StatusCode::SERVICE_UNAVAILABLE, "decode_busy")
+        );
+        assert!(error.message.contains("storing"), "shed at the row stage");
+        assert_eq!(error.into_response().headers()[RETRY_AFTER], "1");
+        assert_eq!(pipeline.wal_backlog_bytes(), 0, "nothing was committed");
+        assert!(nothing_is_exported(&mut imports).await);
+        drop(others);
+
+        // 2,200 rows of 64 KiB are more than the 128 MiB this gateway has in all, and
+        // are stored whole: a piece of them is reserved and written at a time.
+        let points = 2_200;
+        let rows_bytes = (points * SHARED_STRING) as u64;
+        assert!(rows_bytes > memory.total_bytes());
+        let body_len = repeated_description(points).encoded_len();
+        let (response, item_count, _, metered) = send(points).await.expect("stored in pieces");
+        assert_eq!(
+            (response.status(), item_count, metered),
+            (StatusCode::OK, 1, body_len)
+        );
+        assert_eq!(memory.reserved_bytes(), 0, "a finished request returns its memory");
+        let rows = exported_rows(&mut imports, points).await;
+        assert_eq!(rows.len(), points, "every row once");
+        assert!(rows.iter().all(|(datasource, row)| {
+            datasource == "metrics_gauge"
+                && row["metric_description"].as_str().map(str::len) == Some(SHARED_STRING)
+        }));
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    /// A batch shaped like a JVM service's, whose rows come to more than the gateway's
+    /// whole shared memory, is accepted: only a piece of its rows is held at a time.
+    #[tokio::test]
+    async fn an_ordinary_batch_whose_rows_outgrow_the_shared_memory_is_accepted() {
+        let queue_dir = unique_main_test_dir("row-outgrow");
+        let raw_key = "maple_sk_test_row_outgrow";
+        let (mut state, mut imports) =
+            native_test_state(raw_key, "org_row_outgrow", &queue_dir).await;
+        state.decode_memory = DecodeMemory::new(40 * 1024 * 1024);
+        let mut batch = test_log_request("GET /api/orders 200");
+        let resource = batch.resource_logs[0].resource.as_mut().unwrap();
+        resource.attributes.push(KeyValue {
+            key: "process.command_line".to_owned(),
+            key_strindex: 0,
+            value: Some(AnyValue {
+                value: Some(any_value::Value::StringValue(
+                    "/usr/lib/jvm/bin/java -Xmx2g -javaagent:/otel.jar ".repeat(40),
+                )),
+            }),
+        });
+        let records = &mut batch.resource_logs[0].scope_logs[0].log_records;
+        *records = vec![records[0].clone(); 20_000];
+        let rows = RowSource::Logs(&batch).plan("org", ROW_PIECE_BYTES).total;
+        assert!(rows.row_bytes() > state.decode_memory.total_bytes(), "{rows:?}");
+        let body = gzip_bytes(batch.encode_to_vec());
+
+        let (response, item_count, _, _) =
+            handle_signal_inner(&state, &gzip_headers(raw_key), body, Ingress::Otlp(Signal::Logs))
+                .await
+                .expect("an ordinary batch is never refused for its size");
+        assert_eq!((response.status(), item_count), (StatusCode::OK, 20_000));
+        assert_eq!(exported_rows(&mut imports, 20_000).await.len(), 20_000);
+        assert_eq!(state.decode_memory.reserved_bytes(), 0);
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    /// An ordinary batch spread across many pieces reaches the warehouse whole and once,
+    /// each row as it is when the batch is built in one piece.
+    #[tokio::test]
+    async fn a_batch_built_in_many_pieces_is_stored_whole() {
+        let queue_dir = unique_main_test_dir("row-pieces");
+        let raw_key = "maple_sk_test_row_pieces";
+        let (mut state, mut imports) =
+            native_test_state(raw_key, "org_row_pieces", &queue_dir).await;
+        let request = test_log_request("piece");
+        let mut batch = request.clone();
+        let records = &mut batch.resource_logs[0].scope_logs[0].log_records;
+        let record = records[0].clone();
+        *records = (0..3_000)
+            .map(|index| LogRecord {
+                time_unix_nano: 1_700_000_000_000_000_000 + index,
+                ..record.clone()
+            })
+            .collect();
+        let whole: Vec<serde_json::Value> = maple_ingest::telemetry::encode_log_rows(&batch)
+            .unwrap()
+            .iter()
+            .flat_map(|payload| payload.split(|byte| *byte == b'\n'))
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+
+        state.config.row_piece_bytes = 16 * 1024;
+        let plan = RowSource::Logs(&batch).plan("org_row_pieces", state.config.row_piece_bytes);
+        assert!(plan.pieces.len() > 20, "{} pieces", plan.pieces.len());
+        let (response, item_count, _, _) = handle_signal_inner(
+            &state,
+            &test_headers(raw_key),
+            Bytes::from(batch.encode_to_vec()),
+            Ingress::Otlp(Signal::Logs),
+        )
+        .await
+        .expect("accepted");
+        assert_eq!((response.status(), item_count), (StatusCode::OK, 3_000));
+        let mut rows: Vec<serde_json::Value> = exported_rows(&mut imports, 3_000)
+            .await
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect();
+        let key = |row: &serde_json::Value| row["timestamp"].as_str().unwrap_or("").to_owned();
+        rows.sort_by_key(key);
+        let mut expected = whole;
+        expected.sort_by_key(key);
+        assert_eq!(rows.len(), 3_000);
+        // The enrichment the gateway adds is the same on every row of both.
+        for (row, expected) in rows.iter().zip(&expected) {
+            assert_eq!(row["timestamp"], expected["timestamp"]);
+            assert_eq!(row["body"], expected["body"]);
+        }
+        assert!(nothing_is_exported(&mut imports).await, "no row twice");
+        assert_eq!(state.decode_memory.reserved_bytes(), 0);
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    /// A batch whose rows the org's queue could never hold at once is refused before
+    /// its first piece, instead of storing pieces until the cap and failing.
+    #[tokio::test]
+    async fn rows_larger_than_the_org_queue_are_refused_before_any_piece_is_written() {
+        let queue_dir = unique_main_test_dir("rows-exceed-queue");
+        let raw_key = "maple_sk_test_rows_exceed_queue";
+        let mib = 1024 * 1024;
+        let (mut state, mut imports) =
+            native_test_state_capped(raw_key, "org_rows_exceed_queue", &queue_dir, 16 * mib).await;
+        // Expansion is not what this refuses.
+        state.config.max_row_expansion = 0;
+        let pipeline = state.telemetry_pipeline.clone().unwrap();
+        let request = repeated_description(400);
+        let plan = RowSource::Metrics(&request).plan("org_rows_exceed_queue", ROW_PIECE_BYTES);
+        assert!(plan.pieces.len() > 2, "stored in several pieces");
+        assert!(plan.total.row_bytes() > 16 * mib);
+        assert!(
+            plan.largest_piece_heap() < 16 * mib,
+            "any one piece fits the queue"
+        );
+        let counted = metrics::data_loss_count("rows_exceed_queue");
+
+        let (error, error_kind) = send_repeated_description(&state, raw_key, 400)
+            .await
+            .expect_err("larger than the org queue");
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(error.kind.tag, "@maple/ingest/RowsExceedQueue");
+        assert!(!error.kind.retryable);
+        assert_eq!(error_kind, "rows_exceed_queue");
+        assert_eq!(pipeline.wal_backlog_bytes(), 0, "no piece written");
+        assert_eq!(state.decode_memory.reserved_bytes(), 0);
+        assert_eq!(metrics::data_loss_count("rows_exceed_queue"), counted + 1);
+        assert!(nothing_is_exported(&mut imports).await);
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[tokio::test]
+    async fn the_row_stage_is_admitted_on_what_it_stores_and_allocates() {
+        let queue_dir = unique_main_test_dir("row-admission");
+        let (state, _imports) = native_test_state(
+            "maple_sk_test_row_admission",
+            "org_row_admission",
+            &queue_dir,
+        )
+        .await;
+        let mib = 1024 * 1024;
+        let rows = RowEstimate {
+            rows: 100,
+            payload_bytes: [8 * mib, 0, 0, 0],
+            work_bytes: mib,
+        };
+        let stage = RowStage {
+            metered_bytes: 1024 * 1024,
+            decode_heap: 4 * mib,
+            native: true,
+            forward_bytes: 2 * mib,
+        };
+        let admit = |stage: RowStage, memory: &mut DecodeReservation| {
+            admit_rows(
+                &state,
+                Signal::Logs,
+                "org_row_admission",
+                &rows,
+                rows.heap_bytes(),
+                stage,
+                memory,
+            )
+        };
+
+        // The rows and the forward body are both reserved, before either exists.
+        let mut memory = state.decode_memory.reservation();
+        admit(stage, &mut memory).expect("eight times its size, well inside the memory");
+        assert_eq!(memory.held_bytes(), rows.heap_bytes() + 2 * mib);
+        // A forward-only request builds no rows here, only the body.
+        let mut forward_only = state.decode_memory.reservation();
+        let forwarded = RowStage {
+            native: false,
+            ..stage
+        };
+        admit(forwarded, &mut forward_only).expect("forward only");
+        assert_eq!(forward_only.held_bytes(), 2 * mib);
+        drop((memory, forward_only));
+
+        // Past the ceiling on what it is metered for, in either mode.
+        for native in [true, false] {
+            let expanded = RowStage {
+                metered_bytes: 8 * 1024,
+                native,
+                ..stage
+            };
+            let error = admit(expanded, &mut state.decode_memory.reservation())
+                .expect_err("1024 times its metered size");
+            assert_eq!(error.kind.tag, "@maple/ingest/RowExpansion");
+        }
+
+        // With the decode memory the request still holds it could never fit, so
+        // retrying is pointless; without it, it is only waiting on other requests.
+        let total = state.decode_memory.total_bytes();
+        let holding = RowStage {
+            decode_heap: total - 8 * mib,
+            ..stage
+        };
+        let error = admit(holding, &mut state.decode_memory.reservation())
+            .expect_err("more than the gateway has, with what it already holds");
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        // The forward body is reserved at its real size: one that could never fit is a
+        // 413, and one that fits only an idle gateway waits as rows do.
+        let mut forward_only = state.decode_memory.reservation();
+        let whole_budget = RowStage {
+            native: false,
+            forward_bytes: 2 * total,
+            ..stage
+        };
+        let error = admit(whole_budget, &mut forward_only).expect_err("larger than the budget");
+        assert_eq!(error.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            forward_only.held_bytes(),
+            0,
+            "nothing reserved for a refusal"
+        );
+        let most_of_it = RowStage {
+            native: false,
+            forward_bytes: total - 8 * mib,
+            ..stage
+        };
+        admit(most_of_it, &mut forward_only).expect("fits an idle gateway");
+        assert_eq!(forward_only.held_bytes(), total - 8 * mib, "reserved whole");
+        let error = admit(most_of_it, &mut state.decode_memory.reservation())
+            .expect_err("the first one holds the memory");
+        assert_eq!(error.kind.tag, "@maple/ingest/DecodeBusy");
+        assert!(error.kind.retryable);
+        drop(forward_only);
+        let mut others = state.decode_memory.reservation();
+        assert!(others.try_add(total - 8 * mib));
+        let error = admit(stage, &mut state.decode_memory.reservation())
+            .expect_err("other requests hold the memory");
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(error.kind.retryable);
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[tokio::test]
+    async fn ordinary_batches_are_stored_and_metered_on_their_decoded_size() {
+        use opentelemetry_proto::tonic::metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+        };
+        use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span as OtlpSpan};
+        let queue_dir = unique_main_test_dir("row-ordinary");
+        let raw_key = "maple_sk_test_row_ordinary";
+        let (state, mut imports) = native_test_state(raw_key, "org_row_ordinary", &queue_dir).await;
+        let resource = || test_log_request("").resource_logs[0].resource.clone();
+        let logs = {
+            let mut request = test_log_request("checkout priced a cart");
+            let records = &mut request.resource_logs[0].scope_logs[0].log_records;
+            *records = vec![records[0].clone(); 40];
+            request
+        };
+        let traces = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                resource: resource(),
+                scope_spans: vec![ScopeSpans {
+                    spans: (1..=40)
+                        .map(|index| OtlpSpan {
+                            trace_id: vec![index; 16],
+                            span_id: vec![index; 8],
+                            name: "GET /carts".to_owned(),
+                            start_time_unix_nano: 1_700_000_000_000_000_000,
+                            end_time_unix_nano: 1_700_000_000_040_000_000,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let metrics = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                resource: resource(),
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "process.cpu.time".to_owned(),
+                        description: "CPU seconds used by the process.".to_owned(),
+                        unit: "s".to_owned(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![
+                                NumberDataPoint {
+                                    time_unix_nano: 1_700_000_000_000_000_000,
+                                    ..Default::default()
+                                };
+                                40
+                            ],
+                        })),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+
+        // Items are records and spans, and for metrics the metrics themselves.
+        for (signal, protobuf, datasource, items) in [
+            (Signal::Logs, logs.encode_to_vec(), "logs", 40),
+            (Signal::Traces, traces.encode_to_vec(), "traces", 40),
+            (Signal::Metrics, metrics.encode_to_vec(), "metrics_gauge", 1),
+        ] {
+            let path = signal.path();
+            let (response, item_count, _, metered) = handle_signal_inner(
+                &state,
+                &test_headers(raw_key),
+                Bytes::from(protobuf.clone()),
+                Ingress::Otlp(signal),
+            )
+            .await
+            .expect(path);
+            // Metered on the bytes it decoded to, whatever its rows come to.
+            assert_eq!(
+                (response.status(), item_count, metered),
+                (StatusCode::OK, items, protobuf.len()),
+                "{}",
+                signal.path()
+            );
+            let rows = exported_rows(&mut imports, 40).await;
+            assert_eq!(rows.len(), 40, "{}", signal.path());
+            assert!(
+                rows.iter().all(|(name, row)| {
+                    name == datasource && row["service_name"] == "routing-test"
+                }),
+                "{}: each row carries its resource",
+                signal.path()
+            );
+            assert_eq!(state.decode_memory.reserved_bytes(), 0, "{}", signal.path());
+        }
 
         drop(std::fs::remove_dir_all(&queue_dir));
     }
@@ -14133,6 +18525,65 @@ mod tests {
         drop(std::fs::remove_dir_all(queue_dir));
     }
 
+    const GCP_AUDIT_ENTRY: &str = r#"{"logName":"projects/acme-prod/logs/cloudaudit.googleapis.com%2Factivity","insertId":"abc123","timestamp":"2026-10-09T10:00:00Z","resource":{"type":"service_account","labels":{"project_id":"acme-prod"}},"protoPayload":{"serviceName":"iam.googleapis.com","methodName":"google.iam.admin.v1.CreateServiceAccountKey","authenticationInfo":{"principalEmail":"ada@acme.test"}}}"#;
+
+    // An Admin Activity entry names a person and what they changed. It goes to
+    // the audit trail, which only admins read, and never to the org's logs.
+    #[tokio::test]
+    async fn gcp_logpush_stores_an_audit_entry_in_the_audit_trail_and_not_as_a_log() {
+        let (ch_url, mut ch_rx) = spawn_fake_clickhouse().await;
+        let (mut state, store, queue_dir) = gcp_logpush_state("gcp-logpush-audit", &ch_url).await;
+        let mut imports = store_audit_trail(
+            Arc::get_mut(&mut state).expect("the state is not shared yet"),
+            &queue_dir,
+        )
+        .await;
+
+        let accepted = gcp_push(&state, "gcp_conn_1", Some("gcp-secret"), GCP_AUDIT_ENTRY).await;
+
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(store.connector_successes.load(Ordering::Relaxed), 1);
+        let (datasource, rows) = tokio::time::timeout(Duration::from_secs(2), imports.recv())
+            .await
+            .expect("the entry should reach Tinybird")
+            .expect("the Tinybird channel should stay open");
+        assert_eq!(datasource, "audit_trail_events");
+        let row: serde_json::Value = serde_json::from_str(rows.trim()).expect("one NDJSON row");
+        assert_eq!(
+            (
+                row["OrgId"].as_str(),
+                row["ProviderEventId"].as_str(),
+                row["ActorEmail"].as_str()
+            ),
+            (Some("org_gcp"), Some("abc123"), Some("ada@acme.test"))
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), ch_rx.recv())
+                .await
+                .is_err(),
+            "an audit entry must not be written to the org's logs"
+        );
+        drop(std::fs::remove_dir_all(queue_dir));
+    }
+
+    // A gateway that only forwards has no audit trail table, and one where the
+    // trail is not turned on does not write to it: there the entry stays a log.
+    #[tokio::test]
+    async fn gcp_logpush_keeps_an_audit_entry_as_a_log_where_the_gateway_only_forwards() {
+        let (ch_url, mut ch_rx) = spawn_fake_clickhouse().await;
+        let (state, _store, queue_dir) = gcp_logpush_state("gcp-logpush-audit-fwd", &ch_url).await;
+
+        let accepted = gcp_push(&state, "gcp_conn_1", Some("gcp-secret"), GCP_AUDIT_ENTRY).await;
+
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let stored = tokio::time::timeout(Duration::from_secs(2), ch_rx.recv())
+            .await
+            .expect("the entry should reach the org's ClickHouse")
+            .expect("ClickHouse channel should stay open");
+        assert!(stored.query.starts_with("INSERT INTO logs"));
+        drop(std::fs::remove_dir_all(queue_dir));
+    }
+
     #[tokio::test]
     async fn gcp_logpush_acks_an_entry_past_the_rule_scan_budget() {
         let (ch_url, mut ch_rx) = spawn_fake_clickhouse().await;
@@ -14516,7 +18967,7 @@ mod tests {
             DecodedPayload::Logs(payload),
             &sentinel,
             KeyAdmission::Ingest,
-            decoded_bytes,
+            Received::unbudgeted(decoded_bytes),
             &ClaimOutcome::default(),
         )
         .await
@@ -14545,7 +18996,7 @@ mod tests {
             DecodedPayload::Logs(real),
             &resolved,
             KeyAdmission::Ingest,
-            real_bytes,
+            Received::unbudgeted(real_bytes),
             &ClaimOutcome::default(),
         )
         .await
@@ -14599,7 +19050,7 @@ mod tests {
             &state,
             &headers,
             Bytes::from_static(UNDECODABLE_BODY),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect_err("a denied org must be refused");
@@ -14612,7 +19063,7 @@ mod tests {
             &state,
             &test_headers("maple_sk_test_otlp_allowed"),
             Bytes::from(test_log_request("allowed").encode_to_vec()),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect("an allowed org is accepted");
@@ -14629,12 +19080,91 @@ mod tests {
             &state,
             &headers,
             Bytes::from_static(UNDECODABLE_BODY),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect_err("an undecodable body is refused");
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(error_kind, "decode");
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    #[tokio::test]
+    async fn vercel_log_drain_maps_each_delivery_format_onto_otlp_logs() {
+        let (forward_url, mut forward_rx) = spawn_forward_collector().await;
+        let queue_dir = unique_main_test_dir("vercel-log-drain");
+        let store = Arc::new(FakeKeyStore::default());
+        store.insert_private(
+            "maple_sk_test_vercel",
+            KeyRow {
+                org_id: "org_vercel".to_owned(),
+                self_managed: false,
+                clickhouse_ready: false,
+            },
+        );
+        let state = test_app_state(
+            store,
+            queue_dir.clone(),
+            forward_url,
+            Duration::from_secs(5),
+        )
+        .await;
+        let headers = |encoding: Option<&str>| {
+            let mut headers = test_headers("maple_sk_test_vercel");
+            headers.insert(CONTENT_TYPE, "application/x-ndjson".parse().unwrap());
+            if let Some(encoding) = encoding {
+                headers.insert(CONTENT_ENCODING, encoding.parse().unwrap());
+            }
+            headers
+        };
+        let log = r#"{"id":"1","projectId":"prj_1","deploymentId":"dpl_1","source":"lambda","level":"info","message":"hi","timestamp":1573817187330}"#;
+        let ndjson = format!("{log}\n{log}\n");
+        let gzipped_array = gzip_bytes(format!("[{log}]")).to_vec();
+
+        // The drain's test delivery is an empty batch.
+        for (body, encoding, rows) in [
+            (ndjson.into_bytes(), None, 2),
+            (gzipped_array, Some("gzip"), 1),
+            (b"[]".to_vec(), None, 0),
+        ] {
+            let (response, item_count, org_id, _) = handle_signal_inner(
+                &state,
+                &headers(encoding),
+                Bytes::from(body),
+                Ingress::VercelLogDrain,
+            )
+            .await
+            .expect("a drain delivery is accepted");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!((item_count, org_id.as_str()), (rows, "org_vercel"));
+            let forwarded = tokio::time::timeout(Duration::from_secs(2), forward_rx.recv())
+                .await
+                .expect("the delivery is forwarded")
+                .expect("forward channel should stay open");
+            assert_eq!(forwarded.content_type, "application/x-protobuf");
+        }
+
+        let (error, error_kind) = handle_signal_inner(
+            &state,
+            &headers(None),
+            Bytes::from_static(b"{\"projectId\":"),
+            Ingress::VercelLogDrain,
+        )
+        .await
+        .expect_err("malformed JSON is refused");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_kind, "enrich");
+
+        let (error, _) = handle_signal_inner(
+            &state,
+            &HeaderMap::new(),
+            Bytes::from_static(b"[]"),
+            Ingress::VercelLogDrain,
+        )
+        .await
+        .expect_err("a delivery without the ingest key is refused");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
 
         drop(std::fs::remove_dir_all(&queue_dir));
     }
@@ -14675,7 +19205,7 @@ mod tests {
             let mut headers = HeaderMap::new();
             headers.insert(name, value.parse().unwrap());
             headers.insert(CONTENT_TYPE, "application/x-protobuf".parse().unwrap());
-            let (error, _) = handle_signal_inner(&state, &headers, body(), Signal::Logs)
+            let (error, _) = handle_signal_inner(&state, &headers, body(), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect_err("a blocked key must be refused");
             assert_eq!(error.status, StatusCode::UNAUTHORIZED, "{name}: {value:?}");
@@ -14687,7 +19217,7 @@ mod tests {
         }
 
         let (response, ..) =
-            handle_signal_inner(&state, &test_headers(allowed), body(), Signal::Logs)
+            handle_signal_inner(&state, &test_headers(allowed), body(), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect("an unblocked key still ingests");
         assert_eq!(response.status(), StatusCode::OK);
@@ -15483,7 +20013,7 @@ mod tests {
             &state,
             &test_headers(raw_key),
             Bytes::from(test_log_request("span tree").encode_to_vec()),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .instrument(server_span)
         .await
@@ -15566,7 +20096,7 @@ mod tests {
             &state,
             &test_headers(raw_key),
             Bytes::from(first_payload),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect("non-ready request should be accepted through forward path");
@@ -15612,7 +20142,7 @@ mod tests {
             &state,
             &test_headers(raw_key),
             Bytes::from(second_payload),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect("ready request should be accepted through ClickHouse path");
@@ -15671,25 +20201,38 @@ mod tests {
 
     const FIXTURE_KEY: &str = "BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU=";
     const OTHER_KEY: &str = "BgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgYGBgY=";
-    // A v2 envelope sealed by SecretBox.ts for org "org_fixture" under FIXTURE_KEY.
-    // The same triple is opened in packages/backend/src/platform/secret-slots.test.ts.
+    // A v3 envelope sealed by SecretBox.ts for org "org_fixture" and `ch_url` = CH_URL under
+    // FIXTURE_KEY. The same triple is opened in packages/backend/src/platform/secret-slots.test.ts.
+    const CH_URL: &str = "https://ch.example.com:8443";
+    const V3_CIPHERTEXT: &str = "v3.IGjfnBNl.xeDTFXH6xa2O+HjUIA==";
+    const V3_IV: &str = "AAECAwQFBgcICQoL";
+    const V3_TAG: &str = "kDzWdYJ8UBBoQYMWpL9KSg==";
+    // The same password in the v2 envelope, bound to the org only.
     const V2_CIPHERTEXT: &str = "v2.IGjfnBNl.1HbzraIYWPNUxiGCnA==";
     const V2_IV: &str = "3gBID0+h49Y9q+SD";
     const V2_TAG: &str = "s2cyY7uChmyKqIcJzE8m7Q==";
 
     #[test]
-    fn secret_keyring_opens_a_v2_password_sealed_by_the_api() {
+    fn secret_keyring_opens_a_v3_password_only_at_the_url_it_was_sealed_for() {
         let keyring = SecretKeyring::parse(FIXTURE_KEY, None).expect("keyring parses");
-        let plaintext = keyring
-            .open_clickhouse_password("org_fixture", V2_CIPHERTEXT, V2_IV, V2_TAG)
-            .expect("v2 fixture opens");
-        assert_eq!(plaintext, "ch-secret-123");
+        let opened =
+            keyring.open_clickhouse_password("org_fixture", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG);
+        assert_eq!(opened, Ok("ch-secret-123".to_owned()));
+        let moved = keyring.open_clickhouse_password(
+            "org_fixture",
+            "https://attacker.example:8443",
+            V3_CIPHERTEXT,
+            V3_IV,
+            V3_TAG,
+        );
+        assert_eq!(moved, Err("Decryption failed".to_owned()));
     }
 
     #[test]
-    fn secret_keyring_refuses_a_v2_password_moved_to_another_org() {
+    fn secret_keyring_refuses_a_v3_password_moved_to_another_org() {
         let keyring = SecretKeyring::parse(FIXTURE_KEY, None).expect("keyring parses");
-        let moved = keyring.open_clickhouse_password("org_other", V2_CIPHERTEXT, V2_IV, V2_TAG);
+        let moved =
+            keyring.open_clickhouse_password("org_other", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG);
         assert_eq!(moved, Err("Decryption failed".to_owned()));
     }
 
@@ -15697,34 +20240,140 @@ mod tests {
     fn secret_keyring_opens_with_a_decrypt_only_key_after_rotation() {
         let rotated = SecretKeyring::parse(OTHER_KEY, Some(&format!(" {FIXTURE_KEY} ,")))
             .expect("keyring parses");
-        let v2 = rotated.open_clickhouse_password("org_fixture", V2_CIPHERTEXT, V2_IV, V2_TAG);
-        assert_eq!(v2, Ok("ch-secret-123".to_owned()));
+        let v3 =
+            rotated.open_clickhouse_password("org_fixture", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG);
+        assert_eq!(v3, Ok("ch-secret-123".to_owned()));
     }
 
     #[test]
-    fn secret_keyring_refuses_a_password_from_before_the_v2_envelope() {
+    fn secret_keyring_refuses_a_password_not_bound_to_its_url() {
         let keyring = SecretKeyring::parse(FIXTURE_KEY, None).expect("keyring parses");
+        let v2 =
+            keyring.open_clickhouse_password("org_fixture", CH_URL, V2_CIPHERTEXT, V2_IV, V2_TAG);
         let old = keyring.open_clickhouse_password(
             "org_fixture",
+            CH_URL,
             "vDjK0A+Vv5bHlJ2a3A==",
             "AQIDBAUGBwgJCgsM",
             "b7D1umrvI8557NFvR9nJ/A==",
         );
-        assert_eq!(
-            old,
-            Err("Stored value is not in the v2 envelope".to_owned())
-        );
+        let unbound = Err("Stored value is not bound to its destination".to_owned());
+        assert_eq!(v2, unbound);
+        assert_eq!(old, unbound);
     }
 
     #[test]
     fn secret_keyring_names_a_missing_key_and_rejects_a_malformed_one() {
         let other = SecretKeyring::parse(OTHER_KEY, None).expect("keyring parses");
-        let missing = other.open_clickhouse_password("org_fixture", V2_CIPHERTEXT, V2_IV, V2_TAG);
+        let missing =
+            other.open_clickhouse_password("org_fixture", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG);
         assert_eq!(
             missing,
             Err("Sealed with a key this deployment does not hold".to_owned())
         );
         assert!(SecretKeyring::parse(FIXTURE_KEY, Some("not-a-key")).is_err());
+    }
+
+    // FIXTURE_KEY's slot keys, as `clickHousePasswordSlotKeys` in packages/infra derives them.
+    // Pinned the same in packages/backend/src/platform/secret-slot-keys-parity.test.ts.
+    const FIXTURE_SLOT_KEYS: &str = "IGjfnBNl:DxboU6BYcIHPRlnXrZyrpik+g9IlCixfjGcrpISh4AU=";
+
+    fn slot_keys_of(master: &str) -> String {
+        let key = SecretKey::new(parse_base64_aes256_gcm_key(master).expect("fixture key"))
+            .expect("fixture derives");
+        format!("{}:{}", key.id, STANDARD.encode(key.clickhouse_password_subkey))
+    }
+
+    #[test]
+    fn secret_keyring_slot_keys_match_the_pinned_derivation() {
+        assert_eq!(slot_keys_of(FIXTURE_KEY), FIXTURE_SLOT_KEYS);
+    }
+
+    #[test]
+    fn secret_keyring_slot_keys_open_v3_and_refuse_an_unbound_v2() {
+        let keyring = SecretKeyring::parse_slot_keys(FIXTURE_SLOT_KEYS).expect("slot keys parse");
+        // Slot keys refuse an unbound v2 value exactly as the master key does (#2804).
+        let v2 = keyring.open_clickhouse_password("org_fixture", CH_URL, V2_CIPHERTEXT, V2_IV, V2_TAG);
+        assert_eq!(
+            v2,
+            Err("Stored value is not bound to its destination".to_owned())
+        );
+        let v3 = keyring.open_clickhouse_password("org_fixture", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG);
+        assert_eq!(v3, Ok("ch-secret-123".to_owned()));
+        let moved = keyring.open_clickhouse_password(
+            "org_fixture",
+            "https://attacker.example:8443",
+            V3_CIPHERTEXT,
+            V3_IV,
+            V3_TAG,
+        );
+        assert_eq!(moved, Err("Decryption failed".to_owned()));
+        let other_org =
+            keyring.open_clickhouse_password("org_other", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG);
+        assert_eq!(other_org, Err("Decryption failed".to_owned()));
+    }
+
+    #[test]
+    fn secret_keyring_slot_keys_open_with_a_decrypt_only_entry_after_rotation() {
+        let rotated = format!(" {} , {FIXTURE_SLOT_KEYS} ,", slot_keys_of(OTHER_KEY));
+        let keyring = SecretKeyring::parse_slot_keys(&rotated).expect("slot keys parse");
+        let v3 = keyring.open_clickhouse_password("org_fixture", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG);
+        assert_eq!(v3, Ok("ch-secret-123".to_owned()));
+    }
+
+    #[test]
+    fn secret_keyring_slot_keys_refuse_a_wrong_key_id_or_subkey() {
+        let wrong_id = SecretKeyring::parse_slot_keys(&FIXTURE_SLOT_KEYS.replace("IGjfnBNl", "AAAAAAAA"))
+            .expect("slot keys parse");
+        assert_eq!(
+            wrong_id.open_clickhouse_password("org_fixture", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG),
+            Err("Sealed with a key this deployment does not hold".to_owned())
+        );
+        // The fixture's keyId with another master's subkey: a mislabelled key does not open.
+        let other_subkey = slot_keys_of(OTHER_KEY);
+        let (_, subkey) = other_subkey.split_once(':').expect("id:subkey");
+        let mislabelled =
+            SecretKeyring::parse_slot_keys(&format!("IGjfnBNl:{subkey}")).expect("slot keys parse");
+        assert_eq!(
+            mislabelled.open_clickhouse_password("org_fixture", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG),
+            Err("Decryption failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn secret_keyring_slot_keys_reject_malformed_values() {
+        for raw in [
+            "",
+            " , ",
+            "IGjfnBNl",
+            "IGjfnBNl:not-base64!",
+            "IGjfnBNl:AAAA",
+            "short:DxboU6BYcIHPRlnXrZyrpik+g9IlCixfjGcrpISh4AU=",
+            "IGjfnBNl:DxboU6BYcIHPRlnXrZyrpik+g9IlCixfjGcrpISh4AU=,garbage",
+            FIXTURE_KEY,
+        ] {
+            let parsed = SecretKeyring::parse_slot_keys(raw);
+            assert!(parsed.is_err(), "{raw:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn secret_keyring_prefers_slot_keys_and_falls_back_to_master_keys() {
+        // Slot keys win: an unusable master beside them is never read.
+        let from_slot_keys =
+            SecretKeyring::from_env_values(Some(FIXTURE_SLOT_KEYS), Some("not-a-key"), None)
+                .expect("slot keys used");
+        assert!(from_slot_keys
+            .open_clickhouse_password("org_fixture", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG)
+            .is_ok());
+        // Blank slot keys fall back to the master key, as on a self-hosted deploy.
+        let from_master = SecretKeyring::from_env_values(Some("  "), Some(FIXTURE_KEY), None)
+            .expect("master key used");
+        assert!(from_master
+            .open_clickhouse_password("org_fixture", CH_URL, V3_CIPHERTEXT, V3_IV, V3_TAG)
+            .is_ok());
+        assert!(SecretKeyring::from_env_values(None, None, None).is_err());
+        assert!(SecretKeyring::from_env_values(Some("IGjfnBNl:bad"), Some(FIXTURE_KEY), None).is_err());
     }
 
     #[test]
@@ -15788,11 +20437,12 @@ mod tests {
         store.insert_clickhouse_target(
             "org_fixture",
             ClickHouseTargetRow {
-                ch_url: "https://clickhouse.example/".to_owned(),
+                ch_url: format!("{CH_URL}/"),
                 ch_user: "ingest".to_owned(),
-                ch_password_ciphertext: Some(V2_CIPHERTEXT.to_owned()),
-                ch_password_iv: Some(V2_IV.to_owned()),
-                ch_password_tag: Some(V2_TAG.to_owned()),
+                // The fixture password in v3 for this exact `ch_url`, trailing slash included.
+                ch_password_ciphertext: Some(V3_CIPHERTEXT.to_owned()),
+                ch_password_iv: Some(V3_IV.to_owned()),
+                ch_password_tag: Some("jkCOg5e0Y+nPj6FCPR0IPA==".to_owned()),
                 ch_database: "maple".to_owned(),
                 schema_version: CLICKHOUSE_SCHEMA_VERSION.to_owned(),
             },
@@ -15811,7 +20461,7 @@ mod tests {
             .await
             .expect("target lookup should not fail")
             .expect("target should resolve");
-        assert_eq!(target.endpoint, "https://clickhouse.example");
+        assert_eq!(target.endpoint, CH_URL);
         assert_eq!(target.user, "ingest");
         assert_eq!(target.password, "ch-secret-123");
         assert_eq!(target.database, "maple");
@@ -15825,9 +20475,10 @@ mod tests {
             ClickHouseTargetRow {
                 ch_url: "http://clickhouse.example/".to_owned(),
                 ch_user: "ingest".to_owned(),
-                ch_password_ciphertext: Some(V2_CIPHERTEXT.to_owned()),
-                ch_password_iv: Some(V2_IV.to_owned()),
-                ch_password_tag: Some(V2_TAG.to_owned()),
+                // The fixture password sealed in v3 for this exact `ch_url`.
+                ch_password_ciphertext: Some(V3_CIPHERTEXT.to_owned()),
+                ch_password_iv: Some(V3_IV.to_owned()),
+                ch_password_tag: Some("5P0wvEF8hm5nYU3du07Jtg==".to_owned()),
                 ch_database: "maple".to_owned(),
                 schema_version: CLICKHOUSE_SCHEMA_VERSION.to_owned(),
             },
@@ -16243,7 +20894,7 @@ mod tests {
         let body = Bytes::from(test_log_request("refused").encode_to_vec());
 
         let (response, decoded_bytes, org_id, items) =
-            handle_signal_inner(&state, &test_headers(paused), body.clone(), Signal::Logs)
+            handle_signal_inner(&state, &test_headers(paused), body.clone(), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect("a paused key is answered with success");
         assert_eq!(response.status(), StatusCode::OK);
@@ -16264,7 +20915,7 @@ mod tests {
         );
 
         let (error, error_kind) =
-            handle_signal_inner(&state, &test_headers(expired), body, Signal::Logs)
+            handle_signal_inner(&state, &test_headers(expired), body, Ingress::Otlp(Signal::Logs))
                 .await
                 .expect_err("an expired key is refused");
         assert_eq!(error.status, StatusCode::UNAUTHORIZED);
@@ -16410,8 +21061,12 @@ mod tests {
         .await;
         let body = Bytes::from(test_log_request("refused").encode_to_vec());
 
-        let (response, _items, _org_id, metered_bytes) =
-            handle_signal_inner(&state, &test_headers(raw_key), body, Signal::Logs)
+        let (response, _items, _org_id, metered_bytes) = handle_signal_inner(
+            &state,
+            &test_headers(raw_key),
+            body,
+            Ingress::Otlp(Signal::Logs),
+        )
                 .await
                 .expect("a collector 4xx is relayed, not raised");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -16433,7 +21088,7 @@ mod tests {
             DecodedPayload::Logs(payload),
             &resolved,
             KeyAdmission::Ingest,
-            decoded_bytes,
+            Received::unbudgeted(decoded_bytes),
             &ClaimOutcome::default(),
         )
         .await
@@ -16471,7 +21126,7 @@ mod tests {
 
         // Request 1: accepted, with the override in the forwarded payload.
         let (response, _, org_id, _) =
-            handle_signal_inner(&state, &test_headers(raw_key), body.clone(), Signal::Logs)
+            handle_signal_inner(&state, &test_headers(raw_key), body.clone(), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect("an allowed signal is accepted");
         assert_eq!(response.status(), StatusCode::OK);
@@ -16497,7 +21152,7 @@ mod tests {
 
         // A signal outside the allow-list is 403 on every transport.
         let (error, error_kind) =
-            handle_signal_inner(&state, &test_headers(raw_key), body.clone(), Signal::Traces)
+            handle_signal_inner(&state, &test_headers(raw_key), body.clone(), Ingress::Otlp(Signal::Traces))
                 .await
                 .expect_err("traces are not allowed");
         assert_eq!(error.status, StatusCode::FORBIDDEN);
@@ -16526,11 +21181,11 @@ mod tests {
         assert_eq!(status.code(), tonic::Code::PermissionDenied);
 
         // Request 2 spends the last token of the 2 rps burst; request 3 is 429.
-        handle_signal_inner(&state, &test_headers(raw_key), body.clone(), Signal::Logs)
+        handle_signal_inner(&state, &test_headers(raw_key), body.clone(), Ingress::Otlp(Signal::Logs))
             .await
             .expect("the second request fits the burst");
         let (error, error_kind) =
-            handle_signal_inner(&state, &test_headers(raw_key), body, Signal::Logs)
+            handle_signal_inner(&state, &test_headers(raw_key), body, Ingress::Otlp(Signal::Logs))
                 .await
                 .expect_err("the third request is over the limit");
         assert_eq!(error.status, StatusCode::TOO_MANY_REQUESTS);
@@ -16905,7 +21560,7 @@ mod tests {
             &state,
             &test_headers(raw_key),
             Bytes::from(request.encode_to_vec()),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect("default key traffic is accepted");
@@ -16943,7 +21598,7 @@ mod tests {
             &state,
             &test_headers(raw_key),
             Bytes::from(test_log_request("no claims").encode_to_vec()),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect("default key traffic is accepted");
@@ -16953,6 +21608,143 @@ mod tests {
             vec![
                 INTEGRATION_SOURCE_UUID.to_owned(),
                 DEFAULT_SOURCE_UUID.to_owned()
+            ]
+        );
+
+        drop(std::fs::remove_dir_all(&queue_dir));
+    }
+
+    fn header_claimed_logs(header: Option<&str>, own_claim: Option<&str>) -> DecodedPayload {
+        let mut request = test_log_request("header claim");
+        let mut claimed = request.resource_logs[0].clone();
+        if let Some(own_claim) = own_claim {
+            claimed
+                .resource
+                .as_mut()
+                .expect("resource")
+                .attributes
+                .push(string_attribute("maple_source_id", own_claim));
+        }
+        request.resource_logs.push(claimed);
+        request.resource_logs.push(ResourceLogs::default());
+        let mut decoded = DecodedPayload::Logs(request);
+        let mut headers = HeaderMap::new();
+        if let Some(header) = header {
+            headers.insert(SOURCE_ID_HEADER, header.parse().expect("header value"));
+        }
+        apply_header_source_claim(&mut decoded, &headers, &test_key());
+        decoded
+    }
+
+    fn resource_claims(decoded: &DecodedPayload) -> Vec<Option<String>> {
+        let DecodedPayload::Logs(request) = decoded else {
+            panic!("logs");
+        };
+        request
+            .resource_logs
+            .iter()
+            .map(|r| {
+                r.resource
+                    .as_ref()
+                    .and_then(|resource| source_id_claim(&resource.attributes))
+                    .map(str::to_owned)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_source_header_claims_every_resource_without_its_own() {
+        let header = public_id(INTEGRATION_SOURCE_UUID);
+        let own = public_id(SOURCE_UUID);
+        assert_eq!(
+            resource_claims(&header_claimed_logs(Some(&header), Some(&own))),
+            vec![Some(header.clone()), Some(own), Some(header)]
+        );
+        assert_eq!(
+            resource_claims(&header_claimed_logs(Some("  "), None)),
+            vec![None, None, None]
+        );
+        let oversized = "s".repeat(MAX_PUBLIC_ID_LEN + 1);
+        assert_eq!(
+            resource_claims(&header_claimed_logs(Some(&oversized), None)),
+            vec![None, None, None]
+        );
+    }
+
+    #[test]
+    fn the_source_header_is_ignored_for_source_tokens() {
+        let mut decoded = DecodedPayload::Logs(test_log_request("token"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SOURCE_ID_HEADER,
+            public_id(INTEGRATION_SOURCE_UUID)
+                .parse()
+                .expect("header value"),
+        );
+        let token = ResolvedIngestKey {
+            key_type: IngestKeyType::Source,
+            ..test_key()
+        };
+        apply_header_source_claim(&mut decoded, &headers, &token);
+        assert_eq!(resource_claims(&decoded), vec![None]);
+    }
+
+    #[tokio::test]
+    async fn header_claims_are_verified_like_attribute_claims() {
+        let (forward_url, mut forward_rx) = spawn_capturing_logs_collector().await;
+        let queue_dir = unique_main_test_dir("header-source-claim");
+        let store = Arc::new(FakeKeyStore::default());
+        let raw_key = "maple_sk_header_source_claim";
+        store.insert_private(
+            raw_key,
+            KeyRow {
+                org_id: "org_header_claim".to_owned(),
+                self_managed: false,
+                clickhouse_ready: false,
+            },
+        );
+        store.insert_source_row("org_header_claim", DEFAULT_SOURCE_UUID, "default");
+        store.insert_source_row("org_header_claim", INTEGRATION_SOURCE_UUID, "integration");
+        store.insert_source_row("org_someone_else", SOURCE_UUID, "token");
+        let state = test_app_state(
+            Arc::clone(&store),
+            queue_dir.clone(),
+            forward_url,
+            Duration::from_secs(30),
+        )
+        .await;
+
+        let mut stamped = Vec::new();
+        for header in [public_id(INTEGRATION_SOURCE_UUID), public_id(SOURCE_UUID)] {
+            let mut headers = test_headers(raw_key);
+            headers.insert(SOURCE_ID_HEADER, header.parse().expect("header value"));
+            let (response, ..) = handle_signal_inner(
+                &state,
+                &headers,
+                Bytes::from(test_log_request("header claim").encode_to_vec()),
+                Ingress::Otlp(Signal::Logs),
+            )
+            .await
+            .expect("default key traffic is accepted");
+            assert_eq!(response.status(), StatusCode::OK);
+            let forwarded = tokio::time::timeout(Duration::from_secs(2), forward_rx.recv())
+                .await
+                .expect("the export is forwarded")
+                .expect("forward channel should stay open");
+            let forwarded =
+                ExportLogsServiceRequest::decode(forwarded).expect("forwarded protobuf");
+            let resource = forwarded.resource_logs[0]
+                .resource
+                .as_ref()
+                .expect("resource");
+            stamped.push(string_attributes(&resource.attributes)["maple_source_id"].clone());
+        }
+        // The org's own source is kept; another org's id gives way to the default source.
+        assert_eq!(
+            stamped,
+            vec![
+                public_id(INTEGRATION_SOURCE_UUID),
+                public_id(DEFAULT_SOURCE_UUID)
             ]
         );
 
@@ -17010,7 +21802,7 @@ mod tests {
             &state,
             &test_headers(raw_key),
             request_with(&[paused.clone(), Some(public_id(SOURCE_UUID)), None]),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect("default key traffic is accepted");
@@ -17038,7 +21830,7 @@ mod tests {
             &state,
             &test_headers(raw_key),
             request_with(&[paused.clone(), paused.clone()]),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect("a paused source's batch is acked");
@@ -17056,7 +21848,7 @@ mod tests {
             &state,
             &test_headers(raw_key),
             request_with(&[paused, None]),
-            Signal::Logs,
+            Ingress::Otlp(Signal::Logs),
         )
         .await
         .expect("default key traffic is accepted");
@@ -17122,7 +21914,7 @@ mod tests {
                     state,
                     &test_headers(raw_key),
                     Bytes::from(body),
-                    Signal::Logs,
+                    Ingress::Otlp(Signal::Logs),
                 )
                 .await
                 .expect("default key traffic is accepted");
@@ -17248,7 +22040,7 @@ mod tests {
 
         for _ in 0..2 {
             let (response, ..) =
-                handle_signal_inner(&state, &test_headers(raw_key), body.clone(), Signal::Logs)
+                handle_signal_inner(&state, &test_headers(raw_key), body.clone(), Ingress::Otlp(Signal::Logs))
                     .await
                     .expect("default key traffic is accepted");
             assert_eq!(response.status(), StatusCode::OK);
@@ -17517,7 +22309,7 @@ mod tests {
         let state = with_ingest_rules(state, &store);
 
         let body = log_request_at("login from jane@example.com", 9).encode_to_vec();
-        let (response, ..) = handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Signal::Logs)
+        let (response, ..) = handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Ingress::Otlp(Signal::Logs))
             .await
             .expect("accepted");
         assert_eq!(response.status(), StatusCode::OK);
@@ -17545,7 +22337,7 @@ mod tests {
 
         let body = log_request_at("noisy debug line", 5).encode_to_vec();
         let (response, item_count, _, metered) =
-            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Signal::Logs)
+            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect("a fully dropped batch is still acked");
         assert_eq!(response.status(), StatusCode::OK);
@@ -17579,7 +22371,7 @@ mod tests {
         let body = request.encode_to_vec();
         let received = body.len();
         let (_, item_count, _, metered) =
-            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Signal::Logs)
+            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect("accepted");
         assert_eq!(item_count, 1);
@@ -17601,7 +22393,7 @@ mod tests {
 
         let body = log_request_at("login from jane@example.com", 9).encode_to_vec();
         let (_, _, _, metered) =
-            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body.clone()), Signal::Logs)
+            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body.clone()), Ingress::Otlp(Signal::Logs))
                 .await
                 .expect("accepted");
         assert_eq!(metered, body.len());
@@ -17658,7 +22450,7 @@ mod tests {
 
         let body = log_request_at("login from jane@example.com", 9).encode_to_vec();
         let Err((error, _)) =
-            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Signal::Logs).await
+            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Ingress::Otlp(Signal::Logs)).await
         else {
             panic!("an unredactable payload must not be accepted");
         };
@@ -17686,7 +22478,7 @@ mod tests {
     ) -> (ApiError, &'static str) {
         let body = log_request_at("login from jane@example.com", 9).encode_to_vec();
         let Err((error, kind)) =
-            handle_signal_inner(state, &test_headers(raw_key), Bytes::from(body), Signal::Logs).await
+            handle_signal_inner(state, &test_headers(raw_key), Bytes::from(body), Ingress::Otlp(Signal::Logs)).await
         else {
             panic!("the payload must be refused");
         };
@@ -17738,7 +22530,7 @@ mod tests {
         );
 
         let body = log_request_at("login from jane@example.com", 9).encode_to_vec();
-        handle_signal_inner(&state, &test_headers(other_key), Bytes::from(body), Signal::Logs)
+        handle_signal_inner(&state, &test_headers(other_key), Bytes::from(body), Ingress::Otlp(Signal::Logs))
             .await
             .expect("another org's rules still apply");
         let forwarded = next_forwarded_logs(&mut forward_rx).await;
@@ -17783,7 +22575,7 @@ mod tests {
             DecodedPayload::Logs(payload),
             &resolved,
             KeyAdmission::Ingest,
-            decoded_bytes,
+            Received::unbudgeted(decoded_bytes),
             &ClaimOutcome::default(),
         )
         .await
@@ -17805,7 +22597,7 @@ mod tests {
 
         let body = log_request_at("login from jane@example.com", 9).encode_to_vec();
         let accepted =
-            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Signal::Logs).await;
+            handle_signal_inner(&state, &test_headers(raw_key), Bytes::from(body), Ingress::Otlp(Signal::Logs)).await;
         assert!(
             accepted.map_or(true, |(response, ..)| !response.status().is_success()),
             "the collector refused the batch"
@@ -17933,5 +22725,806 @@ mod tests {
              ($9, $10, to_timestamp($11::bigint / 1000.0), $12, $13::bigint, $14::bigint, $15::bigint, $16::bigint)"
         ));
         assert!(sql.contains("dropped_bytes = org_ingest_rule_stats.dropped_bytes + EXCLUDED.dropped_bytes"));
+    }
+
+    /// Prometheus remote write, posted over HTTP to the gateway's own routes.
+    mod prometheus_write {
+        use super::*;
+        use maple_ingest::prometheus_remote_write::{
+            Label, MetricMetadata, MetricType, Sample, TimeSeries, WriteRequest, STALE_NAN_BITS,
+        };
+
+        const T0: i64 = 1_700_000_000_000;
+
+        fn series(labels: &[(&str, &str)], samples: &[(f64, i64)]) -> TimeSeries {
+            TimeSeries {
+                labels: labels
+                    .iter()
+                    .map(|(name, value)| Label {
+                        name: (*name).to_owned(),
+                        value: (*value).to_owned(),
+                    })
+                    .collect(),
+                samples: samples
+                    .iter()
+                    .map(|&(value, timestamp)| Sample { value, timestamp })
+                    .collect(),
+                exemplars: Vec::new(),
+                histograms: Vec::new(),
+            }
+        }
+
+        fn snappy(plain: &[u8]) -> Vec<u8> {
+            snap::raw::Encoder::new().compress_vec(plain).unwrap()
+        }
+
+        /// One scrape of an `api` target as Prometheus would write it: a counter, a
+        /// gauge, two buckets of a classic histogram, and what Maple does not store.
+        fn scrape() -> WriteRequest {
+            let target = [("instance", "10.0.0.1:9090"), ("job", "api")];
+            let with = |name: &'static str, extra: &[(&'static str, &'static str)]| {
+                let mut labels = vec![("__name__", name)];
+                labels.extend_from_slice(extra);
+                labels.extend_from_slice(&target);
+                labels
+            };
+            WriteRequest {
+                timeseries: vec![
+                    series(
+                        &with("http_requests_total", &[("code", "200")]),
+                        &[(1027.0, T0)],
+                    ),
+                    series(&with("process_resident_memory_bytes", &[]), &[(5.5e7, T0)]),
+                    series(
+                        &with("rpc_duration_seconds_bucket", &[("le", "0.5")]),
+                        &[(12.0, T0)],
+                    ),
+                    series(
+                        &with("rpc_duration_seconds_bucket", &[("le", "+Inf")]),
+                        &[(20.0, T0)],
+                    ),
+                    series(&with("up", &[]), &[(f64::from_bits(STALE_NAN_BITS), T0)]),
+                    series(&target, &[(1.0, T0)]),
+                ],
+                metadata: vec![MetricMetadata {
+                    kind: MetricType::Gauge.into(),
+                    metric_family_name: "process_resident_memory_bytes".to_owned(),
+                    help: "Resident memory size in bytes.".to_owned(),
+                    unit: "bytes".to_owned(),
+                }],
+            }
+        }
+
+        /// A gateway with one private key, forwarding to `forward_endpoint`.
+        async fn gateway_state(
+            raw_key: &str,
+            org_id: &str,
+            queue_dir: &std::path::Path,
+            forward_endpoint: String,
+        ) -> AppState {
+            let store = Arc::new(FakeKeyStore::default());
+            store.insert_private(
+                raw_key,
+                KeyRow {
+                    org_id: org_id.to_owned(),
+                    self_managed: false,
+                    clickhouse_ready: false,
+                },
+            );
+            test_app_state(
+                store,
+                queue_dir.to_path_buf(),
+                forward_endpoint,
+                Duration::from_secs(30),
+            )
+            .await
+        }
+
+        /// Serves the gateway's routes on a local port; returns the remote write URL.
+        async fn serve(state: AppState) -> String {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let url = format!(
+                "http://{}{}",
+                listener.local_addr().unwrap(),
+                prometheus_remote_write::ROUTE
+            );
+            let app = ingest_routes().with_state(Arc::new(state));
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            url
+        }
+
+        /// A request with the headers Prometheus sets on a 1.0 remote write.
+        fn remote_write(url: &str, body: Vec<u8>) -> reqwest::RequestBuilder {
+            Client::new()
+                .post(url)
+                .header(CONTENT_ENCODING, "snappy")
+                .header(CONTENT_TYPE, "application/x-protobuf")
+                .header("X-Prometheus-Remote-Write-Version", "0.1.0")
+                .header("User-Agent", "Prometheus/3.5.0")
+                .body(body)
+        }
+
+        /// The response's status and the `code` of its error envelope.
+        async fn outcome(request: reqwest::RequestBuilder) -> (StatusCode, String) {
+            let response = request.send().await.expect("the gateway answers");
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            (
+                status,
+                body["error"]["code"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+        }
+
+        /// A collector for `WriteMode::Forward` that keeps what it is sent at `/v1/metrics`.
+        async fn spawn_metrics_collector() -> (
+            String,
+            tokio::sync::mpsc::UnboundedReceiver<(HeaderMap, Bytes)>,
+        ) {
+            async fn capture(
+                State(tx): State<tokio::sync::mpsc::UnboundedSender<(HeaderMap, Bytes)>>,
+                headers: HeaderMap,
+                body: Bytes,
+            ) -> StatusCode {
+                drop(tx.send((headers, body)));
+                StatusCode::OK
+            }
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route("/v1/metrics", post(capture))
+                .with_state(tx);
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            (format!("http://{addr}"), rx)
+        }
+
+        /// Rows the fake Tinybird received, by datasource, until `expected` rows arrived.
+        async fn imported_rows(
+            imports: &mut TinybirdImports,
+            expected: usize,
+        ) -> HashMap<String, Vec<serde_json::Value>> {
+            let mut rows: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+            while rows.values().map(Vec::len).sum::<usize>() < expected {
+                let (datasource, ndjson) =
+                    tokio::time::timeout(Duration::from_secs(5), imports.recv())
+                        .await
+                        .expect("the rows are exported")
+                        .expect("the import channel stays open");
+                rows.entry(datasource).or_default().extend(
+                    ndjson
+                        .lines()
+                        .map(|line| serde_json::from_str(line).expect("a row is JSON")),
+                );
+            }
+            rows
+        }
+
+        #[tokio::test]
+        async fn a_remote_write_is_stored_as_otlp_metric_rows() {
+            let queue_dir = unique_main_test_dir("prometheus-native");
+            let raw_key = "maple_sk_test_prometheus_native";
+            let mut state = gateway_state(
+                raw_key,
+                "org_prometheus",
+                &queue_dir,
+                "http://127.0.0.1:1".to_owned(),
+            )
+            .await;
+            let mut imports = store_in_fake_tinybird(&mut state, test_tinybird_config(queue_dir.join("native"))).await;
+            let (state, mut autumn) = with_fake_autumn(state).await;
+            let url = serve(state).await;
+
+            let plain = scrape().encode_to_vec();
+            let response = remote_write(&url, snappy(&plain))
+                .bearer_auth(raw_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let rows = imported_rows(&mut imports, 4).await;
+            // (name, value, is_monotonic, aggregation_temporality), then the `le` attribute.
+            let sums: Vec<_> = rows["metrics_sum"]
+                .iter()
+                .map(|row| {
+                    (
+                        row["metric_name"].as_str().unwrap(),
+                        row["value"].as_f64().unwrap(),
+                        row["is_monotonic"].as_bool().unwrap(),
+                        row["aggregation_temporality"].as_i64().unwrap(),
+                        row["metric_attributes"]["le"].as_str(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                sums,
+                vec![
+                    ("http_requests_total", 1027.0, true, 2, None),
+                    ("rpc_duration_seconds_bucket", 12.0, true, 2, Some("0.5")),
+                    ("rpc_duration_seconds_bucket", 20.0, true, 2, Some("+Inf")),
+                ]
+            );
+            let counter = &rows["metrics_sum"][0];
+            assert_eq!(
+                counter["metric_attributes"],
+                serde_json::json!({ "code": "200", "instance": "10.0.0.1:9090", "job": "api" })
+            );
+            assert_eq!(
+                counter["resource_attributes"],
+                serde_json::json!({
+                    "maple_ingest_key_type": "private",
+                    "maple_ingest_source": "prometheus-remote-write",
+                    "maple_org_id": "org_prometheus",
+                    "service.instance.id": "10.0.0.1:9090",
+                    "service.name": "api",
+                })
+            );
+            assert_eq!(counter["service_name"], "api");
+            assert_eq!(counter["scope_name"], "maple-prometheus-remote-write");
+            assert_eq!(counter["timestamp"], "2023-11-14 22:13:20.000000000");
+            assert_eq!(
+                counter["start_timestamp"], "1970-01-01 00:00:00.000000000",
+                "remote write does not say when a series started"
+            );
+            assert_eq!(counter["flags"], 0);
+
+            // The stale `up` sample and the series without a name left no row.
+            assert_eq!(rows["metrics_gauge"].len(), 1);
+            let gauge = &rows["metrics_gauge"][0];
+            assert_eq!(gauge["metric_name"], "process_resident_memory_bytes");
+            assert_eq!(gauge["value"], 5.5e7);
+            assert_eq!(gauge["metric_unit"], "bytes");
+            assert_eq!(
+                gauge["metric_description"],
+                "Resident memory size in bytes."
+            );
+            assert_eq!(rows.len(), 2, "only sums and gauges: {:?}", rows.keys());
+
+            // Metered once, as metrics, on the size of the OTLP request it was mapped to.
+            let (mapped, _) = prometheus_remote_write::decode(&plain).unwrap();
+            let calls = drain_autumn_calls(&mut autumn).await;
+            assert_eq!(
+                tracked(&calls),
+                vec![("metrics", billable_gb(mapped.encoded_len() as u64))],
+                "{calls:?}"
+            );
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
+
+        #[tokio::test]
+        async fn many_samples_of_one_series_are_metered_for_what_they_store() {
+            let queue_dir = unique_main_test_dir("prometheus-metered");
+            let raw_key = "maple_sk_test_prometheus_metered";
+            let mut state = gateway_state(
+                raw_key,
+                "org_prometheus_metered",
+                &queue_dir,
+                "http://127.0.0.1:1".to_owned(),
+            )
+            .await;
+            let mut imports = store_in_fake_tinybird(&mut state, test_tinybird_config(queue_dir.join("native"))).await;
+            let (state, mut autumn) = with_fake_autumn(state).await;
+            let url = serve(state).await;
+
+            // One series with wide labels and 200 samples: the labels cross the wire once
+            // and are stored 200 times.
+            let wide = "x".repeat(200);
+            let names: Vec<String> = (0..8).map(|i| format!("label_{i}")).collect();
+            let mut pairs: Vec<(&str, &str)> = vec![("__name__", "queue_depth"), ("job", "api")];
+            pairs.extend(names.iter().map(|name| (name.as_str(), wide.as_str())));
+            let samples: Vec<(f64, i64)> = (0..200_i32)
+                .map(|i| (f64::from(i), T0 + i64::from(i) * 1000))
+                .collect();
+            let plain = WriteRequest {
+                timeseries: vec![series(&pairs, &samples)],
+                metadata: Vec::new(),
+            }
+            .encode_to_vec();
+
+            let response = remote_write(&url, snappy(&plain))
+                .bearer_auth(raw_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let rows = imported_rows(&mut imports, 200).await;
+            assert_eq!(rows["metrics_gauge"].len(), 200);
+
+            let calls = drain_autumn_calls(&mut autumn).await;
+            let billed = tracked(&calls);
+            assert_eq!(billed.len(), 1, "{calls:?}");
+            // The wire form is about 5 kB; what is stored, and billed, is over fifty times that.
+            assert!(
+                billed[0].1 > billable_gb(50 * plain.len() as u64),
+                "billed {:?} for {} wire bytes",
+                billed[0].1,
+                plain.len()
+            );
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
+
+        #[tokio::test]
+        async fn a_remote_write_is_forwarded_to_the_collector_as_otlp() {
+            let (forward_url, mut forwarded) = spawn_metrics_collector().await;
+            let queue_dir = unique_main_test_dir("prometheus-forward");
+            let raw_key = "maple_sk_test_prometheus_forward";
+            let state =
+                gateway_state(raw_key, "org_prometheus_forward", &queue_dir, forward_url).await;
+            let url = serve(state).await;
+
+            let response = remote_write(&url, snappy(&scrape().encode_to_vec()))
+                .basic_auth("maple", Some(raw_key))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+
+            let (headers, body) = tokio::time::timeout(Duration::from_secs(2), forwarded.recv())
+                .await
+                .expect("the batch is forwarded")
+                .expect("the collector channel stays open");
+            assert_eq!(headers[CONTENT_TYPE], "application/x-protobuf");
+            assert!(
+                !headers.contains_key(CONTENT_ENCODING),
+                "the collector is sent OTLP, not the sender's snappy"
+            );
+            let request = ExportMetricsServiceRequest::decode(body).expect("OTLP metrics");
+            assert_eq!(request.resource_metrics.len(), 1);
+            let resource = string_attributes(
+                &request.resource_metrics[0]
+                    .resource
+                    .as_ref()
+                    .unwrap()
+                    .attributes,
+            );
+            assert_eq!(resource["service.name"], "api");
+            assert_eq!(resource["service.instance.id"], "10.0.0.1:9090");
+            assert_eq!(resource["maple_org_id"], "org_prometheus_forward");
+            assert_eq!(resource["maple_ingest_source"], "prometheus-remote-write");
+            let metrics: Vec<_> = request.resource_metrics[0].scope_metrics[0]
+                .metrics
+                .iter()
+                .map(|metric| {
+                    let kind = match &metric.data {
+                        Some(metric::Data::Sum(sum)) if sum.is_monotonic => "monotonic_sum",
+                        Some(metric::Data::Gauge(_)) => "gauge",
+                        other => panic!("{} became {other:?}", metric.name),
+                    };
+                    (metric.name.as_str(), kind)
+                })
+                .collect();
+            assert_eq!(
+                metrics,
+                vec![
+                    ("http_requests_total", "monotonic_sum"),
+                    ("process_resident_memory_bytes", "gauge"),
+                    ("rpc_duration_seconds_bucket", "monotonic_sum"),
+                ]
+            );
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
+
+        #[tokio::test]
+        async fn the_ingest_key_is_read_from_every_place_prometheus_can_put_it() {
+            let (forward_url, mut forwarded) = spawn_metrics_collector().await;
+            let queue_dir = unique_main_test_dir("prometheus-auth");
+            let raw_key = "maple_sk_test_prometheus_auth";
+            let state =
+                gateway_state(raw_key, "org_prometheus_auth", &queue_dir, forward_url).await;
+            let url = serve(state).await;
+            let body = || snappy(&scrape().encode_to_vec());
+            let basic = |credentials: &str| format!("Basic {}", STANDARD.encode(credentials));
+
+            // `authorization.credentials`, `basic_auth.password` under any username, and
+            // the header OTLP senders use.
+            let accepted = [
+                remote_write(&url, body()).bearer_auth(raw_key),
+                remote_write(&url, body()).basic_auth("maple", Some(raw_key)),
+                remote_write(&url, body()).basic_auth("", Some(raw_key)),
+                remote_write(&url, body()).header(
+                    AUTHORIZATION,
+                    format!("basic {}", STANDARD.encode(format!("x:{raw_key}"))),
+                ),
+                remote_write(&url, body()).header("x-maple-ingest-key", raw_key),
+            ];
+            for request in accepted {
+                assert_eq!(outcome(request).await, (StatusCode::OK, String::new()));
+                tokio::time::timeout(Duration::from_secs(2), forwarded.recv())
+                    .await
+                    .expect("an authenticated write is forwarded")
+                    .expect("the collector channel stays open");
+            }
+
+            let refused = [
+                ("no credential", remote_write(&url, body())),
+                (
+                    "an unknown bearer token",
+                    remote_write(&url, body()).bearer_auth("maple_sk_test_unknown"),
+                ),
+                (
+                    "an unknown password",
+                    remote_write(&url, body()).basic_auth("maple", Some("maple_sk_test_unknown")),
+                ),
+                (
+                    "the key as the username",
+                    remote_write(&url, body()).basic_auth(raw_key, None::<&str>),
+                ),
+                (
+                    "an empty password",
+                    remote_write(&url, body()).basic_auth(raw_key, Some("")),
+                ),
+                (
+                    "basic auth that is not base64",
+                    remote_write(&url, body()).header(AUTHORIZATION, "Basic not base64!"),
+                ),
+                (
+                    "basic auth without a colon",
+                    remote_write(&url, body()).header(AUTHORIZATION, basic(raw_key)),
+                ),
+                (
+                    "another scheme",
+                    remote_write(&url, body()).header(AUTHORIZATION, format!("Digest {raw_key}")),
+                ),
+            ];
+            for (case, request) in refused {
+                assert_eq!(
+                    outcome(request).await,
+                    (StatusCode::UNAUTHORIZED, "ingest_unauthorized".to_owned()),
+                    "{case}"
+                );
+            }
+            assert!(
+                forwarded.try_recv().is_err(),
+                "an unauthenticated write stores nothing"
+            );
+
+            // The public test token looks accepted and stores nothing, as on OTLP.
+            assert_eq!(
+                outcome(remote_write(&url, body()).bearer_auth(SENTINEL_TOKEN)).await,
+                (StatusCode::OK, String::new())
+            );
+            assert!(forwarded.try_recv().is_err());
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
+
+        #[tokio::test]
+        async fn a_source_token_is_held_to_its_signals_and_rate_like_otlp_metrics() {
+            let (forward_url, _forwarded) = spawn_metrics_collector().await;
+            let queue_dir = unique_main_test_dir("prometheus-source");
+            let store = Arc::new(FakeKeyStore::default());
+            let logs_only = "maple_src_prometheus_logs_only_00000000000000";
+            let limited = "maple_src_prometheus_one_per_second_000000000";
+            store.insert_source(
+                logs_only,
+                source_row(
+                    "org_prometheus_source",
+                    source_config(Some(r#"["logs"]"#), None, "[]"),
+                ),
+            );
+            store.insert_source(
+                limited,
+                source_row(
+                    "org_prometheus_source",
+                    source_config(Some(r#"["metrics"]"#), Some(1), "[]"),
+                ),
+            );
+            let state = test_app_state(
+                store,
+                queue_dir.clone(),
+                forward_url,
+                Duration::from_secs(30),
+            )
+            .await;
+            let url = serve(state).await;
+            let body = || snappy(&scrape().encode_to_vec());
+
+            assert_eq!(
+                outcome(remote_write(&url, body()).bearer_auth(logs_only)).await,
+                (
+                    StatusCode::FORBIDDEN,
+                    "ingest_signal_not_allowed".to_owned()
+                )
+            );
+
+            assert_eq!(
+                outcome(remote_write(&url, body()).bearer_auth(limited)).await,
+                (StatusCode::OK, String::new())
+            );
+            // Prometheus retries a 429 after the delay the gateway names.
+            let throttled = remote_write(&url, body())
+                .bearer_auth(limited)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(throttled.headers()[RETRY_AFTER], "1");
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
+
+        #[tokio::test]
+        async fn a_body_that_is_not_a_snappy_write_request_is_a_400() {
+            let (forward_url, mut forwarded) = spawn_metrics_collector().await;
+            let queue_dir = unique_main_test_dir("prometheus-malformed");
+            let raw_key = "maple_sk_test_prometheus_malformed";
+            let state =
+                gateway_state(raw_key, "org_prometheus_malformed", &queue_dir, forward_url).await;
+            let url = serve(state).await;
+
+            let plain = scrape().encode_to_vec();
+            let valid = snappy(&plain);
+            let mut framed = Vec::new();
+            {
+                let mut encoder = snap::write::FrameEncoder::new(&mut framed);
+                encoder.write_all(&plain).unwrap();
+                encoder.flush().unwrap();
+            }
+            let cases = [
+                ("an empty body", Vec::new()),
+                ("the protobuf uncompressed", plain.clone()),
+                (
+                    "a truncated snappy block",
+                    valid[..valid.len() / 2].to_vec(),
+                ),
+                ("the snappy framed format", framed),
+                ("a gzip body", gzip_bytes(&plain).to_vec()),
+                ("snappy of something else", snappy(b"{\"timeseries\":[]}")),
+                (
+                    "snappy of a truncated request",
+                    snappy(&plain[..plain.len() - 3]),
+                ),
+            ];
+            for (case, body) in cases {
+                assert_eq!(
+                    outcome(remote_write(&url, body).bearer_auth(raw_key)).await,
+                    (StatusCode::BAD_REQUEST, "ingest_bad_request".to_owned()),
+                    "{case}"
+                );
+            }
+            assert!(
+                forwarded.try_recv().is_err(),
+                "a refused body stores nothing"
+            );
+
+            // Without the header the body is still read as snappy.
+            let unlabelled = Client::new().post(&url).bearer_auth(raw_key).body(valid);
+            assert_eq!(outcome(unlabelled).await, (StatusCode::OK, String::new()));
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
+
+        #[tokio::test]
+        async fn version_2_and_other_encodings_are_a_415() {
+            let (forward_url, mut forwarded) = spawn_metrics_collector().await;
+            let queue_dir = unique_main_test_dir("prometheus-unsupported");
+            let raw_key = "maple_sk_test_prometheus_unsupported";
+            let state = gateway_state(
+                raw_key,
+                "org_prometheus_unsupported",
+                &queue_dir,
+                forward_url,
+            )
+            .await;
+            let url = serve(state).await;
+            let plain = scrape().encode_to_vec();
+
+            // Each sets its own `Content-Type`: `header` would add a second one.
+            let typed = |content_type: &'static str| {
+                Client::new()
+                    .post(&url)
+                    .bearer_auth(raw_key)
+                    .header(CONTENT_ENCODING, "snappy")
+                    .header(CONTENT_TYPE, content_type)
+                    .body(snappy(&plain))
+            };
+            let v2 = typed("application/x-protobuf;proto=io.prometheus.write.v2.Request")
+                .header("X-Prometheus-Remote-Write-Version", "2.0.0")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(v2.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            let body: serde_json::Value = v2.json().await.unwrap();
+            assert_eq!(
+                body["error"]["message"],
+                "Prometheus remote write 2.0 is not supported yet; send version 1.0 \
+                 (prometheus.WriteRequest)"
+            );
+
+            // The parameter may be a quoted string.
+            let quoted = typed("application/x-protobuf; proto=\"io.prometheus.write.v2.Request\"");
+            assert_eq!(
+                outcome(quoted).await,
+                (
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    "ingest_unsupported_media_type".to_owned()
+                )
+            );
+
+            // The version 1.0 content type, spelled out, is accepted.
+            let v1 = typed("application/x-protobuf;proto=prometheus.WriteRequest");
+            assert_eq!(outcome(v1).await, (StatusCode::OK, String::new()));
+            assert!(forwarded.recv().await.is_some());
+
+            for encoding in ["gzip", "zstd"] {
+                let request = Client::new()
+                    .post(&url)
+                    .bearer_auth(raw_key)
+                    .header(CONTENT_ENCODING, encoding)
+                    .body(gzip_bytes(&plain));
+                assert_eq!(
+                    outcome(request).await,
+                    (
+                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        "ingest_unsupported_media_type".to_owned()
+                    ),
+                    "{encoding}"
+                );
+            }
+            assert!(forwarded.try_recv().is_err());
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
+
+        #[tokio::test]
+        async fn a_write_that_inflates_or_decodes_past_the_limits_is_a_413() {
+            let (forward_url, mut forwarded) = spawn_metrics_collector().await;
+            let queue_dir = unique_main_test_dir("prometheus-too-large");
+            let raw_key = "maple_sk_test_prometheus_too_large";
+            let mut state =
+                gateway_state(raw_key, "org_prometheus_too_large", &queue_dir, forward_url).await;
+            state.config.max_decoded_body_bytes = 64 * 1024;
+            state.config.max_decode_heap_bytes = 4 * 1024 * 1024;
+            let memory = state.decode_memory.clone();
+            let url = serve(state).await;
+            let too_large = (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "ingest_payload_too_large".to_owned(),
+            );
+
+            // Five bytes that declare 4 GiB: refused on the header, nothing inflated.
+            let bomb = vec![0xff, 0xff, 0xff, 0xff, 0x0f];
+            assert_eq!(
+                outcome(remote_write(&url, bomb).bearer_auth(raw_key)).await,
+                too_large
+            );
+            // A real block one byte past the ceiling.
+            let over = snappy(&vec![0_u8; 64 * 1024 + 1]);
+            assert!(over.len() < 8 * 1024, "{} compressed bytes", over.len());
+            assert_eq!(
+                outcome(remote_write(&url, over).bearer_auth(raw_key)).await,
+                too_large
+            );
+
+            // Under the byte ceiling, but one series with 2,000 samples is 2,000 copies
+            // of its labels: over the heap one request may decode into.
+            let samples: Vec<_> = (0..2_000).map(|i| (1.0, T0 + i)).collect();
+            let labels: Vec<(String, String)> = (0..40)
+                .map(|i| (format!("label_{i}"), "v".repeat(32)))
+                .collect();
+            let mut all = vec![("__name__", "wide_total")];
+            all.extend(
+                labels
+                    .iter()
+                    .map(|(name, value)| (name.as_str(), value.as_str())),
+            );
+            let wide = WriteRequest {
+                timeseries: vec![series(&all, &samples)],
+                metadata: Vec::new(),
+            }
+            .encode_to_vec();
+            assert!(wide.len() < 64 * 1024, "{} decoded bytes", wide.len());
+            let refused = remote_write(&url, snappy(&wide))
+                .bearer_auth(raw_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body: serde_json::Value = refused.json().await.unwrap();
+            assert_eq!(
+                body["error"]["message"],
+                "Request decodes past the 4 MiB the gateway allows one request; send smaller batches"
+            );
+
+            // Inside both of those, but 300 samples of one series with 1 kB of labels map
+            // to more OTLP than the 64 kB an OTLP request may carry here.
+            let samples: Vec<_> = (0..300).map(|i| (1.0, T0 + i)).collect();
+            let value = "v".repeat(1024);
+            let fan_out = WriteRequest {
+                timeseries: vec![series(
+                    &[("__name__", "fan_out"), ("payload", value.as_str())],
+                    &samples,
+                )],
+                metadata: Vec::new(),
+            }
+            .encode_to_vec();
+            assert!(fan_out.len() < 8 * 1024, "{} decoded bytes", fan_out.len());
+            let refused = remote_write(&url, snappy(&fan_out))
+                .bearer_auth(raw_key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::PAYLOAD_TOO_LARGE);
+            let body: serde_json::Value = refused.json().await.unwrap();
+            assert_eq!(
+                body["error"]["message"],
+                "This remote write holds more metric data than one request may carry; send fewer \
+                 samples per request"
+            );
+
+            assert!(
+                forwarded.try_recv().is_err(),
+                "a refused body stores nothing"
+            );
+            assert_eq!(memory.reserved_bytes(), 0, "every reservation was returned");
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
+
+        #[tokio::test]
+        async fn an_org_over_its_plan_limit_is_refused_before_the_body_is_read() {
+            let (forward_url, mut forwarded) = spawn_metrics_collector().await;
+            let queue_dir = unique_main_test_dir("prometheus-billing");
+            let raw_key = "maple_sk_test_prometheus_denied";
+            let state = with_autumn_denying(
+                gateway_state(raw_key, "org_prometheus_denied", &queue_dir, forward_url).await,
+                "org_prometheus_denied",
+            )
+            .await;
+            let url = serve(state).await;
+
+            // Not a snappy body: the plan limit answers first, as on OTLP metrics.
+            let request = remote_write(&url, b"not snappy".to_vec()).bearer_auth(raw_key);
+            assert_eq!(
+                outcome(request).await,
+                (
+                    StatusCode::PAYMENT_REQUIRED,
+                    "ingest_plan_limit_reached".to_owned()
+                )
+            );
+            assert!(forwarded.try_recv().is_err());
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
+
+        #[tokio::test]
+        async fn a_write_with_nothing_to_store_is_accepted_and_not_metered() {
+            let (forward_url, mut forwarded) = spawn_metrics_collector().await;
+            let queue_dir = unique_main_test_dir("prometheus-empty");
+            let raw_key = "maple_sk_test_prometheus_empty";
+            let state =
+                gateway_state(raw_key, "org_prometheus_empty", &queue_dir, forward_url).await;
+            let (state, mut autumn) = with_fake_autumn(state).await;
+            let url = serve(state).await;
+
+            // Prometheus sends metadata on its own, in requests without series.
+            let metadata_only = WriteRequest {
+                timeseries: Vec::new(),
+                metadata: scrape().metadata,
+            };
+            let only_stale = WriteRequest {
+                timeseries: vec![series(
+                    &[("__name__", "up"), ("job", "api")],
+                    &[(f64::from_bits(STALE_NAN_BITS), T0)],
+                )],
+                metadata: Vec::new(),
+            };
+            for request in [WriteRequest::default(), metadata_only, only_stale] {
+                let body = snappy(&request.encode_to_vec());
+                assert_eq!(
+                    outcome(remote_write(&url, body).bearer_auth(raw_key)).await,
+                    (StatusCode::OK, String::new())
+                );
+            }
+            assert!(forwarded.try_recv().is_err(), "nothing is forwarded");
+            let calls = drain_autumn_calls(&mut autumn).await;
+            assert!(tracked(&calls).is_empty(), "nothing is metered: {calls:?}");
+            drop(std::fs::remove_dir_all(&queue_dir));
+        }
     }
 }

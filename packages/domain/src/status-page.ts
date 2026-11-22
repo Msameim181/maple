@@ -1,4 +1,6 @@
-import { Effect, Option, Schema, Array as Arr, String as Str } from "effect"
+import { sha256 } from "@noble/hashes/sha2"
+import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils"
+import { Effect, Option, Schema, SchemaTransformation, Struct, Array as Arr, String as Str } from "effect"
 import {
 	StatusPageComponentId,
 	StatusPageComponentStatus,
@@ -7,6 +9,7 @@ import {
 	StatusPageIncidentKind,
 	StatusPageIncidentStatus,
 	StatusPageUpdateSource,
+	StatusPageVisibility,
 	type UptimeMonitorStatus,
 } from "@maple/primitives"
 
@@ -25,17 +28,231 @@ export const STATUS_PAGE_INCIDENT_HISTORY_DAYS = 14
 export const STATUS_PAGE_STALE_AFTER_MS = 5 * 60_000
 /** Longest page link (website, logo, privacy, terms) the service stores; the editor checks it too. */
 export const STATUS_PAGE_MAX_URL_LENGTH = 2048
+/**
+ * Largest uploaded logo or favicon, in bytes. An upload is stored as a base64 `data:` URL in the
+ * page's URL column, so the edge serves it from the snapshot with no extra storage.
+ */
+export const STATUS_PAGE_MAX_IMAGE_BYTES = 128 * 1024
+/** The image types an upload may be; the editor's file picker accepts the same. */
+export const STATUS_PAGE_IMAGE_TYPES = [
+	"image/png",
+	"image/jpeg",
+	"image/webp",
+	"image/gif",
+	"image/svg+xml",
+	"image/x-icon",
+	"image/vnd.microsoft.icon",
+] as const
+const IMAGE_DATA_URL_PATTERN =
+	/^data:image\/(?:png|jpeg|webp|gif|svg\+xml|x-icon|vnd\.microsoft\.icon);base64,((?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?)$/u
+/** Base64 of the largest upload, plus room for the longest `data:<type>;base64,` prefix: a cheap first cut. */
+const MAX_IMAGE_DATA_URL_LENGTH = Math.ceil(STATUS_PAGE_MAX_IMAGE_BYTES / 3) * 4 + 64
 
-/** Lowercase letters, digits and inner hyphens: the `<slug>` in `<slug>.<status domain>`. */
+/** Bytes a base64 payload decodes to: three per four characters, less one per `=`. */
+const decodedBytes = (base64: string): number =>
+	(base64.length / 4) * 3 - (Str.endsWith("==")(base64) ? 2 : Str.endsWith("=")(base64) ? 1 : 0)
+
+/** An uploaded image: a base64 `data:` URL of an allowed image type, at most the size cap decoded. */
+export const isStatusPageImageDataUrl = (value: string): boolean => {
+	if (value.length > MAX_IMAGE_DATA_URL_LENGTH) return false
+	const payload = IMAGE_DATA_URL_PATTERN.exec(value)?.[1]
+	return payload !== undefined && payload.length > 0 && decodedBytes(payload) <= STATUS_PAGE_MAX_IMAGE_BYTES
+}
+
+/** A logo or favicon value the page may render: an https URL or an uploaded image. */
+export const isStatusPageImageSource = (value: string): boolean =>
+	isStatusPageImageDataUrl(value) ||
+	(value.length <= STATUS_PAGE_MAX_URL_LENGTH &&
+		URL.canParse(value) &&
+		new URL(value).protocol === "https:")
+
+/** Longest incident update message, in characters; the API, the service and the editor all check it. */
+export const STATUS_PAGE_UPDATE_MAX_LENGTH = 20_000
+
+/** Lowercase letters, digits and inner hyphens: the `<slug>` in `/s/<org key>/<slug>`, unique per org. */
 export const StatusPageSlug = Schema.String.check(
 	Schema.isPattern(/^[a-z0-9](?:[a-z0-9-]{1,46}[a-z0-9])$/u),
 ).annotate({ identifier: "@maple/StatusPageSlug", title: "Status Page Slug" })
 export type StatusPageSlug = Schema.Schema.Type<typeof StatusPageSlug>
 
+/**
+ * The org's part of a hosted address: the first 12 hex digits of SHA-256 over the org id. It
+ * keeps slugs per org without putting the org id in the URL; web and the publisher both derive it.
+ */
+export const statusPageOrgKey = (orgId: string): string =>
+	Str.slice(0, 12)(bytesToHex(sha256(utf8ToBytes(orgId))))
+
+/** A page's hosted address on Maple's status domain, without the `/s/` prefix: `<org key>/<slug>`. */
+export const statusPageAddress = (orgId: string, slug: string): string => `${statusPageOrgKey(orgId)}/${slug}`
+
+const STATUS_PAGE_SLUG_MAX = 48
+
+/**
+ * A slug suggested from a page name: `Acme Status!` as `acme-status`. Lowercase letters and
+ * digits, accents dropped, single inner hyphens. Not always a valid slug: a name with under three
+ * letters or digits gives a short one.
+ */
+export const slugFromName = (name: string): string =>
+	Str.replace(
+		/-+$/u,
+		"",
+	)(
+		Str.slice(
+			0,
+			STATUS_PAGE_SLUG_MAX,
+		)(
+			Str.replace(
+				/^-+|-+$/gu,
+				"",
+			)(
+				Str.replace(
+					/[^a-z0-9]+/gu,
+					"-",
+				)(Str.replace(/\p{M}+/gu, "")(Str.normalize("NFKD")(Str.toLowerCase(name)))),
+			),
+		),
+	)
+
+/** Longest custom domain hostname Maple stores (DNS caps a name at 253 characters). */
+export const STATUS_PAGE_CUSTOM_DOMAIN_MAX_LENGTH = 253
+
+/**
+ * Hostnames a customer may not claim: Maple's own, Cloudflare's shared ones and names that never
+ * resolve publicly. A suffix match covers the name itself and every name under it.
+ */
+const RESERVED_CUSTOM_DOMAIN_SUFFIXES = [
+	"maple.dev",
+	"workers.dev",
+	"pages.dev",
+	"cloudflare.com",
+	"localhost",
+	"local",
+	"internal",
+	"test",
+	"example",
+	"invalid",
+	"arpa",
+] as const
+
+const HOSTNAME_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u
+
+/**
+ * Common two-label public suffixes: `acme.co.uk` is an apex, so it needs a fourth label. Not the
+ * full public suffix list; a missed apex only sits in pending DNS until removed.
+ */
+const TWO_LABEL_PUBLIC_SUFFIXES = new Set([
+	"co.uk",
+	"org.uk",
+	"me.uk",
+	"ltd.uk",
+	"plc.uk",
+	"ac.uk",
+	"gov.uk",
+	"com.au",
+	"net.au",
+	"org.au",
+	"co.nz",
+	"org.nz",
+	"co.za",
+	"co.jp",
+	"ne.jp",
+	"or.jp",
+	"co.kr",
+	"co.in",
+	"com.br",
+	"com.cn",
+	"com.mx",
+	"com.tr",
+	"com.sg",
+	"com.hk",
+	"com.tw",
+	"co.il",
+	"com.ar",
+	"co.id",
+	"com.my",
+	"com.ph",
+	"github.io",
+	"netlify.app",
+	"vercel.app",
+])
+
+/** Trimmed, lower-cased, without a trailing dot: the one spelling a custom domain is stored in. */
+export const normalizeCustomDomain = (raw: string): string =>
+	Str.replace(/\.$/u, "")(Str.toLowerCase(Str.trim(raw)))
+
+/**
+ * Why a normalized hostname cannot be a status page's custom domain, or null when it can. A
+ * subdomain is required (`status.acme.com`): an apex cannot CNAME to Maple.
+ */
+export const customDomainIssue = (hostname: string): string | null => {
+	if (hostname === "") return "Enter a hostname, like status.acme.com."
+	if (hostname.length > STATUS_PAGE_CUSTOM_DOMAIN_MAX_LENGTH)
+		return `A hostname has at most ${STATUS_PAGE_CUSTOM_DOMAIN_MAX_LENGTH} characters.`
+	if (Str.includes("/")(hostname)) return "Enter the hostname alone, without https:// or a path."
+	const labels = Str.split(".")(hostname)
+	if (!Arr.every(labels, (label) => HOSTNAME_LABEL.test(label)))
+		return "Use letters, digits and hyphens between the dots, like status.acme.com."
+	if (/^[0-9]+$/u.test(labels.at(-1) ?? "")) return "Enter a hostname, not an IP address."
+	const suffixLabels = TWO_LABEL_PUBLIC_SUFFIXES.has(Arr.join(labels.slice(-2), ".")) ? 2 : 1
+	if (labels.length < suffixLabels + 2)
+		return "Use a subdomain, like status.acme.com: an apex domain cannot point at Maple."
+	const reserved = Arr.findFirst(
+		RESERVED_CUSTOM_DOMAIN_SUFFIXES,
+		(suffix) => hostname === suffix || Str.endsWith(`.${suffix}`)(hostname),
+	)
+	return Option.match(reserved, {
+		onNone: () => null,
+		onSome: (suffix) => `Names under ${suffix} cannot be a custom domain.`,
+	})
+}
+
+/** Why a customer adds a DNS record: to route the hostname to Maple, prove they own it, or get its certificate. */
+export const StatusPageCustomDomainRecordPurpose = Schema.Literals(["routing", "ownership", "certificate"])
+export type StatusPageCustomDomainRecordPurpose = Schema.Schema.Type<
+	typeof StatusPageCustomDomainRecordPurpose
+>
+
+/** One DNS record the customer adds at their DNS provider. */
+export const StatusPageCustomDomainDnsRecord = Schema.Struct({
+	type: Schema.Literals(["CNAME", "TXT"]),
+	name: Schema.String,
+	value: Schema.String,
+	purpose: StatusPageCustomDomainRecordPurpose,
+})
+export type StatusPageCustomDomainDnsRecord = Schema.Schema.Type<typeof StatusPageCustomDomainDnsRecord>
+
+/** The DNS label, under the hostname, of the TXT record that proves a claim on a custom domain. */
+export const CUSTOM_DOMAIN_CHALLENGE_LABEL = "_maple-challenge"
+
+/** True for the record that proves a claim: Maple sets a new domain up only once it is published. */
+export const isCustomDomainChallengeRecord = (
+	record: Pick<StatusPageCustomDomainDnsRecord, "type" | "name">,
+): boolean => record.type === "TXT" && Str.startsWith(`${CUSTOM_DOMAIN_CHALLENGE_LABEL}.`)(record.name)
+
+/** A custom domain as the API takes it: any case, trimmed, then checked by {@link customDomainIssue}. */
+export const StatusPageCustomDomainHostname = Schema.String.pipe(
+	Schema.decodeTo(
+		Schema.String.check(
+			Schema.makeFilter((hostname: string) => customDomainIssue(hostname) ?? undefined),
+		),
+		SchemaTransformation.transform<string, string>({
+			decode: normalizeCustomDomain,
+			encode: (hostname) => hostname,
+		}),
+	),
+).annotate({
+	identifier: "@maple/StatusPageCustomDomainHostname",
+	title: "Status Page Custom Domain",
+	description:
+		"A subdomain you control, like `status.acme.com`. Not an apex domain, an IP address or a Maple hostname.",
+	examples: ["status.acme.com"],
+})
+
 /** `YYYY-MM-DD`, UTC. */
 export const StatusPageDay = Schema.String.check(Schema.isPattern(/^\d{4}-\d{2}-\d{2}$/u))
 
-export const StatusPageDayState = Schema.Literals(["none", "ok", "degraded", "down"])
+/** How one day of a component's uptime bar reads, mildest first; {@link classifyDay} decides it. */
+export const StatusPageDayState = Schema.Literals(["none", "ok", "maintenance", "degraded", "down"])
 export type StatusPageDayState = Schema.Schema.Type<typeof StatusPageDayState>
 
 export const StatusPageDayBar = Schema.Struct({
@@ -100,6 +317,8 @@ export const StatusPageIncidentHistoryEntry = Schema.Struct({
 	impact: StatusPageIncidentImpact,
 	startedAt: Schema.Number,
 	resolvedAt: Schema.NullOr(Schema.Number),
+	/** The components it affected, so their bars carry it; older snapshots carry none. */
+	componentIds: Schema.Array(Schema.String).pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed([]))),
 })
 export type StatusPageIncidentHistoryEntry = Schema.Schema.Type<typeof StatusPageIncidentHistoryEntry>
 
@@ -563,15 +782,35 @@ export const themeContrastIssue = (theme: StatusPageTheme): string | null => {
 export const StatusPageSnapshotPage = Schema.Struct({
 	name: Schema.String,
 	slug: StatusPageSlug,
+	/** {@link statusPageOrgKey} of the page's org; empty in snapshots published before slugs were per org. */
+	orgKey: Schema.String.pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(""))),
 	description: Schema.NullOr(Schema.String),
 	websiteUrl: Schema.NullOr(Schema.String),
 	logoUrl: Schema.NullOr(Schema.String),
+	// Branding added later: absent from older snapshots, which render without them.
+	/** Shown instead of the logo in dark mode. */
+	logoDarkUrl: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(null))),
+	faviconUrl: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(null))),
+	/** Where visitors get help, linked in the header. */
+	supportUrl: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(null))),
 	// Snapshots published before themes existed carry none; they render the default until republished.
 	theme: StatusPageTheme.pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(DEFAULT_STATUS_PAGE_THEME))),
 	showPoweredBy: Schema.Boolean,
 	// Footer links; absent from snapshots published before they existed.
 	privacyUrl: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(null))),
 	termsUrl: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(null))),
+	/**
+	 * The page's active custom domain (`status.acme.com`), or null. When set it is the page's
+	 * canonical address: feeds, the Slack command and emails link there.
+	 */
+	customDomain: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(null))),
+	/**
+	 * Who may read the page. A password page has no feeds or subscribe options (feed readers
+	 * cannot sign in); an internal one is never served at the edge. Absent before visibility existed.
+	 */
+	visibility: StatusPageVisibility.pipe(
+		Schema.withDecodingDefaultTypeKey(Effect.succeed("public" as const)),
+	),
 })
 export type StatusPageSnapshotPage = Schema.Schema.Type<typeof StatusPageSnapshotPage>
 
@@ -584,6 +823,11 @@ export const StatusPageSnapshot = Schema.Struct({
 	page: StatusPageSnapshotPage,
 	/** SHA-256 (base64url) of the break-glass token; null when none is issued. */
 	breakGlassTokenSha256: Schema.NullOr(Schema.String),
+	/**
+	 * The password hash (`status-page-access.ts`) of a password page, null otherwise. The status
+	 * Worker checks posted passwords and signs access cookies with it; nothing renders it.
+	 */
+	passwordHash: Schema.NullOr(Schema.String).pipe(Schema.withDecodingDefaultTypeKey(Effect.succeed(null))),
 	components: Schema.Array(StatusPageSnapshotComponent),
 	/** Open incidents, upcoming and active maintenance, and recently resolved ones; newest first. */
 	incidents: Schema.Array(StatusPageSnapshotIncident),
@@ -596,6 +840,16 @@ export const StatusPageSnapshot = Schema.Struct({
 	),
 })
 export type StatusPageSnapshot = Schema.Schema.Type<typeof StatusPageSnapshot>
+
+/** The credentials only the edge holds. */
+const SNAPSHOT_SECRETS = ["breakGlassTokenSha256", "passwordHash"] as const
+
+/** A snapshot as the API returns it to members: without the credentials the edge checks. */
+export const StatusPagePublicSnapshot = StatusPageSnapshot.mapFields(Struct.omit(SNAPSHOT_SECRETS))
+export type StatusPagePublicSnapshot = Schema.Schema.Type<typeof StatusPagePublicSnapshot>
+
+export const toPublicStatusPageSnapshot = (snapshot: StatusPageSnapshot): StatusPagePublicSnapshot =>
+	Struct.omit(snapshot, SNAPSHOT_SECRETS)
 
 /**
  * Written after each successful publish sweep. `probesSeenAt` is the newest scheduled check result
@@ -830,11 +1084,55 @@ const withIncidentImpact = (
 }
 
 /** The banner status: the worst component, or `operational` for an empty page. */
-export const overallStatus = (snapshot: StatusPageSnapshot): StatusPageComponentStatus =>
+export const overallStatus = (snapshot: StatusPagePublicSnapshot): StatusPageComponentStatus =>
 	worstStatus(Arr.map(snapshot.components, (component) => component.status))
 
-export const dayState = (bar: StatusPageDayBar): StatusPageDayState =>
-	bar.checks === 0 ? "none" : bar.downChecks > 0 ? "down" : bar.failures > 0 ? "degraded" : "ok"
+/** Downtime share of a day's checks (about 15 minutes at one check a minute) that makes it `down`. */
+export const DAY_DOWN_SHARE = 0.01
+/** Failed share of a day's checks that makes it `degraded` while the monitor never went down. */
+export const DAY_FAILED_SHARE = 0.05
+
+export const DAY_STATE_RANK = {
+	none: 0,
+	ok: 1,
+	maintenance: 2,
+	degraded: 3,
+	down: 4,
+} as const satisfies Record<StatusPageDayState, number>
+
+export const worstDayState = (states: ReadonlyArray<StatusPageDayState>): StatusPageDayState =>
+	Arr.reduce<StatusPageDayState, StatusPageDayState>(states, "none", (worst, state) =>
+		DAY_STATE_RANK[state] > DAY_STATE_RANK[worst] ? state : worst,
+	)
+
+/** What the checks alone say: scattered failed checks are noise, sustained ones and downtime are not. */
+const checksDayState = (bar: StatusPageDayBar): StatusPageDayState => {
+	if (bar.checks === 0) return "none"
+	if (bar.downChecks >= bar.checks * DAY_DOWN_SHARE) return "down"
+	if (bar.downChecks > 0 || bar.failures >= bar.checks * DAY_FAILED_SHARE) return "degraded"
+	return "ok"
+}
+
+const INCIDENT_DAY_STATE = {
+	operational: "none",
+	maintenance: "maintenance",
+	degraded: "degraded",
+	partial_outage: "down",
+	major_outage: "down",
+} as const satisfies Record<StatusPageComponentStatus, StatusPageDayState>
+
+/**
+ * A day of a component's bar. `incident` is the worst status an incident or maintenance gave the
+ * component that day (`operational` for none). Incidents raise the checks' verdict; maintenance
+ * replaces it, since downtime it announced was planned.
+ */
+export const classifyDay = (
+	bar: StatusPageDayBar,
+	incident: StatusPageComponentStatus = "operational",
+): StatusPageDayState => {
+	const fromIncident = INCIDENT_DAY_STATE[incident]
+	return fromIncident === "maintenance" ? fromIncident : worstDayState([fromIncident, checksDayState(bar)])
+}
 
 /** Share of checks not taken while down, as a percentage; null when nothing was checked. */
 export const uptimePercent = (days: ReadonlyArray<StatusPageDayBar>): number | null => {
@@ -903,8 +1201,12 @@ export const sha256Base64Url = async (value: string): Promise<string> => {
 /** Edge storage keys, shared by the publisher and the status Worker. */
 export const StatusPageKeys = {
 	host: (hostname: string) => `host:${Str.toLowerCase(hostname)}`,
-	/** Path addressing (`/s/<slug>`), for hosts without a page of their own such as workers.dev. */
-	slug: (slug: string) => `slug:${slug}`,
+	/**
+	 * Path addressing (`/s/<address>`), for hosts without a page of their own such as workers.dev.
+	 * The address is {@link statusPageAddress}; a bare slug is the key of a page published before
+	 * slugs were per org, which the status Worker redirects to its current address.
+	 */
+	slug: (address: string) => `slug:${address}`,
 	snapshot: (pageId: string) => `page:${pageId}:snapshot`,
 	/**
 	 * One key per break-glass entry, written once by the status Worker and deleted by the
@@ -917,8 +1219,16 @@ export const StatusPageKeys = {
 	/** R2 copy of the snapshot, read when KV fails. */
 	snapshotObject: (pageId: string) => `pages/${pageId}/snapshot.json`,
 	hostObject: (hostname: string) => `hosts/${Str.toLowerCase(hostname)}`,
-	slugObject: (slug: string) => `slugs/${slug}`,
+	slugObject: (address: string) => `slugs/${address}`,
 } as const
+
+/**
+ * What the publisher leaves in R2 where it took a snapshot or a slug route off the edge. The
+ * status Worker reads it as "not here" for certain, where a missing object could be an outage.
+ */
+export const STATUS_PAGE_TOMBSTONE = '{"gone":true}'
+
+export const isStatusPageTombstone = (raw: string): boolean => Str.trim(raw) === STATUS_PAGE_TOMBSTONE
 
 export const decodeStatusPageSnapshotJson = Schema.decodeUnknownOption(
 	Schema.fromJsonString(StatusPageSnapshot),

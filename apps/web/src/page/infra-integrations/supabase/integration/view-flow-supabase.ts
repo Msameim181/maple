@@ -13,12 +13,12 @@ import { columnHead, dataTable, dataTableEmpty } from "../../../kit/data-table"
 import { SUPABASE_NOT_CONFIGURED } from "../connect"
 import { lifecycleOf } from "../health"
 import {
+	connectionTabItem,
 	type CheckRow,
 	flowColumns,
 	flowRail,
 	foundChips,
 	liveChecklist,
-	savedBanner,
 	statusRow,
 	stepCard,
 } from "../../../kit/connect-flow"
@@ -32,6 +32,7 @@ import {
 	SUPABASE_LOGS_NOTE,
 	supabaseProjectNotes,
 	supabaseProjectSwitches,
+	supabaseFeatures,
 } from "./view-supabase"
 import { typography, typographyClass } from "@maple/views/ui/typography"
 import { hstack, hstackClass, vstack } from "@maple/views/ui/stack"
@@ -312,7 +313,11 @@ const chooseStep = (h: H, model: Model): Html => {
 		h,
 		[
 			stepCard(h, { title: `Which projects in ${supabaseOrgName(status)} should Maple watch?` }, [
-				muted(h, "Switches are per project and per signal, and save as you flip them."),
+				muted(
+					h,
+					"Switches save as you flip them. A feature below sets every project; the table sets one.",
+				),
+				supabaseFeatures(h, model, status, "flow"),
 				dataTable(
 					h,
 					{ ariaLabel: "Supabase projects" },
@@ -351,7 +356,7 @@ const showsUpRail = (h: H): Html =>
 				title: "Project pages",
 				detail: "Resources, Postgres, API traffic and logs",
 			},
-			{ icon: "GearIcon", title: "Source page", detail: "Switches, Sync now, Disconnect" },
+			connectionTabItem("Switches, Sync now, Disconnect"),
 		],
 		timeNote: "First metrics usually within 2 minutes",
 		docs: DOCS_HREF === undefined ? null : { label: "Docs", href: DOCS_HREF },
@@ -501,12 +506,8 @@ const liveStep = (h: H, model: Model, timeZone: string): Html => {
 	return flowColumns(
 		h,
 		[
-			savedBanner(
-				h,
-				"Saved as a source. Safe to leave; collection keeps running.",
-				"Nothing to apply in Supabase",
-			),
 			liveChecklist(h, {
+				saved: "Saved as a source. Safe to leave; collection keeps running.",
 				rows:
 					status === null || !status.connected
 						? [{ state: "waiting", title: "Waiting for Supabase's status" }]

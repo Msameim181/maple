@@ -2,7 +2,7 @@ import type { Html, HtmlBuilder } from "foldkit/html"
 import { button } from "@maple/views/ui/button"
 import { kbd } from "@maple/views/ui/display"
 import { textLink } from "@maple/views/ui/text-link"
-import { serviceDot } from "@maple/views/ui/values"
+import { serviceLabel } from "@maple/views/ui/service-label"
 import { Message } from "./message"
 import type { Model } from "./model"
 import { typography } from "@maple/views/ui/typography"
@@ -31,7 +31,7 @@ export const footer = (h: H, model: Model): Html =>
 			h.div(
 				[
 					h.Class(
-						"hidden shrink-0 items-center gap-3 text-foreground-faint @min-[560px]/timeline:flex",
+						"hidden shrink-0 items-center gap-3 text-foreground-subtle @min-[560px]/timeline:flex",
 					),
 				],
 				[
@@ -44,7 +44,7 @@ export const footer = (h: H, model: Model): Html =>
 							tone: "muted",
 							onClick: Message.ClickedShortcuts(),
 							className:
-								"gap-1.5 text-foreground-faint hover:text-foreground-soft active:text-foreground-soft hover:no-underline active:no-underline",
+								"gap-1.5 text-foreground-subtle hover:text-foreground-soft active:text-foreground-soft hover:no-underline active:no-underline",
 						},
 						[kbd(h, HINT_KBD, ["?"]), "all shortcuts"],
 					),
@@ -58,10 +58,12 @@ export const footer = (h: H, model: Model): Html =>
 				],
 				[
 					...Arr.map(model.services, (service) =>
-						hstack(h, { gap: "1", className: "shrink-0" }, [
-							serviceDot(h, { serviceName: service }),
-							typography(h, { weight: "medium", className: "whitespace-nowrap" }, [service]),
-						]),
+						serviceLabel(h, {
+							serviceName: service,
+							weight: "medium",
+							truncate: "none",
+							className: "shrink-0",
+						}),
 					),
 					hstack(h, { gap: "1", className: "shrink-0" }, [
 						h.span(

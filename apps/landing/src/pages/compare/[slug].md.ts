@@ -12,6 +12,8 @@
 import type { APIRoute, GetStaticPaths } from "astro"
 import { competitors, type Competitor, MAPLE_SURFACES } from "../../lib/competitors"
 import { absolute, blocks, docHeader, markdown, table } from "../../lib/page-markdown"
+import { scaleProofMarkdown } from "../../lib/scale-proof"
+import { enterpriseOfferMarkdown } from "../../lib/enterprise-offer"
 import * as m from "../../paraglide/messages.js"
 import {
 	defaultValues,
@@ -74,23 +76,23 @@ export const GET: APIRoute = ({ props, site }) => {
 			Arr.map(competitor.parity, (item) => item()),
 			" · ",
 		)}`,
+		scaleProofMarkdown(site),
+		enterpriseOfferMarkdown(site),
 	)
 
-	// The Surfaces section, where the page has one: the same four rows, with
-	// the artifact's argument carried by its copy rather than the drawing.
-	const surfaces = competitor.surfaces
-		? blocks(
-				`## ${m.cmp_surfaces_title({ name })}`,
-				competitor.surfaces.lede(),
-				Arr.join(
-					Arr.map(competitor.surfaces.rows, (row) => {
-						const surface = MAPLE_SURFACES[row.surface]
-						return `- **${surface.name()}**: ${surface.body()} ${m.cmp_surfaces_instead_label({ name })} ${row.instead()}`
-					}),
-					"\n",
-				),
-			)
-		: undefined
+	// The Surfaces section: the same rows and heading as the page, with the
+	// artifact's argument carried by its copy rather than the drawing.
+	const surfaces = blocks(
+		`## ${(competitor.surfaces.title ?? m.cmp_surfaces_title_side)({ name })}`,
+		competitor.surfaces.lede(),
+		Arr.join(
+			Arr.map(competitor.surfaces.rows, (row) => {
+				const surface = MAPLE_SURFACES[row.surface]
+				return `- **${surface.name()}**: ${surface.body()} ${m.cmp_surfaces_instead_label({ name })} ${row.instead()}`
+			}),
+			"\n",
+		),
+	)
 
 	const values = defaultValues(competitor.vendor)
 	const config = vendorConfigs[competitor.vendor]

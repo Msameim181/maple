@@ -12,6 +12,8 @@ import { String as Str, Array as Arr, Option } from "effect"
 export const INGEST_PINNED_TABLES: ReadonlyArray<string> = [
 	"alert_checks",
 	"audit_log",
+	"audit_trail_events",
+	"cost_daily",
 	"search_console_daily",
 ]
 

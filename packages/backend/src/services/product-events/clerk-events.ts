@@ -70,6 +70,30 @@ export const ClerkUserDeletedData = Schema.Struct({
 	id: Schema.optionalKey(Schema.String),
 })
 
+/** `user.updated`: only the fields Maple acts on. `deprovisioned` is set by SCIM deactivation. */
+export const ClerkUserUpdatedData = Schema.Struct({
+	id: Schema.String,
+	deprovisioned: Schema.optionalKey(Schema.NullOr(Schema.Boolean)),
+})
+
+/** `directoryGroup.*`: a group the IdP pushed over SCIM. */
+export const ClerkDirectoryGroupData = Schema.Struct({
+	id: Schema.String,
+	directory_id: Schema.String,
+	display_name: Schema.String,
+	updated_at: Schema.Number,
+})
+
+export const CLERK_DIRECTORY_GROUP_EVENTS = [
+	"directoryGroup.created",
+	"directoryGroup.updated",
+	"directoryGroup.synced",
+	"directoryGroup.deleted",
+] as const
+export type ClerkDirectoryGroupEventType = (typeof CLERK_DIRECTORY_GROUP_EVENTS)[number]
+export const isClerkDirectoryGroupEvent = (type: string): type is ClerkDirectoryGroupEventType =>
+	(CLERK_DIRECTORY_GROUP_EVENTS as ReadonlyArray<string>).includes(type)
+
 export const ClerkWebhookEnvelope = Schema.Struct({
 	type: Schema.String,
 	data: Schema.Unknown,
@@ -82,6 +106,8 @@ export const decodeClerkEnvelope = Schema.decodeUnknownEffect(Schema.fromJsonStr
 export const decodeClerkUserCreated = Schema.decodeUnknownEffect(ClerkUserCreatedData)
 export const decodeClerkOrganizationMembership = Schema.decodeUnknownEffect(ClerkOrganizationMembershipData)
 export const decodeClerkUserDeleted = Schema.decodeUnknownEffect(ClerkUserDeletedData)
+export const decodeClerkUserUpdated = Schema.decodeUnknownEffect(ClerkUserUpdatedData)
+export const decodeClerkDirectoryGroup = Schema.decodeUnknownEffect(ClerkDirectoryGroupData)
 type ClerkUserCreatedData = Schema.Schema.Type<typeof ClerkUserCreatedData>
 
 const emailDomain = (data: ClerkUserCreatedData): string | undefined => {
@@ -125,5 +151,26 @@ export const signupCompletedEvent = (
 			sign_up_source: signUpSource(data),
 			...(domain !== undefined ? { email_domain: domain } : undefined),
 		},
+	}
+}
+
+/**
+ * A membership that started or ended → `member_joined` / `member_removed`, on
+ * the member and the org. A role change emits nothing: the identify trait
+ * carries the current role. `role` is Clerk's role key (`org:admin`), never a
+ * name or address.
+ */
+export const membershipProductEvent = (
+	event: ClerkMembershipEventType,
+	data: ClerkOrganizationMembershipData,
+	envelopeTimestamp: number | undefined,
+): ProductEventInput | undefined => {
+	if (event === "organizationMembership.updated") return undefined
+	return {
+		name: event === "organizationMembership.created" ? "member_joined" : "member_removed",
+		userId: data.public_user_data.user_id,
+		groupId: data.organization.id,
+		timestamp: envelopeTimestamp,
+		...(data.role !== undefined ? { attributes: { role: data.role } } : undefined),
 	}
 }

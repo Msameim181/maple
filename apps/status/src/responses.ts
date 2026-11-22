@@ -1,4 +1,7 @@
-import { Array as Arr } from "effect"
+import { Array as Arr, Schema } from "effect"
+
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
+
 /** Edge-cacheable for 15s, served stale for a day if this Worker errors. */
 export const PUBLIC_CACHE_CONTROL = "public, max-age=15, stale-while-revalidate=60, stale-if-error=86400"
 
@@ -47,6 +50,32 @@ export const asset = (body: string, contentType: string, extra: Record<string, s
 		},
 	})
 
+/**
+ * The link preview. Under the URL the page links (`?v=` the current version) it is cached for a
+ * day; any other `v` gets the current card for as long as the page itself.
+ */
+export const png = (body: Uint8Array<ArrayBuffer>, current: boolean): Response =>
+	new Response(body, {
+		headers: {
+			...COMMON_HEADERS,
+			"content-type": "image/png",
+			"cache-control": current ? "public, max-age=86400" : PUBLIC_CACHE_CONTROL,
+			"content-security-policy": "default-src 'none'",
+		},
+	})
+
+/** A JSON API error, `{ "error": message }`, readable cross-origin like the API itself. */
+export const jsonError = (status: number, message: string): Response =>
+	new Response(encodeJson({ error: message }), {
+		status,
+		headers: {
+			...COMMON_HEADERS,
+			"content-type": "application/json; charset=utf-8",
+			"cache-control": "no-store",
+			"access-control-allow-origin": "*",
+		},
+	})
+
 export const plain = (body: string, status: number, cacheControl = "no-store"): Response =>
 	new Response(body, {
 		status,
@@ -57,8 +86,26 @@ export const plain = (body: string, status: number, cacheControl = "no-store"): 
 		},
 	})
 
-export const redirect = (location: string): Response =>
-	new Response(null, { status: 303, headers: { ...COMMON_HEADERS, location, "cache-control": "no-store" } })
+export const redirect = (location: string, extra: Record<string, string> = {}): Response =>
+	new Response(null, {
+		status: 303,
+		headers: { ...COMMON_HEADERS, location, "cache-control": "no-store", ...extra },
+	})
+
+/**
+ * A page's old address: `/s/<slug>` from before slugs were per org now lives at `/s/<org key>/<slug>`.
+ * 308 keeps the method (break-glass posts to `_manage`); CORS lets embedded JSON fetches follow it.
+ */
+export const movedPermanently = (location: string): Response =>
+	new Response(null, {
+		status: 308,
+		headers: {
+			...COMMON_HEADERS,
+			location,
+			"cache-control": PUBLIC_CACHE_CONTROL,
+			"access-control-allow-origin": "*",
+		},
+	})
 
 const NOT_FOUND_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Status page not found</title></head><body><h1>Status page not found</h1><p>There is no status page at this address.</p></body></html>`
 

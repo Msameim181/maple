@@ -6,14 +6,38 @@
 import { randomUUID } from "node:crypto"
 import { IntegrationsPersistenceError, type OrgId } from "@maple/domain/http"
 import * as PG from "@maple-dev/effect-orm/postgres"
-import { leaseClaimable } from "../lease"
+import { leaseStillOurs } from "../lease"
+import { leaseFree, type LeaseSpec } from "../poller"
 import { PlanetscalePollState } from "@maple/db/tables"
-import { Clock, Duration, Effect, Array as Arr } from "effect"
+import { Duration, Effect, Array as Arr } from "effect"
 import type { DatabaseApi } from "@maple/backend/platform/DatabaseLive"
 import { makeDbExecute, makePersistenceErrorMapper } from "@maple/backend/platform/db-execute"
 
 /** The metrics API poller's org-wide row (`databaseId` ""), whose watermark is its last window. */
 export const PLANETSCALE_METRICS_DATASET = "metrics"
+/** Per-database deploy-request backfill rows, whose watermark is the newest update seen. */
+export const PLANETSCALE_DEPLOY_REQUESTS_DATASET = "deploy_requests"
+
+export type UnclaimedReason = "disabled" | "fresh" | "held" | "lease_held"
+
+/**
+ * A claimed row's result, written through the lease. Advancing `watermarkAt` only on success is
+ * what keeps a failed page from being skipped forever.
+ */
+export const pollStateResult = (
+	now: number,
+	error: string | null,
+	watermarkAt: number | null = null,
+): PG.UpdateSetOf<typeof PlanetscalePollState> =>
+	error === null
+		? {
+				lastSuccessAt: now,
+				lastError: null,
+				lastErrorAt: null,
+				updatedAt: now,
+				...(watermarkAt === null ? undefined : { watermarkAt }),
+			}
+		: { lastError: error, lastErrorAt: now, updatedAt: now }
 
 /** Tick-overlap lease. */
 const LEASE_MS = Duration.toMillis(Duration.minutes(4))
@@ -25,79 +49,6 @@ const toPersistenceError = makePersistenceErrorMapper(
 
 export const makePlanetScalePollState = (database: DatabaseApi, service: string) => {
 	const dbExecute = makeDbExecute(database, service, toPersistenceError)
-
-	/**
-	 * Claim a dataset row for this tick. A non-"claimed" outcome says why the
-	 * work was skipped (polling disabled, data still fresh, or another tick holds
-	 * the lease), so the caller can put the reason on its span.
-	 */
-	const claimPollWork = Effect.fn("PlanetScalePollState.claimPollWork")(function* (
-		orgId: OrgId,
-		dataset: string,
-		databaseId: string,
-		ttlMs: number,
-	) {
-		const now = yield* Clock.currentTimeMillis
-		const rows = yield* dbExecute((db) =>
-			db.run(
-				PG.from(PlanetscalePollState)
-					.select()
-					.where(($) => [$.orgId.eq(orgId), $.dataset.eq(dataset), $.databaseId.eq(databaseId)])
-					.limit(1),
-			),
-		)
-		const existing = rows[0]
-
-		if (existing === undefined) {
-			yield* dbExecute((db) =>
-				db.run(
-					PG.insertInto(PlanetscalePollState).values({
-						id: randomUUID(),
-						orgId,
-						dataset,
-						databaseId,
-						leaseUntil: now + LEASE_MS,
-						createdAt: now,
-						updatedAt: now,
-					}),
-				),
-			)
-			return "claimed" as const
-		}
-
-		if (!existing.enabled) return "disabled" as const
-		if (existing.lastSuccessAt !== null && now - existing.lastSuccessAt < ttlMs) {
-			return "fresh" as const
-		}
-
-		// Lease claim: only wins if the previous lease expired. `.returning()`
-		// length is the claim signal (never read driver write-result shapes).
-		const claimed = yield* dbExecute((db) =>
-			db.run(
-				PG.update(PlanetscalePollState)
-					.set({ leaseUntil: now + LEASE_MS, updatedAt: now })
-					.where(($) => [$.id.eq(existing.id), leaseClaimable($.leaseUntil, now)])
-					.returning("id"),
-			),
-		)
-		return claimed.length > 0 ? ("claimed" as const) : ("lease_held" as const)
-	})
-
-	const readPollState = Effect.fn("PlanetScalePollState.readPollState")(function* (
-		orgId: OrgId,
-		dataset: string,
-		databaseId: string,
-	) {
-		const rows = yield* dbExecute((db) =>
-			db.run(
-				PG.from(PlanetscalePollState)
-					.select()
-					.where(($) => [$.orgId.eq(orgId), $.dataset.eq(dataset), $.databaseId.eq(databaseId)])
-					.limit(1),
-			),
-		)
-		return rows[0]
-	})
 
 	/** `databaseId → lastSuccessAt`, for round-robining a budgeted sweep. */
 	const pollStateByDatabaseId = Effect.fn("PlanetScalePollState.pollStateByDatabaseId")(function* (
@@ -115,41 +66,90 @@ export const makePlanetScalePollState = (database: DatabaseApi, service: string)
 	})
 
 	/**
-	 * Release a non-inventory dataset row. Advancing `watermarkAt` only on
-	 * success is what keeps a failed page from being skipped forever.
+	 * Why `pollStateLease` did not claim the row: polling disabled, data still fresh, a failure's
+	 * hold, or another tick's lease. The caller puts it on its span.
 	 */
-	const recordPollResult = Effect.fn("PlanetScalePollState.recordPollResult")(function* (
+	const unclaimedReason = (
 		orgId: OrgId,
 		dataset: string,
 		databaseId: string,
-		error: string | null,
-		watermarkAt: number | null,
-	) {
-		const now = yield* Clock.currentTimeMillis
-		yield* dbExecute((db) =>
+		freshMs: number,
+		now: number,
+	) =>
+		dbExecute((db) =>
 			db.run(
-				PG.update(PlanetscalePollState)
-					.set(
-						error === null
-							? {
-									lastSuccessAt: now,
-									lastError: null,
-									lastErrorAt: null,
-									leaseUntil: null,
-									updatedAt: now,
-									...(!(watermarkAt === null) ? { watermarkAt } : undefined),
-								}
-							: {
-									lastError: error,
-									lastErrorAt: now,
-									leaseUntil: null,
-									updatedAt: now,
-								},
-					)
-					.where(($) => [$.orgId.eq(orgId), $.dataset.eq(dataset), $.databaseId.eq(databaseId)]),
+				PG.from(PlanetscalePollState)
+					.select("enabled", "lastSuccessAt", "holdUntil")
+					.where(($) => [$.orgId.eq(orgId), $.dataset.eq(dataset), $.databaseId.eq(databaseId)])
+					.limit(1),
 			),
+		).pipe(
+			Effect.map(([row]): UnclaimedReason => {
+				if (row === undefined) return "lease_held"
+				if (!row.enabled) return "disabled"
+				if (row.lastSuccessAt !== null && now - row.lastSuccessAt < freshMs) return "fresh"
+				if (row.holdUntil !== null && row.holdUntil > now) return "held"
+				return "lease_held"
+			}),
 		)
+
+	/**
+	 * The (org, dataset, database) row as a {@link LeaseSpec}: created on first use, claimed while
+	 * enabled, past `freshMs` since its last success, and free of a lease or hold.
+	 */
+	const pollStateLease = (
+		orgId: OrgId,
+		dataset: string,
+		databaseId: string,
+		freshMs: number,
+	): LeaseSpec<
+		PG.SelectRowOf<typeof PlanetscalePollState>,
+		PG.UpdateSetOf<typeof PlanetscalePollState>,
+		IntegrationsPersistenceError
+	> => ({
+		leaseMs: LEASE_MS,
+		claim: (leaseUntil, now) =>
+			dbExecute((db) =>
+				Effect.gen(function* () {
+					yield* db.run(
+						PG.insertInto(PlanetscalePollState)
+							.values({
+								id: randomUUID(),
+								orgId,
+								dataset,
+								databaseId,
+								createdAt: now,
+								updatedAt: now,
+							})
+							.onConflictDoNothing({ target: ["orgId", "dataset", "databaseId"] }),
+					)
+					const rows = yield* db.run(
+						PG.update(PlanetscalePollState)
+							.set({ leaseUntil, updatedAt: now })
+							.where(($) => [
+								$.orgId.eq(orgId),
+								$.dataset.eq(dataset),
+								$.databaseId.eq(databaseId),
+								$.enabled.eq(true),
+								PG.or($.lastSuccessAt.isNull(), $.lastSuccessAt.lte(now - freshMs)),
+								leaseFree($.leaseUntil, $.holdUntil, now, LEASE_MS),
+							])
+							.returning(),
+					)
+					return rows[0] ?? null
+				}),
+			),
+		write: (claimed, set) =>
+			dbExecute((db) =>
+				db.run(
+					PG.update(PlanetscalePollState)
+						.set(set)
+						.where(($) => [$.id.eq(claimed.id), leaseStillOurs($.leaseUntil, claimed.leaseUntil)])
+						.returning("id"),
+				),
+			).pipe(Effect.map((rows) => rows.length > 0)),
+		release: (holdUntil, now) => ({ leaseUntil: null, holdUntil, updatedAt: now }),
 	})
 
-	return { claimPollWork, readPollState, pollStateByDatabaseId, recordPollResult }
+	return { pollStateByDatabaseId, pollStateLease, unclaimedReason }
 }

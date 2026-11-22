@@ -1,10 +1,9 @@
 import { afterEach, assert, describe, it } from "@effect/vitest"
 import { ConfigProvider, Effect, Layer, Schema, Array as Arr, String as Str, Option } from "effect"
 import { TestClock } from "effect/testing"
-import { FetchHttpClient } from "effect/http"
 import { OrgId, UserId, SupabaseProjectUpdateRequest } from "@maple/domain/http"
 import { SupabaseProjectRef } from "@maple/primitives"
-import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import {
 	cleanupTestDbs,
 	createTestDb,
@@ -45,9 +44,9 @@ type Fake = ReturnType<typeof makeFakeSupabase>
 const makeLayer = (testDb: TestDb, fake: Fake) =>
 	Layer.mergeAll(SupabaseConnectionService.layer, SupabaseOAuthService.layer).pipe(
 		Layer.provide(testDb.layer),
-		Layer.provide(Env.layer),
+		Layer.provide(EnvTestLive),
 		Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(config))),
-		Layer.merge(Layer.succeed(FetchHttpClient.Fetch, fake.fetch)),
+		Layer.merge(fake.layer),
 	)
 
 const asOrgId = Schema.decodeUnknownSync(OrgId)
@@ -385,7 +384,11 @@ describe("SupabaseConnectionService", () => {
 		return Effect.gen(function* () {
 			const service = yield* SupabaseConnectionService
 			yield* connect(fake)
-			assert.deepStrictEqual(yield* service.disconnect(ORG), { disconnected: true })
+			assert.deepStrictEqual(yield* service.disconnect(ORG), {
+				disconnected: true,
+				drainsRemoved: true,
+				grantRevoked: true,
+			})
 			assert.strictEqual(apiCalls(fake, "/v1/oauth/revoke"), 1)
 
 			const counts = yield* Effect.promise(() =>
@@ -400,7 +403,11 @@ describe("SupabaseConnectionService", () => {
 			)
 			assert.deepStrictEqual(counts, { connections: 0, projects: 0, sources: 0, grants: 0 })
 			assert.isFalse((yield* service.getStatus(ORG)).connected)
-			assert.deepStrictEqual(yield* service.disconnect(ORG), { disconnected: false })
+			assert.deepStrictEqual(yield* service.disconnect(ORG), {
+				disconnected: false,
+				drainsRemoved: true,
+				grantRevoked: true,
+			})
 		}).pipe(Effect.provide(makeLayer(testDb, fake)))
 	})
 })
@@ -1057,6 +1064,29 @@ describe("SupabaseConnectionService log drains", () => {
 			}).pipe(Effect.provide(makeLayer(testDb, fake)))
 		},
 	)
+
+	it.effect("disconnect says so when Supabase refuses to delete a drain, and still disconnects", () => {
+		const testDb = createTestDb(trackedDbs)
+		const fake = makeFakeSupabase({ projects: [fakeProject(REF_A)] })
+		return Effect.gen(function* () {
+			const service = yield* SupabaseConnectionService
+			yield* connect(fake)
+			yield* service.updateProject(
+				ORG,
+				USER,
+				asRef(REF_A),
+				new SupabaseProjectUpdateRequest({ logDrainEnabled: true }),
+			)
+			fake.state.drainDeleteStatus = 403
+
+			assert.deepStrictEqual(yield* service.disconnect(ORG), {
+				disconnected: true,
+				drainsRemoved: false,
+				grantRevoked: true,
+			})
+			assert.isFalse((yield* service.getStatus(ORG)).connected)
+		}).pipe(Effect.provide(makeLayer(testDb, fake)))
+	})
 
 	it.effect("discovery flags a drain deleted upstream or a deleted source, and never recreates it", () => {
 		const testDb = createTestDb(trackedDbs)

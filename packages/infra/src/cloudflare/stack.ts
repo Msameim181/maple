@@ -28,7 +28,7 @@ export interface MapleDbLogin {
 
 /**
  * A deploy-declared database (PlanetScale on prd, Neon on previews): the migrated branch, the
- * Hyperdrive config each consumer binds as `MAPLE_DB` (undefined on US prd), and the ECS logins.
+ * Hyperdrive config each consumer binds as `MAPLE_DB` (US prd: lookups of its dashboard configs), and the ECS logins.
  */
 export interface MapleDbResources {
 	/** The branch's name. As Worker env it orders the upload after the migrations. */
@@ -45,7 +45,7 @@ export interface MapleUrls {
 	readonly api: string
 	readonly ingest: string
 	readonly electricSync: string
-	/** The status Worker's origin; empty where it has no domain (prd until one is bought). */
+	/** The status Worker's origin; empty where the stage has no status domain. */
 	readonly status: string
 }
 

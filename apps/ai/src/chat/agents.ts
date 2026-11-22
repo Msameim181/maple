@@ -27,6 +27,7 @@ import {
 	type ChatMode,
 	type ChatSessionKind,
 	type ChatTurnOrigin,
+	type PullRequestTurnRepository,
 } from "@maple/domain/chat-session"
 import { PrReviewId, PrReviewReplyId } from "@maple/domain/http"
 import { InvestigationId } from "@maple/primitives"
@@ -44,7 +45,7 @@ import {
 } from "./budgets"
 import type { PermissionRuleset } from "@maple/domain/permission"
 import type { ResolvedModel } from "../platform/Llm"
-import { DEFAULT_RULESET, PR_REVIEW_RULESET } from "./permissions"
+import { DEFAULT_RULESET, PR_REVIEW_RULESETS } from "./permissions"
 import {
 	CLOSE_OUT_PROMPT,
 	INVESTIGATE_SYSTEM_PROMPT,
@@ -52,6 +53,7 @@ import {
 	PR_REPLY_SYSTEM_PROMPT,
 	PR_REVIEW_CLOSE_OUT_PROMPT,
 	PR_REVIEW_CONTINUE_PROMPT,
+	PR_REVIEW_RESUME_PROMPT,
 	PR_REVIEW_SYSTEM_PROMPT,
 	SYSTEM_PROMPT,
 } from "./prompts"
@@ -74,6 +76,8 @@ export interface AgentCompletion {
 	readonly billingSource: Extract<AiUsageSource, "triage" | "review">
 	/** A stuck pass starts over once, and one that answered in prose continues with this prompt. */
 	readonly continuePrompt?: string
+	/** A pass a passing provider outage stopped resumes once from its transcript with this prompt. */
+	readonly resumePrompt?: string
 }
 
 export interface AgentDefinition {
@@ -82,10 +86,11 @@ export interface AgentDefinition {
 	readonly prompt: string
 	readonly permission: PermissionRuleset
 	/**
-	 * The narrower ruleset the agent's *unattended* pass runs under, when it has one of its own.
-	 * Without it an autonomous turn runs read-only; see `profileForTurn`.
+	 * The narrower rulesets a pull request agent's *unattended* pass runs under, by where it posts:
+	 * on a public repository nothing it reads may come from telemetry. Without them an autonomous
+	 * turn runs read-only; see `profileForTurn`.
 	 */
-	readonly autonomousPermission?: PermissionRuleset
+	readonly autonomousPermission?: { readonly [R in PullRequestTurnRepository]: PermissionRuleset }
 	/**
 	 * What a turn as this agent may spend. An attended reply and an unattended investigation are
 	 * different work; they shared one budget until 2026-09-20, and it was the investigation's.
@@ -145,9 +150,9 @@ export const AGENTS: {
 		description: "Reviews a pull request: correctness, security, performance and observability.",
 		prompt: PR_REVIEW_SYSTEM_PROMPT,
 		permission: DEFAULT_RULESET,
-		// The pass sees the diff, the code, and the read-only telemetry tools its rubric needs, and
-		// nothing else: every unoffered schema is prompt it does not pay for on each call.
-		autonomousPermission: PR_REVIEW_RULESET,
+		// The pass sees the diff, the code, and on a private repository the read-only telemetry tools
+		// its rubric needs, and nothing else: every unoffered schema is prompt it does not pay for.
+		autonomousPermission: PR_REVIEW_RULESETS,
 		budget: PR_REVIEW_BUDGET,
 		model: "review",
 		codeMode: true,
@@ -158,6 +163,7 @@ export const AGENTS: {
 			closedOutAttribute: "maple.pr_review.closed_out",
 			billingSource: "review",
 			continuePrompt: PR_REVIEW_CONTINUE_PROMPT,
+			resumePrompt: PR_REVIEW_RESUME_PROMPT,
 		},
 	},
 	"pr-reply": {
@@ -165,7 +171,7 @@ export const AGENTS: {
 		description: "Answers a mention on a pull request, and makes a fix when asked.",
 		prompt: PR_REPLY_SYSTEM_PROMPT,
 		permission: DEFAULT_RULESET,
-		autonomousPermission: PR_REVIEW_RULESET,
+		autonomousPermission: PR_REVIEW_RULESETS,
 		budget: PR_REPLY_BUDGET,
 		model: "review",
 		completion: {

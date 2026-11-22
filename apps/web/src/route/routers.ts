@@ -11,12 +11,36 @@ import { Route } from "foldkit"
 import { query, schemaSegment, slash } from "foldkit/route"
 import { AppRoute } from "./app-route"
 import * as Search from "./search"
-import { boundedRestSegments, boundedSegment, path, restSegments, segment } from "./segment"
+import {
+	boundedRestSegments,
+	boundedSegment,
+	mapBiparser,
+	optionalLiteralSegment,
+	path,
+	restSegments,
+	segment,
+} from "./segment"
 import { tanstackSearch } from "./tanstack-search"
 
 const search = <A, I>(schema: Schema.Codec<A, I>) => query(tanstackSearch(schema))
 
 const WorkloadKind = Search.InfraKubernetesWorkloadParams.fields.kind
+
+/**
+ * `/settings/<tab>`, the tab a path segment. An old `?tab=` link parses into `legacyTab`, and
+ * `routeRedirect` moves it to its path.
+ */
+const settingsUrl = mapBiparser(
+	pipe(
+		path("settings"),
+		slash(optionalLiteralSegment(Search.settingsTabValues)),
+		search(Search.SettingsQuery),
+	),
+	({ segment, search: { tab, ...rest } }): { readonly search: typeof Search.SettingsSearch.Type } => ({
+		search: { ...rest, tab: segment, legacyTab: tab },
+	}),
+	({ search: { tab, legacyTab, ...rest } }) => ({ segment: tab, search: { ...rest, tab: legacyTab } }),
+)
 
 /** One biparser per route tag: parses URLs and prints them back (`hrefOf`). */
 const routers = {
@@ -45,8 +69,8 @@ const routers = {
 	QuickStart: pipe(path("quick-start"), search(Search.QuickStartSearch), Route.mapTo(AppRoute.QuickStart)),
 	SelectPlan: pipe(path("select-plan"), search(Search.SelectPlanSearch), Route.mapTo(AppRoute.SelectPlan)),
 	ServiceMap: pipe(path("service-map"), search(Search.ServiceMapSearch), Route.mapTo(AppRoute.ServiceMap)),
-	Settings: pipe(path("settings"), search(Search.SettingsSearch), Route.mapTo(AppRoute.Settings)),
-	Sources: pipe(path("sources"), Route.mapTo(AppRoute.Sources)),
+	Settings: pipe(settingsUrl, Route.mapTo(AppRoute.Settings)),
+	Sources: pipe(path("sources"), search(Search.SourcesSearch), Route.mapTo(AppRoute.Sources)),
 	SourcesNew: pipe(
 		path("sources", "new"),
 		search(Search.SourcesNewSearch),
@@ -143,6 +167,7 @@ const routers = {
 		slash(segment("ruleId")),
 		Route.mapTo(AppRoute.IngestRule),
 	),
+	BillingAiCredits: pipe(path("settings", "billing", "ai-credits"), Route.mapTo(AppRoute.BillingAiCredits)),
 	// Retired: `routeRedirect` sends it to `/status-pages/$pageId`.
 	AlertsStatusPage: pipe(
 		path("alerts", "status-pages"),
@@ -151,12 +176,22 @@ const routers = {
 		Route.mapTo(AppRoute.AlertsStatusPage),
 	),
 	StatusPages: pipe(path("status-pages"), Route.mapTo(AppRoute.StatusPages)),
-	StatusPageNew: pipe(path("status-pages", "new"), Route.mapTo(AppRoute.StatusPageNew)),
+	StatusPageNew: pipe(
+		path("status-pages", "new"),
+		search(Search.StatusPageNewSearch),
+		Route.mapTo(AppRoute.StatusPageNew),
+	),
 	StatusPage: pipe(
 		path("status-pages"),
 		slash(segment("pageId")),
 		search(Search.StatusPageSearch),
 		Route.mapTo(AppRoute.StatusPage),
+	),
+	StatusPageView: pipe(
+		path("status-pages"),
+		slash(segment("pageId")),
+		slash(path("view")),
+		Route.mapTo(AppRoute.StatusPageView),
 	),
 	Anomaly: pipe(
 		path("anomalies"),
@@ -202,6 +237,28 @@ const routers = {
 		path("security", "dependencies"),
 		search(Search.SecurityDependenciesSearch),
 		Route.mapTo(AppRoute.SecurityDependencies),
+	),
+	SecurityCloudFinding: pipe(
+		path("security", "cloud", "finding"),
+		search(Search.SecurityCloudFindingSearch),
+		Route.mapTo(AppRoute.SecurityCloudFinding),
+	),
+	SecurityCloud: pipe(
+		path("security", "cloud"),
+		search(Search.SecurityCloudSearch),
+		Route.mapTo(AppRoute.SecurityCloud),
+	),
+	SecurityDevices: pipe(path("security", "devices"), Route.mapTo(AppRoute.SecurityDevices)),
+	SecurityAuditLog: pipe(
+		path("security", "audit-log"),
+		search(Search.SecurityAuditLogSearch),
+		Route.mapTo(AppRoute.SecurityAuditLog),
+	),
+	SecurityDetections: pipe(path("security", "detections"), Route.mapTo(AppRoute.SecurityDetections)),
+	SecurityDetectionNew: pipe(
+		path("security", "detections", "new"),
+		search(Search.SecurityDetectionNewSearch),
+		Route.mapTo(AppRoute.SecurityDetectionNew),
 	),
 	SecurityRun: pipe(
 		path("security", "code", "runs"),
@@ -267,6 +324,7 @@ const routers = {
 		slash(segment("recommendationKey")),
 		Route.mapTo(AppRoute.Recommendation),
 	),
+	// Retired with the Releases pages; `routeRedirect` sends both on.
 	Release: pipe(
 		path("releases"),
 		slash(segment("commitSha")),
@@ -310,8 +368,20 @@ const routers = {
 		Route.mapTo(AppRoute.AlertsSection),
 	),
 	Analytics: pipe(path("analytics"), search(Search.AnalyticsSearch), Route.mapTo(AppRoute.Analytics)),
+	ProductAnalytics: pipe(
+		path("product-analytics"),
+		search(Search.ProductAnalyticsSearch),
+		Route.mapTo(AppRoute.ProductAnalytics),
+	),
 	Anomalies: pipe(path("anomalies"), search(Search.AnomaliesSearch), Route.mapTo(AppRoute.Anomalies)),
 	CodeReview: pipe(path("code-review"), search(Search.CodeReviewSearch), Route.mapTo(AppRoute.CodeReview)),
+	Cost: pipe(path("cost"), search(Search.CostSearch), Route.mapTo(AppRoute.Cost)),
+	CostBudgets: pipe(path("cost", "budgets"), Route.mapTo(AppRoute.CostBudgets)),
+	CostBudgetNew: pipe(
+		path("cost", "budgets", "new"),
+		search(Search.CostBudgetNewSearch),
+		Route.mapTo(AppRoute.CostBudgetNew),
+	),
 	Dashboards: pipe(path("dashboards"), search(Search.DashboardsSearch), Route.mapTo(AppRoute.Dashboards)),
 	Errors: pipe(path("errors"), search(Search.ErrorsSearch), Route.mapTo(AppRoute.Errors)),
 	Infra: pipe(path("infra"), search(Search.InfraSearch), Route.mapTo(AppRoute.Infra)),
@@ -381,6 +451,12 @@ const routers = {
 		slash(segment("serviceId")),
 		search(Search.InfraRailwayServiceSearch),
 		Route.mapTo(AppRoute.InfraRailwayService),
+	),
+	InfraVercelProject: pipe(
+		path("infra", "vercel"),
+		slash(segment("projectId")),
+		search(Search.InfraVercelProjectSearch),
+		Route.mapTo(AppRoute.InfraVercelProject),
 	),
 	InfraSupabaseProject: pipe(
 		path("infra", "supabase"),
@@ -459,6 +535,11 @@ const routers = {
 		path("infra", "railway"),
 		search(Search.InfraRailwaySearch),
 		Route.mapTo(AppRoute.InfraRailway),
+	),
+	InfraVercel: pipe(
+		path("infra", "vercel"),
+		search(Search.InfraVercelSearch),
+		Route.mapTo(AppRoute.InfraVercel),
 	),
 	InfraSupabase: pipe(
 		path("infra", "supabase"),
@@ -558,8 +639,10 @@ export const urlToAppRoute = Route.parseUrlWithFallback(
 		routers.AlertsEscalationChain,
 		routers.IngestRuleNew,
 		routers.IngestRule,
+		routers.BillingAiCredits,
 		routers.AlertsStatusPage,
 		routers.StatusPageNew,
+		routers.StatusPageView,
 		routers.StatusPage,
 		routers.DashboardsTemplates,
 		routers.SourcesNew,
@@ -572,6 +655,7 @@ export const urlToAppRoute = Route.parseUrlWithFallback(
 		routers.InfraKubernetes,
 		routers.InfraPlanetscale,
 		routers.InfraRailway,
+		routers.InfraVercel,
 		routers.InfraSupabase,
 		routers.McpServerSession,
 		routers.McpServerSessions,

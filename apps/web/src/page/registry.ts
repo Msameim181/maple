@@ -33,16 +33,22 @@ import * as AlertsSchedule from "./alerts/schedule"
 import * as AlertsScheduleNew from "./alerts/schedule-form"
 import * as AlertsEscalationChain from "./alerts/escalation-chain"
 import * as IngestRuleEditor from "./settings/ingest-rule"
+import * as BillingAiCredits from "./settings/ai-credits"
 import * as DashboardsList from "./dashboards/list"
 import * as DashboardTemplates from "./dashboards/templates"
 import * as DashboardView from "./dashboards/view"
 import * as DashboardWidget from "./dashboards/widget"
 import * as CodeReview from "./code-review"
+import * as SecurityAuditLog from "./security/audit-log"
+import * as SecurityDetectionNew from "./security/detection-form"
+import * as SecurityDetections from "./security/detections"
 import * as SecurityDependencies from "./security/dependencies"
 import * as SecurityFinding from "./security/finding"
 import * as SecurityRun from "./security/run"
 import * as SecurityTabs from "./security/tabs"
 import * as SecurityTelemetry from "./security/telemetry"
+import * as SecurityCloud from "./security/cloud"
+import * as SecurityDevices from "./security/devices"
 import * as ErrorsHub from "./errors/hub"
 import * as ErrorIssue from "./errors/issue"
 import * as InfraContainer from "./infra/containers/detail"
@@ -68,6 +74,8 @@ import * as InfraPlanetscaleDatabase from "./infra-integrations/planetscale/db"
 import * as InfraPlanetscale from "./infra-integrations/planetscale/list"
 import * as InfraRailway from "./infra-integrations/railway/list"
 import * as InfraRailwayService from "./infra-integrations/railway/service"
+import * as InfraVercel from "./infra-integrations/vercel/list"
+import * as InfraVercelProject from "./infra-integrations/vercel/project"
 import * as InfraSupabase from "./infra-integrations/supabase/list"
 import * as InfraSupabaseProject from "./infra-integrations/supabase/project"
 import * as Integrations from "./integrations"
@@ -77,11 +85,13 @@ import * as LogsList from "./logs/list"
 import * as LogPage from "./logs/log"
 import * as MetricsBrowse from "./metrics/browse"
 import * as Analytics from "./analytics"
+import * as ProductAnalytics from "./product-analytics"
+import * as Cost from "./cost"
+import * as CostBudgetNew from "./cost/budget-form"
+import * as CostBudgets from "./cost/budgets"
 import * as MetricDetail from "./metrics/detail"
 import * as Overview from "./overview"
 import * as Recommendation from "./recommendations"
-import * as ReleaseDetail from "./releases/detail"
-import * as ReleasesList from "./releases/list"
 import * as ServiceDetail from "./services/detail"
 import * as ServiceMap from "./service-map"
 import * as ReplayDetail from "./replays/detail"
@@ -100,6 +110,7 @@ import * as SourceDetail from "./sources/detail"
 import * as StatusPageBuilder from "./status-pages/builder"
 import * as StatusPageEditor from "./status-pages/editor"
 import * as StatusPagesList from "./status-pages/list"
+import * as StatusPageViewer from "./status-pages/viewer"
 import * as TraceDetail from "./traces/detail"
 import * as TracesList from "./traces/list"
 
@@ -132,6 +143,7 @@ export const pages = [
 	StatusPagesList.page,
 	StatusPageBuilder.page,
 	StatusPageEditor.page,
+	StatusPageViewer.page,
 	AlertEditor.page,
 	ServiceMap.page,
 	InfraHosts.page,
@@ -148,6 +160,8 @@ export const pages = [
 	InfraOverview.page,
 	InfraRailway.page,
 	InfraRailwayService.page,
+	InfraVercel.page,
+	InfraVercelProject.page,
 	InfraSupabase.page,
 	InfraSupabaseProject.page,
 	InfraPlanetscale.page,
@@ -166,7 +180,12 @@ export const pages = [
 	CodeReview.page,
 	SecurityTabs.page,
 	SecurityTelemetry.page,
+	SecurityCloud.page,
+	SecurityDevices.page,
 	SecurityDependencies.page,
+	SecurityAuditLog.page,
+	SecurityDetections.page,
+	SecurityDetectionNew.page,
 	SecurityRun.page,
 	SecurityFinding.page,
 	AgentSessionsList.page,
@@ -177,12 +196,11 @@ export const pages = [
 	Integrations.page,
 	Recommendation.page,
 	AnomalyDetail.page,
-	ReleasesList.page,
-	ReleaseDetail.page,
 	InvestigationsList.page,
 	InvestigationDetail.page,
 	Settings.page,
 	IngestRuleEditor.page,
+	BillingAiCredits.page,
 	McpPage.page,
 	Admin.page,
 	SourcesList.page,
@@ -195,10 +213,17 @@ export const pages = [
 	UserDetail.page,
 	Share.page,
 	Analytics.page,
+	ProductAnalytics.page,
+	Cost.page,
+	CostBudgets.page,
+	CostBudgetNew.page,
 ]
 
 /** Public routes a page renders bare, outside the shell (`/share/$token`). */
 export const isBarePageRoute = AppRoute.isAnyOf(["Share"])
+
+/** A page drawn alone, outside the shell (`isBarePageRoute`). */
+export const isBareSlot = (slot: PageSlotBase): boolean => slot._tag === Share.page.id
 
 export const PageSlot = Schema.Union(Array.map(pages, (page) => page.Slot))
 export type PageSlot = typeof PageSlot.Type
@@ -261,14 +286,52 @@ export const enterRoute = (
 		},
 	)
 
+/** Some `AsyncData` in the Model passes `test`. */
+const someAsyncData =
+	(test: (data: AsyncData.AsyncData<unknown, unknown>) => boolean) =>
+	(value: unknown): boolean => {
+		if (Array.isArray(value)) return Array.some(value, someAsyncData(test))
+		if (!Predicate.isReadonlyObject(value)) return false
+		// An `AsyncData`'s own data holds no requests: rows are not walked.
+		if (AsyncData.isAsyncData(value)) return test(value)
+		return Array.some(Rec.values(value), someAsyncData(test))
+	}
+
 /** Some `AsyncData` in the Model is in flight; its answer would be dropped while parked. */
-const hasLoadInFlight = (value: unknown): boolean => {
-	if (Array.isArray(value)) return Array.some(value, hasLoadInFlight)
-	if (!Predicate.isReadonlyObject(value)) return false
-	// An `AsyncData`'s own data holds no requests: rows are not walked.
-	if (AsyncData.isAsyncData(value)) return AsyncData.isPending(value)
-	return Array.some(Rec.values(value), hasLoadInFlight)
+const hasLoadInFlight = someAsyncData(AsyncData.isPending)
+
+/** Some read of the page is `Loading`. Any `{ _tag: "Loading" }` counts, so a chart runtime still
+ * importing or an Electric sync still connecting holds a navigation too: its page is not drawable yet. */
+export const isLoading = (slot: PageSlot): boolean => someAsyncData(AsyncData.isLoading)(slot.model)
+
+/** A request-keyed read (`Keyed`): `key` is null until it is first requested. */
+const isKeyed = (
+	value: unknown,
+): value is { readonly key: unknown; readonly data: AsyncData.AsyncData<unknown, unknown> } =>
+	Predicate.isReadonlyObject(value) &&
+	"key" in value &&
+	"data" in value &&
+	AsyncData.isAsyncData(value.data)
+
+/** The page's top-level request-keyed reads: what it opens with, not a nested panel's. */
+const topLevelReads = (slot: PageSlot) => {
+	const model: unknown = slot.model
+	return Predicate.isReadonlyObject(model) ? Array.filter(Rec.values(model), isKeyed) : []
 }
+
+/** The page is still reading what it opens with: a read is `Loading`, or none of its top-level reads
+ * is requested yet (they wait on its window). Some stay unrequested on purpose (a lazy column), so
+ * one requested read is enough to stop counting them. */
+export const isAwaitingReads = (slot: PageSlot): boolean => {
+	if (isLoading(slot)) return true
+	const reads = topLevelReads(slot)
+	return reads.length > 0 && Array.every(reads, (read) => read.key === null)
+}
+
+/** The page shows its own content: done reading, or one of its top-level reads has data. A side read
+ * (presence, incidents) answering first does not count. */
+export const showsContent = (slot: PageSlot): boolean =>
+	!isAwaitingReads(slot) || Array.some(topLevelReads(slot), (read) => AsyncData.hasData(read.data))
 
 /** How many left pages are kept to revive; each holds its last data. */
 const PARKED_PAGES_MAX = 4

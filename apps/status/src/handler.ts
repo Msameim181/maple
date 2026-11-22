@@ -1,21 +1,59 @@
 import {
+	ACCESS_PATH,
 	type ManageMessage,
+	OG_IMAGE_PATH,
 	renderAtomFeed,
 	renderBadgeSvg,
 	renderManagePage,
 	renderPage,
+	renderRssFeed,
 	renderStatusJson,
+	renderUptimeJson,
+	statusOgCard,
+	statusOgCardVersion,
+	UPTIME_MAX_DAYS,
 } from "@maple/status-page"
-import { Effect, Option, Schema } from "effect"
+import { STATUS_PAGE_WINDOW_DAYS } from "@maple/domain/status-page"
+import { Effect, Option, Schema, Array as Arr, String as Str } from "effect"
+import { accessPage, hasAccess, postAccess } from "./access"
 import { parseForm, postBreakGlassUpdate } from "./break-glass"
+import { clientRateLimitKey } from "./client-key"
 import type { StatusEnv } from "./ports"
-import { asset, html, notFound, PUBLIC_CACHE_CONTROL, plain, redirect } from "./responses"
+import {
+	asset,
+	html,
+	jsonError,
+	movedPermanently,
+	notFound,
+	PUBLIC_CACHE_CONTROL,
+	plain,
+	png,
+	redirect,
+} from "./responses"
 import { type Lookup, loadView, type PageView, pageIdForHost, pageIdForSlug } from "./snapshot"
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
 
-/** `/s/<slug>` and `/s/<slug>/<rest>`: path addressing for hosts without a page of their own. */
-const SLUG_PATH = /^\/s\/([a-z0-9][a-z0-9-]{1,46}[a-z0-9])(\/.*)?$/u
+/** `/s/<org key>/<slug>` and `/s/<org key>/<slug>/<rest>`: path addressing for hosts without a page of their own. */
+const ADDRESS_PATH = /^\/s\/([0-9a-f]{12})\/([a-z0-9][a-z0-9-]{1,46}[a-z0-9])(\/.*)?$/u
+/** `/s/<slug>[/<rest>]`: an address from before slugs were per org, redirected to the page's current one. */
+const LEGACY_SLUG_PATH = /^\/s\/([a-z0-9][a-z0-9-]{1,46}[a-z0-9])(\/.*)?$/u
+
+/**
+ * Whether a hostname is one of Maple's own for this Worker: its status domain, workers.dev, or a
+ * local dev name. Only these serve `/s/<org key>/<slug>`; any other host is a custom domain.
+ */
+export const sharedHostMatcher =
+	(statusHost: string | null) =>
+	(hostname: string): boolean => {
+		const host = Str.toLowerCase(hostname)
+		return (
+			host === statusHost ||
+			Str.endsWith(".workers.dev")(host) ||
+			host === "localhost" ||
+			Str.endsWith(".localhost")(host)
+		)
+	}
 
 interface Target {
 	readonly pageId: string
@@ -23,31 +61,64 @@ interface Target {
 	readonly basePath: string
 	/** Path within the page, always starting with `/`. */
 	readonly path: string
-	/** The slug the request named, when it came in by `/s/<slug>`. */
+	/** The slug the request named, when it came in by path. */
 	readonly slug: string | null
+	/** Came in by a bare `/s/<slug>`, which only pages published before slugs were per org have. */
+	readonly legacy: boolean
 }
 
-/** The page a request is for: its hostname first, then the `/s/<slug>` path form. */
+/**
+ * The page a request is for: its hostname first, then the `/s/<org key>/<slug>` path form. Path addressing
+ * is for Maple's own hosts only: a customer's domain never serves another customer's page.
+ */
 const resolveTarget = (env: StatusEnv, url: URL): Effect.Effect<Lookup<Target>> =>
 	Effect.gen(function* () {
 		const byHost = yield* pageIdForHost(env, url.hostname)
 		if (byHost._tag === "found")
 			return {
 				_tag: "found",
-				value: { pageId: byHost.value, basePath: "", path: url.pathname, slug: null },
+				value: { pageId: byHost.value, basePath: "", path: url.pathname, slug: null, legacy: false },
 			}
-		const match = SLUG_PATH.exec(url.pathname)
-		const slug = match?.[1]
-		if (slug === undefined) return byHost
-		const bySlug = yield* pageIdForSlug(env, slug)
-		if (bySlug._tag === "found") {
-			return {
-				_tag: "found",
-				value: { pageId: bySlug.value, basePath: `/s/${slug}`, path: match?.[2] ?? "/", slug },
+		if (!env.isSharedHost(url.hostname)) return byHost
+		// A legacy slug can look like an org key, so a miss on the address form tries the bare slug.
+		const byAddress = ADDRESS_PATH.exec(url.pathname)
+		const byLegacy = LEGACY_SLUG_PATH.exec(url.pathname)
+		const candidates = [
+			...(byAddress === null
+				? []
+				: [{ key: byAddress[1] ?? "", slug: byAddress[2] ?? "", rest: byAddress[3], legacy: false }]),
+			...(byLegacy === null
+				? []
+				: [{ key: null, slug: byLegacy[1] ?? "", rest: byLegacy[2], legacy: true }]),
+		]
+		const misses: Array<Lookup<string>> = []
+		for (const candidate of candidates) {
+			const address = candidate.key === null ? candidate.slug : `${candidate.key}/${candidate.slug}`
+			const byPath = yield* pageIdForSlug(env, address)
+			if (byPath._tag === "found") {
+				return {
+					_tag: "found",
+					value: {
+						pageId: byPath.value,
+						basePath: `/s/${address}`,
+						path: candidate.rest ?? "/",
+						slug: candidate.slug,
+						legacy: candidate.legacy,
+					},
+				}
 			}
+			misses.push(byPath)
 		}
-		// Either store being down means the 404 could be wrong, so it must not be cached.
-		return byHost._tag === "unavailable" ? byHost : bySlug
+		// An address the publisher took down is a 404 for certain. Otherwise any store being down
+		// means the 404 could be wrong, so it must not be cached.
+		const lookups = [byHost, ...misses]
+		return Option.getOrElse(
+			Option.orElse(
+				Arr.findFirst(lookups, (lookup) => lookup._tag === "gone"),
+				() => Arr.findFirst(lookups, (lookup) => lookup._tag === "unavailable"),
+			),
+			() => byHost,
+		)
 	})
 
 const managePage = (
@@ -72,10 +143,11 @@ const NOT_SAVED =
 
 const postManage = (env: StatusEnv, request: Request, view: PageView, target: Target) =>
 	Effect.gen(function* () {
-		const ip = request.headers.get("cf-connecting-ip") ?? "unknown"
+		const client = clientRateLimitKey(request.headers.get("cf-connecting-ip") ?? "unknown")
 		// Fails open: the token carries 256 bits, and this form exists for when things are broken.
+		// No budget across clients either, which would let anyone hold the form shut.
 		const allowed = yield* env.storage
-			.rateLimit(`${ip}:${target.pageId}`)
+			.rateLimit(`${client}:${target.pageId}`)
 			.pipe(Effect.orElseSucceed(() => true))
 		if (!allowed) {
 			return managePage(env, view, target, 429, {
@@ -97,8 +169,54 @@ const postManage = (env: StatusEnv, request: Request, view: PageView, target: Ta
 		)
 	})
 
+/**
+ * The page's canonical address: its custom domain once active, else where this request found it.
+ * Feeds, `status.json` and the Slack command publish it, so readers land on the customer's domain.
+ */
+const canonicalUrl = (url: URL, view: PageView, target: Target): string =>
+	view.snapshot.page.customDomain === null
+		? `${url.origin}${target.basePath}`
+		: `https://${view.snapshot.page.customDomain}`
+
+/** `?days=`, 1 to {@link UPTIME_MAX_DAYS}, default one page window; null when it is anything else. */
+const uptimeDays = (url: URL): number | null => {
+	const raw = url.searchParams.get("days")
+	if (raw === null) return STATUS_PAGE_WINDOW_DAYS
+	const days = Number(raw)
+	return /^\d+$/u.test(raw) && days >= 1 && days <= UPTIME_MAX_DAYS ? days : null
+}
+
+const serveUptime = (url: URL, view: PageView, pageUrl: string): Response => {
+	const days = uptimeDays(url)
+	if (days === null) return jsonError(400, `days must be a whole number from 1 to ${UPTIME_MAX_DAYS}.`)
+	const uptime = renderUptimeJson(view.snapshot, pageUrl, {
+		days,
+		componentId: url.searchParams.get("component"),
+	})
+	if (uptime === null) return jsonError(404, "No component on this page shows uptime under that id.")
+	return asset(encodeJson(uptime), "application/json; charset=utf-8", {
+		"access-control-allow-origin": "*",
+	})
+}
+
+/** The card as the page links it; a renderer failure is a 503 the crawler retries, never cached. */
+const serveOgImage = (env: StatusEnv, url: URL, view: PageView, target: Target, pageUrl: string) => {
+	const card = statusOgCard(view.snapshot, view.freshness, new URL(pageUrl).host)
+	const version = statusOgCardVersion(card)
+	return env.ogImage(`${target.pageId}/${version}`, card).pipe(
+		// A stand-in card is never kept for long: the next fetch may draw the logo.
+		Effect.map((image) => png(image.png, image.complete && url.searchParams.get("v") === version)),
+		Effect.catchTag("@maple/status/OgImageError", (error) =>
+			Effect.logWarning("Status page preview image failed", error).pipe(
+				Effect.as(plain("Preview unavailable", 503)),
+			),
+		),
+	)
+}
+
 const servePage = (env: StatusEnv, request: Request, url: URL, view: PageView, target: Target) => {
 	const isRead = request.method === "GET" || request.method === "HEAD"
+	const pageUrl = canonicalUrl(url, view, target)
 	if (target.path === "/_manage") {
 		if (isRead) return Effect.succeed(managePage(env, view, target, 200))
 		if (request.method === "POST") return postManage(env, request, view, target)
@@ -111,34 +229,62 @@ const servePage = (env: StatusEnv, request: Request, url: URL, view: PageView, t
 			const body = renderPage(view.snapshot, view.freshness, env.nowMs, {
 				nonce,
 				basePath: target.basePath,
+				publicUrl: pageUrl,
 			})
 			return Effect.succeed(html(body, { cacheControl: PUBLIC_CACHE_CONTROL, nonce }))
 		}
 		case "/api/v1/status.json":
 			return Effect.succeed(
 				asset(
-					encodeJson(renderStatusJson(view.snapshot, view.freshness)),
+					encodeJson(renderStatusJson(view.snapshot, view.freshness, pageUrl)),
 					"application/json; charset=utf-8",
 					{
 						"access-control-allow-origin": "*",
 					},
 				),
 			)
+		case "/api/v1/uptime.json":
+			return Effect.succeed(serveUptime(url, view, pageUrl))
+		case OG_IMAGE_PATH:
+			return serveOgImage(env, url, view, target, pageUrl)
 		case "/badge.svg":
 			return Effect.succeed(
 				asset(renderBadgeSvg(view.snapshot, view.freshness), "image/svg+xml; charset=utf-8"),
 			)
 		case "/feed.atom":
 			return Effect.succeed(
-				asset(
-					renderAtomFeed(view.snapshot, `${url.origin}${target.basePath}`),
-					"application/atom+xml; charset=utf-8",
-				),
+				asset(renderAtomFeed(view.snapshot, pageUrl), "application/atom+xml; charset=utf-8"),
+			)
+		case "/feed.rss":
+			return Effect.succeed(
+				asset(renderRssFeed(view.snapshot, pageUrl), "application/rss+xml; charset=utf-8"),
 			)
 		default:
 			return Effect.succeed(notFound())
 	}
 }
+
+/**
+ * A password page: the form and its POST are open, everything else (the page, feeds, JSON, badge,
+ * break-glass) needs a valid access cookie. What it serves is the visitor's alone: never cached
+ * by a shared cache, never indexed.
+ */
+const serveProtected = (env: StatusEnv, request: Request, url: URL, view: PageView, target: Target) =>
+	Effect.gen(function* () {
+		const snapshot = view.snapshot
+		if (target.path === ACCESS_PATH) {
+			if (request.method === "POST") return yield* postAccess(env, request, snapshot, target.basePath)
+			return accessPage(env, snapshot, target.basePath, 200)
+		}
+		const response = (yield* hasAccess(env, request, snapshot))
+			? yield* servePage(env, request, url, view, target)
+			: target.path === "/"
+				? accessPage(env, snapshot, target.basePath, 401)
+				: plain("This status page is password-protected.", 401)
+		response.headers.set("cache-control", "private, no-store")
+		response.headers.set("x-robots-tag", "noindex")
+		return response
+	})
 
 /** One request: resolve the page, load what is still reachable, render. Never fails. */
 export const handleRequest = (request: Request, env: StatusEnv): Effect.Effect<Response> =>
@@ -151,15 +297,27 @@ export const handleRequest = (request: Request, env: StatusEnv): Effect.Effect<R
 			yield* Effect.logWarning("Status page route lookup failed in every store")
 			return plain(UNAVAILABLE, 503)
 		}
-		if (target._tag === "missing") return notFound()
+		if (target._tag !== "found") return notFound()
 		const view = yield* loadView(env, target.value.pageId)
 		yield* Effect.annotateCurrentSpan("maple.status_page.id", target.value.pageId)
-		if (Option.isNone(view)) {
+		// Taken off the edge: every path of the page answers as if it never existed.
+		if (view._tag === "gone") return notFound()
+		if (view._tag !== "found") {
 			yield* Effect.logWarning("Status page snapshot missing from every store")
 			return plain(UNAVAILABLE, 503)
 		}
+		const page = view.value.snapshot.page
+		// An old `/s/<slug>` link moves to the page's address; a snapshot from before org keys serves as it is.
+		if (target.value.legacy && page.orgKey !== "" && page.visibility !== "internal")
+			return movedPermanently(
+				`/s/${page.orgKey}/${page.slug}${Str.slice(target.value.basePath.length)(url.pathname)}${url.search}`,
+			)
 		// A renamed page keeps its old `slug:` key until cleanup; only the current slug serves it.
-		if (target.value.slug !== null && view.value.snapshot.page.slug !== target.value.slug)
-			return notFound()
+		if (target.value.slug !== null && page.slug !== target.value.slug) return notFound()
+		const visibility = page.visibility
+		// Internal pages are taken off the edge; one still reachable here answers as if it were.
+		if (visibility === "internal") return notFound()
+		if (visibility === "password")
+			return yield* serveProtected(env, request, url, view.value, target.value)
 		return yield* servePage(env, request, url, view.value, target.value)
 	})

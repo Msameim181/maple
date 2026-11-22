@@ -37,6 +37,8 @@ import { AlertSilencesService } from "./AlertSilencesService"
 import { AlertMaintenanceWindowsService } from "./AlertMaintenanceWindowsService"
 import { AlertRulesService, type AlertRulesServiceApi } from "./AlertRulesService"
 import { SloAlertSource } from "@maple/backend/services/slos/SloAlertSource"
+import { AuditTrailService } from "@maple/backend/services/audit-trail/AuditTrailService"
+import { CostBudgetSource } from "@maple/backend/services/cost/CostBudgetSource"
 import { UptimeAlertSource } from "@maple/backend/services/uptime/UptimeAlertSource"
 import { AnomalyAlertSource } from "@maple/backend/services/alerts/anomaly/AnomalyAlertSource"
 import { BucketCacheService } from "@maple/query-engine/caching"
@@ -44,6 +46,7 @@ import { EdgeCacheService } from "@maple/cache"
 import { baselineWarehouseCapabilities } from "@maple/query-engine"
 import { CacheBackendLive } from "@maple/backend/platform/CacheBackendLive"
 import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import { LinearOAuthService } from "@maple/backend/services/auth/LinearOAuthService"
 import { LinearIssueTracker } from "./LinearIssueTracker"
 import { EmailService } from "@maple/backend/platform/EmailService"
@@ -277,7 +280,7 @@ export const makeLayer = (
 					refreshWidgets: () => Effect.succeed(noPushes),
 				})
 	const configLive = makeConfig()
-	const envLive = Env.layer.pipe(Layer.provide(configLive))
+	const envLive = EnvTestLive.pipe(Layer.provide(configLive))
 	const databaseLive = testDb.layer
 	// Held only so the service can hand an autonomous investigation turn its `submit_diagnosis`
 	// tool; no test here starts one. The real layer is cheap — it depends on nothing beyond Env
@@ -359,6 +362,15 @@ export const makeLayer = (
 			Layer.effect(SloAlertSource, SloAlertSource.make).pipe(
 				Layer.provide(Layer.effect(SloReadService, SloReadService.make)),
 				Layer.provide(Layer.mergeAll(databaseLive, warehouseLive)),
+			),
+		),
+		// One `provide` for both: the pipe above is at its twenty-argument limit.
+		Layer.provide(
+			Layer.mergeAll(
+				Layer.effect(AuditTrailService, AuditTrailService.make).pipe(Layer.provide(warehouseLive)),
+				Layer.effect(CostBudgetSource, CostBudgetSource.make).pipe(
+					Layer.provide(Layer.mergeAll(databaseLive, warehouseLive, queryEngineLive)),
+				),
 			),
 		),
 		Layer.provide(chatSessions === undefined ? Layer.empty : Layer.succeed(ChatSessions, chatSessions)),

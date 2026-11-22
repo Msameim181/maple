@@ -28,6 +28,7 @@ import { linkIssueDialog } from "./view-link-dialog"
 import { anomalySidebar } from "./view-sidebar"
 import { hstack } from "@maple/views/ui/stack"
 import { Array as Arr } from "effect"
+import { canRespondToIncidents, gatedControl } from "../../kit/session-grants"
 
 type H = HtmlBuilder<Message>
 
@@ -69,28 +70,32 @@ const headerActions = (h: H, model: Model, incident: AnomalyIncidentDocument, ti
 								: "Resolved",
 						],
 		),
-		button(
-			h,
-			{
-				size: "sm",
-				variant: "outline",
-				isDisabled: isBusy,
-				isLoading: model.busy === "investigate",
-				attributes: [h.OnClick(Message.ClickedInvestigate())],
-			},
-			[icon(h, "PulseIcon"), "Open investigation"],
+		gatedControl(h, model, "investigations:run", (isLocked) =>
+			button(
+				h,
+				{
+					size: "sm",
+					variant: "outline",
+					isDisabled: isLocked || isBusy,
+					isLoading: model.busy === "investigate",
+					attributes: [h.OnClick(Message.ClickedInvestigate())],
+				},
+				[icon(h, "PulseIcon"), "Open investigation"],
+			),
 		),
 		...(isOpen
 			? [
-					button(
-						h,
-						{
-							size: "sm",
-							variant: "outline",
-							isDisabled: isBusy,
-							attributes: [h.OnClick(Message.ClickedResolve())],
-						},
-						["Resolve"],
+					gatedControl(h, model, "incidents:respond", (isLocked) =>
+						button(
+							h,
+							{
+								size: "sm",
+								variant: "outline",
+								isDisabled: isLocked || isBusy,
+								attributes: [h.OnClick(Message.ClickedResolve())],
+							},
+							["Resolve"],
+						),
 					),
 				]
 			: []),
@@ -130,7 +135,7 @@ const loadedBody = (
 							{ as: "h2", className: "mb-3 block", attributes: [h.Id("linked-issue-heading")] },
 							["Linked issue"],
 						),
-						linkedIssueCard(h, model, incident, isBusy),
+						linkedIssueCard(h, model, incident, isBusy, canRespondToIncidents(model)),
 					],
 				),
 			],
@@ -164,6 +169,7 @@ export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, 
 						rightPanel: anomalySidebar(h, {
 							incident: state.incident,
 							isBusy: model.busy !== null,
+							canRespond: canRespondToIncidents(model),
 							nowMs: model.nowMs,
 							timeZone,
 						}),

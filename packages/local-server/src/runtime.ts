@@ -1,3 +1,4 @@
+// oxlint-disable-next-line typescript/triple-slash-reference -- the CLI and the sidecar compile this source under their own tsconfig, which does not include assets.d.ts
 /// <reference path="./assets.d.ts" />
 import * as BunServices from "@effect/platform-bun/BunServices"
 import { DateTime, Duration, Effect, Exit, Option, Schedule, Schema, Scope } from "effect"
@@ -282,7 +283,7 @@ const own = (options: LocalOptions, portChoice: PortChoice, parent: Scope.Scope)
 		const attempt = yield* Scope.fork(parent)
 		return yield* acquireLocal(options, portChoice).pipe(
 			Scope.provide(attempt),
-			Effect.onExit((exit) => (Exit.isFailure(exit) ? Scope.close(attempt, exit) : Effect.void)),
+			Effect.onError((cause) => Scope.close(attempt, Exit.failCause(cause))),
 		)
 	})
 

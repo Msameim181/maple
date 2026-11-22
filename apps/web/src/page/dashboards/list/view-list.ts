@@ -2,6 +2,7 @@ import { pluralize } from "@maple/ui/lib/format"
 import { cn } from "@maple/ui/lib/utils"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { AppRoute, hrefOf } from "../../../route"
+import { lockedControl } from "@maple/views/ui/locked-control"
 import { button, linkButton } from "@maple/views/ui/button"
 import { cardButton } from "@maple/views/ui/card-button"
 import {
@@ -15,6 +16,7 @@ import {
 import { icon } from "@maple/views/ui/icon"
 import { iconButton } from "@maple/views/ui/icon-button"
 import { rowActionsMenu } from "@maple/views/ui/row-actions-menu"
+import { ROW_FOCUSED_CLASS, rowFocusAttributes } from "@maple/views/ui/row-focus"
 import { listSectionHeader, toolbarSearch } from "../kit/list-parts"
 import * as Menu from "@maple/views/ui/menu"
 import * as MenuView from "@maple/views/ui/menu-view"
@@ -29,7 +31,7 @@ import * as TagEditor from "../kit/tag-editor"
 import { Message } from "./message"
 import type { ListDashboard, Model, Scope } from "./model"
 import { isReadOnly, rowMenuIdOf } from "./update"
-import { deleteDialog } from "./view-dialogs"
+import { deleteDialog, importReportDialog } from "./view-dialogs"
 import { tagFilterView } from "./view-tag-filter"
 import { typography, typographyClass } from "@maple/views/ui/typography"
 import { hstack, vstack } from "@maple/views/ui/stack"
@@ -50,25 +52,16 @@ const SCOPE_OPTIONS = [
 	{ value: "favorites", label: "Favorites" },
 ] as const
 
-/** A disabled control wrapped in a `contents` tooltip trigger. */
-const disabledReason = (h: H, child: Html): Html =>
-	h.div(
-		[
-			h.Class("contents"),
-			h.DataAttribute("base-ui-tooltip-trigger", ""),
-			h.DataAttribute("slot", "tooltip-trigger"),
-		],
-		[child],
-	)
-
 /** Disabled with its reason while no dashboard carries a tag. */
 const tagFilter = (h: H, model: Model, allTags: ReadonlyArray<string>): Html =>
 	allTags.length === 0
-		? disabledReason(
+		? lockedControl(
 				h,
+				"Add tags to a dashboard to filter by them.",
 				button(h, { variant: "outline", size: "sm", className: "shrink-0", isDisabled: true }, [
 					"Tags",
 				]),
+				{ className: "shrink-0" },
 			)
 		: h.submodel({
 				slotId: "dashboards-tag-filter",
@@ -193,6 +186,7 @@ type RowContext = Readonly<{ model: Model; nowMs: number; timeZone: string }>
 
 /** One link for the whole row, then the star and the kebab above it. */
 const dashboardRow = (h: H, context: RowContext, dashboard: ListDashboard, isFavorite: boolean): Html => {
+	const isFocused = context.model.focusedId === dashboard.id
 	const isEmpty = dashboard.widgetCount === 0
 	const widgets = `${dashboard.widgetCount} ${pluralize(dashboard.widgetCount, "widget")}`
 	const name = displayName(dashboard.name)
@@ -200,8 +194,12 @@ const dashboardRow = (h: H, context: RowContext, dashboard: ListDashboard, isFav
 		dashboard.id,
 		[
 			h.Class(
-				"group relative flex items-center border-b border-border last:border-b-0 hover:bg-surface-sunken active:bg-surface-sunken focus-within:bg-surface-sunken",
+				cn(
+					ROW_FOCUSED_CLASS,
+					"group relative flex items-center border-b border-border last:border-b-0 hover:bg-surface-sunken active:bg-surface-sunken focus-within:bg-surface-sunken",
+				),
 			),
+			...rowFocusAttributes(h, isFocused),
 		],
 		[
 			h.span(
@@ -548,6 +546,7 @@ export const listBody = (
 			toParentMessage: (message) => Message.GotTagEditorMessage({ message }),
 		}),
 		deleteDialog(h, model),
+		importReportDialog(h, model),
 	])
 }
 

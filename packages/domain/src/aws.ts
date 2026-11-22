@@ -1,4 +1,5 @@
 import { Schema, Array as Arr, String as Str } from "effect"
+import type { OrganizationFeatureFlags } from "./organization-feature-flags"
 import {
 	type AwsAccountId,
 	type AwsConnectionId,
@@ -27,6 +28,8 @@ interface AwsModuleSpec {
 	readonly summary: string
 	/** Whether Maple reads anything with it yet. A planned module is not offered. */
 	readonly available: boolean
+	/** A module that is not `available` is still offered to an org with this rollout flag on. */
+	readonly rolloutFlag?: keyof OrganizationFeatureFlags
 	/** AWS managed policies attached when the module is on. Metadata only: never data reads. */
 	readonly managedPolicies: ReadonlyArray<string>
 	/** Actions of the module's own policy, beyond the managed ones. */
@@ -60,35 +63,82 @@ export const AWS_MODULE_SPECS = {
 	},
 	security: {
 		title: "Security scan",
-		summary: "Misconfigurations and findings, ranked by the traffic they are exposed to.",
+		summary:
+			"GuardDuty, Security Hub, Inspector and Access Analyzer findings, matched to the services they affect.",
 		available: false,
+		rolloutFlag: "cloudSecurity",
 		managedPolicies: ["arn:aws:iam::aws:policy/SecurityAudit"],
+		// Every read the findings poller makes, so none hangs on the managed policy. SecurityAudit also
+		// allows CloudTrail's LookupEvents, so this module grants `audit` too.
 		actions: [
-			"securityhub:GetFindings",
+			"account:ListRegions",
 			"guardduty:ListDetectors",
 			"guardduty:ListFindings",
 			"guardduty:GetFindings",
+			"securityhub:DescribeHub",
+			"securityhub:GetFindings",
+			"inspector2:BatchGetAccountStatus",
 			"inspector2:ListFindings",
+			"access-analyzer:ListAnalyzers",
 			"access-analyzer:ListFindingsV2",
+			"cloudtrail:LookupEvents",
 		],
+	},
+	audit: {
+		title: "Audit log",
+		summary:
+			"CloudTrail management write events (IAM, access keys, sign-ins, resource changes) in the audit log.",
+		available: true,
+		managedPolicies: [],
+		actions: ["account:ListRegions", "cloudtrail:LookupEvents"],
 	},
 	cost: {
 		title: "Cost",
-		summary: "Spend by service and resource, and what to cut.",
-		available: false,
+		summary:
+			"Daily spend by service, region and usage type. AWS bills USD 0.01 per Cost Explorer request.",
+		available: true,
 		managedPolicies: [],
+		// Every cost read Maple plans to make: adding one later means each customer updates the stack.
 		actions: [
 			"ce:GetCostAndUsage",
+			"ce:GetCostAndUsageWithResources",
 			"ce:GetCostForecast",
+			"ce:GetDimensionValues",
+			"ce:GetTags",
+			"ce:GetCostCategories",
+			"ce:GetSavingsPlansCoverage",
+			"ce:GetSavingsPlansUtilization",
+			"ce:GetSavingsPlansPurchaseRecommendation",
+			"ce:GetReservationCoverage",
+			"ce:GetReservationUtilization",
+			"ce:GetReservationPurchaseRecommendation",
+			"ce:GetAnomalies",
+			"ce:GetAnomalyMonitors",
+			// The hub carries Compute Optimizer's rightsizing, so only its enrollment is read there.
+			"cost-optimization-hub:ListEnrollmentStatuses",
+			"cost-optimization-hub:ListRecommendations",
+			"cost-optimization-hub:ListRecommendationSummaries",
+			"cost-optimization-hub:GetRecommendation",
 			"compute-optimizer:GetEnrollmentStatus",
-			"compute-optimizer:GetEC2InstanceRecommendations",
 			"bcm-data-exports:ListExports",
 			"bcm-data-exports:GetExport",
+			"bcm-data-exports:ListExecutions",
+			"bcm-data-exports:GetExecution",
 		],
 	},
 } as const satisfies Record<AwsModule, AwsModuleSpec>
 
-export const isAwsModuleAvailable = (module: AwsModule) => AWS_MODULE_SPECS[module].available
+/** Whether an org with these rollout flags is offered the module, and may turn it on. */
+export const isAwsModuleAvailable = (module: AwsModule, flags: OrganizationFeatureFlags): boolean => {
+	const spec: AwsModuleSpec = AWS_MODULE_SPECS[module]
+	return spec.available || (spec.rolloutFlag !== undefined && flags[spec.rolloutFlag])
+}
+
+/** The rollout flag of a module that is built but offered only to orgs in its rollout. */
+export const awsModuleRolloutFlag = (module: AwsModule): keyof OrganizationFeatureFlags | undefined => {
+	const spec: AwsModuleSpec = AWS_MODULE_SPECS[module]
+	return spec.rolloutFlag
+}
 
 /** Every connection's role starts with it. The cleanup keeps the OIDC provider while one is left. */
 export const AWS_ROLE_NAME_PREFIX = "MapleIntegration-"
@@ -110,6 +160,8 @@ export const awsConnectionResourceNames = (connectionId: AwsConnectionId) => {
 		/** The stack of one region's metric stream; the same name in every region it runs in. */
 		metricsStackName: `maple-metrics-${hex}`,
 		metricStreamName: `maple-${hex}`,
+		/** The stack that forwards one region's finding events to the main stack's region. */
+		eventsStackName: `maple-events-${hex}`,
 	}
 }
 
@@ -154,6 +206,22 @@ export const awsModuleOfPolicyName = (roleName: string, policyName: string): Aws
 	return isAwsModule(rest) ? rest : undefined
 }
 
+/**
+ * Whether a role with these module policies attached can do what `module` needs. Security scan's
+ * SecurityAudit policy allows CloudTrail's LookupEvents, so it also covers the audit log. The
+ * attached list itself stays exact: it is compared with the asked-for modules to spot a stale stack.
+ */
+export const awsModuleGranted = (attached: ReadonlyArray<string> | null, module: AwsModule): boolean =>
+	attached !== null && (attached.includes(module) || (module === "audit" && attached.includes("security")))
+
+/**
+ * Whether the deployed role matches what is asked for: every asked-for module is granted (one
+ * covered by another's policy counts), and no module policy is left attached that is not asked for.
+ */
+export const awsGrantsMatch = (modules: ReadonlyArray<string>, attached: ReadonlyArray<string>): boolean =>
+	Arr.every(modules, (module) => isAwsModule(module) && awsModuleGranted(attached, module)) &&
+	Arr.every(attached, (module) => isAwsModule(module) && modules.includes(module))
+
 export interface AwsSetupPlanInput {
 	readonly connectionId: AwsConnectionId
 	readonly accountId: AwsAccountId
@@ -180,6 +248,7 @@ export interface AwsSetupPlan {
 	readonly stackName: string
 	readonly metricsStackName: string
 	readonly metricStreamName: string
+	readonly eventsStackName: string
 	readonly roleArn: string
 	/** The account's IAM OIDC provider for Maple's issuer, shared by every connection to it. */
 	readonly oidcProvider: { readonly arn: string; readonly url: string; readonly audience: string }
@@ -206,6 +275,7 @@ export const awsSetupPlan = (input: AwsSetupPlanInput): AwsSetupPlan => {
 		stackName: names.stackName,
 		metricsStackName: names.metricsStackName,
 		metricStreamName: names.metricStreamName,
+		eventsStackName: names.eventsStackName,
 		roleArn,
 		oidcProvider: { arn: providerArn, url: input.issuer, audience: AWS_OIDC_AUDIENCE },
 		// Only a token Maple signed for this connection: the audience every Maple token carries,

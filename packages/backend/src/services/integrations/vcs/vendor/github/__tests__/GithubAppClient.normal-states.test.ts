@@ -12,7 +12,7 @@ import {
 	String as Str,
 } from "effect"
 import { TestClock } from "effect/testing"
-import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import { GithubAppClient } from "@maple/backend/services/integrations/vcs/vendor/github/GithubAppClient"
 import { fakeGithubHttp } from "@maple/backend/services/integrations/vcs/__tests__/harness"
 
@@ -22,7 +22,7 @@ const privateKey = generateKeyPairSync("rsa", {
 	privateKeyEncoding: { type: "pkcs8", format: "pem" },
 }).privateKey
 
-const env = Env.layer.pipe(
+const env = EnvTestLive.pipe(
 	Layer.provide(
 		ConfigProvider.layer(
 			ConfigProvider.fromUnknown({
@@ -119,7 +119,33 @@ describe("GithubAppClient responses that are normal states", () => {
 		return Effect.gen(function* () {
 			const client = yield* GithubAppClient
 			const error = yield* Effect.flip(client.getCommit("42", "octo", "shop", "main"))
-			assert.deepStrictEqual([error.status, error.scope], [409, "repository"])
+			assert.deepStrictEqual(
+				[error._tag, error.status, error._tag === "@maple/backend/vcs/GithubAppError" && error.scope],
+				["@maple/backend/vcs/GithubAppError", 409, "repository"],
+			)
+		}).pipe(Effect.provide(layer))
+	})
+
+	it.effect("fails a commit lookup in a blocked repository as the repository being blocked", () => {
+		const blocked = (status: number) =>
+			new Response(
+				'{"message":"Repository access blocked","block":{"reason":"dmca","created_at":"2025-08-26T19:06:05Z"}}',
+				{ status },
+			)
+		const layer = clientLayer([tokenResponse(), blocked(451), blocked(403)], [])
+		return Effect.gen(function* () {
+			const client = yield* GithubAppClient
+			const legal = yield* Effect.flip(client.getCommit("42", "octo", "shop", "main"))
+			const tos = yield* Effect.flip(client.getCommit("42", "octo", "shop", "main"))
+			assert.deepStrictEqual(
+				[legal._tag, legal.status, tos._tag, tos.status],
+				[
+					"@maple/http/errors/VcsRepositoryBlockedError",
+					451,
+					"@maple/http/errors/VcsRepositoryBlockedError",
+					403,
+				],
+			)
 		}).pipe(Effect.provide(layer))
 	})
 

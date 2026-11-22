@@ -54,6 +54,7 @@ import {
 	coverageSettled,
 	coverageOf,
 	findingsStateOf,
+	fixedByRun,
 	latestDetailOf,
 	latestRunFor,
 	RUN_LIST_CAP,
@@ -61,13 +62,14 @@ import {
 	openConfirmed,
 	openLeads,
 	openNeedsValidation,
-	runningRuns,
+	type ResolvedCounts,
+	resolvedCounts,
 	runsOf,
 	settingsOf,
 	spendThisMonth,
-	targetsOf,
 } from "./derive"
-import { canRunAudits, Message, type Model } from "./model"
+import { Message, type Model } from "./model"
+import { gatedControl } from "../../kit/session-grants"
 import { bucketOf, countByBucket, isUnverified } from "../kit/findings"
 import { estimatedSeverityBadge, unverifiedChip } from "../kit/findings-view"
 import { auditSteps, emptyOnRamp } from "./view-empty"
@@ -158,13 +160,18 @@ const spendTile = (h: H, model: Model): Html => {
 		hint: `of ${formatUsd(limit)}`,
 		tone: isReached ? "warn" : undefined,
 		compact: true,
-		action: canRunAudits(model)
-			? textLink(
-					h,
-					{ tone: "muted", className: "text-2xs", onClick: Message.ClickedSpendAndModels() },
-					["Edit limit"],
-				)
-			: undefined,
+		action: gatedControl(h, model, "security_audit:run", (isDisabled) =>
+			textLink(
+				h,
+				{
+					tone: "muted",
+					className: "text-2xs",
+					onClick: Message.ClickedSpendAndModels(),
+					isDisabled,
+				},
+				["Edit limit"],
+			),
+		),
 		subline: vstack(h, { gap: "1.5", as: "span" }, [
 			meter(h, {
 				value: Math.min(settings.spentUsd, limit),
@@ -197,16 +204,33 @@ const kpis = (h: H, model: Model): Html => {
 			: state._tag === "Gated"
 				? "Admins and engineers"
 				: placeholder(h, "h-7 w-10")
-	const running = runningRuns(model).length
 	const coverage = coverageAcross(model)
 	// Until its reads land, an empty sum is unknown, not "not mapped".
 	const coverageUnknown = coverage === null && !coverageSettled(model)
+	const resolved = resolvedCounts(findings)
 	return statRail(h, { columns: 4, className: NARROW_TWO_COLUMNS }, [
 		statRailItem(h, {
 			eyebrow: "Open leads",
 			value: unknown ?? String(confirmed + toValidate),
 			compact: true,
 			subline: unknown === null ? leadsLine(confirmed, toValidate) : undefined,
+		}),
+		statRailItem(h, {
+			eyebrow: "Resolved",
+			value: unknown ?? String(resolved.total),
+			compact: true,
+			action:
+				unknown === null && resolved.total > 0
+					? typography(h, { size: "2xs" }, [
+							textLink(h, { tone: "muted", href: resolvedHref(resolved) }, ["View"]),
+						])
+					: undefined,
+			subline:
+				unknown !== null
+					? undefined
+					: resolved.total === 0
+						? "fixed by a later run, or triaged"
+						: resolvedLine(resolved),
 		}),
 		statRailItem(h, {
 			eyebrow: "Coverage",
@@ -232,18 +256,36 @@ const kpis = (h: H, model: Model): Html => {
 							`latest run of ${coverage.targets} ${coverage.targets === 1 ? "target" : "targets"}`,
 						]),
 		}),
-		statRailItem(h, {
-			eyebrow: "Targets",
-			value: String(targetsOf(model).length),
-			compact: true,
-			subline:
-				running === 0
-					? "no audit running"
-					: `${running} ${running === 1 ? "audit" : "audits"} running now`,
-		}),
 		spendTile(h, model),
 	])
 }
+
+/** "2 fixed · 1 dismissed": how the closed findings closed, zeros left out. */
+const resolvedLine = (resolved: ResolvedCounts): string =>
+	Arr.join(
+		Arr.map(
+			Arr.filter(
+				[
+					[resolved.fixed, "fixed"],
+					[resolved.dismissed, "dismissed"],
+					[resolved.acceptedRisk, "accepted risk"],
+				] as const,
+				([count]) => count > 0,
+			),
+			([count, label]) => `${count} ${label}`,
+		),
+		" · ",
+	)
+
+/** The Findings tab at the first status that has something in it. */
+const resolvedHref = (resolved: ResolvedCounts): string =>
+	hrefOf(
+		AppRoute.SecurityCodeFindings({
+			search: {
+				status: resolved.fixed > 0 ? "fixed" : resolved.dismissed > 0 ? "dismissed" : "accepted_risk",
+			},
+		}),
+	)
 
 /** "3 high, 1 unverified": how many of a severity's count are estimates. */
 const countTitle = (
@@ -588,8 +630,13 @@ const topFindingsPanel = (h: H, model: Model, targets: ReadonlyArray<SecurityAud
 	])
 }
 
+/** "2 fixed": what a run closed, nothing when it closed none. */
+const fixedNote = (fixed: number): ReadonlyArray<string> => (fixed === 0 ? [] : [`${fixed} fixed`])
+
 const recentRunsPanel = (h: H, model: Model, targets: ReadonlyArray<SecurityAuditTarget>): Html => {
 	const runs = runsOf(model).slice(0, 4)
+	const state = findingsStateOf(model)
+	const findings = state._tag === "Ready" ? state.findings : []
 	return panel(h, { className: "overflow-hidden" }, [
 		panelHeader(h, {
 			title: "Recent runs",
@@ -624,6 +671,7 @@ const recentRunsPanel = (h: H, model: Model, targets: ReadonlyArray<SecurityAudi
 												Str.toLowerCase(RUN_KIND_LABEL[run.kind]),
 												PROFILE_LABEL[run.profile],
 												note,
+												...fixedNote(fixedByRun(findings, run.id)),
 											],
 											" · ",
 										),
@@ -679,25 +727,31 @@ export const overviewBody = (h: H, model: Model): ReadonlyArray<Html> =>
 					],
 	})
 
-/** Admins add targets; a member gets no control they would be refused. */
-export const addTargetButton = (h: H, model: Model): Html | undefined =>
-	canRunAudits(model)
-		? button(h, { size: "sm", attributes: [h.OnClick(Message.ClickedAddTarget())] }, [
-				icon(h, "PlusIcon"),
-				"Add target",
-			])
-		: undefined
+/** Admins add targets; anyone else sees it locked, with who can. */
+export const addTargetButton = (h: H, model: Model): Html =>
+	gatedControl(h, model, "security_audit:run", (isDisabled) =>
+		button(h, { size: "sm", isDisabled, attributes: [h.OnClick(Message.ClickedAddTarget())] }, [
+			icon(h, "PlusIcon"),
+			"Add target",
+		]),
+	)
 
 /** The Overview's actions: Spend & models once the settings are in, then Add target. */
-export const overviewActions = (h: H, model: Model): Html | undefined => {
+export const overviewActions = (h: H, model: Model): Html => {
 	const add = addTargetButton(h, model)
-	if (add === undefined) return undefined
 	if (settingsOf(model) === null) return add
 	return hstack(h, { gap: "2" }, [
-		button(
-			h,
-			{ size: "sm", variant: "outline", attributes: [h.OnClick(Message.ClickedSpendAndModels())] },
-			[icon(h, "GearIcon"), "Spend & models"],
+		gatedControl(h, model, "security_audit:run", (isDisabled) =>
+			button(
+				h,
+				{
+					size: "sm",
+					variant: "outline",
+					isDisabled,
+					attributes: [h.OnClick(Message.ClickedSpendAndModels())],
+				},
+				[icon(h, "GearIcon"), "Spend & models"],
+			),
 		),
 		add,
 	])

@@ -7,6 +7,7 @@ import {
 	makeSnapshot,
 } from "@maple/status-page/fixtures"
 import { beforeEach, describe, expect, it } from "vitest"
+import { sharedHostMatcher } from "./handler"
 import { CACHE_FRESH_MS, cacheKey } from "./snapshot"
 import {
 	type FakeStorage,
@@ -16,10 +17,19 @@ import {
 	publish,
 	putOverlayEntry,
 	send,
+	takeOffEdge,
 } from "./test-support"
-import { Option, Array as Arr, String as Str } from "effect"
+import { Option, Schema, Array as Arr, String as Str } from "effect"
 
 const PAGE = "https://status.acme.example/"
+
+const decodeUptime = Schema.decodeUnknownSync(
+	Schema.Struct({
+		page: Schema.Struct({ status_url: Schema.String }),
+		days: Schema.Number,
+		components: Schema.Array(Schema.Struct({ name: Schema.String, days: Schema.Array(Schema.Unknown) })),
+	}),
+)
 const TOKEN = "mstat_correct-horse-battery-staple"
 
 const delayedBanner = (html: string): string =>
@@ -104,15 +114,15 @@ describe("serving a page", () => {
 	})
 
 	it("serves the slug path form on a shared host, with links under the prefix", async () => {
-		const response = await send(fake, "https://status.maple.workers.dev/s/acme/")
+		const response = await send(fake, "https://status.maple.workers.dev/s/a1b2c3d4e5f6/acme/")
 		const html = await response.text()
 		expect(response.status).toBe(200)
-		expect(html).toContain(`href="/s/acme/feed.atom"`)
+		expect(html).toContain(`href="/s/a1b2c3d4e5f6/acme/feed.atom"`)
 		expect((await send(fake, "https://status.maple.workers.dev/s/unknown/")).status).toBe(404)
 	})
 
 	it("asks KV for the shared host once per cache window, not on every slug request", async () => {
-		const url = "https://status.maple.workers.dev/s/acme/"
+		const url = "https://status.maple.workers.dev/s/a1b2c3d4e5f6/acme/"
 		const hostKey = StatusPageKeys.host("status.maple.workers.dev")
 		const hostReads = () => Arr.filter(fake.kvReads, (key) => key === hostKey).length
 		expect((await send(fake, url)).status).toBe(200)
@@ -130,12 +140,39 @@ describe("serving a page", () => {
 	})
 
 	it("keeps a host's own page ahead of the slug path, so it never serves another page", async () => {
-		expect((await send(fake, "https://status.acme.example/s/acme/")).status).toBe(404)
+		expect((await send(fake, "https://status.acme.example/s/a1b2c3d4e5f6/acme/")).status).toBe(404)
 	})
 
 	it("stops serving a renamed page under its old slug", async () => {
+		fake.kv.set(StatusPageKeys.slug("a1b2c3d4e5f6/old-acme"), FIXTURE_PAGE_ID)
+		expect((await send(fake, "https://status.maple.workers.dev/s/a1b2c3d4e5f6/old-acme/")).status).toBe(
+			404,
+		)
+	})
+
+	it("moves a link from before slugs were per org to the page's address", async () => {
 		fake.kv.set(StatusPageKeys.slug("old-acme"), FIXTURE_PAGE_ID)
-		expect((await send(fake, "https://status.maple.workers.dev/s/old-acme/")).status).toBe(404)
+		const response = await send(fake, "https://status.maple.workers.dev/s/old-acme/feed.atom?v=1")
+		expect(response.status).toBe(308)
+		expect(response.headers.get("location")).toBe("/s/a1b2c3d4e5f6/acme/feed.atom?v=1")
+		expect(response.headers.get("access-control-allow-origin")).toBe("*")
+		const bare = await send(fake, "https://status.maple.workers.dev/s/old-acme")
+		expect(bare.headers.get("location")).toBe("/s/a1b2c3d4e5f6/acme")
+	})
+
+	it("serves a bare-slug link as before while the page's snapshot has no org key", async () => {
+		publish(fake, makeSnapshot({ page: { ...makeSnapshot().page, orgKey: "" } }))
+		fake.kv.set(StatusPageKeys.slug("acme"), FIXTURE_PAGE_ID)
+		const response = await send(fake, "https://status.maple.workers.dev/s/acme/")
+		expect(response.status).toBe(200)
+		expect(await response.text()).toContain(`href="/s/acme/feed.atom"`)
+	})
+
+	it("reads a legacy slug that looks like an org key as a slug", async () => {
+		fake.kv.set(StatusPageKeys.slug("abcdef123456"), FIXTURE_PAGE_ID)
+		const response = await send(fake, "https://status.maple.workers.dev/s/abcdef123456/history")
+		expect(response.status).toBe(308)
+		expect(response.headers.get("location")).toBe("/s/a1b2c3d4e5f6/acme/history")
 	})
 
 	it("merges break-glass entries listed from their per-entry keys into the page", async () => {
@@ -188,7 +225,7 @@ describe("serving a page", () => {
 
 	it("serves the slug route from R2 when KV throws", async () => {
 		fake.failing.add("kv")
-		const response = await send(fake, "https://status.maple.workers.dev/s/acme/")
+		const response = await send(fake, "https://status.maple.workers.dev/s/a1b2c3d4e5f6/acme/")
 		expect(response.status).toBe(200)
 		expect(await response.text()).toContain("<title>Acme status</title>")
 	})
@@ -199,7 +236,7 @@ describe("serving a page", () => {
 		const byHost = await send(fake, PAGE)
 		expect(byHost.status).toBe(503)
 		expect(byHost.headers.get("cache-control")).toBe("no-store")
-		const bySlug = await send(fake, "https://status.maple.workers.dev/s/acme/")
+		const bySlug = await send(fake, "https://status.maple.workers.dev/s/a1b2c3d4e5f6/acme/")
 		expect(bySlug.status).toBe(503)
 		expect(bySlug.headers.get("cache-control")).toBe("no-store")
 	})
@@ -215,6 +252,37 @@ describe("serving a page", () => {
 		expect(html).toContain("Live checks are delayed")
 	})
 
+	it("serves daily uptime as public JSON, cached like status.json", async () => {
+		const response = await send(fake, `${PAGE}api/v1/uptime.json?days=7`)
+		expect(response.status).toBe(200)
+		expect(response.headers.get("access-control-allow-origin")).toBe("*")
+		expect(response.headers.get("cache-control")).toBe(
+			(await send(fake, `${PAGE}api/v1/status.json`)).headers.get("cache-control"),
+		)
+		const json = decodeUptime(await response.json())
+		expect(json.page.status_url).toBe("https://status.acme.example")
+		// The fixture's third component has no monitor: it has no uptime to report.
+		expect(Arr.map(json.components, (component) => component.name)).toEqual(["API", "Dashboard"])
+		expect(Arr.map(json.components, (component) => component.days.length)).toEqual([7, 7])
+
+		const one = decodeUptime(
+			await (await send(fake, `${PAGE}api/v1/uptime.json?component=${fixtureComponentId(1)}`)).json(),
+		)
+		expect(Arr.map(one.components, (component) => component.name)).toEqual(["Dashboard"])
+		expect(one.days).toBe(90)
+	})
+
+	it("refuses a bad window and an id with no uptime, as JSON", async () => {
+		for (const days of ["0", "366", "7.5", "week"]) {
+			const response = await send(fake, `${PAGE}api/v1/uptime.json?days=${days}`)
+			expect(response.status).toBe(400)
+			expect(await response.json()).toEqual({ error: "days must be a whole number from 1 to 365." })
+		}
+		const missing = await send(fake, `${PAGE}api/v1/uptime.json?component=${fixtureComponentId(2)}`)
+		expect(missing.status).toBe(404)
+		expect(missing.headers.get("access-control-allow-origin")).toBe("*")
+	})
+
 	it("serves status.json, the badge and the feed", async () => {
 		const json = await send(fake, `${PAGE}api/v1/status.json`)
 		expect(json.headers.get("content-type")).toBe("application/json; charset=utf-8")
@@ -226,6 +294,66 @@ describe("serving a page", () => {
 
 		const feed = await send(fake, `${PAGE}feed.atom`)
 		expect(await feed.text()).toContain(`<link rel="self" href="https://status.acme.example/feed.atom"/>`)
+
+		const rss = await send(fake, `${PAGE}feed.rss`)
+		expect(rss.headers.get("content-type")).toBe("application/rss+xml; charset=utf-8")
+		expect(rss.headers.get("cache-control")).toBe(feed.headers.get("cache-control"))
+		expect(await rss.text()).toContain(
+			`<atom:link href="https://status.acme.example/feed.rss" rel="self"`,
+		)
+	})
+
+	it("serves the RSS feed under the slug path with links under the prefix", async () => {
+		const rss = await send(fake, "https://status.maple.workers.dev/s/a1b2c3d4e5f6/acme/feed.rss")
+		expect(rss.status).toBe(200)
+		expect(await rss.text()).toContain(
+			"<link>https://status.maple.workers.dev/s/a1b2c3d4e5f6/acme/</link>",
+		)
+	})
+
+	it("draws the preview the page links, cached for a day under that URL", async () => {
+		const html = await (await send(fake, PAGE)).text()
+		const linked =
+			Option.getOrThrow(Str.match(/<meta property="og:image" content="([^"]+)">/u)(html))[1] ?? ""
+		const version = new URL(linked).searchParams.get("v")
+		const response = await send(fake, linked)
+		expect(response.status).toBe(200)
+		expect(response.headers.get("content-type")).toBe("image/png")
+		expect(response.headers.get("cache-control")).toBe("public, max-age=86400")
+		expect(await response.text()).toBe(`png:${FIXTURE_PAGE_ID}/${version}`)
+		expect(fake.og.renders[0]?.card.host).toBe("status.acme.example")
+	})
+
+	it("draws the current card for an old preview URL, cached only as long as the page", async () => {
+		const response = await send(fake, `${PAGE}og.png?v=old`)
+		expect(response.status).toBe(200)
+		expect(response.headers.get("cache-control")).toBe(
+			(await send(fake, PAGE)).headers.get("cache-control"),
+		)
+	})
+
+	it("draws a break-glass incident into the preview", async () => {
+		putOverlayEntry(fake, entry())
+		await send(fake, `${PAGE}og.png`)
+		expect(fake.og.renders[0]?.card.details).toEqual(["Checkout failing"])
+	})
+
+	it("caches a stand-in preview only as long as the page, even under the linked URL", async () => {
+		fake.og.complete = false
+		const html = await (await send(fake, PAGE)).text()
+		const linked =
+			Option.getOrThrow(Str.match(/<meta property="og:image" content="([^"]+)">/u)(html))[1] ?? ""
+		const response = await send(fake, linked)
+		expect(response.headers.get("cache-control")).toBe(
+			(await send(fake, PAGE)).headers.get("cache-control"),
+		)
+	})
+
+	it("answers an uncached 503 when the preview cannot be drawn", async () => {
+		fake.og.fail = true
+		const response = await send(fake, `${PAGE}og.png`)
+		expect(response.status).toBe(503)
+		expect(response.headers.get("cache-control")).toBe("no-store")
 	})
 
 	it("answers /_health without touching storage", async () => {
@@ -373,6 +501,20 @@ describe("break-glass updates", () => {
 		expect(overlayEntries(fake)).toEqual([])
 	})
 
+	it("rate limits an IPv6 client by its /64", async () => {
+		fake.limits.allow = false
+		const fields = new URLSearchParams(await update(TOKEN).text())
+		const response = await send(fake, postForm(`${PAGE}_manage`, [...fields], "2001:db8:12:3400:a:b:c:d"))
+		expect(response.status).toBe(429)
+		expect(fake.limits.keys).toEqual([`2001:db8:12:3400::/64:${FIXTURE_PAGE_ID}`])
+	})
+
+	it("still takes an update when the limiter cannot answer", async () => {
+		fake.limiterDown.add("client")
+		expect((await send(fake, update(TOKEN))).status).toBe(303)
+		expect(overlayEntries(fake)).toHaveLength(1)
+	})
+
 	it("refuses once the page holds the maximum number of listed entry keys", async () => {
 		Array.from({ length: 49 }, (_, index) => putOverlayEntry(fake, entry({ id: `e${index}` })))
 		// A corrupt key still counts toward the cap.
@@ -483,5 +625,136 @@ describe("break-glass updates", () => {
 			]),
 		)
 		expect(overlayEntries(fake)[0]?.componentIds).toEqual([fixtureComponentId(0), fixtureComponentId(1)])
+	})
+})
+
+describe("a page taken off the edge", () => {
+	const SLUG_PAGE = "https://status.maple.workers.dev/s/a1b2c3d4e5f6/acme/"
+	const ROUTES = [
+		"",
+		"feed.rss",
+		"feed.atom",
+		"api/v1/status.json",
+		"api/v1/uptime.json",
+		"badge.svg",
+		"_manage",
+	]
+	const URLS = Arr.flatMap([PAGE, SLUG_PAGE], (base) => Arr.map(ROUTES, (route) => `${base}${route}`))
+	// Past the window in which a colo answers from its cache without asking any store.
+	const LATER = FIXTURE_NOW + CACHE_FRESH_MS + 1
+
+	let fake: FakeStorage
+	beforeEach(async () => {
+		fake = makeFakeStorage()
+		publish(fake, makeSnapshot())
+		// Both addresses were read while the page was public, so the colo holds a copy of each.
+		expect((await send(fake, PAGE)).status).toBe(200)
+		expect((await send(fake, SLUG_PAGE)).status).toBe(200)
+		takeOffEdge(fake, makeSnapshot())
+	})
+
+	const statuses = (urls: ReadonlyArray<string>, nowMs = LATER) =>
+		Promise.all(Arr.map(urls, async (url) => (await send(fake, url, { nowMs })).status))
+
+	it("is not found on any route, with KV answering", async () => {
+		expect(new Set(await statuses(URLS))).toEqual(new Set([404]))
+	})
+
+	it("is not found on any route while KV fails, whatever the colo cached", async () => {
+		fake.failing.add("kv")
+		expect(new Set(await statuses(URLS))).toEqual(new Set([404]))
+		const body = await (await send(fake, PAGE, { nowMs: LATER })).text()
+		expect(body).not.toContain("Acme status")
+	})
+
+	it("is not found by its slug when only the snapshot's tombstone is left", async () => {
+		// The slug's own tombstone is gone, so the lookup falls back to the page id the colo cached.
+		fake.r2.delete(StatusPageKeys.slugObject("acme"))
+		fake.failing.add("kv")
+		expect(await statuses([SLUG_PAGE, `${SLUG_PAGE}feed.rss`])).toEqual([404, 404])
+	})
+
+	it("stays not found when R2 fails as well, once the colo has read the tombstone", async () => {
+		fake.failing.add("kv")
+		expect(await statuses([PAGE, SLUG_PAGE])).toEqual([404, 404])
+		fake.failing.add("r2")
+		expect(await statuses([PAGE, SLUG_PAGE], LATER + 60_000)).toEqual([404, 404])
+	})
+
+	it("refuses a break-glass post instead of saving it", async () => {
+		fake.failing.add("kv")
+		const post = postForm(`${PAGE}_manage`, [
+			["token", TOKEN],
+			["incidentId", "new"],
+			["title", "Payments down"],
+			["body", "We are on it"],
+		])
+		expect((await send(fake, post, { nowMs: LATER })).status).toBe(404)
+		expect(overlayEntries(fake)).toEqual([])
+	})
+
+	it("is served again once a publish replaces the tombstones", async () => {
+		publish(fake, makeSnapshot())
+		fake.failing.add("kv")
+		expect(await statuses([PAGE, SLUG_PAGE, `${PAGE}feed.rss`])).toEqual([200, 200, 200])
+	})
+})
+
+describe("custom domains", () => {
+	const CUSTOM = "https://status.acme.com"
+	let fake: FakeStorage
+	beforeEach(() => {
+		fake = makeFakeStorage()
+		publish(fake, makeSnapshot({ page: { ...makeSnapshot().page, customDomain: "status.acme.com" } }), {
+			host: "status.acme.com",
+		})
+	})
+
+	it("serves the page and every route of it on the custom domain", async () => {
+		const page = await send(fake, `${CUSTOM}/`)
+		expect(page.status).toBe(200)
+		expect(await page.text()).toContain("<title>Acme status</title>")
+		for (const path of ["/feed.atom", "/feed.rss", "/api/v1/status.json", "/badge.svg", "/_manage"])
+			expect((await send(fake, `${CUSTOM}${path}`)).status, path).toBe(200)
+	})
+
+	it("links feeds, status.json and the Slack command to the custom domain, wherever the page is read", async () => {
+		const viaSlug = "https://status.maple.workers.dev/s/a1b2c3d4e5f6/acme"
+		expect(await (await send(fake, `${viaSlug}/feed.atom`)).text()).toContain(
+			`<link rel="self" href="${CUSTOM}/feed.atom"/>`,
+		)
+		expect(await (await send(fake, `${viaSlug}/feed.rss`)).text()).toContain(`<link>${CUSTOM}/</link>`)
+		expect(await (await send(fake, `${viaSlug}/api/v1/status.json`)).json()).toMatchObject({
+			page: { status_url: CUSTOM },
+		})
+		const html = await (await send(fake, `${viaSlug}/`)).text()
+		expect(html).toContain(`/feed subscribe ${CUSTOM}/feed.rss`)
+		expect(html).toContain(`<link rel="canonical" href="${CUSTOM}/">`)
+		expect(html).toContain(`<meta property="og:url" content="${CUSTOM}/">`)
+		expect(await (await send(fake, `${viaSlug}/api/v1/uptime.json`)).json()).toMatchObject({
+			page: { status_url: CUSTOM },
+		})
+	})
+
+	it("answers 404 on a host with no page, and never serves another page by path there", async () => {
+		const unknown = await send(fake, "https://status.other.com/")
+		expect(unknown.status).toBe(404)
+		const bySlug = await send(fake, "https://status.other.com/s/a1b2c3d4e5f6/acme/")
+		expect(bySlug.status).toBe(404)
+		// A page's own domain does not serve /s/<slug> of any page either.
+		expect((await send(fake, `${CUSTOM}/s/a1b2c3d4e5f6/acme/`)).status).toBe(404)
+	})
+})
+
+describe("sharedHostMatcher", () => {
+	const isShared = sharedHostMatcher("status.maple.dev")
+
+	it.each([
+		["status.maple.dev", true],
+		["STATUS.Maple.Dev", true],
+		["status.maple.dev.evil.com", false],
+		["evil-status.maple.dev", false],
+	])("treats %s as shared: %s", (hostname, shared) => {
+		expect(isShared(hostname)).toBe(shared)
 	})
 })

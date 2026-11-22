@@ -24,7 +24,7 @@ import * as Menu from "@maple/views/ui/menu"
 import type { MenuEntry } from "@maple/views/ui/menu-view"
 import { rowActionsMenu } from "@maple/views/ui/row-actions-menu"
 import { statusDot } from "@maple/views/ui/status-dot"
-import { ROW_LINK_LIFT, rowLink } from "@maple/views/ui/table"
+import { ROW_LINK_LIFT, rowNameLink } from "@maple/views/ui/table"
 import { listToolbar, toolbarCount } from "../../kit/list-toolbar"
 import { filteredEmpty } from "@maple/views/ui/signal-empty-state"
 import { HEADROOM_FILL } from "../shared/headroom-tone"
@@ -39,7 +39,7 @@ import { stripClass, dividedList } from "@maple/views/ui/rule"
 import { hstack } from "@maple/views/ui/stack"
 import { borderedBox } from "@maple/views/ui/bordered-box"
 import { Array as Arr, String as Str } from "effect"
-import { canManageAlerts } from "../../kit/session-grants"
+import { gatedEntries } from "../../kit/gated-controls"
 import { toEpochMs } from "@maple/ui/lib/time-format"
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -333,18 +333,11 @@ const ruleRow = (h: H, model: Model, row: RowInputs): Html => {
 			[h.Class("min-w-0 space-y-0.5")],
 			[
 				hstack(h, { gap: "2", shrink: true }, [
-					rowLink(
-						h,
-						{
-							href: ruleHref(rule.id),
-							className: cn(
-								"block truncate text-sm font-medium",
-								!rule.enabled && "text-muted-foreground",
-							),
-							attributes: [h.Title(rule.name)],
-						},
-						[rule.name],
-					),
+					rowNameLink(h, {
+						href: ruleHref(rule.id),
+						name: rule.name,
+						isMuted: !rule.enabled,
+					}),
 					...(isDefault
 						? [badge(h, { variant: "outline", size: "sm", className: "shrink-0" }, ["Default"])]
 						: []),
@@ -375,17 +368,15 @@ const ruleRow = (h: H, model: Model, row: RowInputs): Html => {
 		),
 		h.span(
 			[h.Class(ROW_LINK_LIFT)],
-			canManageAlerts(model)
-				? [
-						rowActionsMenu(h, {
-							slotId: menuId,
-							model: model.menus[menuId] ?? Menu.init(menuId),
-							entries,
-							label: `Actions for ${rule.name}`,
-							toParentMessage: (message) => Message.GotRowMenuMessage({ menuId, message }),
-						}),
-					]
-				: [],
+			[
+				rowActionsMenu(h, {
+					slotId: menuId,
+					model: model.menus[menuId] ?? Menu.init(menuId),
+					entries: gatedEntries(model, "alerts:manage", entries, ["open"]),
+					label: `Actions for ${rule.name}`,
+					toParentMessage: (message) => Message.GotRowMenuMessage({ menuId, message }),
+				}),
+			],
 		),
 	])
 }

@@ -156,6 +156,8 @@ export const ChartSpec = defineTaggedUnion({
 		/** `showPoints`: every point, none, or (absent) only isolated ones unless they fit. */
 		showPoints: Schema.optionalKey(Schema.Boolean),
 		axis: Schema.optionalKey(TimeseriesAxisSpec),
+		/** `per_second`: rate values are already per second (PromQL); absent divides by the bucket. */
+		rateBasis: Schema.optionalKey(Schema.Literals(["per_bucket", "per_second"])),
 	},
 	/**
 	 * The query-builder bar chart (threshold-free, linear): the rows as returned, the resolved colour per
@@ -173,6 +175,10 @@ export const ChartSpec = defineTaggedUnion({
 		stacked: Schema.Boolean,
 		showTooltip: Schema.Boolean,
 		axis: Schema.optionalKey(TimeseriesAxisSpec),
+		/** Series keys the legend has hidden; they are left out of the plot. */
+		hidden: Schema.optionalKey(Schema.Array(Schema.String)),
+		/** `per_second`: rate values are already per second (PromQL); absent divides by the bucket. */
+		rateBasis: Schema.optionalKey(Schema.Literals(["per_bucket", "per_second"])),
 	},
 	/** An issue's occurrences: bucketed counts as bars. */
 	Occurrences: {
@@ -354,7 +360,8 @@ export const ChartSpec = defineTaggedUnion({
 		),
 		/**
 		 * The metric keys behind `primary` and (when paired) `companion`, in paint order. `label`
-		 * names a series that is not an analytics metric (Search Console clicks); it formats as a count.
+		 * names a series that is not an analytics metric (a Search Console metric); it reads in
+		 * `valueFormat`.
 		 */
 		series: Schema.Array(
 			Schema.Struct({
@@ -365,6 +372,12 @@ export const ChartSpec = defineTaggedUnion({
 		),
 		/** The metric whose format the y ticks use. */
 		tickMetric: Schema.String,
+		/**
+		 * How a labelled series and the ticks read; without it the ticks use `tickMetric`'s format
+		 * and a labelled series is a count. `percent` is a 0..1 ratio (CTR), `decimal` one decimal
+		 * place (average position).
+		 */
+		valueFormat: Schema.optionalKey(Schema.Literals(["count", "percent", "decimal"])),
 		/** Resolved `primary` / `companion` colours plus `border` / `background` chrome. */
 		colors: Schema.Record(Schema.String, Schema.String),
 		timeZone: Schema.String,

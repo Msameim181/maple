@@ -15,9 +15,10 @@ import {
 	UnauthorizedError,
 	UserId,
 } from "@maple/domain/http"
-import { mintSessionToken } from "@maple/auth"
-import { ConfigProvider, Effect, Exit, Layer, Option, Schema, Array as Arr, String as Str } from "effect"
+import { mintSessionToken, selfHostedSessionKey } from "@maple/auth"
+import { ConfigProvider, Effect, Exit, Layer, Option, Redacted, Schema, Array as Arr, String as Str } from "effect"
 import { TestClock } from "effect/testing"
+import { AuditLogService } from "@maple/backend/services/audit/AuditLogService"
 import { Env } from "@maple/backend/platform/Env"
 import { cleanupTestDbs, createTestDb, executeSql, type TestDb } from "@maple/backend/testing/test-pglite"
 import { AuthService } from "@maple/backend/services/auth/AuthService"
@@ -143,6 +144,13 @@ const fakeProvisioner = Layer.succeed(OrgProvisioner)({
 })
 
 const ROOT_PASSWORD = "test-root-password"
+// The key a session is signed with when no MAPLE_SESSION_SIGNING_SECRET is set.
+const ROOT_KEY = Effect.runSync(
+	selfHostedSessionKey({
+		MAPLE_ROOT_PASSWORD: Option.some(Redacted.make(ROOT_PASSWORD)),
+		MAPLE_SESSION_SIGNING_SECRET: Option.none(),
+	}),
+)
 
 const makeLayer = (
 	testDb: TestDb,
@@ -170,7 +178,9 @@ const makeLayer = (
 		),
 	)
 	const base = Layer.mergeAll(env, testDb.layer)
-	const revocation = MembershipRevocationService.layer.pipe(Layer.provide(noEdgeCache))
+	const revocation = MembershipRevocationService.layer.pipe(
+		Layer.provide(Layer.mergeAll(noEdgeCache, AuditLogService.layerMemory)),
+	)
 	const directory = Layer.effect(DirectoryService, DirectoryService.make).pipe(
 		Layer.provide(Layer.mergeAll(idp, fakeProvisioner, fakeEmail, revocation)),
 	)
@@ -736,7 +746,7 @@ describe("DirectoryService", () => {
 						ttlSeconds: OIDC_TTL_SECONDS,
 						sessionExpiresAt: NOW_MS / 1000 + 3600,
 					},
-					ROOT_PASSWORD,
+					ROOT_KEY,
 				)
 				// It still verifies until it expires...
 				yield* auth.resolveTenant({ authorization: `Bearer ${legacy.token}` })
@@ -800,14 +810,14 @@ describe("DirectoryService", () => {
 						ttlSeconds: 600,
 						sessionExpiresAt: NOW_MS / 1000 + 3600,
 					},
-					ROOT_PASSWORD,
+					ROOT_KEY,
 				)
 				// A token signed with the root password no longer verifies.
 				const exit = yield* Effect.exit(auth.resolveTenant({ authorization: `Bearer ${legacy.token}` }))
 				assert.instanceOf(failureOf(exit), UnauthorizedError)
 			}),
 			makeIdp().layer,
-			{ MAPLE_SESSION_SECRET: "a-separate-session-secret" },
+			{ MAPLE_SESSION_SIGNING_SECRET: "a-separate-session-secret" },
 		)
 	})
 
@@ -861,7 +871,7 @@ describe("DirectoryService", () => {
 						ttlSeconds: OIDC_TTL_SECONDS,
 						sessionExpiresAt: NOW_MS / 1000 + 3600,
 					},
-					ROOT_PASSWORD,
+					ROOT_KEY,
 				)
 				const [header, payload, signature] = Str.split(".")(login.token)
 				const claims = JSON.parse(Buffer.from(payload ?? "", "base64url").toString("utf8"))

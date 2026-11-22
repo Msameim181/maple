@@ -102,6 +102,81 @@ describe("TinybirdOrgTokenService", () => {
 		}).pipe(Effect.provide(limitedLayer))
 	})
 
+	it.effect("gives Maple's own reads a bucket apart from raw SQL, without the raw-SQL ceiling", () => {
+		const limitedLayer = TinybirdOrgTokenService.layer.pipe(
+			Layer.provide(Env.layer),
+			Layer.provide(testConfig({ TINYBIRD_RAW_SQL_JWT_RPS_LIMIT: "25" })),
+		)
+		return Effect.gen(function* () {
+			const svc = yield* TinybirdOrgTokenService
+			const raw = decodePayload(yield* svc.getOrgReadToken(asOrgId("org_a"), "raw-sql"))
+			const trusted = decodePayload(yield* svc.getOrgReadToken(asOrgId("org_a"), "trusted-read"))
+			assert.notStrictEqual(trusted.name, raw.name)
+			assert.deepStrictEqual(raw.limits, { rps: 25 })
+			assert.isUndefined(trusted.limits)
+			// The same org filter either way. Only Maple's own reads reach the audit log, which
+			// raw SQL is kept out of even inside the caller's org.
+			assert.isTrue(Arr.every(trusted.scopes, (scope) => scope.filter === "OrgId = 'org_a'"))
+			const resources = (payload: typeof raw) => Arr.map(payload.scopes, (scope) => scope.resource)
+			assert.include(resources(trusted), "audit_log")
+			assert.notInclude(resources(raw), "audit_log")
+			assert.deepStrictEqual(
+				Arr.filter(resources(trusted), (name) => !Arr.contains(resources(raw), name)),
+				["audit_log", "audit_trail_events"],
+			)
+		}).pipe(Effect.provide(limitedLayer))
+	})
+
+	it.effect("lists only the datasources a statement names, and all of them when it names none", () =>
+		Effect.gen(function* () {
+			const svc = yield* TinybirdOrgTokenService
+			const resourcesFor = (statement: string) =>
+				Effect.map(svc.getOrgReadToken(asOrgId("org_a"), "trusted-read", statement), (token) =>
+					Arr.map(decodePayload(token).scopes, (scope) => scope.resource),
+				)
+			// `traces` is a prefix of the rollup's name and must not ride in on it.
+			assert.deepStrictEqual(
+				yield* resourcesFor(
+					"SELECT count() FROM traces_aggregates_hourly AS t INNER JOIN logs AS l ON t.OrgId = l.OrgId WHERE t.OrgId = 'org_a'",
+				),
+				["logs", "traces_aggregates_hourly"],
+			)
+			assert.deepStrictEqual(
+				yield* resourcesFor("SELECT 1 FROM default.traces WHERE OrgId = 'org_a'"),
+				["traces"],
+			)
+			const everything = decodePayload(yield* svc.getOrgReadToken(asOrgId("org_a"), "trusted-read"))
+			assert.lengthOf(yield* resourcesFor("SELECT 1"), everything.scopes.length)
+		}).pipe(Effect.provide(layer)),
+	)
+
+	const startsUnsigned = (extra: Record<string, string>) =>
+		Effect.asVoid(TinybirdOrgTokenService).pipe(
+			Effect.provide(
+				TinybirdOrgTokenService.layer.pipe(
+					Layer.provide(Env.layer),
+					Layer.provide(testConfig(extra, false)),
+				),
+			),
+			Effect.exit,
+		)
+
+	it.effect("refuses to start a multi-org deployment on Tinybird without a signing key", () =>
+		Effect.map(startsUnsigned({ MAPLE_AUTH_MODE: "clerk", CLERK_SECRET_KEY: "sk_test_x" }), (exit) => {
+			assert.isTrue(Exit.isFailure(exit))
+			if (Exit.isFailure(exit)) {
+				assert.match(
+					String(Cause.squash(exit.cause)),
+					/multi-org deployment reading Tinybird needs TINYBIRD_SIGNING_KEY/,
+				)
+			}
+		}),
+	)
+
+	it.effect("starts single-org self-hosted without a signing key, which has no other org to isolate", () =>
+		Effect.map(startsUnsigned({}), (exit) => assert.isTrue(Exit.isSuccess(exit))),
+	)
+
 	it.effect("bounds the per-isolate token cache with LRU eviction", () =>
 		Effect.gen(function* () {
 			const svc = yield* TinybirdOrgTokenService

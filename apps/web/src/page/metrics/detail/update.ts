@@ -2,7 +2,7 @@ import { pickerStep } from "../../kit/page-time"
 import { keyedSlot } from "../../kit/keyed-step"
 import { chartEnvHandlers } from "@maple/views/charts/chart-env"
 import type { RequestMode } from "@maple/views/data/keyed"
-import { Option, Array as Arr, Record as Rec } from "effect"
+import { Option, Array as Arr, Record as Rec, Schema } from "effect"
 import { AsyncData, Command, type Update } from "foldkit"
 import * as AddToDashboard from "./add-to-dashboard"
 import { behindToastContent } from "../../dashboards/kit/store"
@@ -23,12 +23,14 @@ import { requestKey } from "@maple/views/data/request-key"
 import type { TimeWindow } from "../../../data/time-range"
 import type { Resources } from "../../../platform/resources"
 import { AppRoute, hrefOf } from "../../../route"
-import type { MetricSearch } from "../../../route/search"
+import { type MetricSearch, MetricSearchAggregation } from "../../../route/search"
 import * as Combobox from "@maple/views/ui/combobox"
 import * as CopyButton from "@maple/views/ui/copy-button"
 import * as Select from "@maple/views/ui/select"
 import { type PageContext, PageOutMessage, type PageReturn } from "../../contract"
 import { routeWindowStep, snapModeOf } from "../../kit/route-window"
+import * as SavedViews from "../../kit/saved-views"
+import { metricViewsExplorer } from "../saved-views"
 import * as TimeRangePicker from "../../kit/time-range-picker"
 import type { PresetValue } from "../../kit/time-controls"
 import {
@@ -254,6 +256,8 @@ const liftAddToDashboard = (
 
 export const AGGREGATION_SELECT_ID = "metric-aggregation"
 
+const toSavedViews = (message: SavedViews.Message) => Message.GotSavedViewsMessage({ message })
+
 export const init = (route: Route, context: PageContext): Return => {
 	const model: Model = {
 		metricName: route.metricName,
@@ -277,9 +281,11 @@ export const init = (route: Route, context: PageContext): Return => {
 			selected: [breakdownKeyOf(route.search)],
 		}),
 		copyLink: CopyButton.init(),
+		copyPromql: CopyButton.init(),
 		addToDashboard: AddToDashboard.init(),
 		chart: Chart.init(),
 		timePicker: TimeRangePicker.init("metric-time-range"),
+		savedViews: SavedViews.init("metric-views"),
 		chartRuntime: { _tag: "Loading" },
 		themeColors: null,
 		refreshVersion: 0,
@@ -287,12 +293,16 @@ export const init = (route: Route, context: PageContext): Return => {
 	}
 	return {
 		model,
-		commands: [resolveCommand(model, context, "Load"), LoadChartRuntime()],
+		commands: [
+			resolveCommand(model, context, "Load"),
+			LoadChartRuntime(),
+			SavedViews.loadCommand(metricViewsExplorer([model.metricName, model.search]), toSavedViews),
+		],
 	}
 }
 
 /** The query changed in the URL: inputs resync, and a new window re-resolves first. */
-export const routeChanged = (model: Model, route: Route, context: PageContext): Return => {
+const routed = (model: Model, route: Route, context: PageContext): Return => {
 	if (metricHref(model, model.search) === metricHref(model, route.search)) return { model }
 	const next = syncControls({
 		...model,
@@ -313,6 +323,9 @@ export const routeChanged = (model: Model, route: Route, context: PageContext): 
 export const contextChanged = (model: Model, context: PageContext): Return =>
 	model.window === null ? { model } : requestAll(model, context, model.window, "Load")
 
+// Every aggregation the picker can offer is one the URL can carry.
+const isSearchAggregation = Schema.is(MetricSearchAggregation)
+
 const liftAggregation = (model: Model, message: Select.Message): Return => {
 	const next = Select.update(model.aggregationSelect, message)
 	const lifted: Return = {
@@ -323,15 +336,7 @@ const liftAggregation = (model: Model, message: Select.Message): Return => {
 	}
 	if (next.outMessage === undefined) return lifted
 	const agg = next.outMessage.value
-	const isKnown =
-		agg === "avg" ||
-		agg === "sum" ||
-		agg === "min" ||
-		agg === "max" ||
-		agg === "count" ||
-		agg === "rate" ||
-		agg === "increase"
-	return isKnown
+	return isSearchAggregation(agg)
 		? { ...lifted, outMessage: patchSearch(lifted.model, { ...model.search, agg }).outMessage }
 		: lifted
 }
@@ -359,6 +364,16 @@ const liftCopyLink = (model: Model, message: CopyButton.Message): Return => {
 		model: { ...model, copyLink: next.model },
 		commands: Command.mapMessages(next.commands, (inner) =>
 			Message.GotCopyLinkMessage({ message: inner }),
+		),
+	}
+}
+
+const liftCopyPromql = (model: Model, message: CopyButton.Message): Return => {
+	const next = CopyButton.update(model.copyPromql, message)
+	return {
+		model: { ...model, copyPromql: next.model },
+		commands: Command.mapMessages(next.commands, (inner) =>
+			Message.GotCopyPromqlMessage({ message: inner }),
 		),
 	}
 }
@@ -519,6 +534,7 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 				(value) => ({ ...model.search, bd: value }),
 			),
 		GotCopyLinkMessage: ({ message: inner }) => liftCopyLink(model, inner),
+		GotCopyPromqlMessage: ({ message: inner }) => liftCopyPromql(model, inner),
 		GotChartMessage: ({ message: inner }) => {
 			const next = Chart.update(model.chart, inner)
 			return {
@@ -529,4 +545,33 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 			}
 		},
 		GotTimePickerMessage: ({ message: inner }) => liftTimePicker(model, inner),
+		GotSavedViewsMessage: ({ message: inner }) =>
+			SavedViews.pageStep(
+				model,
+				inner,
+				metricViewsExplorer([model.metricName, model.search]),
+				toSavedViews,
+				draftsFromView,
+			),
 	})
+
+// A picked view replaces the where and step drafts, and a debounce still pending from the
+// old where draft must not put it back over the view's filter.
+const draftsFromView = (model: Model, search: SavedViews.ViewSearch): Model => ({
+	...model,
+	whereInput: typeof search["where"] === "string" ? search["where"] : "",
+	stepInput: typeof search["step"] === "string" ? search["step"] : "",
+	whereGeneration: model.whereGeneration + 1,
+})
+
+/** The view the old URL was stays the page's view as the URL moves on. */
+const withRememberedView = (model: Model): Model => {
+	const savedViews = SavedViews.remembered(
+		model.savedViews,
+		metricViewsExplorer([model.metricName, model.search]),
+	)
+	return savedViews === model.savedViews ? model : { ...model, savedViews }
+}
+
+export const routeChanged = (model: Model, route: Route, context: PageContext): Return =>
+	routed(withRememberedView(model), route, context)

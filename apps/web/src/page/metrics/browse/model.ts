@@ -6,6 +6,7 @@ import { TimeWindow } from "../../../data/time-range"
 import { MetricsSearch } from "../../../route/search"
 import * as Select from "@maple/views/ui/select"
 import { SignalPresenceData } from "@maple/views/data/signal-presence"
+import * as SavedViews from "../../kit/saved-views"
 import * as TimeRangePicker from "../../kit/time-range-picker"
 import { MetricRow } from "../shared"
 
@@ -56,8 +57,12 @@ export const Model = Schema.Struct({
 	typeSelect: Select.Model,
 	presence: SignalPresenceData.schema,
 	timePicker: TimeRangePicker.Model,
+	/** The header's Views control: the saved metrics views and the one this URL is. */
+	savedViews: SavedViews.Model,
 	...ChartEnvFields,
 	refreshVersion: Schema.Number,
 	isReloading: Schema.Boolean,
+	/** The table's keyboard-focused row; none until J or K is pressed. */
+	focusedIndex: Schema.NullOr(Schema.Number),
 })
 export type Model = typeof Model.Type

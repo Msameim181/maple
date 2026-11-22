@@ -16,7 +16,7 @@ import { defineLabWithFlags } from "../define"
 import { defineMessageUnion } from "foldkit/message"
 import * as PricingCards from "../../page/onboarding/pricing-cards"
 import * as QuickStart from "../../page/onboarding/quick-start"
-import { ConnectMessage } from "../../page/onboarding/quick-start-connect"
+import { ConnectMessage, SETUP_LINK_COPY } from "../../page/onboarding/quick-start-connect"
 import { DEFAULT_QUICK_START_STATE, STEP_IDS } from "../../page/onboarding/quick-start-state"
 import { ready, TeamMessage, updateTeam } from "../../page/onboarding/quick-start-team"
 
@@ -48,6 +48,7 @@ export const PLANS = [
 			meteredItem("logs", 100, 0.3, 1, "then $0.3 per Logs"),
 			meteredItem("traces", 100, 0.3, 1, "then $0.3 per Traces"),
 			meteredItem("metrics", 100, 0.3, 1, "then $0.3 per Metrics"),
+			meteredItem("profiles", 10, 0.6, 1, "then $0.6 per Profiles"),
 			meteredItem("browser_sessions", 5000, 0.002, 1, "then $0.002 per browser session"),
 			meteredItem("product_events", 1_000_000, 0.005, 1000, "then $0.005 per 1,000 product events"),
 		],
@@ -169,6 +170,13 @@ const stepMessage = (model: Model, message: QuickStart.Message): Return => {
 		case "GotTeamMessage":
 			return teamStep(model, message.message)
 		case "GotConnectMessage":
+			// The phone note's "Copy link" copies a sample address: the preview has no page to resume.
+			if (message.message._tag === "ClickedCopySetupLink")
+				return copyStep(
+					model,
+					SETUP_LINK_COPY,
+					CopyButton.Message.ClickedCopy({ text: "https://app.maple.dev/quick-start" }),
+				)
 			return message.message._tag === "GotSnippetCopyMessage"
 				? copyStep(model, message.message.snippet, message.message.message)
 				: { model: screenStep(model, message) }
@@ -226,7 +234,7 @@ const complete = (h: HtmlBuilder<Message>): Html =>
 	h.div(
 		[h.Class("flex min-h-dvh flex-col items-center justify-center gap-6 px-6 py-16 text-center")],
 		[
-			icon(h, "MapleMark", { size: 56, className: "text-primary" }),
+			icon(h, "MapleMark", { size: 56, className: "text-brand-maple" }),
 			h.h1([h.Class("text-2xl font-semibold")], ["Preview complete"]),
 			h.p(
 				[h.Class("max-w-md text-sm text-muted-foreground")],

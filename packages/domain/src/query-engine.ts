@@ -49,8 +49,30 @@ export const MetricsMetric = Schema.Literals([
 	"latest",
 	"rate",
 	"increase",
+	"p50",
+	"p75",
+	"p90",
+	"p95",
+	"p99",
 ])
 export type MetricsMetric = Schema.Schema.Type<typeof MetricsMetric>
+
+/**
+ * The quantile each percentile aggregation reads. On a histogram it is
+ * estimated from the merged buckets; on a gauge or sum it is the quantile of
+ * each series' samples in the bucket.
+ */
+export const METRICS_PERCENTILES = {
+	p50: 0.5,
+	p75: 0.75,
+	p90: 0.9,
+	p95: 0.95,
+	p99: 0.99,
+} as const satisfies Partial<Record<MetricsMetric, number>>
+export type MetricsPercentile = keyof typeof METRICS_PERCENTILES
+
+export const isMetricsPercentile = (metric: MetricsMetric): metric is MetricsPercentile =>
+	metric in METRICS_PERCENTILES
 
 /**
  * How the per-series values of one group are combined (the space aggregation).
@@ -61,7 +83,12 @@ export const MetricsSpaceAggregation = Schema.Literals(QUERY_BUILDER_SPACE_AGGRE
 export type MetricsSpaceAggregation = Schema.Schema.Type<typeof MetricsSpaceAggregation>
 
 export const defaultSpaceAggregation = (metric: MetricsMetric): MetricsSpaceAggregation =>
-	metric === "avg" || metric === "min" || metric === "max" ? metric : "sum"
+	metric === "avg" || metric === "min" || metric === "max"
+		? metric
+		: // Per-series percentiles do not add up; their average is the neutral reading.
+			isMetricsPercentile(metric)
+			? "avg"
+			: "sum"
 
 /** Group-by keys per query across `groupByAttributeKeys` and `groupByResourceAttributeKeys`. */
 export const MAX_METRICS_GROUP_BY_KEYS = 5
@@ -101,6 +128,23 @@ export const TracesMatchModes = Schema.Struct({
 })
 export type TracesMatchModes = Schema.Schema.Type<typeof TracesMatchModes>
 
+export const TRACES_NUMERIC_AGGREGATION_FNS = ["avg", "sum", "min", "max", "p50", "p95", "p99"] as const
+export const TracesNumericAggregationFn = Schema.Literals(TRACES_NUMERIC_AGGREGATION_FNS)
+export type TracesNumericAggregationFn = Schema.Schema.Type<typeof TracesNumericAggregationFn>
+
+export const TRACES_NUMERIC_ATTRIBUTE_KEY_MAX_LENGTH = 256
+
+/** Chart `fn` over a numeric span attribute (`SpanAttributes[key]`) instead of the span count. */
+export const TracesNumericAggregation = Schema.Struct({
+	key: Schema.String.check(
+		Schema.isMinLength(1),
+		Schema.isTrimmed(),
+		Schema.isMaxLength(TRACES_NUMERIC_ATTRIBUTE_KEY_MAX_LENGTH),
+	),
+	fn: TracesNumericAggregationFn,
+})
+export type TracesNumericAggregation = Schema.Schema.Type<typeof TracesNumericAggregation>
+
 export const TracesFilters = Schema.Struct({
 	serviceName: Schema.optional(ServiceName),
 	spanName: Schema.optional(SpanName),
@@ -133,6 +177,8 @@ export const TracesFilters = Schema.Struct({
 	excludedEnvironments: Schema.optional(Schema.Array(DeploymentEnvironment)),
 	excludedNamespaces: Schema.optional(Schema.Array(ServiceNamespace)),
 	excludedCommitShas: Schema.optional(Schema.Array(CommitSha)),
+	// The spec keeps `metric: "count"`; this replaces the charted value.
+	numericAggregation: Schema.optionalKey(TracesNumericAggregation),
 })
 export type TracesFilters = Schema.Schema.Type<typeof TracesFilters>
 
@@ -394,6 +440,13 @@ export const MetricsSparklinesQuery = Schema.Struct({
 })
 export type MetricsSparklinesQuery = Schema.Schema.Type<typeof MetricsSparklinesQuery>
 
+/**
+ * The deepest offset the trace list reads. The client pages by rows consumed (noise
+ * traces are dropped after the read), so it must stop on this, not on rows shown.
+ * Stage 1 only reads the three light sort columns, so a deep offset stays cheap.
+ */
+export const MAX_TRACES_LIST_OFFSET = 2_000
+
 export const TracesListQuery = Schema.Struct({
 	kind: Schema.Literal("list"),
 	source: Schema.Literal("traces"),
@@ -409,15 +462,11 @@ export const TracesListQuery = Schema.Struct({
 	limit: Schema.optional(
 		Schema.Number.check(Schema.isInt(), Schema.isGreaterThan(0), Schema.isLessThanOrEqualTo(200)),
 	),
-	// Bound matches the web list's MAX_RETAINED_TRACES (2000): with server-side
-	// noise filtering the client pages by rows CONSUMED, so a 1000 cap would end
-	// pagination while far fewer rows are visible. Stage 1 only reads the three
-	// light sort columns, so a deep offset stays cheap.
 	offset: Schema.optional(
 		Schema.Number.check(
 			Schema.isInt(),
 			Schema.isGreaterThanOrEqualTo(0),
-			Schema.isLessThanOrEqualTo(2000),
+			Schema.isLessThanOrEqualTo(MAX_TRACES_LIST_OFFSET),
 		),
 	),
 	cursor: Schema.optional(Schema.String),
@@ -532,6 +581,19 @@ export const AttributeValuesQuery = Schema.Struct({
 })
 export type AttributeValuesQuery = Schema.Schema.Type<typeof AttributeValuesQuery>
 
+/**
+ * Prometheus `label/<label>/values?match[]=<match>` over the metric tables: the same discovery
+ * PromQL panels read by, so an imported `label_values(metric, label)` names what panels see.
+ * Answers with an `attributeValues` result.
+ */
+export const PromqlLabelValuesQuery = Schema.Struct({
+	kind: Schema.Literal("promqlLabelValues"),
+	source: Schema.Literal("metrics"),
+	label: Schema.String.check(Schema.isMaxLength(256)),
+	match: Schema.optional(Schema.String.check(Schema.isMaxLength(4096))),
+})
+export type PromqlLabelValuesQuery = Schema.Schema.Type<typeof PromqlLabelValuesQuery>
+
 export const LogsCountQuery = Schema.Struct({
 	kind: Schema.Literal("count"),
 	source: Schema.Literal("logs"),
@@ -559,6 +621,7 @@ export const QuerySpec = Schema.Union([
 	ServicesFacetsQuery,
 	TracesStatsQuery,
 	AttributeValuesQuery,
+	PromqlLabelValuesQuery,
 	LogsCountQuery,
 ])
 export type QuerySpec = Schema.Schema.Type<typeof QuerySpec>

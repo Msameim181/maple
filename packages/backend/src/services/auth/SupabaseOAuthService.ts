@@ -8,10 +8,11 @@ import {
 	type OrgId,
 	type UserId,
 } from "@maple/domain/http"
-import { Clock, Context, Effect, Layer, Option, String as Str } from "effect"
+import { Clock, Context, Effect, Layer, Option, Redacted, String as Str } from "effect"
 import { FetchHttpClient, HttpClient } from "effect/http"
 import { Database } from "@maple/backend/platform/DatabaseLive"
 import { Env, type EnvConfig } from "@maple/backend/platform/Env"
+import { SupabaseOAuthClientSecret } from "@maple/infra/secrets"
 import {
 	isSupabaseTokenRejected,
 	listOrganizations,
@@ -36,10 +37,13 @@ export const SUPABASE_CALLBACK_PATH = "/api/integrations/supabase/callback"
 const apiBaseOf = (env: EnvConfig) => Str.replace(/\/$/, "")(env.MAPLE_SUPABASE_API_BASE_URL)
 
 /** Whether the OAuth app credentials are set; without them the integration reads as not configured. */
-const isSupabaseConfigured = (env: EnvConfig) =>
-	Option.isSome(env.SUPABASE_OAUTH_CLIENT_ID) && Option.isSome(env.SUPABASE_OAUTH_CLIENT_SECRET)
+const isSupabaseConfigured = (env: EnvConfig, clientSecret: Option.Option<Redacted.Redacted>) =>
+	Option.isSome(env.SUPABASE_OAUTH_CLIENT_ID) && Option.isSome(clientSecret)
 
-const resolveConfig = Effect.fn("SupabaseOAuthService.resolveConfig")(function* (env: EnvConfig) {
+const resolveConfig = Effect.fn("SupabaseOAuthService.resolveConfig")(function* (
+	env: EnvConfig,
+	configuredSecret: Option.Option<Redacted.Redacted>,
+) {
 	const missing = (name: string) =>
 		new IntegrationsConfigurationError({
 			message: `${name} is required to use the Supabase integration`,
@@ -47,7 +51,7 @@ const resolveConfig = Effect.fn("SupabaseOAuthService.resolveConfig")(function* 
 	const clientId = yield* Effect.fromOption(env.SUPABASE_OAUTH_CLIENT_ID).pipe(
 		Effect.mapError(() => missing("SUPABASE_OAUTH_CLIENT_ID")),
 	)
-	const clientSecret = yield* Effect.fromOption(env.SUPABASE_OAUTH_CLIENT_SECRET).pipe(
+	const clientSecret = yield* Effect.fromOption(configuredSecret).pipe(
 		Effect.mapError(() => missing("SUPABASE_OAUTH_CLIENT_SECRET")),
 	)
 	const apiBaseUrl = apiBaseOf(env)
@@ -123,9 +127,14 @@ export interface SupabaseOAuthServiceApi {
 	/** Whether a grant is stored and not stamped revoked, i.e. discovery may use it. */
 	readonly isGrantUsable: (orgId: OrgId) => Effect.Effect<boolean, IntegrationsPersistenceError>
 	/** Revoke the grant at Supabase (best effort, logged) and drop the stored tokens. */
-	readonly disconnect: (
-		orgId: OrgId,
-	) => Effect.Effect<{ readonly disconnected: boolean }, IntegrationsPersistenceError>
+	readonly disconnect: (orgId: OrgId) => Effect.Effect<
+		{
+			readonly disconnected: boolean
+			/** False when a stored grant was not revoked at the vendor; the local grant is dropped anyway. */
+			readonly grantRevoked: boolean
+		},
+		IntegrationsPersistenceError
+	>
 }
 
 export class SupabaseOAuthService extends Context.Service<SupabaseOAuthService, SupabaseOAuthServiceApi>()(
@@ -134,6 +143,7 @@ export class SupabaseOAuthService extends Context.Service<SupabaseOAuthService, 
 		make: Effect.gen(function* () {
 			const database = yield* Database
 			const env = yield* Env
+			const clientSecret = yield* SupabaseOAuthClientSecret
 			const httpClient = yield* HttpClient.HttpClient
 			const oauth = yield* makeOAuthConnectionHelpers({
 				provider: SUPABASE_PROVIDER,
@@ -149,7 +159,7 @@ export class SupabaseOAuthService extends Context.Service<SupabaseOAuthService, 
 				options: { readonly callbackUrl: string; readonly returnTo?: string },
 			) {
 				yield* Effect.annotateCurrentSpan({ orgId })
-				const config = yield* resolveConfig(env)
+				const config = yield* resolveConfig(env, clientSecret)
 				const state = yield* newOAuthState
 				const codeVerifier = generateCodeVerifier()
 				yield* oauth.saveState(
@@ -175,7 +185,7 @@ export class SupabaseOAuthService extends Context.Service<SupabaseOAuthService, 
 				state: string,
 				initiator: OAuthFlowInitiator,
 			) {
-				const config = yield* resolveConfig(env)
+				const config = yield* resolveConfig(env, clientSecret)
 				const stateRow = yield* oauth.consumeStateRow(state, initiator)
 				if (stateRow.codeVerifier === null) {
 					return yield* new IntegrationsValidationError({
@@ -278,7 +288,7 @@ export class SupabaseOAuthService extends Context.Service<SupabaseOAuthService, 
 				orgId: OrgId,
 			) {
 				yield* Effect.annotateCurrentSpan({ orgId })
-				const config = yield* resolveConfig(env)
+				const config = yield* resolveConfig(env, clientSecret)
 				// A stamped grant failed a refresh or had a fresh token rejected; reconnecting clears it.
 				const { accessToken } = yield* oauth.getValidConnectionToken(config, orgId, {
 					failIfRevoked: true,
@@ -290,7 +300,7 @@ export class SupabaseOAuthService extends Context.Service<SupabaseOAuthService, 
 				orgId: OrgId,
 				use: (accessToken: string) => Effect.Effect<A, E | SupabaseApiError>,
 			) =>
-				resolveConfig(env).pipe(
+				resolveConfig(env, clientSecret).pipe(
 					Effect.flatMap((config) =>
 						oauth.withRejectedTokenRetry(config, orgId, isSupabaseTokenRejected, use),
 					),
@@ -303,12 +313,13 @@ export class SupabaseOAuthService extends Context.Service<SupabaseOAuthService, 
 				return row !== null && row.revokedAt === null
 			})
 
-			/** Best effort: a failed revoke still drops the local grant, and is logged. */
+			/** Answers whether a stored grant was revoked. Best effort: a failed revoke still drops the local grant, and is logged. */
 			const revokeUpstream = Effect.fn("SupabaseOAuthService.revokeUpstream")(function* (orgId: OrgId) {
-				const config = yield* resolveConfig(env)
 				const row = yield* oauth.loadConnection(orgId)
+				// Nothing stored: there is no grant to leave behind.
+				if (row === null) return true
+				const config = yield* resolveConfig(env, clientSecret)
 				if (
-					row === null ||
 					row.refreshTokenCiphertext === null ||
 					row.refreshTokenIv === null ||
 					row.refreshTokenTag === null
@@ -335,11 +346,12 @@ export class SupabaseOAuthService extends Context.Service<SupabaseOAuthService, 
 					),
 				)
 				yield* Effect.annotateCurrentSpan("maple.supabase.revoked_upstream", revoked)
-				return yield* oauth.deleteConnection(orgId)
+				const deleted = yield* oauth.deleteConnection(orgId)
+				return { ...deleted, grantRevoked: revoked }
 			})
 
 			return {
-				isConfigured: isSupabaseConfigured(env),
+				isConfigured: isSupabaseConfigured(env, clientSecret),
 				apiBaseUrl,
 				startConnect,
 				completeConnect,

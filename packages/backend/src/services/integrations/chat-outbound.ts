@@ -56,6 +56,9 @@ export interface OwnedChatWorkspace {
 	readonly name: string
 	/** The connector's per-workspace secret, or `undefined` for a connector that stored none. */
 	readonly credentials: string | undefined
+	/** The workspace's switches: alert posts to channels, and pages by direct message. */
+	readonly alertsEnabled: boolean
+	readonly directMessagesEnabled: boolean
 }
 
 /**
@@ -102,6 +105,8 @@ export const loadOwnedChatWorkspace = Effect.fn("ChatOutbound.loadOwnedChatWorks
 		externalWorkspaceId: row.externalWorkspaceId,
 		name: row.name,
 		credentials,
+		alertsEnabled: row.alertsEnabled,
+		directMessagesEnabled: row.directMessagesEnabled,
 	})
 })
 
@@ -120,6 +125,18 @@ export const missingOutboundConfig = (
 	)
 
 /**
+ * What a connector reads its credentials from: the deployment's outbound config, and the
+ * workspace's own credential under `WORKSPACE_CREDENTIALS` when it stored one.
+ */
+export const chatConnectorCredentials = (
+	outboundConfig: ConnectorConfig,
+	credentials: string | undefined,
+): ConnectorConfig =>
+	credentials === undefined
+		? outboundConfig
+		: new Map(outboundConfig).set(WORKSPACE_CREDENTIALS, credentials)
+
+/**
  * The workspace's outbound transport, with the deployment's outbound config and the workspace's
  * own credential under `WORKSPACE_CREDENTIALS` — the same map the bot Worker builds for a turn.
  */
@@ -131,11 +148,7 @@ export const chatOutboundTransport = (
 	workspace.connector.outbound.transport.pipe(
 		Effect.provideService(
 			ConnectorCredentials,
-			Effect.succeed(
-				workspace.credentials === undefined
-					? outboundConfig
-					: new Map(outboundConfig).set(WORKSPACE_CREDENTIALS, workspace.credentials),
-			),
+			Effect.succeed(chatConnectorCredentials(outboundConfig, workspace.credentials)),
 		),
 		Effect.provideService(HttpClient.HttpClient, httpClient),
 	)

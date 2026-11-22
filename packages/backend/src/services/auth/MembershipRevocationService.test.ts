@@ -9,6 +9,7 @@ import { parseSecretKeyring, sealSecret } from "@maple/backend/platform/SecretBo
 import { alertDestinationSecretSlot } from "@maple/backend/platform/secret-slots"
 import { cleanupTestDbs, createTestDb, queryFirstRow, type TestDb } from "@maple/backend/testing/test-pglite"
 import { ApiKeysService } from "@maple/backend/services/org/ApiKeysService"
+import { AuditLogService, type AuditLogRecordInput } from "@maple/backend/services/audit/AuditLogService"
 import { CliDeviceAuthService } from "./CliDeviceAuthService"
 import { McpOAuthService } from "./McpOAuthService"
 import { MembershipRevocationService } from "./MembershipRevocationService"
@@ -50,11 +51,24 @@ const recordingEdgeCache = () => {
 	return { invalidated, layer }
 }
 
-const makeLayer = (testDb: TestDb, edgeCache: Layer.Layer<EdgeCacheService>) => {
+const recordingAudit = () => {
+	const recorded: Array<AuditLogRecordInput> = []
+	const layer = Layer.succeed(AuditLogService, {
+		record: (input) => Effect.sync(() => void recorded.push(input)),
+		list: () => Effect.succeed([]),
+	})
+	return { recorded, layer }
+}
+
+const makeLayer = (
+	testDb: TestDb,
+	edgeCache: Layer.Layer<EdgeCacheService>,
+	audit: Layer.Layer<AuditLogService> = recordingAudit().layer,
+) => {
 	const base = Layer.mergeAll(testDb.layer, Env.layer.pipe(Layer.provide(config())))
 	const apiKeys = ApiKeysService.layer.pipe(Layer.provide(base))
 	return Layer.mergeAll(
-		MembershipRevocationService.layer.pipe(Layer.provide(Layer.mergeAll(base, edgeCache))),
+		MembershipRevocationService.layer.pipe(Layer.provide(Layer.mergeAll(base, edgeCache, audit))),
 		McpOAuthService.layer.pipe(Layer.provide(base)),
 		CliDeviceAuthService.layer.pipe(Layer.provideMerge(apiKeys), Layer.provide(base)),
 		apiKeys,
@@ -139,7 +153,8 @@ const seedChatIdentity = (db: TestDb, id: string, org: OrgId, user: UserId) =>
 		),
 	)
 
-const issueMcpGrant = Effect.fnUntraced(function* (
+/** An MCP authorization the user approved and the client has not exchanged yet. */
+const approveMcpAuthorization = Effect.fnUntraced(function* (
 	oauth: McpOAuthService,
 	user: UserId,
 	org: OrgId,
@@ -168,17 +183,30 @@ const issueMcpGrant = Effect.fnUntraced(function* (
 		roles,
 		userEmail: null,
 	})
-	const tokens = yield* oauth.exchangeAuthorizationCode(
+	return { clientId: client.client_id, code: new URL(approved.redirectUri).searchParams.get("code")! }
+})
+
+const exchangeMcpCode = (oauth: McpOAuthService, approval: { clientId: string; code: string }) =>
+	oauth.exchangeAuthorizationCode(
 		{
-			code: new URL(approved.redirectUri).searchParams.get("code")!,
-			clientId: client.client_id,
+			code: approval.code,
+			clientId: approval.clientId,
 			redirectUri,
 			codeVerifier: verifier,
 			resource,
 		},
 		"127.0.0.1",
 	)
-	return { clientId: client.client_id, tokens }
+
+const issueMcpGrant = Effect.fnUntraced(function* (
+	oauth: McpOAuthService,
+	user: UserId,
+	org: OrgId,
+	roles: ReadonlyArray<RoleName> = [memberRole],
+) {
+	const approval = yield* approveMcpAuthorization(oauth, user, org, roles)
+	const tokens = yield* exchangeMcpCode(oauth, approval)
+	return { clientId: approval.clientId, tokens }
 })
 
 /** A digest subscriber row; `optedOut` stamps the member's own opt-out. */
@@ -199,6 +227,35 @@ const digestState = (db: TestDb) =>
 			 from digest_subscriptions order by id`,
 		),
 	).pipe(Effect.map((result) => result.rows))
+
+/** A dashboard plus one live share link on it, made by `creator`. */
+const seedShare = (db: TestDb, id: string, org: OrgId, creator: UserId) =>
+	Effect.promise(async () => {
+		await db.pglite.query(
+			`insert into dashboards (org_id, id, name, payload_json, created_at, updated_at, created_by, updated_by)
+			 values ($1, $2, 'Ops', '{}'::jsonb, now(), now(), $3, $3)`,
+			[org, `dash_${id}`, creator],
+		)
+		await db.pglite.query(
+			`insert into dashboard_shares
+				(org_id, id, dashboard_id, mode, token_hash, token_ciphertext, token_iv, token_tag,
+				 token_suffix, created_at, created_by, updated_at, updated_by)
+			 values ($1, $2, $3, 'public', $2, 'c', 'i', 't', 'sfx', now(), $4, now(), $4)`,
+			[org, id, `dash_${id}`, creator],
+		)
+	})
+
+/** A non-email destination; the secret is never read on this path, so any bytes do. */
+const seedWebhookDestination = (db: TestDb, id: string, org: OrgId, creator: UserId, type = "webhook") =>
+	Effect.promise(() =>
+		db.pglite.query(
+			`insert into alert_destinations
+				(id, org_id, name, type, config_json, secret_ciphertext, secret_iv, secret_tag,
+				 created_at, updated_at, created_by, updated_by)
+			 values ($1, $2, $3 || $1, $3, '{}'::jsonb, 'c', 'i', 't', now(), now(), $4, $4)`,
+			[id, org, type, creator],
+		),
+	)
 
 const countRows = (db: TestDb, sql: string, params: unknown[] = []) =>
 	Effect.promise(() => queryFirstRow<{ count: number }>(db, sql, params)).pipe(
@@ -483,6 +540,26 @@ describe("MembershipRevocationService", () => {
 			const toMember = yield* revocation.demoteMembership(orgId, stayerId, [memberRole])
 			expect(toMember.apiKeysRevoked).toBe(1)
 			expect(yield* stillWorks(engineerToken)).toBe(false)
+
+			// An approval made as an engineer and not yet redeemed mints nothing after the demotion.
+			const pending = yield* cli.start("Laptop", "127.0.0.1")
+			yield* cli.approve(pending.userCode, {
+				orgId,
+				userId: stayerId,
+				roles: [engineerRole],
+				userEmail: null,
+			})
+			// One approved at the role the member keeps survives.
+			const kept = yield* cli.start("Laptop", "127.0.0.1")
+			yield* cli.approve(kept.userCode, {
+				orgId,
+				userId: stayerId,
+				roles: [memberRole],
+				userEmail: null,
+			})
+			yield* revocation.demoteMembership(orgId, stayerId, [memberRole])
+			expect((yield* cli.poll(pending.deviceCode)).status).toBe("expired")
+			expect((yield* cli.poll(kept.deviceCode)).status).toBe("complete")
 		}).pipe(Effect.provide(makeLayer(db, cache.layer)))
 	})
 
@@ -510,6 +587,25 @@ describe("MembershipRevocationService", () => {
 		}).pipe(Effect.provide(makeLayer(db, cache.layer)))
 	})
 
+	it.effect("leaves nothing to exchange from an MCP approval made above the new role", () => {
+		const db = createTestDb(createdDbs)
+		const cache = recordingEdgeCache()
+		return Effect.gen(function* () {
+			const revocation = yield* MembershipRevocationService
+			const oauth = yield* McpOAuthService
+
+			const pending = yield* approveMcpAuthorization(oauth, stayerId, orgId, [engineerRole])
+			const kept = yield* approveMcpAuthorization(oauth, stayerId, orgId, [memberRole])
+			yield* revocation.demoteMembership(orgId, stayerId, [memberRole])
+
+			const refused = yield* Effect.result(exchangeMcpCode(oauth, pending))
+			expect(refused._tag).toBe("Failure")
+			if (refused._tag === "Failure") expect(refused.failure).toMatchObject({ error: "invalid_grant" })
+			// One approved at the role the member keeps is still good.
+			expect((yield* exchangeMcpCode(oauth, kept)).token_type).toBe("Bearer")
+		}).pipe(Effect.provide(makeLayer(db, cache.layer)))
+	})
+
 	it.effect("sweeps every org for a deleted user", () => {
 		const db = createTestDb(createdDbs)
 		const cache = recordingEdgeCache()
@@ -524,5 +620,85 @@ describe("MembershipRevocationService", () => {
 			expect(summary.mobileDevicesDeleted).toBe(2)
 			expect(yield* countRows(db, "select count(*)::int as count from mobile_devices")).toBe(1)
 		}).pipe(Effect.provide(makeLayer(db, cache.layer)))
+	})
+
+	it.effect("revokes the share links a removed member made in that org, keeping the rows", () => {
+		const db = createTestDb(createdDbs)
+		const cache = recordingEdgeCache()
+		const audit = recordingAudit()
+		return Effect.gen(function* () {
+			const revocation = yield* MembershipRevocationService
+			yield* seedShare(db, "dshare_leaver", orgId, userId)
+			yield* seedShare(db, "dshare_leaver_elsewhere", otherOrgId, userId)
+			yield* seedShare(db, "dshare_stayer", orgId, stayerId)
+
+			const summary = yield* revocation.revokeMembership(orgId, userId)
+			const retry = yield* revocation.revokeMembership(orgId, userId)
+
+			expect(summary.dashboardSharesRevoked).toBe(1)
+			expect(retry.dashboardSharesRevoked).toBe(0)
+			const rows = yield* Effect.promise(() =>
+				db.pglite.query<{ id: string; revoked: boolean }>(
+					"select id, revoked_at is not null as revoked from dashboard_shares order by id",
+				),
+			)
+			expect(rows.rows).toEqual([
+				{ id: "dshare_leaver", revoked: true },
+				{ id: "dshare_leaver_elsewhere", revoked: false },
+				{ id: "dshare_stayer", revoked: false },
+			])
+			// One entry per link, and none for the retry that found nothing left.
+			expect(
+				Arr.map(audit.recorded, (entry) => [entry.action, entry.orgId, entry.affectedUserId]),
+			).toEqual([["dashboard_share.revoked", orgId, userId]])
+		}).pipe(Effect.provide(makeLayer(db, cache.layer, audit.layer)))
+	})
+
+	it.effect("disables the webhook and chat destinations a removed member created", () => {
+		const db = createTestDb(createdDbs)
+		const cache = recordingEdgeCache()
+		const audit = recordingAudit()
+		return Effect.gen(function* () {
+			const revocation = yield* MembershipRevocationService
+			yield* seedWebhookDestination(db, "00000000-0000-4000-8000-0000000000e5", orgId, userId)
+			yield* seedWebhookDestination(db, "00000000-0000-4000-8000-0000000000e4", orgId, userId, "teams")
+			yield* seedWebhookDestination(db, "00000000-0000-4000-8000-0000000000e2", otherOrgId, userId)
+			yield* seedWebhookDestination(db, "00000000-0000-4000-8000-0000000000e3", orgId, stayerId)
+			yield* seedEmailDestination(db, "00000000-0000-4000-8000-0000000000d4", orgId, [stayerId])
+			yield* Effect.promise(() =>
+				db.pglite.query("update alert_destinations set created_by = $1 where type = 'email'", [
+					userId,
+				]),
+			)
+
+			const summary = yield* revocation.revokeMembership(orgId, userId)
+
+			expect(summary.alertDestinationsDisabled).toBe(2)
+			const rows = yield* Effect.promise(() =>
+				db.pglite.query<{ id: string; enabled: boolean; disabled_reason: string | null }>(
+					"select id, enabled, disabled_reason from alert_destinations order by id",
+				),
+			)
+			// The email destination is handled by recipient, so a stayer's inbox keeps its alerts.
+			expect(rows.rows).toEqual([
+				{ id: "00000000-0000-4000-8000-0000000000d4", enabled: true, disabled_reason: null },
+				{ id: "00000000-0000-4000-8000-0000000000e2", enabled: true, disabled_reason: null },
+				{ id: "00000000-0000-4000-8000-0000000000e3", enabled: true, disabled_reason: null },
+				{
+					id: "00000000-0000-4000-8000-0000000000e4",
+					enabled: false,
+					disabled_reason: "Creator left the organization",
+				},
+				{
+					id: "00000000-0000-4000-8000-0000000000e5",
+					enabled: false,
+					disabled_reason: "Creator left the organization",
+				},
+			])
+			expect(Arr.map(audit.recorded, (entry) => entry.action)).toEqual([
+				"alert_destination.disabled",
+				"alert_destination.disabled",
+			])
+		}).pipe(Effect.provide(makeLayer(db, cache.layer, audit.layer)))
 	})
 })

@@ -5,9 +5,14 @@
  * Google's error code and reason only, never a response body, transport error or schema issue.
  * The one sentence of Google's that is read, to tell a missing billing account from a missing
  * role, chooses a reason and is dropped.
- * Untraced on purpose: the HTTP client records a span per request, and "not set up yet" is not an
- * exception.
+ * Untraced on purpose: each request gets its own Client span, and "not set up yet" is not an
+ * exception. Monitoring, Cloud Asset and IAM go through `@distilled.cloud/gcp`; the OAuth token
+ * exchange and BigQuery stay on plain HTTP (the SDK drops BigQuery's `error.errors[].reason`).
  */
+import * as Gcp from "@distilled.cloud/gcp"
+import * as CloudAsset from "@distilled.cloud/gcp/cloudasset_v1"
+import * as IamCredentials from "@distilled.cloud/gcp/iamcredentials_v1"
+import * as Monitoring from "@distilled.cloud/gcp/monitoring_v3"
 import { gcpConnectorResourceNames } from "@maple/domain/gcp"
 import {
 	GCP_ASSET_TYPES,
@@ -19,17 +24,22 @@ import type { GcpConnectorId, GcpProjectId } from "@maple/primitives"
 import {
 	Duration,
 	Effect,
+	Layer,
 	Option,
 	Redacted,
+	Schedule,
 	Schema,
 	Array as Arr,
 	Record as Rec,
 	String as Str,
 } from "effect"
-import { HttpClient, HttpClientRequest } from "effect/http"
+import { type HttpClient, HttpClientRequest } from "effect/http"
 import { pemToPkcs8, RS256, signJwt } from "@maple/backend/platform/jwt"
+import * as VendorHttp from "../vendor-http"
+import * as VendorSdk from "../vendor-sdk"
 
-const TOKEN_URL = "https://oauth2.googleapis.com/token"
+const OAUTH_URL = "https://oauth2.googleapis.com"
+const TOKEN_URL = `${OAUTH_URL}/token`
 const IAM_SCOPE = "https://www.googleapis.com/auth/iam"
 // Cloud Asset Inventory accepts no narrower scope. What the token can do is bounded by the
 // reader account's roles, which the setup script keeps to read-only viewers.
@@ -49,6 +59,7 @@ const GcpApi = Schema.Literals([
 	"IAM Credentials",
 	"Cloud Monitoring",
 	"Cloud Asset Inventory",
+	"BigQuery",
 ])
 
 export class GcpApiError extends Schema.TaggedError<GcpApiError>()("@maple/api/integrations/GcpApiError", {
@@ -77,6 +88,8 @@ const errorKind = (status: number): GcpApiError["kind"] =>
 					? "invalid"
 					: "upstream"
 
+const decodeJsonBody = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Unknown))
+
 // Google APIs answer `{ error: { status: "PERMISSION_DENIED" } }`, the OAuth endpoint
 // `{ error: "invalid_grant" }`. Only a value that reads like one of those codes is kept.
 const decodeErrorCode = Schema.decodeUnknownOption(
@@ -90,7 +103,7 @@ const errorCode = (body: unknown): string => {
 	if (Option.isNone(decoded)) return ""
 	const error = decoded.value.error
 	const code = typeof error === "string" ? error : error.status
-	return /^[A-Za-z_]{1,40}$/.test(code) ? ` ${code}` : ""
+	return /^[A-Za-z_]{1,40}$/.test(code) ? code : ""
 }
 
 // A refusal can name its cause in `error.details`, as a `google.rpc.ErrorInfo` whose `reason` is
@@ -105,60 +118,168 @@ const decodeErrorInfo = Schema.decodeUnknownOption(
 	}),
 )
 
+// BigQuery names why it refused a call in the older `error.errors[].reason` (`rateLimitExceeded`,
+// `quotaExceeded`, `billingNotEnabled`), on a 403 that otherwise reads like a missing role.
+const decodeLegacyReasons = Schema.decodeUnknownOption(
+	Schema.Struct({
+		error: Schema.Struct({ errors: Schema.Array(Schema.Struct({ reason: Schema.String })) }),
+	}),
+)
+
+const legacyReason = (body: unknown): string => {
+	const reasons = Arr.map(
+		Arr.flatMap(Option.toArray(decodeLegacyReasons(body)), (decoded) => decoded.error.errors),
+		(error) => error.reason,
+	)
+	if (Arr.contains(reasons, "rateLimitExceeded") || Arr.contains(reasons, "quotaExceeded")) {
+		return "RATE_LIMIT_EXCEEDED"
+	}
+	return Arr.contains(reasons, "billingNotEnabled") ? "BILLING_DISABLED" : ""
+}
+
 const decodeErrorMessage = Schema.decodeUnknownOption(
 	Schema.Struct({ error: Schema.Struct({ message: Schema.String }) }),
 )
 
 // Cloud Monitoring refuses a project without billing with a bare 403: no `ErrorInfo`, only a
 // sentence. Its wording is the one thing that tells that refusal from a missing role.
-const reasonFromMessage = (body: unknown): string | undefined => {
+const reasonFromMessage = (body: unknown): string => {
 	const message = Option.getOrUndefined(decodeErrorMessage(body))?.error.message
-	if (message === undefined) return undefined
+	if (message === undefined) return ""
 	if (Str.includes("requires billing")(message)) return "BILLING_DISABLED"
+	// BigQuery refuses a query over `maximumBytesBilled` with a bare 400.
+	if (Str.includes("exceeded limit for bytes billed")(message)) return "BYTES_BILLED_LIMIT_EXCEEDED"
 	return Str.includes("has not been used")(message) || Str.includes("is disabled")(message)
 		? "SERVICE_DISABLED"
-		: undefined
+		: ""
 }
 
-const errorReason = (body: unknown, kind: GcpApiError["kind"]): string | undefined =>
+const errorInfoReason = (body: unknown): string =>
 	Arr.flatMap(
 		Arr.flatMap(Option.toArray(decodeErrorDetails(body)), (decoded) => decoded.error.details),
 		(detail) => Option.toArray(decodeErrorInfo(detail)),
-	)[0]?.reason ?? (kind === "denied" ? reasonFromMessage(body) : undefined)
+	)[0]?.reason ?? ""
 
-/** One JSON call. `api` names the Google service in the error. */
-const call = <A>(
+/**
+ * What a refusal's parsed body says, kept as `code|ErrorInfo reason|reason read from the message`:
+ * each part a short code with no `|`. The body itself is dropped with the error.
+ */
+const googleDetailOf = (parsed: unknown) => {
+	const fromMessage = reasonFromMessage(parsed)
+	return `${errorCode(parsed)}|${errorInfoReason(parsed)}|${fromMessage === "" ? legacyReason(parsed) : fromMessage}`
+}
+
+const googleDetail = (body: string) => googleDetailOf(Option.getOrNull(decodeJsonBody(body)))
+
+// The SDK keeps the envelope's gRPC `status` (or `code` on an unmapped status), `message` and
+// `details`; the same reading applies to them as to a whole body.
+const decodeSdkRefusal = Schema.decodeUnknownOption(
+	Schema.Struct({
+		status: Schema.optionalKey(Schema.Unknown),
+		code: Schema.optionalKey(Schema.Unknown),
+		message: Schema.optionalKey(Schema.Unknown),
+		details: Schema.optionalKey(Schema.Unknown),
+	}),
+)
+
+const sdkGoogleDetail = (error: VendorSdk.SdkFailure) =>
+	Option.match(decodeSdkRefusal(error), {
+		onNone: () => "||",
+		onSome: (refusal) =>
+			googleDetailOf({
+				error: {
+					status: typeof refusal.status === "string" ? refusal.status : refusal.code,
+					message: refusal.message,
+					details: refusal.details,
+				},
+			}),
+	})
+
+/** A failed call as the poller sees it: Google's status, code and reason, never the body. */
+const toGcpApiError =
+	(api: GcpApiError["api"]) =>
+	(error: VendorHttp.VendorHttpError): GcpApiError => {
+		if (error.status === undefined) {
+			const what =
+				error.kind === "timeout"
+					? "request timed out"
+					: error.kind === "invalid_response"
+						? "answered with an unexpected body"
+						: "request failed"
+			return new GcpApiError({ message: `${api} ${what}`, api, kind: "upstream" })
+		}
+		const kind = errorKind(error.status)
+		const [code, infoReason = "", messageReason = ""] = Str.split("|")(error.detail ?? "")
+		const reason =
+			infoReason !== ""
+				? infoReason
+				: (kind === "denied" || messageReason === "BYTES_BILLED_LIMIT_EXCEEDED") &&
+					  messageReason !== ""
+					? messageReason
+					: undefined
+		return new GcpApiError({
+			message: `${api} returned ${error.status}${code === "" ? "" : ` ${code}`}${reason === undefined ? "" : `, ${reason}`}`,
+			api,
+			kind,
+			...(reason === undefined ? undefined : { reason }),
+		})
+	}
+
+/**
+ * One Google API. A failed GET is tried once more at once; a 429 is never waited out, since the
+ * tick's call budget is better spent on other connectors.
+ */
+export const google = (
 	httpClient: HttpClient.HttpClient,
 	api: GcpApiError["api"],
-	request: HttpClientRequest.HttpClientRequest,
-	decode: (body: unknown) => Effect.Effect<A, Schema.SchemaError>,
-): Effect.Effect<A, GcpApiError> => {
-	const failed = (what: string) => () =>
-		Effect.fail(new GcpApiError({ message: `${api} ${what}`, api, kind: "upstream" }))
-	return Effect.gen(function* () {
-		const response = yield* httpClient.execute(request)
-		const body = yield* response.json.pipe(Effect.orElseSucceed(() => null))
-		if (response.status >= 300) {
-			const kind = errorKind(response.status)
-			const reason = errorReason(body, kind)
-			return yield* new GcpApiError({
-				message: `${api} returned ${response.status}${errorCode(body)}${reason === undefined ? "" : `, ${reason}`}`,
-				api,
-				kind,
-				...(reason === undefined ? undefined : { reason }),
-			})
-		}
-		return yield* decode(body)
-	}).pipe(
-		Effect.timeout(REQUEST_TIMEOUT),
-		Effect.catchTags({
-			HttpClientError: failed("request failed"),
-			TimeoutError: failed("request timed out"),
-			SchemaError: failed("answered with an unexpected body"),
-		}),
-		Effect.annotateSpans("peer.service", "google-cloud"),
-	)
-}
+	baseUrl: string,
+	auth: VendorHttp.VendorAuth,
+) =>
+	VendorHttp.make({
+		httpClient,
+		peerService: "google-cloud",
+		baseUrl,
+		auth,
+		toError: toGcpApiError(api),
+		detail: googleDetail,
+		timeout: REQUEST_TIMEOUT,
+		retry: Schedule.recurs(1),
+		// A page that does not decode is read once more, as before the kit.
+		retryInvalidResponse: true,
+		maxRetryAfter: Duration.zero,
+	})
+
+const STATUS_BY_TAG = Rec.fromEntries(
+	Arr.map(Rec.toEntries(Gcp.HTTP_STATUS_MAP), ([status, error]) => [error.name, Number(status)]),
+)
+
+/** One Google API through the SDK, under the same rules as {@link google}. */
+const googleSdk = (
+	httpClient: HttpClient.HttpClient,
+	api: GcpApiError["api"],
+	credentials: { readonly accessToken: Redacted.Redacted; readonly quotaProject?: string },
+) =>
+	VendorSdk.make({
+		httpClient,
+		peerService: "google-cloud",
+		sdk: Layer.mergeAll(
+			Layer.succeed(Gcp.Credentials, Effect.succeed(credentials)),
+			Layer.succeed(Gcp.Retry.Retry, { while: () => false }),
+		),
+		statusByTag: STATUS_BY_TAG,
+		toError: toGcpApiError(api),
+		detail: sdkGoogleDetail,
+		timeout: REQUEST_TIMEOUT,
+		retry: Schedule.recurs(1),
+		retryInvalidResponse: true,
+		maxRetryAfter: Duration.zero,
+	})
+
+/** The reader's token, its project paying the quota (`x-goog-user-project`). */
+const readerCredentials = (reader: GcpReader) => ({
+	accessToken: reader.accessToken,
+	quotaProject: reader.quotaProject,
+})
 
 const ServiceAccountKey = Schema.Struct({
 	client_email: Schema.String,
@@ -198,9 +319,7 @@ export const importServiceAccountKey = (encoded: Redacted.Redacted) =>
 		),
 	)
 
-const decodeAccessToken = Schema.decodeUnknownEffect(
-	Schema.Struct({ access_token: Schema.RedactedFromValue(Schema.String) }),
-)
+const AccessToken = Schema.Struct({ access_token: Schema.RedactedFromValue(Schema.String) })
 
 /** Maple's own access token: an RS256-signed JWT exchanged at Google's OAuth endpoint. */
 export const fetchMapleAccessToken = Effect.fnUntraced(function* (
@@ -230,23 +349,19 @@ export const fetchMapleAccessToken = Effect.fnUntraced(function* (
 				}),
 		),
 	)
-	const response = yield* call(
-		httpClient,
-		"Google OAuth",
-		HttpClientRequest.post(TOKEN_URL).pipe(
-			HttpClientRequest.bodyUrlParams({
-				grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
-				assertion,
-			}),
-		),
-		decodeAccessToken,
+	const response = yield* google(httpClient, "Google OAuth", OAUTH_URL, VendorHttp.noAuth).json(
+		AccessToken,
+		{
+			method: "POST",
+			path: "/token",
+			form: { grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer", assertion },
+			operation: "signing in",
+		},
 	)
 	return response.access_token
 })
 
-const decodeImpersonatedToken = Schema.decodeUnknownEffect(
-	Schema.Struct({ accessToken: Schema.RedactedFromValue(Schema.String) }),
-)
+const ImpersonatedToken = Schema.Struct({ accessToken: Schema.RedactedFromValue(Schema.String) })
 
 /** A connector's reader account, signed in. Its project pays the quota for what it reads. */
 export interface GcpReader {
@@ -254,11 +369,13 @@ export interface GcpReader {
 	readonly quotaProject: GcpProjectId
 }
 
-const asReader = (reader: GcpReader) => (request: HttpClientRequest.HttpClientRequest) =>
-	request.pipe(
-		HttpClientRequest.bearerToken(reader.accessToken),
-		HttpClientRequest.setHeader("x-goog-user-project", reader.quotaProject),
-	)
+export const asReader =
+	(reader: GcpReader): VendorHttp.VendorAuth =>
+	(request) =>
+		request.pipe(
+			HttpClientRequest.bearerToken(reader.accessToken),
+			HttpClientRequest.setHeader("x-goog-user-project", reader.quotaProject),
+		)
 
 /**
  * A short-lived token for one connector's reader account: the service account the setup script
@@ -272,23 +389,19 @@ export const impersonateReader = Effect.fnUntraced(function* (
 ) {
 	// A project id has nothing to encode; encoding keeps any other stored value inside the path.
 	const account = `${gcpConnectorResourceNames(connector.id).serviceAccountId}@${encodeURIComponent(connector.projectId)}.iam.gserviceaccount.com`
-	const response = yield* call(
-		httpClient,
-		"IAM Credentials",
-		HttpClientRequest.post(
-			`https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${account}:generateAccessToken`,
-		).pipe(
-			HttpClientRequest.bearerToken(mapleToken),
-			HttpClientRequest.bodyJsonUnsafe({
-				scope: [READER_SCOPE],
-				lifetime: `${TOKEN_LIFETIME_SECONDS}s`,
+	const response = yield* googleSdk(httpClient, "IAM Credentials", { accessToken: mapleToken })
+		.call(
+			ImpersonatedToken,
+			IamCredentials.generateAccessTokenProjectsServiceAccounts({
+				name: `projects/-/serviceAccounts/${account}`,
+				body: { scope: [READER_SCOPE], lifetime: `${TOKEN_LIFETIME_SECONDS}s` },
 			}),
-		),
-		decodeImpersonatedToken,
-	).pipe(
-		// Not made through the host project, so its reason says nothing about that project.
-		Effect.mapError(({ message, api, kind }) => new GcpApiError({ message, api, kind })),
-	)
+			{ method: "POST", operation: "impersonating the reader" },
+		)
+		.pipe(
+			// Not made through the host project, so its reason says nothing about that project.
+			Effect.mapError(({ message, api, kind }) => new GcpApiError({ message, api, kind })),
+		)
 	return { accessToken: response.accessToken, quotaProject: connector.projectId } satisfies GcpReader
 })
 
@@ -338,12 +451,10 @@ const TimeSeries = Schema.Struct({
 export type GcpTimeSeries = typeof TimeSeries.Type
 export type GcpBucketOptions = typeof BucketOptions.Type
 
-const decodeTimeSeriesPage = Schema.decodeUnknownEffect(
-	Schema.Struct({
-		timeSeries: Schema.optionalKey(Schema.Array(TimeSeries)),
-		nextPageToken: Schema.optionalKey(Schema.String),
-	}),
-)
+const TimeSeriesPage = Schema.Struct({
+	timeSeries: Schema.optionalKey(Schema.Array(TimeSeries)),
+	nextPageToken: Schema.optionalKey(Schema.String),
+})
 
 export interface GcpTimeSeriesQuery {
 	/** `projects/<id>`, `folders/<number>` or `organizations/<number>`. */
@@ -362,38 +473,43 @@ export const gcpAlignmentMs = (query: Pick<GcpTimeSeriesQuery, "group" | "startM
  * One page of one metric type over `[startMs, endMs]` for everything in the scope, aligned per
  * `gcpAlignmentMs` and reduced to the project plus the labels the table keeps.
  */
+/** The `timeSeries.list` operation of a scope's kind; all three send the same request. */
+const listTimeSeriesOf = (scope: string) =>
+	Str.startsWith("folders/")(scope)
+		? Monitoring.listFoldersTimeSeries
+		: Str.startsWith("organizations/")(scope)
+			? Monitoring.listOrganizationsTimeSeries
+			: Monitoring.listProjectsTimeSeries
+
 export const listTimeSeriesPage = (
 	httpClient: HttpClient.HttpClient,
 	reader: GcpReader,
 	query: GcpTimeSeriesQuery,
 	pageToken: string | undefined,
 ) =>
-	call(
-		httpClient,
-		"Cloud Monitoring",
-		HttpClientRequest.get(`https://monitoring.googleapis.com/v3/${query.scope}/timeSeries`).pipe(
-			asReader(reader),
-			HttpClientRequest.setUrlParams({
-				filter: `metric.type = "${query.metric.type}" AND resource.type = "${query.group.resourceType}"`,
-				"interval.startTime": new Date(query.startMs).toISOString(),
-				"interval.endTime": new Date(query.endMs).toISOString(),
-				"aggregation.alignmentPeriod": `${gcpAlignmentMs(query) / 1000}s`,
-				"aggregation.perSeriesAligner": gcpMetricAligner(query.metric),
-				"aggregation.crossSeriesReducer": query.metric.reducer,
-				"aggregation.groupByFields": [
-					"resource.label.project_id",
-					...Arr.map(query.group.resourceLabels, (label) => `resource.label.${label}`),
-					...Arr.map(
-						[...query.group.resourceMetricLabels, ...query.metric.labels],
-						(label) => `metric.label.${label}`,
-					),
-				],
-				view: "FULL",
-				pageSize: TIME_SERIES_PAGE_SIZE,
-				pageToken,
-			}),
-		),
-		decodeTimeSeriesPage,
+	googleSdk(httpClient, "Cloud Monitoring", readerCredentials(reader)).call(
+		TimeSeriesPage,
+		listTimeSeriesOf(query.scope)({
+			name: query.scope,
+			filter: `metric.type = "${query.metric.type}" AND resource.type = "${query.group.resourceType}"`,
+			"interval.startTime": new Date(query.startMs).toISOString(),
+			"interval.endTime": new Date(query.endMs).toISOString(),
+			"aggregation.alignmentPeriod": `${gcpAlignmentMs(query) / 1000}s`,
+			"aggregation.perSeriesAligner": gcpMetricAligner(query.metric),
+			"aggregation.crossSeriesReducer": query.metric.reducer,
+			"aggregation.groupByFields": [
+				"resource.label.project_id",
+				...Arr.map(query.group.resourceLabels, (label) => `resource.label.${label}`),
+				...Arr.map(
+					[...query.group.resourceMetricLabels, ...query.metric.labels],
+					(label) => `metric.label.${label}`,
+				),
+			],
+			view: "FULL",
+			pageSize: TIME_SERIES_PAGE_SIZE,
+			...(pageToken === undefined ? undefined : { pageToken }),
+		}),
+		{ operation: "reading metrics" },
 	)
 
 const ResourceSearchResult = Schema.Struct({
@@ -411,12 +527,13 @@ const ResourceSearchResult = Schema.Struct({
 })
 export type GcpResourceSearchResult = typeof ResourceSearchResult.Type
 
-const decodeResourcePage = Schema.decodeUnknownEffect(
-	Schema.Struct({
-		results: Schema.optionalKey(Schema.Array(ResourceSearchResult)),
-		nextPageToken: Schema.optionalKey(Schema.String),
-	}),
-)
+const ResourcePage = Schema.Struct({
+	results: Schema.optionalKey(Schema.Array(ResourceSearchResult)),
+	nextPageToken: Schema.optionalKey(Schema.String),
+})
+
+const cloudAsset = (httpClient: HttpClient.HttpClient, reader: GcpReader) =>
+	googleSdk(httpClient, "Cloud Asset Inventory", readerCredentials(reader))
 
 export const searchResourcesPage = (
 	httpClient: HttpClient.HttpClient,
@@ -424,19 +541,16 @@ export const searchResourcesPage = (
 	scope: string,
 	pageToken: string | undefined,
 ) =>
-	call(
-		httpClient,
-		"Cloud Asset Inventory",
-		HttpClientRequest.get(`https://cloudasset.googleapis.com/v1/${scope}:searchAllResources`).pipe(
-			asReader(reader),
-			HttpClientRequest.setUrlParams({
-				assetTypes: GCP_ASSET_TYPES,
-				readMask: Arr.join(Rec.keys(ResourceSearchResult.fields), ","),
-				pageSize: RESOURCE_PAGE_SIZE,
-				pageToken,
-			}),
-		),
-		decodeResourcePage,
+	cloudAsset(httpClient, reader).call(
+		ResourcePage,
+		CloudAsset.searchAllResourcesV1({
+			scope,
+			assetTypes: [...GCP_ASSET_TYPES],
+			readMask: Arr.join(Rec.keys(ResourceSearchResult.fields), ","),
+			pageSize: RESOURCE_PAGE_SIZE,
+			...(pageToken === undefined ? undefined : { pageToken }),
+		}),
+		{ operation: "listing resources" },
 	)
 
 /** What Maple reads of a Cloud SQL instance: the Cloud SQL Admin API's `DatabaseInstance`. */
@@ -467,22 +581,18 @@ const SqlInstanceData = Schema.Struct({
 })
 export type GcpSqlInstanceData = typeof SqlInstanceData.Type
 
-const decodeSqlInstancePage = Schema.decodeUnknownEffect(
-	Schema.Struct({
-		assets: Schema.optionalKey(
-			Schema.Array(
-				Schema.Struct({
-					/** The full resource name, as the search answers it. */
-					name: Schema.String,
-					resource: Schema.optionalKey(
-						Schema.Struct({ data: Schema.optionalKey(SqlInstanceData) }),
-					),
-				}),
-			),
+const SqlInstancePage = Schema.Struct({
+	assets: Schema.optionalKey(
+		Schema.Array(
+			Schema.Struct({
+				/** The full resource name, as the search answers it. */
+				name: Schema.String,
+				resource: Schema.optionalKey(Schema.Struct({ data: Schema.optionalKey(SqlInstanceData) })),
+			}),
 		),
-		nextPageToken: Schema.optionalKey(Schema.String),
-	}),
-)
+	),
+	nextPageToken: Schema.optionalKey(Schema.String),
+})
 
 /**
  * One page of the Cloud SQL instances in a scope with their settings, for the inventory sync:
@@ -495,17 +605,14 @@ export const listSqlInstancesPage = (
 	scope: string,
 	pageToken: string | undefined,
 ) =>
-	call(
-		httpClient,
-		"Cloud Asset Inventory",
-		HttpClientRequest.get(`https://cloudasset.googleapis.com/v1/${scope}/assets`).pipe(
-			asReader(reader),
-			HttpClientRequest.setUrlParams({
-				assetTypes: "sqladmin.googleapis.com/Instance",
-				contentType: "RESOURCE",
-				pageSize: RESOURCE_PAGE_SIZE,
-				pageToken,
-			}),
-		),
-		decodeSqlInstancePage,
+	cloudAsset(httpClient, reader).call(
+		SqlInstancePage,
+		CloudAsset.listAssets({
+			parent: scope,
+			assetTypes: ["sqladmin.googleapis.com/Instance"],
+			contentType: "RESOURCE",
+			pageSize: RESOURCE_PAGE_SIZE,
+			...(pageToken === undefined ? undefined : { pageToken }),
+		}),
+		{ operation: "listing Cloud SQL instances" },
 	)

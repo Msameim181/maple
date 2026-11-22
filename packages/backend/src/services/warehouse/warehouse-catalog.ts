@@ -81,6 +81,11 @@ const TABLE_NOTES: Record<string, ReadonlyArray<string>> = {
 		"Aggregate state columns: merge `DurationQuantiles` with `quantilesTDigestMerge(0.5, 0.95, 0.99)` (NANOSECONDS), `BodySizeQuantiles` with `quantilesTDigestIfMerge(0.5, 0.95, 0.99)` (bytes), `UserAgents` with `approx_top_kMerge(10)`, and `SlowestTraceId`/`SlowestTimestamp`/`SlowestBodySize` with `argMaxMerge` (`SlowestBodySize` -1 = no body size). Sum `SpanCount`/`EstimatedSpanCount`/`BodyCount`.",
 		"Keeps 90 days at hour grain. Sorting key: `(OrgId, ServiceName, Hour, DeploymentEnv, SpanName, HttpStatusCode, ErrorType)`.",
 	],
+	aws_metrics_hourly: [
+		"One row per AWS series (`MetricType` 'sum' or 'gauge', `MetricName`, `ServiceName`, `Attributes`, `CloudRegion`, `CloudAccountId`) and `Hour` of the CloudWatch stream's `aws.*` metrics. ALWAYS prefer this over `metrics_sum` / `metrics_gauge` for `aws.*` metrics over more than a few hours.",
+		"Sum `Total` and `Samples` (a gauge's mean is `sum(Total) / sum(Samples)`), `max(Peak)`, `max(LastSeen)`.",
+		"Keeps 90 days at hour grain: snap range bounds with `toStartOfHour`. Sorting key: `(OrgId, MetricType, MetricName, Hour, ServiceName, Attributes, CloudRegion, CloudAccountId)`.",
+	],
 	user_activity_hourly: [
 		"One row per (`ServiceNamespace`, `UserId`, `Hour`, `ServiceName`) of spans and logs carrying `user.id` (else `enduser.id`). ALWAYS prefer this over `traces` + `SpanAttributes['user.id']` for per-user request, error and log counts.",
 		"Sum `SpanCount`, `ErrorSpanCount`, `RequestCount` (entry-point spans), `FailedRequestCount`, `LogCount`, `WarnLogCount`, `ErrorLogCount`; `min(FirstSeen)` / `max(LastSeen)`. Merge `TraceIds` / `SessionIds` with `uniqIfMerge`, `RequestDurationQuantiles` with `quantilesTDigestIfMerge(0.5, 0.95)` (NANOSECONDS), `TopRoutes` with `approx_top_kMerge(10)` (drop the '' entry).",
@@ -148,7 +153,7 @@ const TABLE_NOTES: Record<string, ReadonlyArray<string>> = {
 	service_usage: [
 		"Hourly per-service rollup of STORED rows, 365-day TTL — far longer than the 30-day `logs`/`traces` retention, so it is the right table for long-range volume trends.",
 		"`Hour` is a top-of-hour DateTime. Snap both range bounds to their hour floor (`toStartOfHour`) or sub-hour windows return no rows at all; this necessarily over-reports at the window edges.",
-		"The `*SizeBytes` columns are STORAGE ESTIMATES, not measured bytes — the materialized views compute them as `length(Body) + 200` (logs), `length(SpanName) + 300` (spans) and flat per-point constants (metrics). They will NOT reconcile with an Autumn invoice and must never be presented as billed usage.",
+		"The `*SizeBytes` columns are STORAGE ESTIMATES, not measured bytes: the materialized views compute them as `length(Body) + 200` (logs), `length(SpanName) + 300` (spans), flat per-point constants (metrics) and `length(Frames) * 16 + 200` per stack row (profiles, `ProfileRowCount` / `ProfileSizeBytes`, 0 before migration 0068). They will NOT reconcile with an Autumn invoice and must never be presented as billed usage.",
 		"For real billed bytes use `metrics_sum` / `maple_ingest_org_bytes_total`, which records the decoded payload size the gateway actually metered. Counts here are also post-sampling and post-drop, i.e. what was stored, not what was accepted.",
 		"`TraceCount` counts stored SPANS (not distinct traces) and `LogCount` log records; there is no `SpanCount` column.",
 		"Metric counts are split across four columns by point type (`SumMetricCount`, `GaugeMetricCount`, `HistogramMetricCount`, `ExpHistogramMetricCount`) — add all four for a total metric-point count.",
@@ -158,6 +163,15 @@ const TABLE_NOTES: Record<string, ReadonlyArray<string>> = {
 		"Hourly per-source rollup of STORED rows, keyed by `SourceId`, the public `src_…` id the ingest gateway stamps as `ResourceAttributes['maple_source_id']`. Rows without a source id are not counted here.",
 		"`SpanCount`, `LogCount` and `MetricCount` (data points across every metric type) with `*SizeBytes` STORAGE ESTIMATES computed like `service_usage`'s; never present them as billed usage.",
 		"Filled forward by its views from migration 0046, never backfilled, 90-day TTL.",
+	],
+	cost_daily: [
+		"Time column: `Date`, midnight UTC of the usage day. Filter whole days: `Date >= toStartOfDay($__startTime) AND Date <= $__endTime`. The newest days are restated by the provider for days to weeks and carry `Estimated = 1` until final.",
+		"Versions: each pull writes a source's whole day with one `IngestedAt`, and a restated day can drop keys an older pull still holds. Keep only each day's newest pull: `AND (SourceId, Date, IngestedAt) IN (SELECT SourceId, Date, max(IngestedAt) FROM cost_daily WHERE <the OrgId, SourceId and Date filters only> GROUP BY SourceId, Date)`, never argMax per key. Keep every other filter (region, service, ...) out of that subquery, or an older pull that still has the value comes back.",
+		"Money: `BilledCost` is what the provider invoices; `EffectiveCost` spreads upfront commitments over their term; both in `Currency`, never converted. A sum is only meaningful within one `Currency`: group by it or filter on it, never add across. `Basis` is 'billed' (provider-reported money) or 'estimated' (usage times list price). Float64: round sums to cents for display.",
+		"`CloudService` is the provider's own service name; `ServiceName` is the telemetry service the resource resolves to and is '' when none does. `Region` is '' or 'global' for charges with no region. `ResourceId` is '' unless the source supplies resource-level cost.",
+		"`ChargeCategory` is 'none' on the zero row that only versions an empty day (exclude it from counts), 'tax' for tax, and 'unknown' where the provider does not split charge types: AWS rows net credits, refunds and commitment fees into their service. `AccountId` is the connected account: for an AWS management account, the charges of its member accounts are included and not split out.",
+		"A disconnected source keeps its rows: the cost tools read only an org's active sources, so filter `SourceId` when a total must match them.",
+		"Pulled into Maple's managed warehouse only: an org on its own ClickHouse reads it empty here.",
 	],
 	search_console_daily: [
 		"Time column: `Date`, midnight UTC holding Google's Pacific day. Filter whole days: `Date >= toStartOfDay($__startTime) AND Date <= $__endTime`. Imports run through today, so the newest days are partial (Google reports with a 2 to 3 day lag): end windows at yesterday (Pacific) or earlier for complete days.",
@@ -246,19 +260,21 @@ export interface TableInfo extends TableSummary {
  * The audit log records every member's activity and origin IP and is served
  * only through the admin-gated `GET /v2/audit_log`; letting `run_sql` or a
  * dashboard widget read it would bypass that gate (and let the log observe
- * itself being read).
+ * itself being read). The unified audit trail carries the same kind of data
+ * for every connected platform and sits behind the same permission.
  */
-const RAW_SQL_HIDDEN_DATASOURCES: ReadonlySet<string> = new Set(["audit_log"])
+const RAW_SQL_HIDDEN_DATASOURCES: ReadonlySet<string> = new Set(["audit_log", "audit_trail_events"])
 
+// `Datasources` exports a mix of datasource definitions, type aliases, helper
+// functions, and constant lookup tables. `isDatasourceDefinition` is the
+// runtime filter; we cast to `unknown` first because the static union of all
+// exports is too wide for TS to narrow with the predicate.
+const collectEveryDatasource = () =>
+	Arr.filter(Rec.values(Datasources) as ReadonlyArray<unknown>, isDatasourceDefinition)
+
+/** What a caller's SQL, the table list and `describe` may see. */
 function collectDatasources() {
-	// `Datasources` exports a mix of datasource definitions, type aliases, helper
-	// functions, and constant lookup tables. `isDatasourceDefinition` is the
-	// runtime filter; we cast to `unknown` first because the static union of all
-	// exports is too wide for TS to narrow with the predicate.
-	return Arr.filter(
-		Arr.filter(Rec.values(Datasources) as ReadonlyArray<unknown>, isDatasourceDefinition),
-		(ds) => !RAW_SQL_HIDDEN_DATASOURCES.has(ds._name),
-	)
+	return Arr.filter(collectEveryDatasource(), (ds) => !RAW_SQL_HIDDEN_DATASOURCES.has(ds._name))
 }
 
 export function listWarehouseTables(): ReadonlyArray<TableSummary> {
@@ -285,6 +301,20 @@ export function listOrgScopedDatasourceNames(): ReadonlyArray<string> {
 	return Arr.sort(
 		Arr.map(
 			Arr.filter(collectDatasources(), (ds) => "OrgId" in ds._schema),
+			(ds) => ds._name,
+		),
+		Order.String,
+	)
+}
+
+/**
+ * Every datasource with an `OrgId` column, the ones raw SQL must not reach included: what a
+ * query Maple compiled may read under an org-scoped token. Never the allowlist for caller SQL.
+ */
+export function listTrustedReadDatasourceNames(): ReadonlyArray<string> {
+	return Arr.sort(
+		Arr.map(
+			Arr.filter(collectEveryDatasource(), (ds) => "OrgId" in ds._schema),
 			(ds) => ds._name,
 		),
 		Order.String,

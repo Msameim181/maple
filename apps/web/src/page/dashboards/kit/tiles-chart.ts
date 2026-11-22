@@ -13,7 +13,7 @@ import * as HeatmapChart from "@maple/views/charts/heatmap-chart"
 import * as HistogramChart from "@maple/views/charts/histogram-chart"
 import * as PathsChart from "@maple/views/charts/paths-chart"
 import * as PieChart from "@maple/views/charts/pie-chart"
-import { hoistedSeries } from "@maple/views/charts/timeseries"
+import { hoistedSeries, type RateBasis } from "@maple/views/charts/timeseries"
 import type { TimeseriesAxisSpec } from "@maple/views/charts/chart-spec"
 import { resolveColor, type ThemeColors } from "@maple/views/charts/theme-colors"
 import { validateCssColor } from "@maple/ui/lib/sanitizers"
@@ -24,7 +24,8 @@ import type { TileContext, TileWidget } from "./tiles"
 import { frame } from "./tiles-frame"
 import { isServiceChart, serviceChart, serviceLegend } from "./tiles-service"
 import { chartFrameClass } from "@maple/views/ui/chart-frame"
-import { Array as Arr, Record as Rec } from "effect"
+import { Array as Arr, Predicate, Record as Rec } from "effect"
+import { dataSourceEndpoint, PRODUCT_EVENTS_FUNNEL_ENDPOINT } from "@maple/widgets/dashboard"
 
 // Each chart branch hands its chart only the settings it declares.
 // TODO(chart-axes): line/area/bar thresholds, log scale and soft bounds are not drawn yet.
@@ -82,6 +83,21 @@ const toPrimitiveRows = (rows: Rows): ReadonlyArray<Primitive> =>
 			),
 		),
 	)
+
+/**
+ * The funnel's bars are ordered steps of one population, not categories: it reads the product-event
+ * funnel route. A share strips the endpoint, so there any route-fed funnel counts.
+ */
+const isStepFunnel = (dataSource: unknown): boolean => {
+	const endpoint = dataSourceEndpoint(dataSource)
+	return endpoint === null
+		? Predicate.hasProperty(dataSource, "kind") && dataSource.kind === "route"
+		: endpoint === PRODUCT_EVENTS_FUNNEL_ENDPOINT
+}
+
+/** PromQL answers rates per second already; every other source's rates are counts per bucket. */
+export const rateBasisOf = (dataSource: unknown): RateBasis =>
+	Predicate.hasProperty(dataSource, "kind") && dataSource.kind === "promql" ? "per_second" : "per_bucket"
 
 const skeletonOf = (category: ChartCategory, widget: Widget): ChartSkeletonVariant =>
 	category === "funnel" && widget.display.funnel?.variant === "dropoff" ? "funnel-dropoff" : category
@@ -147,6 +163,7 @@ const chartView = <M>(h: HtmlBuilder<M>, ctx: TileContext<M>, widget: Widget, re
 					data: primitiveRows(data),
 					theme,
 					unit: display.unit,
+					rateBasis: rateBasisOf(widget.dataSource),
 					timeZone: ctx.timeZone,
 					nowMs: ctx.nowMs,
 					className,
@@ -173,6 +190,7 @@ const chartView = <M>(h: HtmlBuilder<M>, ctx: TileContext<M>, widget: Widget, re
 					data: primitiveRows(data),
 					theme,
 					unit: display.unit,
+					rateBasis: rateBasisOf(widget.dataSource),
 					timeZone: ctx.timeZone,
 					nowMs: ctx.nowMs,
 					stacked: display.stacked === true,
@@ -260,6 +278,7 @@ const chartView = <M>(h: HtmlBuilder<M>, ctx: TileContext<M>, widget: Widget, re
 				className,
 				unit: display.unit,
 				showStepPercent: display.funnel?.showStepPercent,
+				isSingleHue: isStepFunnel(widget.dataSource),
 			}
 			return display.funnel?.variant === "dropoff"
 				? h.submodel({ ...common, view: FunnelDropoffChart.view, viewInputs: inputs })

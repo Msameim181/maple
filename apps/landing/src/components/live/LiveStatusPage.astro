@@ -1,0 +1,98 @@
+---
+/**
+ * LiveStatusPage: the real public status page (`@maple/status-page`'s renderer, the same
+ * HTML `apps/status` serves), first operational and then with `Checkout API` down and an
+ * incident open. Both states render at build time into sandboxed iframes with scripts off,
+ * so the page's own styles stay isolated, and they crossfade on one 14s loop.
+ *
+ * The base (unanimated) state is the outage, which is what `prefers-reduced-motion` shows.
+ */
+import { demoPageHtml, MAPLE_DARK } from "../../lib/status-page-demo"
+
+interface Props {
+	/** The page's height from `sm` up, e.g. "30rem". Shorter shows less of the page, never a scaled one. */
+	height?: string
+}
+
+const { height } = Astro.props
+const operational = demoPageHtml(MAPLE_DARK, "operational")
+const outage = demoPageHtml(MAPLE_DARK, "outage")
+---
+
+<div class="live-frame">
+	<div class="live-frame__head">
+		<span>status.acme.com</span>
+		<span class="live-frame__live">
+			<span class="live-frame__live-dot"></span>
+			DEMO
+		</span>
+	</div>
+
+	<!-- inert: the frames are pictures. It keeps their buttons and links out of the tab order
+	     and hides them from assistive tech, which reads this sentence instead. -->
+	<p class="sr-only">
+		A demo of the Acme status page: all systems operational, then a major outage of Checkout API with an
+		open incident.
+	</p>
+	<div class="lsp-stage" style={height ? `--lsp-height: ${height};` : undefined}>
+		<iframe class="lsp-page lsp-page--before" srcdoc={operational} sandbox="" loading="lazy" inert title="Acme status page, operational"></iframe>
+		<iframe class="lsp-page lsp-page--after" srcdoc={outage} sandbox="" loading="lazy" inert title="Acme status page, major outage"></iframe>
+	</div>
+
+	<div
+		class="flex justify-between gap-4 border-t border-border bg-bg-elevated px-3.5 py-2.5 text-[10px] uppercase tracking-wider text-fg-muted"
+	>
+		<span>status from monitor checkout-api</span>
+		<span class="hidden sm:inline">rss · atom · status.json · badge.svg</span>
+	</div>
+</div>
+
+<style>
+	.lsp-stage {
+		display: grid;
+		/* Tall enough on desktop to reach Checkout API's 90-day bars below the incident. */
+		height: var(--lsp-height, 830px);
+		overflow: hidden;
+		/* The maple theme's dark background, so the frame never flashes while the iframes load. */
+		background: #1a1714;
+	}
+	.lsp-page {
+		grid-area: 1 / 1;
+		width: 100%;
+		height: 100%;
+		border: 0;
+		/* A picture of the page: clicks would navigate inside the frame. */
+		pointer-events: none;
+	}
+
+	/* 0–26% operational, then the monitor fails and the outage page holds until 96%. */
+	.lsp-page--after {
+		animation: lsp-after 14s linear infinite;
+	}
+	@keyframes lsp-after {
+		0%,
+		25% {
+			opacity: 0;
+		}
+		28%,
+		96% {
+			opacity: 1;
+		}
+		100% {
+			opacity: 0;
+		}
+	}
+
+	@media (max-width: 639px) {
+		.lsp-stage {
+			height: 520px;
+		}
+	}
+
+	/* Reduced motion: the base state is the outage. */
+	@media (prefers-reduced-motion: reduce) {
+		.lsp-page--after {
+			animation: none;
+		}
+	}
+</style>

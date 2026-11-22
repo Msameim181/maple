@@ -1,92 +1,52 @@
-import { type StatusPageComponentId, StatusPageIncidentImpact } from "@maple/domain"
-import type { V2StatusPageComponent, V2StatusPageIncident } from "@maple/domain/http/v2"
+import type { StatusPageIncidentImpact } from "@maple/domain"
+import type { V2StatusPageIncident } from "@maple/domain/http/v2"
 import { formatTimestampInTimezone } from "@maple/ui/lib/timezone-format"
-import type { Html, HtmlBuilder } from "foldkit/html"
+import type { ChildAttribute, Html, HtmlBuilder } from "foldkit/html"
 import { failureMessage, type LoadFailure } from "@maple/views/data/load-failure"
 import { alert, alertDescription, alertTitle } from "@maple/views/ui/alert"
 import { button } from "@maple/views/ui/button"
-import * as Checkbox from "@maple/views/ui/checkbox"
 import { badge } from "@maple/views/ui/display"
 import { eyebrow } from "@maple/views/ui/eyebrow"
 import { icon } from "@maple/views/ui/icon"
-import { segmentedSelect } from "@maple/views/ui/segmented-select"
 import { timestamp } from "@maple/views/ui/timestamp"
-import { heading } from "@maple/views/ui/heading"
-import { label } from "@maple/views/ui/label"
-import { INCIDENT_STATUS_LABEL } from "@maple/status-page"
+import { INCIDENT_STATUS_LABEL, renderUpdateBody } from "@maple/status-page"
+import { cn } from "@maple/ui/lib/utils"
 import { relativeTime } from "../../kit/relative-time"
-import {
-	closingStatus,
-	COMPONENT_STATUS_LABEL,
-	COMPONENT_STATUS_OPTIONS,
-	componentStatus,
-	IMPACT_LABEL,
-	isOpenIncident,
-	STATUSES_OF_KIND,
-} from "../shared/derive"
-import { selectField, textareaField, textField } from "../shared/fields"
-import { incidentIssues } from "../shared/form"
+import { IMPACT_LABEL, IMPACT_TONE, isOpenIncident } from "../shared/derive"
 import { checkedRows, hasRowIssues } from "../shared/picker"
 import { pickerView } from "../shared/picker-view"
 import { FocusNewRow } from "./command"
 import { Message } from "./message"
-import { canManage, type Model } from "./model"
-import { componentsOf, incidentsOf, monitorsOf } from "./reads"
-import { ADD_PICKER_ID, PANEL_TITLE_ID } from "./update-components"
-import { INCIDENT_EDIT_TITLE_ID, UPDATE_BODY_ID } from "./update-incidents"
-import { typography, typographyClass } from "@maple/views/ui/typography"
+import type { Model } from "./model"
+import { gatedControl } from "../../kit/session-grants"
+import { componentsOf, monitorsOf } from "./reads"
+import { ADD_PICKER_ID } from "./update-components"
+import { typography } from "@maple/views/ui/typography"
 import { hstack, vstack, vstackClass } from "@maple/views/ui/stack"
-import { Array as Arr, String as Str } from "effect"
+import { Array as Arr } from "effect"
 
-// The side panel: one component (saved as you go), one incident, the composer, or Add component.
+// The side sheet: one incident or maintenance with its actions and updates, or Add monitors.
 
 type H = HtmlBuilder<Message>
 
 export type TimeInputs = Readonly<{ nowMs: number; timeZone: string }>
 
-const frame = (
-	h: H,
-	options: Readonly<{ kind: string; title: string; status?: Html }>,
-	children: ReadonlyArray<Html>,
-): Html =>
-	h.aside(
+/** The public page's update markup: paragraphs, lists, code and links. */
+const UPDATE_BODY_CLASS =
+	"space-y-2 text-sm text-foreground-soft [&_a]:text-primary [&_a]:underline [&_code]:font-mono [&_code]:text-xs [&_ol]:list-decimal [&_ol]:pl-5 [&_ul]:list-disc [&_ul]:pl-5"
+
+/** An update's message as the public page renders it, so the editor shows what visitors read. */
+export const updateBody = (h: H, body: string, className?: string): Html =>
+	h.div(
 		[
-			h.AriaLabelledBy(PANEL_TITLE_ID),
-			h.Class("flex min-w-0 flex-col gap-5 rounded-lg border bg-background p-4"),
+			h.Class(cn(UPDATE_BODY_CLASS, className)),
+			h.DataAttribute("slot", "update-body"),
+			h.InnerHTML(renderUpdateBody(body)),
 		],
-		[
-			vstack(h, { gap: "3", align: "start" }, [
-				button(
-					h,
-					{
-						size: "xs",
-						variant: "ghost",
-						className: "-ml-2",
-						attributes: [h.OnClick(Message.ClickedClosePanel())],
-					},
-					[icon(h, "ArrowLeftIcon"), "On this page"],
-				),
-				vstack(h, { gap: "1", shrink: true, className: "max-w-full" }, [
-					eyebrow(h, {}, [options.kind]),
-					heading(
-						h,
-						{
-							level: 2,
-							variant: "subsection",
-							id: PANEL_TITLE_ID,
-							className: "truncate outline-none",
-							attributes: [h.Tabindex(-1)],
-						},
-						[options.title],
-					),
-					...(options.status === undefined ? [] : [options.status]),
-				]),
-			]),
-			...children,
-		],
+		[],
 	)
 
-const failureAlert = (h: H, title: string, failure: LoadFailure | null): ReadonlyArray<Html> =>
+export const failureAlert = (h: H, title: string, failure: LoadFailure | null): ReadonlyArray<Html> =>
 	failure === null
 		? []
 		: [
@@ -97,420 +57,48 @@ const failureAlert = (h: H, title: string, failure: LoadFailure | null): Readonl
 				]),
 			]
 
-// COMPONENT
-
-const SAVE_LABEL = { idle: "", saving: "Saving", saved: "Saved", failed: "Not saved" } as const
-
-const saveIndicator = (h: H, model: Model): Html =>
-	h.span(
-		[
-			h.AriaLive("polite"),
-			h.Class(
-				model.componentSave === "failed"
-					? "font-mono text-xs text-destructive-foreground"
-					: typographyClass({ size: "xs", tone: "muted", mono: true }),
-			),
-		],
-		[SAVE_LABEL[model.componentSave]],
-	)
-
-/** The page's other groups as one-click picks, so a group is never retyped (or mistyped). */
-const groupSuggestions = (h: H, model: Model, isReadOnly: boolean): ReadonlyArray<Html> => {
-	const current = Str.trim(model.componentForm.group)
-	const groups = Arr.filter(
-		Arr.dedupe(Arr.flatMap(componentsOf(model), (row) => (row.group === null ? [] : [row.group]))),
-		(group) => group !== current,
-	)
-	return isReadOnly || groups.length === 0
-		? []
-		: [
-				hstack(
-					h,
-					{
-						gap: "1.5",
-						wrap: true,
-						className: "-mt-2",
-						attributes: [h.Role("group"), h.AriaLabel("Groups on this page")],
-					},
-					Arr.map(groups, (group) =>
-						button(
-							h,
-							{
-								size: "xs",
-								variant: "outline",
-								attributes: [
-									h.Key(group),
-									h.OnClick(Message.PickedComponentField({ field: "group", value: group })),
-								],
-							},
-							[group],
-						),
-					),
-				),
-			]
-}
-
-export const componentPanel = (h: H, model: Model, component: V2StatusPageComponent): Html => {
-	const form = model.componentForm
-	const isReadOnly = !canManage(model)
-	const status = componentStatus(component, monitorsOf(model), incidentsOf(model))
-	const hasMonitor = form.monitorId !== ""
-	const uptimeId = "status-page-panel-uptime"
-	return frame(
-		h,
-		{
-			kind: "Component",
-			title: Str.trim(form.name) === "" ? component.name : Str.trim(form.name),
-			status: hstack(
-				h,
-				{ gap: "2", align: "center", className: typographyClass({ size: "xs", tone: "muted" }) },
-				[`Visitors see ${COMPONENT_STATUS_LABEL[status]}`, saveIndicator(h, model)],
-			),
-		},
-		[
-			...(isReadOnly
-				? [
-						typography(h, { size: "xs", tone: "muted", as: "p" }, [
-							"Only org admins and engineers can change components.",
-						]),
-					]
-				: []),
-			vstack(h, { gap: "4" }, [
-				textField(h, {
-					id: "status-page-panel-name",
-					label: "Shown as",
-					value: form.name,
-					isDisabled: isReadOnly,
-					error: Str.trim(form.name) === "" ? "Add a name." : null,
-					onInput: (value) => Message.ChangedComponentField({ field: "name", value }),
-					onBlur: Message.CommittedComponent(),
-				}),
-				textField(h, {
-					id: "status-page-panel-group",
-					label: "Group",
-					value: form.group,
-					placeholder: "None",
-					hint: "Components with one group are listed under it.",
-					isDisabled: isReadOnly,
-					onInput: (value) => Message.ChangedComponentField({ field: "group", value }),
-					onBlur: Message.CommittedComponent(),
-				}),
-				...groupSuggestions(h, model, isReadOnly),
-				textField(h, {
-					id: "status-page-panel-description",
-					label: "Description",
-					value: form.description,
-					placeholder: "None",
-					hint: "A line under the name, for what this covers.",
-					isDisabled: isReadOnly,
-					onInput: (value) => Message.ChangedComponentField({ field: "description", value }),
-					onBlur: Message.CommittedComponent(),
-				}),
-				selectField(h, {
-					id: "status-page-panel-monitor",
-					label: "Driven by",
-					value: form.monitorId,
-					isDisabled: isReadOnly,
-					entries: [
-						{ value: "", label: "No monitor" },
-						...Arr.map(monitorsOf(model), (monitor) => ({
-							value: monitor.id,
-							label: monitor.name,
-						})),
-					],
-					onInput: (value) => Message.PickedComponentField({ field: "monitorId", value }),
-				}),
-				selectField(h, {
-					id: "status-page-panel-status",
-					label: "Override status",
-					value: form.manualStatus,
-					isDisabled: isReadOnly,
-					hint: hasMonitor
-						? "Automatic follows the monitor and open incidents."
-						: "Automatic follows open incidents.",
-					entries: [
-						{ value: "", label: "Automatic" },
-						...Arr.map(COMPONENT_STATUS_OPTIONS, (value) => ({
-							value,
-							label: COMPONENT_STATUS_LABEL[value],
-						})),
-					],
-					onInput: (value) => Message.PickedComponentField({ field: "manualStatus", value }),
-				}),
-				label(
-					h,
-					{
-						className: "flex font-normal text-sm sm:text-sm",
-						attributes: [h.Id(Checkbox.labelId(uptimeId))],
-					},
-					[
-						...Checkbox.view(h, {
-							// The stored value, shown as is; it only takes effect once a monitor drives the component.
-							model: { isChecked: form.showUptime },
-							toParentMessage: () => Message.ToggledComponentUptime(),
-							id: `${uptimeId}-root`,
-							inputId: uptimeId,
-							isDisabled: isReadOnly || !hasMonitor,
-						}),
-						h.span([], ["Show uptime bars"]),
-					],
-				),
-				...(hasMonitor
-					? []
-					: [
-							h.p(
-								[h.Class("-mt-2 text-xs text-muted-foreground")],
-								["Uptime bars need a monitor."],
-							),
-						]),
-			]),
-			...failureAlert(h, "Couldn't save the component", model.componentFailure),
-			...(isReadOnly
-				? []
-				: [
-						h.div(
-							[h.Class("border-t pt-4")],
-							[
-								button(
-									h,
-									{
-										size: "sm",
-										variant: "destructive-outline",
-										attributes: [
-											h.OnClick(
-												Message.ClickedDeleteComponent({ componentId: component.id }),
-											),
-										],
-									},
-									["Remove from page"],
-								),
-							],
-						),
-					]),
-		],
-	)
-}
-
 // INCIDENT
 
-const IMPACT_TONE = {
-	none: "muted",
-	minor: "warn",
-	major: "warn",
-	critical: "crit",
-} as const satisfies Record<StatusPageIncidentImpact, "muted" | "warn" | "crit">
-
-const statusEntries = (kind: V2StatusPageIncident["kind"], isOpening: boolean) =>
-	Arr.map(
-		Arr.filter(STATUSES_OF_KIND[kind], (status) => !isOpening || status !== closingStatus(kind)),
-		(status) => ({ value: status, label: INCIDENT_STATUS_LABEL[status] }),
-	)
-
-const IMPACT_ENTRIES = Arr.map(StatusPageIncidentImpact.literals, (impact) => ({
-	value: impact,
-	label: IMPACT_LABEL[impact],
-}))
-
-/** "Oct 28, 14:00 to 16:00": the maintenance window in the viewer's zone. */
-const windowLine = <M>(
+/**
+ * "Oct 28, 14:00 to 16:00" in the viewer's zone: the maintenance window, or when an incident
+ * started and ended ("Since Oct 28, 14:00" while open).
+ */
+export const windowLine = <M>(
 	h: HtmlBuilder<M>,
 	incident: V2StatusPageIncident,
 	timeZone: string,
 ): ReadonlyArray<Html | string> | null => {
-	if (incident.scheduled_start === null || incident.scheduled_end === null) return null
 	const at = (value: string): Html =>
 		timestamp(h, {
 			value,
 			timeZone,
 			label: formatTimestampInTimezone(value, { timeZone, style: "range" }),
 		})
+	if (incident.kind === "incident")
+		return incident.resolved_at === null
+			? ["Since ", at(incident.started_at)]
+			: [at(incident.started_at), " to ", at(incident.resolved_at)]
+	if (incident.scheduled_start === null || incident.scheduled_end === null) return null
 	return [at(incident.scheduled_start), " to ", at(incident.scheduled_end)]
 }
 
-/** What the public page renders in an update, so authors know before they post. */
-const MESSAGE_HINT = "Supports **bold**, *italic*, `code`, lists and links."
-
-/** A form that opens inside the incident panel: an update to post, or the details to edit. */
-const panelForm = (
-	h: H,
-	options: Readonly<{ label: string; onSubmit: Message }>,
-	children: ReadonlyArray<Html>,
-): Html =>
-	h.form(
-		[
-			h.AriaLabel(options.label),
-			h.OnSubmit(options.onSubmit),
-			h.Class("flex flex-col gap-3 rounded-md border bg-surface-faint p-3"),
-		],
-		children,
-	)
-
-/** The page's components as checkboxes: the ones an incident or a maintenance window names. */
-const componentChecklist = (
-	h: H,
-	model: Model,
-	options: Readonly<{
-		checkedIds: ReadonlyArray<StatusPageComponentId>
-		idPrefix: string
-		onToggle: (componentId: StatusPageComponentId) => Message
-	}>,
-): Html => {
-	const components = componentsOf(model)
-	return h.fieldset(
-		[h.Class(vstackClass({ gap: "1.5" }))],
-		[
-			h.legend([h.Class("mb-1.5 text-xs text-muted-foreground")], ["Affected components"]),
-			components.length === 0
-				? typography(h, { size: "xs", tone: "muted", as: "p" }, ["The page has no components yet."])
-				: vstack(
-						h,
-						{ gap: "2" },
-						Arr.map(components, (component) => {
-							const inputId = `${options.idPrefix}-${component.id}`
-							return label(
-								h,
-								{
-									className: "flex font-normal text-sm sm:text-sm",
-									attributes: [h.Key(component.id), h.Id(Checkbox.labelId(inputId))],
-								},
-								[
-									...Checkbox.view(h, {
-										model: { isChecked: options.checkedIds.includes(component.id) },
-										toParentMessage: () => options.onToggle(component.id),
-										id: `${inputId}-root`,
-										inputId,
-									}),
-									typography(h, { truncate: true }, [component.name]),
-								],
-							)
-						}),
-					),
-		],
-	)
-}
-
-/** Title, impact and components, changed in place: saving posts no update. */
-const editForm = (h: H, model: Model, incident: V2StatusPageIncident): ReadonlyArray<Html> => {
-	const form = model.incidentEdit
-	if (form === null || form.incidentId !== incident.id) return []
-	const isBlank = Str.trim(form.title) === ""
-	return [
-		panelForm(h, { label: "Edit details", onSubmit: Message.SubmittedIncidentEdit() }, [
-			textField(h, {
-				id: INCIDENT_EDIT_TITLE_ID,
-				label: "Title",
-				value: form.title,
-				error: isBlank ? "Add a title." : null,
-				onInput: (value) => Message.ChangedIncidentEditField({ field: "title", value }),
-			}),
-			...(form.kind === "incident"
-				? [
-						selectField(h, {
-							id: "status-page-incident-edit-impact",
-							label: "Impact",
-							value: form.impact,
-							entries: IMPACT_ENTRIES,
-							onInput: (value) => Message.ChangedIncidentEditField({ field: "impact", value }),
-						}),
-					]
-				: []),
-			componentChecklist(h, model, {
-				checkedIds: form.componentIds,
-				idPrefix: "status-page-incident-edit-component",
-				onToggle: (componentId) => Message.ToggledIncidentEditComponent({ componentId }),
-			}),
-			typography(h, { size: "xs", tone: "muted", as: "p" }, [
-				"Saved without posting an update. To tell visitors what changed, post one.",
-			]),
-			...failureAlert(h, "Couldn't save the changes", model.incidentEditFailure),
-			hstack(h, { gap: "2", align: "stretch", justify: "end" }, [
-				button(
-					h,
-					{
-						size: "sm",
-						variant: "ghost",
-						isDisabled: model.isSavingIncident,
-						attributes: [h.OnClick(Message.ClickedCancelIncidentEdit())],
-					},
-					["Cancel"],
-				),
-				button(
-					h,
-					{ size: "sm", type: "submit", isLoading: model.isSavingIncident, isDisabled: isBlank },
-					["Save changes"],
-				),
-			]),
-		]),
-	]
-}
-
-const updateForm = (h: H, model: Model): ReadonlyArray<Html> => {
-	const state = model.updateForm
-	if (state._tag === "Closed") return []
-	const form = state.form
-	const isPosting = state._tag === "Posting"
-	return [
-		panelForm(h, { label: "Post an update", onSubmit: Message.SubmittedUpdate() }, [
-			selectField(h, {
-				id: "status-page-update-status",
-				label: "Status",
-				value: form.status,
-				entries: statusEntries(form.kind, false),
-				hint: form.status === closingStatus(form.kind) ? "This closes it on the page." : undefined,
-				onInput: (value) => Message.ChangedUpdateField({ field: "status", value }),
-			}),
-			textareaField(h, {
-				id: UPDATE_BODY_ID,
-				label: "Message",
-				value: form.body,
-				hint: MESSAGE_HINT,
-				onInput: (value) => Message.ChangedUpdateField({ field: "body", value }),
-			}),
-			...failureAlert(h, "Couldn't post the update", state._tag === "Failed" ? state.failure : null),
-			hstack(h, { gap: "2", align: "stretch", justify: "end" }, [
-				button(
-					h,
-					{
-						size: "sm",
-						variant: "ghost",
-						isDisabled: isPosting,
-						attributes: [h.OnClick(Message.ClickedCancelUpdate())],
-					},
-					["Cancel"],
-				),
-				button(
-					h,
-					{
-						size: "sm",
-						type: "submit",
-						isLoading: isPosting,
-						isDisabled: Str.trim(form.body) === "",
-					},
-					[
-						form.status === closingStatus(form.kind)
-							? form.kind === "incident"
-								? "Resolve"
-								: "Complete"
-							: "Post update",
-					],
-				),
-			]),
-		]),
-	]
-}
+const impactBadgeVariant = (impact: StatusPageIncidentImpact) =>
+	IMPACT_TONE[impact] === "neutral" ? "muted" : IMPACT_TONE[impact]
 
 /** An open incident can be published, updated and closed; any incident can have its details edited. */
-const incidentActions = (h: H, model: Model, incident: V2StatusPageIncident): ReadonlyArray<Html> => {
-	if (model.updateForm._tag !== "Closed" || model.incidentEdit?.incidentId === incident.id) return []
+const incidentActions = (h: H, model: Model, incident: V2StatusPageIncident): Html => {
 	const isOpen = isOpenIncident(incident)
-	return [
-		hstack(h, { gap: "2", align: "stretch", wrap: true }, [
-			...(isOpen && !incident.published
-				? [
+	const post = (control: (isDisabled: boolean) => Html): Html =>
+		gatedControl(h, model, "status_page_incidents:post", control)
+	return hstack(h, { gap: "2", align: "stretch", wrap: true }, [
+		...(isOpen && !incident.published
+			? [
+					post((isDisabled) =>
 						button(
 							h,
 							{
 								size: "sm",
+								isDisabled,
 								isLoading: model.publishingIncidentIds.includes(incident.id),
 								attributes: [
 									h.OnClick(Message.ClickedPublishIncident({ incidentId: incident.id })),
@@ -518,14 +106,17 @@ const incidentActions = (h: H, model: Model, incident: V2StatusPageIncident): Re
 							},
 							["Publish"],
 						),
-					]
-				: []),
-			...(isOpen
-				? [
+					),
+				]
+			: []),
+		...(isOpen
+			? [
+					post((isDisabled) =>
 						button(
 							h,
 							{
 								size: "sm",
+								isDisabled,
 								variant: "outline",
 								attributes: [
 									h.OnClick(
@@ -538,10 +129,13 @@ const incidentActions = (h: H, model: Model, incident: V2StatusPageIncident): Re
 							},
 							["Post update"],
 						),
+					),
+					post((isDisabled) =>
 						button(
 							h,
 							{
 								size: "sm",
+								isDisabled,
 								variant: "outline",
 								attributes: [
 									h.OnClick(
@@ -554,54 +148,65 @@ const incidentActions = (h: H, model: Model, incident: V2StatusPageIncident): Re
 							},
 							[incident.kind === "incident" ? "Resolve" : "Complete"],
 						),
-					]
-				: []),
+					),
+				]
+			: []),
+		post((isDisabled) =>
 			button(
 				h,
 				{
 					size: "sm",
+					isDisabled,
 					variant: "outline",
 					attributes: [h.OnClick(Message.ClickedEditIncident({ incidentId: incident.id }))],
 				},
 				["Edit details"],
 			),
-		]),
-	]
+		),
+	])
 }
 
-export const incidentPanel = (h: H, model: Model, incident: V2StatusPageIncident, time: TimeInputs): Html => {
+/** The sheet's heading line: status, impact, and whether visitors can see it yet. */
+const incidentBadges = (h: H, incident: V2StatusPageIncident): Html =>
+	hstack(h, { gap: "1.5", wrap: true }, [
+		badge(h, { variant: isOpenIncident(incident) ? "info" : "muted" }, [
+			INCIDENT_STATUS_LABEL[incident.status],
+		]),
+		...(incident.kind === "incident"
+			? [
+					badge(h, { variant: impactBadgeVariant(incident.impact) }, [
+						`${IMPACT_LABEL[incident.impact]} impact`,
+					]),
+				]
+			: []),
+		...(incident.published ? [] : [badge(h, { variant: "meta" }, ["Draft, not public"])]),
+	])
+
+/** What the sheet shows for an incident or maintenance: where it stands, what to do next, its updates. */
+export const incidentSheetBody = (
+	h: H,
+	model: Model,
+	incident: V2StatusPageIncident,
+	time: TimeInputs,
+): ReadonlyArray<Html> => {
 	const names = Arr.map(
 		Arr.filter(componentsOf(model), (component) => incident.component_ids.includes(component.id)),
 		(component) => component.name,
 	)
 	const window = windowLine(h, incident, time.timeZone)
-	return frame(
-		h,
-		{
-			kind: incident.kind === "incident" ? "Incident" : "Maintenance",
-			title: incident.title,
-			status: hstack(h, { gap: "1.5", wrap: true }, [
-				badge(h, { variant: isOpenIncident(incident) ? "info" : "muted" }, [
-					INCIDENT_STATUS_LABEL[incident.status],
+	return [
+		vstack(h, { gap: "5" }, [
+			vstack(h, { gap: "2" }, [
+				incidentBadges(h, incident),
+				typography(h, { size: "xs", tone: "muted", as: "p" }, [
+					names.length === 0 ? "No components named" : Arr.join(names, ", "),
+					...(window === null ? [] : [" · ", ...window]),
+					...(incident.kind === "maintenance" && isOpenIncident(incident)
+						? [incident.auto_complete ? " · completes on its own" : " · you complete it"]
+						: []),
 				]),
-				...(incident.kind === "incident"
-					? [
-							badge(h, { variant: IMPACT_TONE[incident.impact] }, [
-								`${IMPACT_LABEL[incident.impact]} impact`,
-							]),
-						]
-					: []),
-				...(incident.published ? [] : [badge(h, { variant: "meta" }, ["Draft, not public"])]),
 			]),
-		},
-		[
-			typography(h, { size: "xs", tone: "muted", as: "p" }, [
-				names.length === 0 ? "No components named" : Arr.join(names, ", "),
-				...(window === null ? [] : [" · ", ...window]),
-			]),
-			...incidentActions(h, model, incident),
-			...editForm(h, model, incident),
-			...updateForm(h, model),
+			incidentActions(h, model, incident),
 			vstack(h, { gap: "2", as: "section", attributes: [h.AriaLabel("Updates")] }, [
 				eyebrow(h, { as: "h3" }, ["Updates"]),
 				h.ol(
@@ -627,191 +232,68 @@ export const incidentPanel = (h: H, model: Model, incident: V2StatusPageIncident
 										timeZone: time.timeZone,
 									}),
 								]),
-								typography(h, { size: "sm", as: "p", className: "whitespace-pre-wrap" }, [
-									update.body,
-								]),
+								updateBody(h, update.body),
 							],
 						),
 					),
 				),
 			]),
-			h.div(
-				[h.Class("border-t pt-4")],
-				[
-					button(
-						h,
-						{
-							size: "sm",
-							variant: "destructive-outline",
-							attributes: [
-								h.OnClick(Message.ClickedDeleteIncident({ incidentId: incident.id })),
-							],
-						},
-						[incident.kind === "incident" ? "Delete incident" : "Delete maintenance"],
-					),
-				],
+			deleteIncidentAction(h, model, incident),
+		]),
+	]
+}
+
+const deleteIncidentAction = (h: H, model: Model, incident: V2StatusPageIncident): Html =>
+	h.div(
+		[h.Class("border-t pt-4")],
+		[
+			gatedControl(h, model, "status_page_incidents:post", (isDisabled) =>
+				button(
+					h,
+					{
+						size: "sm",
+						variant: "destructive-outline",
+						isDisabled,
+						attributes: [h.OnClick(Message.ClickedDeleteIncident({ incidentId: incident.id }))],
+					},
+					[incident.kind === "incident" ? "Delete incident" : "Delete maintenance"],
+				),
 			),
 		],
 	)
-}
-
-// COMPOSER
-
-export const composerPanel = (h: H, model: Model, timeZone: string): Html => {
-	const form = model.incidentForm
-	const isMaintenance = form.kind === "maintenance"
-	const issues = incidentIssues(form, timeZone)
-	return frame(h, { kind: "New", title: isMaintenance ? "Schedule maintenance" : "Post incident" }, [
-		h.form(
-			[
-				h.AriaLabelledBy(PANEL_TITLE_ID),
-				h.OnSubmit(Message.SubmittedIncident()),
-				h.Class(vstackClass({ gap: "4" })),
-			],
-			[
-				segmentedSelect(h, {
-					size: "sm",
-					ariaLabel: "Kind",
-					className: "self-start",
-					value: form.kind,
-					onChange: (kind) => Message.ChangedIncidentKind({ kind }),
-					options: [
-						{ value: "incident", label: "Incident" },
-						{ value: "maintenance", label: "Maintenance" },
-					],
-				}),
-				textField(h, {
-					id: "status-page-incident-title-field",
-					label: "Title",
-					value: form.title,
-					placeholder: isMaintenance ? "Database upgrade" : "Elevated API errors",
-					onInput: (value) => Message.ChangedIncidentField({ field: "title", value }),
-				}),
-				h.div(
-					[h.Class("grid gap-4 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-2")],
-					[
-						selectField(h, {
-							id: "status-page-incident-status",
-							label: "Status",
-							value: form.status,
-							entries: statusEntries(form.kind, true),
-							onInput: (value) => Message.ChangedIncidentField({ field: "status", value }),
-						}),
-						...(isMaintenance
-							? []
-							: [
-									selectField(h, {
-										id: "status-page-incident-impact",
-										label: "Impact",
-										value: form.impact,
-										entries: IMPACT_ENTRIES,
-										onInput: (value) =>
-											Message.ChangedIncidentField({ field: "impact", value }),
-									}),
-								]),
-					],
-				),
-				...(isMaintenance
-					? [
-							textField(h, {
-								id: "status-page-incident-start",
-								label: "Starts",
-								type: "datetime-local",
-								value: form.scheduledStart,
-								onInput: (value) =>
-									Message.ChangedIncidentField({ field: "scheduledStart", value }),
-							}),
-							textField(h, {
-								id: "status-page-incident-end",
-								label: "Ends",
-								type: "datetime-local",
-								value: form.scheduledEnd,
-								hint: `Times are in ${timeZone}.`,
-								onInput: (value) =>
-									Message.ChangedIncidentField({ field: "scheduledEnd", value }),
-							}),
-						]
-					: []),
-				componentChecklist(h, model, {
-					checkedIds: form.componentIds,
-					idPrefix: "status-page-incident-component",
-					onToggle: (componentId) => Message.ToggledIncidentComponent({ componentId }),
-				}),
-				textareaField(h, {
-					id: "status-page-incident-body",
-					label: "Message",
-					value: form.body,
-					placeholder: isMaintenance
-						? "We are upgrading the primary database. Expect brief read-only periods."
-						: "We are looking into elevated error rates on the API.",
-					hint: MESSAGE_HINT,
-					onInput: (value) => Message.ChangedIncidentField({ field: "body", value }),
-				}),
-				vstack(h, { gap: "1.5" }, [
-					typography(h, { size: "xs", tone: "muted" }, ["Visibility"]),
-					segmentedSelect(h, {
-						ariaLabel: "Visibility",
-						size: "sm",
-						className: "self-start",
-						value: form.isPublished ? "publish" : "draft",
-						onChange: (value) =>
-							Message.PickedIncidentPublished({ isPublished: value === "publish" }),
-						options: [
-							{ value: "publish", label: "Publish now" },
-							{ value: "draft", label: "Save as draft" },
-						],
-					}),
-				]),
-				...failureAlert(
-					h,
-					isMaintenance ? "Couldn't schedule it" : "Couldn't open the incident",
-					model.incidentFailure,
-				),
-				hstack(h, { gap: "3", align: "center", justify: "between", className: "border-t pt-4" }, [
-					typography(h, { size: "xs", tone: "muted", as: "p" }, [issues[0] ?? ""]),
-					button(
-						h,
-						{
-							size: "sm",
-							type: "submit",
-							isLoading: model.isCreatingIncident,
-							isDisabled: issues.length > 0,
-						},
-						[form.isPublished ? (isMaintenance ? "Schedule" : "Publish incident") : "Save draft"],
-					),
-				]),
-			],
-		),
-	])
-}
 
 // ADD
 
-export const addPanel = (h: H, model: Model): Html => {
+/** Add monitors: the builder's checklist of the monitors not on the page yet. */
+export const addSheetBody = (h: H, model: Model): ReadonlyArray<Html> => [
+	pickerView(h, {
+		picker: model.addPicker,
+		monitors: monitorsOf(model),
+		toMessage: (message) => Message.GotAddPickerMessage({ message }),
+		idPrefix: ADD_PICKER_ID,
+		// Locked while a URL is being monitored: its completion submits what is ticked.
+		isDisabled: model.isAddingComponents || model.addPicker.isCreatingMonitor,
+		focusOnMount: h.OnMount(FocusNewRow()),
+		isOrderable: false,
+	}),
+]
+
+export const addSheetFooter = (
+	h: H,
+	model: Model,
+	close: ReadonlyArray<ChildAttribute>,
+): ReadonlyArray<Html> => {
 	const count = checkedRows(model.addPicker).length
-	return frame(h, { kind: "Add", title: "Add monitors" }, [
-		pickerView(h, {
-			picker: model.addPicker,
-			monitors: monitorsOf(model),
-			toMessage: (message) => Message.GotAddPickerMessage({ message }),
-			idPrefix: ADD_PICKER_ID,
-			// Locked while a URL is being monitored: its completion submits what is ticked.
-			isDisabled: model.isAddingComponents || model.addPicker.isCreatingMonitor,
-			focusOnMount: h.OnMount(FocusNewRow()),
-			isOrderable: false,
-		}),
-		hstack(h, { align: "stretch", justify: "end", className: "border-t pt-4" }, [
-			button(
-				h,
-				{
-					size: "sm",
-					isLoading: model.isAddingComponents,
-					isDisabled:
-						count === 0 || hasRowIssues(model.addPicker) || model.addPicker.isCreatingMonitor,
-					attributes: [h.OnClick(Message.ClickedSubmitAdd())],
-				},
-				[count <= 1 ? "Add component" : `Add ${count} components`],
-			),
-		]),
-	])
+	return [
+		button(h, { variant: "outline", attributes: close }, ["Cancel"]),
+		button(
+			h,
+			{
+				isLoading: model.isAddingComponents,
+				isDisabled: count === 0 || hasRowIssues(model.addPicker) || model.addPicker.isCreatingMonitor,
+				attributes: [h.OnClick(Message.ClickedSubmitAdd())],
+			},
+			[count <= 1 ? "Add component" : `Add ${count} components`],
+		),
+	]
 }

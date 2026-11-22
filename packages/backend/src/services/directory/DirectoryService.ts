@@ -51,7 +51,7 @@ import {
 	type RenewSelfHostedSession,
 	SELF_HOSTED_SESSION_MAX_LIFETIME_SECONDS,
 	SELF_HOSTED_SESSION_TTL_SECONDS,
-	sessionSigningSecret,
+	selfHostedSessionKey,
 	verifySelfHostedSessionToken,
 } from "@maple/auth"
 import {
@@ -60,7 +60,6 @@ import {
 	Effect,
 	Layer,
 	Option,
-	Redacted,
 	Result,
 	Schema,
 	Array as Arr,
@@ -296,13 +295,6 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 			const email = yield* EmailService
 			const revocation = yield* MembershipRevocationService
 			const enabled = oidcEnabled(env)
-			if (enabled && Option.isNone(env.MAPLE_SESSION_SECRET)) {
-				// Once per service build (worker start). The fallback works, but the root password then
-				// doubles as the key that signs every user's session.
-				yield* Effect.logWarning(
-					"MAPLE_SESSION_SECRET is not set: OIDC session tokens are signed with MAPLE_ROOT_PASSWORD. Set MAPLE_SESSION_SECRET (same value on every service) to separate them.",
-				)
-			}
 
 			// Best effort: the invitation stands without it; the person can still sign up at the link.
 			const sendInvitationEmail = (orgName: string, to: string) =>
@@ -335,25 +327,13 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 							}),
 						),
 			)
-			// Every Worker verifies with the same key (MAPLE_SESSION_SECRET, else the root password).
-			const signingSecret = requireEnabled.pipe(
-				Effect.flatMap(() =>
-					Option.match(sessionSigningSecret(env), {
-						onNone: () =>
-							Effect.fail(
-								new DirectoryDisabledError({
-									message: "MAPLE_SESSION_SECRET or MAPLE_ROOT_PASSWORD is required for OIDC sessions",
-								}),
-							),
-						onSome: (secret) => Effect.succeed(Redacted.value(secret)),
-					}),
-				),
-			)
+			// Every Worker verifies with the same derived key (MAPLE_SESSION_SIGNING_SECRET, salted by the root password).
+			const sessionKey = requireEnabled.pipe(Effect.flatMap(() => selfHostedSessionKey(env)))
 			const keyring = yield* secretKeyringFromEnv(env, (message) => new DirectoryPersistenceError({ message }))
 			const nowSeconds = Effect.map(Clock.currentTimeMillis, (ms) => Math.floor(ms / 1000))
 
 			const mint = (
-				secret: string,
+				key: Buffer,
 				sub: UserId,
 				orgId: OrgId,
 				roles: ReadonlyArray<RoleName>,
@@ -375,7 +355,7 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 						sessionExpiresAt,
 						sid,
 					},
-					secret,
+					key,
 				)
 				return new SelfHostedLoginResponse({
 					token,
@@ -502,7 +482,7 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 				})
 
 			const callback = Effect.fn("DirectoryService.callback")(function* (input: OidcCallbackRequest) {
-				const secret = yield* signingSecret
+				const key = yield* sessionKey
 				// Pinned server-side: a code is only redeemed for Maple's own sign-in page.
 				if (input.redirectUri !== signInRedirectUri) {
 					return yield* new UnauthorizedError({ message: "Unexpected redirect URI" })
@@ -608,7 +588,7 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 							Schema.decodeSync(OrgId)(env.MAPLE_DEFAULT_ORG_ID),
 					})
 					const sid = yield* createSession(sub, identity, nowMs, sessionExpiresAt)
-					return mint(secret, sub, orgId, [ROOT_ROLE], now, sessionExpiresAt, sid)
+					return mint(key, sub, orgId, [ROOT_ROLE], now, sessionExpiresAt, sid)
 				}
 
 				const chosen = Arr.findFirst(memberships, (member) => member.orgId === input.orgId).pipe(
@@ -621,7 +601,7 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 				}
 				const sid = yield* createSession(sub, identity, nowMs, sessionExpiresAt)
 				return mint(
-					secret,
+					key,
 					sub,
 					chosen.value.orgId,
 					[asRole(chosen.value.role)],
@@ -682,8 +662,8 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 				token: string | undefined,
 				orgId: OrgId,
 			) {
-				const secret = yield* signingSecret
-				const claims = yield* verifySelfHostedSessionToken(token ?? "", secret).pipe(
+				const key = yield* sessionKey
+				const claims = yield* verifySelfHostedSessionToken(token ?? "", key).pipe(
 					Effect.mapError(() => forbidden("Switching organization needs a self-hosted session")),
 				)
 				// A switch mints a fresh `exp`, so it must not outlive a logout: the session has to be live.
@@ -711,23 +691,18 @@ export class DirectoryService extends Context.Service<DirectoryService>()(
 					claims.session_exp ?? claims.iat + SELF_HOSTED_SESSION_MAX_LIFETIME_SECONDS
 				const now = yield* nowSeconds
 				// Only renewal (which asks the IdP) extends a token; a switch keeps the caller's own `exp`.
-				return mint(secret, claims.sub, orgId, roles, now, sessionExpiresAt, claims.sid, claims.exp)
+				return mint(key, claims.sub, orgId, roles, now, sessionExpiresAt, claims.sid, claims.exp)
 			})
 
 			/** The caller's own session token, verified; who it belongs to and which session it names. */
 			const sessionOf = (token: string | undefined, allowExpiredForLogout = false) =>
-				Option.match(sessionSigningSecret(env), {
-					onNone: () =>
-						Effect.fail(new UnauthorizedError({ message: "Self-hosted sessions are not configured" })),
-					onSome: (secret) =>
-						verifySelfHostedSessionToken(token ?? "", Redacted.value(secret), {
-							allowExpiredForLogout,
-						}).pipe(
-							Effect.mapError(
-								() => new UnauthorizedError({ message: "This needs a self-hosted session token" }),
-							),
+				Effect.flatMap(selfHostedSessionKey(env), (key) =>
+					verifySelfHostedSessionToken(token ?? "", key, { allowExpiredForLogout }).pipe(
+						Effect.mapError(
+							() => new UnauthorizedError({ message: "This needs a self-hosted session token" }),
 						),
-				})
+					),
+				)
 
 			const sessionPersistence = (error: { readonly message: string }) =>
 				new SelfHostedSessionPersistenceError({ message: error.message })

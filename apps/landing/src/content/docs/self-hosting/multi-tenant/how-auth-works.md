@@ -43,7 +43,7 @@ Steps in words:
 5. The API reads `sub`, `email`, `email_verified` and roles from the tokens. IT staff (the role in `MAPLE_OIDC_ROOT_ROLE`, default `maple-root`) become `root`.
 6. If the email is not verified, sign-in is refused and no invitation is accepted.
 7. Otherwise the user is upserted, invitations for the verified email are accepted, and a **session row** is stored with the IdP session id (`sid`) and the IdP refresh token, encrypted.
-8. The API returns a **Maple session token**: a short-lived token signed with `MAPLE_SESSION_SECRET` (falling back to `MAPLE_ROOT_PASSWORD` if unset). It carries the subject, the active organization, the role and `sid`.
+8. The API returns a **Maple session token**: a short-lived token signed with a key derived from `MAPLE_SESSION_SIGNING_SECRET` and `MAPLE_ROOT_PASSWORD`. It carries the subject, the active organization, the role and `sid`.
 
 Every Worker (`api`, `electric-sync`, `alerting`, `ai`) verifies this token itself. API keys, MCP keys and ingest keys are separate: they are organization-bound rows in Postgres and do not use it.
 

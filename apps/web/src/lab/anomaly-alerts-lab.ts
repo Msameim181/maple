@@ -1,6 +1,6 @@
 import * as Policy from "@maple/domain/policy"
 import { OrgId } from "@maple/domain"
-import { Effect, Option, Result, Schema, Array as Arr, String as Str } from "effect"
+import { Effect, Option, Result, Schema, Array as Arr, Record as Rec, String as Str } from "effect"
 import { Command, type Update } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { defineMessageUnion } from "foldkit/message"
@@ -19,7 +19,7 @@ import * as HubModel from "../page/alerts/hub/model"
 import * as HubUpdate from "../page/alerts/hub/update"
 import { breadcrumbs as hubBreadcrumbs, view as hubView } from "../page/alerts/hub/view"
 import type { HealthIncident as Incident } from "../page/kit/service-health"
-import { alertFiringHero, heroCountsOf } from "../page/overview/view-hero"
+import { alertFiringHero, heroSummaryOf } from "../page/overview/view-hero"
 import { vstack } from "@maple/views/ui/stack"
 import { typography } from "@maple/views/ui/typography"
 import * as RuleMessage from "../page/alerts/rule/message"
@@ -51,10 +51,12 @@ import {
 } from "../page/kit/alert-test-rows"
 import type { PageContext } from "../page/contract"
 import type { Resources } from "../platform/resources"
+import { labGrants, LabRole, readLabRole } from "./viewer-role"
 
 // `/lab/anomaly-alerts`: anomalies paging through alert rules, over fixtures. `?state=` picks one:
 // editor-new, editor-blank, editor-scoped, editor-default, editor-critical-destination, incident-warning, incident-critical, incident-spike,
 // hub-anomalies, hub-anomalies-resolved, hub-anomalies-empty, hub-rules, rule-anomaly, overview-banner.
+// `?role=member|analyst` reads the hub and the incident as that viewer: an analyst gets no acknowledge.
 
 export const LabState = Schema.Literals([
 	"editor-new",
@@ -74,14 +76,15 @@ export const LabState = Schema.Literals([
 ])
 export type LabState = typeof LabState.Type
 
-export const Flags = Schema.Struct({ state: LabState })
+export const Flags = Schema.Struct({ state: LabState, role: LabRole })
 export type Flags = typeof Flags.Type
 
-export const flags: Effect.Effect<Flags> = Effect.sync(() => ({
+export const flags: Effect.Effect<Flags> = Effect.map(readLabRole, (role) => ({
 	state: Option.getOrElse(
 		Schema.decodeUnknownOption(LabState)(new URLSearchParams(window.location.search).get("state")),
 		(): LabState => "hub-anomalies",
 	),
+	role,
 }))
 
 export const Model = Schema.Struct({
@@ -157,7 +160,7 @@ const RESOLVED = [
 	}),
 ]
 
-const hubFor = (state: LabState) => {
+const hubFor = (state: LabState, role: LabRole) => {
 	const search: HubAt =
 		state === "hub-rules"
 			? { tab: "rules" }
@@ -183,7 +186,7 @@ const hubFor = (state: LabState) => {
 			}),
 			HubMessage.Message.UpdatedIncidents({ orgId: ORG, rows: incidents }),
 			HubMessage.Message.UpdatedDestinations({ orgId: ORG, rows: [destinationRow()] }),
-			HubMessage.Message.CompletedFetchSession({ orgId: ORG, grants: Policy.allPermissions }),
+			HubMessage.Message.CompletedFetchSession({ orgId: ORG, grants: labGrants(role) }),
 		],
 		(model, message) => HubUpdate.update(model, message, CONTEXT),
 	)
@@ -256,7 +259,7 @@ const INCIDENTS = {
 	"incident-spike": { n: 3, signal: "error_spike", severity: "critical", service: "payments-worker" },
 } as const
 
-const incidentFor = (state: LabState) => {
+const incidentFor = (state: LabState, role: LabRole) => {
 	const scenario =
 		state === "incident-warning" || state === "incident-critical" || state === "incident-spike"
 			? INCIDENTS[state]
@@ -302,7 +305,7 @@ const incidentFor = (state: LabState) => {
 				key: synced.activity.key ?? "",
 				result: Result.succeed([]),
 			}),
-			IncidentMessage.Message.CompletedFetchSession({ grants: Policy.allPermissions }),
+			IncidentMessage.Message.CompletedFetchSession({ grants: labGrants(role) }),
 			IncidentMessage.Message.CompletedFetchSilences({
 				key: synced.silences.key ?? "",
 				result: Result.succeed([]),
@@ -355,9 +358,9 @@ const isIncident = Str.startsWith("incident")
 export const init = (flags: Flags): Return => ({
 	model: {
 		state: flags.state,
-		hub: hubFor(flags.state),
+		hub: hubFor(flags.state, flags.role),
 		editor: editorFor(flags.state),
-		incident: incidentFor(flags.state),
+		incident: incidentFor(flags.state, flags.role),
 		rule: ruleFor(),
 	},
 	// The incident page's chart runtime still loads, so its anomaly chart draws.
@@ -421,33 +424,70 @@ export const breadcrumbs = (model: Model) =>
 				? incidentCrumbs(model.incident)
 				: hubBreadcrumbs(model.hub)
 
-const openIncident = (severity: Incident["severity"], signalType: Incident["signalType"]): Incident => ({
+// Rule ids are real UUIDs so each name links to its rule page.
+const RULE_IDS = {
+	errors: "0b9c6f2e-4a1d-4c7e-9a52-3f1d2c8e7a01",
+	evaluate: "5d2e8a41-7c3b-4f9e-8b16-9a0c4e2d1f02",
+	latency: "8f4a1c93-2e6d-4b5a-a7c8-1d3e5f7a9b03",
+	queue: "c1e7b5d2-9f3a-4e8c-b6d4-2a8f0c1e3d04",
+} as const
+type LabRule = keyof typeof RULE_IDS
+const RULE_NAMES = {
+	errors: "Checkout error rate above 5%",
+	evaluate: "Alert rule cannot evaluate",
+	latency: "API p95 latency above 800ms",
+	queue: "Queue depth growing",
+} as const satisfies Record<LabRule, string>
+
+const openIncident = (
+	rule: LabRule,
+	severity: Incident["severity"],
+	signalType: Incident["signalType"] = "error_rate",
+	groupKey: string | null = null,
+): Incident => ({
+	ruleId: RULE_IDS[rule],
+	ruleName: RULE_NAMES[rule],
 	status: "open",
-	groupKey: null,
+	groupKey,
 	severity,
 	signalType,
 })
-const BANNER_RULES = [...Arr.replicate(true, 18), false]
+// The four rules above are enabled, among 19 in all.
+const BANNER_RULES = [...Rec.values(RULE_IDS), ...Arr.makeBy(15, (n) => `enabled-${n}`)]
 
 // The Overview's alert strip in each case it draws (all clear draws none), each one captioned.
 const BANNER_CASES: ReadonlyArray<readonly [string, ReadonlyArray<Incident>]> = [
-	["Only an anomaly open", [openIncident("critical", "anomaly")]],
-	["Only an incident firing", [openIncident("critical", "error_rate")]],
+	["Only an anomaly open", [openIncident("errors", "critical", "anomaly")]],
+	["One rule firing", [openIncident("errors", "critical")]],
 	[
-		"An incident firing and an anomaly open",
-		[openIncident("critical", "anomaly"), openIncident("warning", "error_rate")],
+		"One warning rule firing for three groups",
+		Arr.map(["us", "eu", "ap"], (region) => openIncident("evaluate", "warning", "raw_query", region)),
+	],
+	[
+		"Several rules firing and an anomaly open",
+		[
+			openIncident("errors", "critical", "anomaly"),
+			openIncident("evaluate", "warning", "raw_query", "us"),
+			openIncident("evaluate", "warning", "raw_query", "eu"),
+			openIncident("latency", "critical", "p95_latency", "checkout"),
+			openIncident("latency", "warning", "p95_latency", "cart"),
+			openIncident("queue", "warning", "builder_query"),
+			openIncident("errors", "warning"),
+		],
 	],
 ]
 
 const overviewBanners = (h: HtmlBuilder<Message>): Html =>
-	vstack(h, { gap: "6", className: "p-6" }, [
-		...Arr.map(BANNER_CASES, ([caption, incidents]) =>
+	vstack(
+		h,
+		{ gap: "6", className: "p-6" },
+		Arr.map(BANNER_CASES, ([caption, incidents]) =>
 			vstack(h, { gap: "2" }, [
 				typography(h, { size: "xs", tone: "muted" }, [caption]),
-				...alertFiringHero(h, heroCountsOf(incidents, BANNER_RULES)),
+				...alertFiringHero(h, heroSummaryOf(incidents, BANNER_RULES)),
 			]),
 		),
-	])
+	)
 
 export const view = (model: Model, h: HtmlBuilder<Message>): Html =>
 	model.state === "overview-banner"

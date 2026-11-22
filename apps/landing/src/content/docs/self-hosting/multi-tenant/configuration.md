@@ -49,7 +49,7 @@ You set values in `deploy/docker/.env`. Docker Compose substitutes them into `do
 | `CLICKHOUSE_ADMIN_PASSWORD` | yes | generated | ClickHouse `admin` user. Used by `maple` to create one database and user per organization. Same caveat as Postgres |
 | `KEYCLOAK_ADMIN_USER` | yes | `admin` | Keycloak's bootstrap admin name (first start only; `bootstrap.sh` signs in with it) |
 | `KEYCLOAK_ADMIN_PASSWORD` | yes | generated | That admin's password. Keycloak ignores it once an admin exists |
-| `MAPLE_ROOT_PASSWORD` | yes | generated | Break-glass IT login. Fallback signing key for session tokens when `MAPLE_SESSION_SECRET` is unset |
+| `MAPLE_ROOT_PASSWORD` | yes | generated | Break-glass IT login. At least 16 characters and not a placeholder, or the API refuses to start. Salts the session signing key |
 | `MAPLE_INGEST_KEY_ENCRYPTION_KEY` | yes | generated (base64, 32 bytes) | **Never change after first start.** Encrypts ingest keys and other stored secrets. A change makes them unreadable |
 | `MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY` | yes | generated | **Never change after first start.** Lookup hash of ingest keys. A change makes every existing key return `401` |
 | `MAPLE_SHARE_TOKEN_HMAC_KEY` | yes | generated | Signs share links. A change invalidates existing links |
@@ -57,7 +57,7 @@ You set values in `deploy/docker/.env`. Docker Compose substitutes them into `do
 | `SANDBOX_INTERNAL_SERVICE_TOKEN` | yes | generated | Token for the PR-review sandbox bridge (the sandbox itself is unavailable here) |
 | `ELECTRIC_SECRET` | yes | generated | Shared by `electric` and `maple`. Electric accepts shape requests only with it |
 | `SD_INTERNAL_TOKEN` | yes | generated | Bearer for the scraper's `/api/internal/*` calls. Must be the same in `maple` and `scraper` |
-| `MAPLE_SESSION_SECRET` | recommended | generated | HMAC key for session tokens. Unset: falls back to `MAPLE_ROOT_PASSWORD`. A change signs everyone out |
+| `MAPLE_SESSION_SIGNING_SECRET` | recommended | generated | Source of the HMAC key for session tokens (HKDF-SHA256, salted with `MAPLE_ROOT_PASSWORD`). Unset: derived from the root password alone, with a startup warning. A change signs everyone out |
 | `MAPLE_OIDC_ADMIN_CLIENT_SECRET` | for IT admin features | generated | Secret of the Keycloak `maple-admin` client. `bootstrap.sh` sets the client to this value |
 
 ### Sign-in and bootstrap
@@ -183,7 +183,7 @@ From `packages/backend/src/platform/Env.ts`. Only the ones that matter for this 
 |---|---|---|---|---|
 | `MAPLE_AUTH_MODE` | no | `self_hosted` | | Leave at the default. Workers verify Maple's own session tokens |
 | `MAPLE_ROOT_PASSWORD` | yes | none | | Root login. Signing-key fallback |
-| `MAPLE_SESSION_SECRET` | no | falls back to `MAPLE_ROOT_PASSWORD` | | HMAC key for session tokens. Every Worker that verifies sessions (api, electric-sync) must see the same value |
+| `MAPLE_SESSION_SIGNING_SECRET` | no | derived from `MAPLE_ROOT_PASSWORD` | | Source of the session HMAC key. Every Worker that verifies sessions (api, electric-sync) must see the same value |
 | `MAPLE_OIDC_AUTHORIZE_URL` | for SSO | none | `https://auth.acme.com/realms/maple/protocol/openid-connect/auth` | Browser-facing authorize endpoint. Compose sets it from `AUTH_HOST` |
 | `MAPLE_OIDC_TOKEN_URL` | for SSO | none | `http://keycloak:8080/realms/maple/protocol/openid-connect/token` | Server-to-server token endpoint (private network). SSO is on only when this **and** `MAPLE_OIDC_CLIENT_ID` are set |
 | `MAPLE_OIDC_CLIENT_ID` | for SSO | none | `maple-web` | The public client's id |
@@ -214,4 +214,4 @@ From `packages/backend/src/platform/Env.ts`. Only the ones that matter for this 
 | `MAPLE_SMTP_BRIDGE_URL` | no | none | When set, email goes through the bridge |
 | `TINYBIRD_HOST`, `TINYBIRD_TOKEN` | yes (placeholders) | none | Required by the code; unused here |
 
-Electric sync (`apps/electric-sync/src/config.ts`) reads `ELECTRIC_URL`, `ELECTRIC_SECRET` and `MAPLE_SESSION_SECRET`. `ELECTRIC_SOURCE_ID` is for Electric Cloud and must stay unset.
+Electric sync (`apps/electric-sync/src/config.ts`) reads `ELECTRIC_URL`, `ELECTRIC_SECRET` and `MAPLE_SESSION_SIGNING_SECRET`. `ELECTRIC_SOURCE_ID` is for Electric Cloud and must stay unset.

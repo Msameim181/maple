@@ -5,7 +5,7 @@ import type {
 	PlanetScaleQueryInsightsResponse,
 	SelfDescribingHttpError,
 } from "@maple/domain/http"
-import { CurrentTenant, PlanetScaleMetricsTokenRequest } from "@maple/domain/http"
+import { CurrentTenant, PlanetScaleFeaturesRequest, PlanetScaleMetricsTokenRequest } from "@maple/domain/http"
 import type { PlanetScaleDatabaseRow } from "@maple/db/tables"
 import type {
 	V2PlanetScaleConnectResponse,
@@ -37,6 +37,7 @@ import {
 } from "@maple/backend/services/auth/PlanetScaleOAuthService"
 import { PlanetScaleConnectionService } from "@maple/backend/services/integrations/PlanetScaleConnectionService"
 import { PlanetScaleService } from "@maple/backend/services/integrations/PlanetScaleService"
+import { requirePerson } from "./require-person"
 
 /**
  * Best-effort origin of the incoming request. `x-forwarded-*` is client-supplied
@@ -136,6 +137,8 @@ const toPlanetScaleStatus = (status: PlanetScaleIntegrationStatus): V2PlanetScal
 					last_scrape_at: isoTimestampOrNull(status.scrapeTarget.lastScrapeAt),
 					last_scrape_error: status.scrapeTarget.lastScrapeError,
 				},
+	metrics_enabled: status.metricsEnabled,
+	events_enabled: status.eventsEnabled,
 	webhooks:
 		status.webhooks === null
 			? null
@@ -244,6 +247,8 @@ export const HttpV2PlanetScaleIntegrationsLive = HttpApiBuilder.group(
 							yield* Policy.check(tenant.roles, "integrations:manage", (denial) =>
 								V2InsufficientPermissions.make(denial.message),
 							)
+							// The OAuth state is bound to `tenant.userId`, who must be the one finishing it.
+							yield* requirePerson
 							const req = yield* HttpServerRequest.HttpServerRequest
 							const origin = resolveRequestOrigin(req)
 							// v1 skipped this check. The callback URL is persisted as
@@ -342,6 +347,34 @@ export const HttpV2PlanetScaleIntegrationsLive = HttpApiBuilder.group(
 							return toPlanetScaleStatus(status)
 						}),
 					)
+					.handle("updateFeatures", ({ payload }) =>
+						Effect.gen(function* () {
+							const tenant = yield* CurrentTenant.Context
+							yield* Policy.check(tenant.roles, "integrations:manage", (denial) =>
+								V2InsufficientPermissions.make(denial.message),
+							)
+							const status = yield* planetscale
+								.setFeatures(
+									tenant.orgId,
+									new PlanetScaleFeaturesRequest({
+										...(payload.metrics_enabled !== undefined && {
+											metricsEnabled: payload.metrics_enabled,
+										}),
+										...(payload.events_enabled !== undefined && {
+											eventsEnabled: payload.events_enabled,
+										}),
+									}),
+								)
+								.pipe(tapHttpErrors("PlanetScale feature update failed"))
+							yield* recordHttpAudit("planetscale_integration.features_updated", {
+								metadata: {
+									metrics_enabled: status.metricsEnabled,
+									events_enabled: status.eventsEnabled,
+								},
+							})
+							return toPlanetScaleStatus(status)
+						}),
+					)
 					.handle("disconnect", () =>
 						Effect.gen(function* () {
 							const tenant = yield* CurrentTenant.Context
@@ -377,13 +410,18 @@ export const HttpV2PlanetScaleIntegrationsLive = HttpApiBuilder.group(
 					.handle("webhookConfig", () =>
 						Effect.gen(function* () {
 							const tenant = yield* CurrentTenant.Context
-							// Needs integrations:manage: the response carries the webhook HMAC secret.
+							// The response carries the webhook HMAC secret: integrations:manage here, and
+							// `requiredScopeForRoute` asks a scoped key for write on this GET.
 							yield* Policy.check(tenant.roles, "integrations:manage", (denial) =>
 								V2InsufficientPermissions.make(denial.message),
 							)
 							const config = yield* planetscale
 								.webhookConfig(tenant.orgId)
 								.pipe(tapHttpErrors("PlanetScale webhook config failed"))
+							// The secret itself stays out of the entry: it records that it was handed out.
+							if (config.secret !== null) {
+								yield* recordHttpAudit("planetscale_integration.webhook_secret_read")
+							}
 							return {
 								object: "planetscale_integration.webhook_config" as const,
 								configured: config.configured,

@@ -2,6 +2,7 @@ import * as PG from "@maple-dev/effect-orm/postgres"
 import type { MapleDb } from "@maple/db/client"
 import {
 	StatusPageComponents,
+	StatusPageCustomDomains,
 	StatusPageIncidentComponents,
 	StatusPageIncidents,
 	StatusPageIncidentUpdates,
@@ -22,6 +23,7 @@ import {
 	type StatusPageIncidentKind,
 	type StatusPageIncidentStatus,
 	type StatusPageUpdateSource,
+	type StatusPageVisibility,
 	type UptimeMonitorId,
 	type UptimeMonitorStatus,
 } from "@maple/primitives"
@@ -38,7 +40,9 @@ import {
 	StatusPageSlug,
 	StatusPageTheme,
 	themeContrastIssue,
+	isStatusPageImageSource,
 	type StatusPageSnapshot,
+	statusPageOrgKey,
 	type StatusPageIncidentHistoryEntry,
 	type StatusPageSnapshotIncident,
 	utcDay,
@@ -58,15 +62,25 @@ export interface SnapshotPageInput {
 	readonly id: StatusPageId
 	readonly name: string
 	readonly slug: string
+	/** `statusPageOrgKey` of the page's org: the first part of its hosted address. */
+	readonly orgKey: string
 	readonly description: string | null
 	readonly websiteUrl: string | null
 	readonly logoUrl: string | null
+	readonly logoDarkUrl: string | null
+	readonly faviconUrl: string | null
+	readonly supportUrl: string | null
 	readonly privacyUrl: string | null
 	readonly termsUrl: string | null
 	readonly theme: StatusPageTheme
 	readonly showPoweredBy: boolean
 	readonly breakGlassTokenSha256: string | null
+	readonly visibility: StatusPageVisibility
+	/** Published only while the page is `password`: the hash of a page made public stays home. */
+	readonly passwordHash: string | null
 	readonly revision: number
+	/** The page's custom domain once it serves traffic; null otherwise. */
+	readonly customDomain: string | null
 }
 
 export interface SnapshotComponentInput {
@@ -148,6 +162,11 @@ export const toSnapshot = (input: SnapshotInput): StatusPageSnapshot => {
 	const days = lastDays(input.nowMs, STATUS_PAGE_HISTORY_DAYS)
 	const firstDay = days[0] ?? ""
 	const daily = Arr.filter(input.daily, (row) => row.day >= firstDay)
+	const componentIdsOf = (incidentId: StatusPageIncidentId): ReadonlyArray<string> =>
+		Arr.map(
+			Arr.filter(input.incidentComponents, (link) => link.incidentId === incidentId),
+			(link) => link.componentId,
+		)
 
 	const incidents: ReadonlyArray<StatusPageSnapshotIncident> = Arr.map(
 		Arr.sort(
@@ -170,10 +189,7 @@ export const toSnapshot = (input: SnapshotInput): StatusPageSnapshot => {
 				resolvedAt: incident.resolvedAt,
 				scheduledStart: incident.scheduledStart,
 				scheduledEnd: incident.scheduledEnd,
-				componentIds: Arr.map(
-					Arr.filter(input.incidentComponents, (link) => link.incidentId === incident.id),
-					(link) => link.componentId,
-				),
+				componentIds: componentIdsOf(incident.id),
 				// The first update came from break-glass: `bg-<entry>` follow-ups still target it.
 				openedByOverlayEntryId: first?.source === "break_glass" ? first.overlayEntryId : null,
 				updates: Arr.map(updates, (update) => ({
@@ -201,6 +217,7 @@ export const toSnapshot = (input: SnapshotInput): StatusPageSnapshot => {
 			impact: incident.impact,
 			startedAt: incident.startedAt,
 			resolvedAt: incident.resolvedAt,
+			componentIds: componentIdsOf(incident.id),
 		}),
 	)
 
@@ -249,15 +266,22 @@ export const toSnapshot = (input: SnapshotInput): StatusPageSnapshot => {
 		page: {
 			name: input.page.name,
 			slug: input.page.slug,
+			orgKey: input.page.orgKey,
 			description: input.page.description,
 			websiteUrl: input.page.websiteUrl,
 			logoUrl: input.page.logoUrl,
+			logoDarkUrl: input.page.logoDarkUrl,
+			faviconUrl: input.page.faviconUrl,
+			supportUrl: input.page.supportUrl,
 			theme: input.page.theme,
 			showPoweredBy: input.page.showPoweredBy,
 			privacyUrl: input.page.privacyUrl,
 			termsUrl: input.page.termsUrl,
+			customDomain: input.page.customDomain,
+			visibility: input.page.visibility,
 		},
 		breakGlassTokenSha256: input.page.breakGlassTokenSha256,
+		passwordHash: input.page.visibility === "password" ? input.page.passwordHash : null,
 		components,
 		incidents,
 		incidentHistory,
@@ -266,7 +290,10 @@ export const toSnapshot = (input: SnapshotInput): StatusPageSnapshot => {
 
 /** A page that has no row yet: what the builder previews before anything is saved. */
 export interface StatusPageDraft {
-	readonly page: Omit<SnapshotPageInput, "id" | "breakGlassTokenSha256" | "revision">
+	readonly page: Omit<
+		SnapshotPageInput,
+		"id" | "orgKey" | "breakGlassTokenSha256" | "passwordHash" | "revision" | "customDomain"
+	>
 	readonly components: ReadonlyArray<Omit<SnapshotComponentInput, "id" | "monitorStatus">>
 }
 
@@ -279,6 +306,9 @@ const DRAFT_PLACEHOLDER_NAME = "Status page"
 const DRAFT_PLACEHOLDER_SLUG = "preview"
 const isSlug = Schema.is(StatusPageSlug)
 const isTheme = Schema.is(StatusPageTheme)
+
+const imageOrNull = (value: string | null) =>
+	value !== null && isStatusPageImageSource(value) ? value : null
 
 const httpsOrNull = (value: string | null) =>
 	value !== null && URL.canParse(value) && new URL(value).protocol === "https:" ? value : null
@@ -296,11 +326,15 @@ export const toStatusPageDraft = (params: StatusPagePreviewParams): StatusPageDr
 			slug: isSlug(config.slug) ? config.slug : DRAFT_PLACEHOLDER_SLUG,
 			description: config.description,
 			websiteUrl: httpsOrNull(config.website_url),
-			logoUrl: httpsOrNull(config.logo_url),
+			logoUrl: imageOrNull(config.logo_url),
+			logoDarkUrl: imageOrNull(config.logo_dark_url),
+			faviconUrl: imageOrNull(config.favicon_url),
+			supportUrl: httpsOrNull(config.support_url),
 			privacyUrl: httpsOrNull(config.privacy_url),
 			termsUrl: httpsOrNull(config.terms_url),
 			theme,
 			showPoweredBy: config.show_powered_by,
+			visibility: config.visibility,
 		},
 		components: Arr.map(config.components, (component) => ({
 			name: component.name,
@@ -401,11 +435,16 @@ export class StatusPageSnapshotBuilder extends Context.Service<
 								description: $.description,
 								websiteUrl: $.websiteUrl,
 								logoUrl: $.logoUrl,
+								logoDarkUrl: $.logoDarkUrl,
+								faviconUrl: $.faviconUrl,
+								supportUrl: $.supportUrl,
 								privacyUrl: $.privacyUrl,
 								termsUrl: $.termsUrl,
 								theme: $.theme,
 								showPoweredBy: $.showPoweredBy,
 								breakGlassTokenSha256: $.breakGlassTokenSha256,
+								visibility: $.visibility,
+								passwordHash: $.passwordHash,
 								revision: $.revision,
 							}))
 							.where(($) => [$.id.eq(pageId)])
@@ -413,6 +452,12 @@ export class StatusPageSnapshotBuilder extends Context.Service<
 					)
 					if (page === undefined) return null
 					const orgId = page.orgId
+					const [domain] = yield* db.run(
+						PG.from(StatusPageCustomDomains)
+							.select(($) => ({ hostname: $.hostname }))
+							.where(($) => [$.pageId.eq(pageId), $.status.eq("active")])
+							.limit(1),
+					)
 					const rows = yield* db.run(
 						PG.from(StatusPageComponents)
 							.select(($) => ({
@@ -494,8 +539,17 @@ export class StatusPageSnapshotBuilder extends Context.Service<
 											PG.inList($.incidentId, incidentIds),
 										]),
 								)
+					// Listed incidents, and indexed ones too: the bars mark the components each touched.
+					const indexedIds = Arr.map(
+						Arr.filter(
+							incidents,
+							(incident) =>
+								isListedIncident(incident, nowMs) || isIndexedIncident(incident, nowMs),
+						),
+						(incident) => incident.id,
+					)
 					const incidentComponents =
-						incidentIds.length === 0
+						indexedIds.length === 0
 							? []
 							: yield* db.run(
 									PG.from(StatusPageIncidentComponents)
@@ -505,10 +559,21 @@ export class StatusPageSnapshotBuilder extends Context.Service<
 										}))
 										.where(($) => [
 											$.orgId.eq(orgId),
-											PG.inList($.incidentId, incidentIds),
+											PG.inList($.incidentId, indexedIds),
 										]),
 								)
-					return { page, components, daily, incidents, updates, incidentComponents }
+					return {
+						page: {
+							...page,
+							orgKey: statusPageOrgKey(orgId),
+							customDomain: domain?.hostname ?? null,
+						},
+						components,
+						daily,
+						incidents,
+						updates,
+						incidentComponents,
+					}
 				}),
 			)
 			if (input === null) {
@@ -538,7 +603,15 @@ export class StatusPageSnapshotBuilder extends Context.Service<
 				),
 			)
 			return toSnapshot({
-				page: { ...draft.page, id: DRAFT_PAGE_ID, breakGlassTokenSha256: null, revision: 0 },
+				page: {
+					...draft.page,
+					id: DRAFT_PAGE_ID,
+					orgKey: statusPageOrgKey(orgId),
+					breakGlassTokenSha256: null,
+					passwordHash: null,
+					revision: 0,
+					customDomain: null,
+				},
 				components: Arr.map(draft.components, (component, index) => ({
 					...component,
 					id: draftComponentId(index),

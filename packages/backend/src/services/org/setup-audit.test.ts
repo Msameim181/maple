@@ -1020,8 +1020,16 @@ describe("integration checks", () => {
 					cloudflareStates: [],
 					cloudflareLogpush: [],
 					cloudflareHyperdrives: [],
+					gcpConnectors: [],
+					gcpResourceCounts: [],
+					awsConnections: [],
+					supabaseConnection: null,
+					supabaseProjects: [],
+					fleetConnection: null,
 					railwayConnection: null,
 					railwayEnvironments: [],
+					vercelConnection: null,
+					vercelProjectCount: 0,
 					planetscaleConnection: null,
 					planetscaleDatabases: [],
 					planetscalePollStates: [],
@@ -1107,6 +1115,8 @@ describe("integration checks", () => {
 		const planetscaleConnection = {
 			psOrganization: "acme",
 			detectedPermissions: { readDatabases: true, readOrganization: true },
+			metricsEnabled: true,
+			eventsEnabled: true,
 			lastInventoryAt: NOW - 30 * 60_000,
 			lastInventoryError: null,
 			createdAt: NOW - 30 * 24 * HOUR,
@@ -1118,7 +1128,13 @@ describe("integration checks", () => {
 			region: "us-east",
 			state: "ready",
 		}
-		const neverPolled = { databaseId: "db-1", lastSuccessAt: null, lastErrorAt: null, lastError: null }
+		const neverPolled = {
+			databaseId: "db-1",
+			dataset: "deploy_requests",
+			lastSuccessAt: null,
+			lastErrorAt: null,
+			lastError: null,
+		}
 
 		it("CFG-INTEG-05 says a database never polled, instead of quoting its metadata as an error", () => {
 			const report = runSetupAudit(
@@ -1218,6 +1234,56 @@ describe("integration checks", () => {
 			const result = check(broken, "CFG-INTEG-06")
 			expect(result.status).toBe("fail")
 			expect(result.affected[0]?.note).toContain("HMAC signature mismatch")
+		})
+
+		it("CFG-INTEG-07 reports a rejected Vercel token and an errored drain", () => {
+			const vercelConnection = {
+				teamName: "acme",
+				authFailedAt: null,
+				logsEnabled: true,
+				tracesEnabled: true,
+				aiGatewayEnabled: true,
+				speedInsightsEnabled: false,
+				webAnalyticsEnabled: false,
+				auditLogEnabled: false,
+				logDrainState: { status: "enabled", lastError: null },
+				traceDrainState: { status: "errored", lastError: "limits-exceeded" },
+				aiGatewayDrainState: { status: "enabled", lastError: null },
+				speedInsightsDrainState: null,
+				webAnalyticsDrainState: null,
+				auditLogDrainState: null,
+				lastSuccessAt: NOW - 60_000,
+				lastErrorAt: null,
+				lastError: null,
+				createdAt: NOW - 30 * 24 * HOUR,
+			}
+			const errored = check(
+				runSetupAudit(inputs({ integrationInventory: inventoryOf({ vercelConnection }) })),
+				"CFG-INTEG-07",
+			)
+			expect(errored.status).toBe("fail")
+			expect(errored.affected).toEqual([
+				{ kind: "integration", name: "drain traces", note: "limits-exceeded" },
+			])
+			const rejected = check(
+				runSetupAudit(
+					inputs({
+						integrationInventory: inventoryOf({
+							vercelConnection: {
+								...vercelConnection,
+								authFailedAt: NOW - HOUR,
+								traceDrainState: { status: "enabled", lastError: null },
+							},
+						}),
+					}),
+				),
+				"CFG-INTEG-07",
+			)
+			expect(
+				Arr.some(rejected.affected, (entity) =>
+					Str.includes("Vercel rejected the access token")(entity.note ?? ""),
+				),
+			).toBe(true)
 		})
 
 		it("passes the inventory checks when the inventory could not be read", () => {
@@ -1346,6 +1412,109 @@ describe("integration checks", () => {
 		expect(result.status).toBe("fail")
 		expect(result.affected[0]?.note).toBe("missing permission (1 minute ago), never succeeded")
 	})
+
+	it.each([{ enabled: false }, { enabled: true, maxDuration: 0 }])(
+		"CFG-INTEG-02 lists unavailable settings %j without counting a stale error as failed",
+		(settings) => {
+			const state = {
+				dataset: "firewall_events",
+				zoneName: "example.com",
+				lastSuccessAt: null,
+				lastErrorAt: NOW - HOUR,
+				lastError: "OAuth request timed out",
+				settingsJson: JSON.stringify(settings),
+			}
+			const result = check(runSetupAudit(inputs({ cloudflareAnalytics: [state] })), "CFG-INTEG-02")
+			expect(result.status).toBe("pass")
+			expect(result.detail).toContain("not included in the Cloudflare plan")
+			expect(result.affected).toEqual([
+				expect.objectContaining({
+					name: "firewall_events · example.com",
+					note: expect.stringContaining("unavailable"),
+				}),
+			])
+		},
+	)
+
+	it("CFG-INTEG-02 caps unavailable entities on a passing result and retains the total", () => {
+		const states = Arr.makeBy(25, (index) => ({
+			dataset: "firewall_events",
+			zoneName: `zone-${index}.example.com`,
+			lastSuccessAt: null,
+			lastErrorAt: null,
+			lastError: null,
+			settingsJson: JSON.stringify({ enabled: false }),
+		}))
+		const result = check(runSetupAudit(inputs({ cloudflareAnalytics: states })), "CFG-INTEG-02")
+		expect(result.status).toBe("pass")
+		expect(result.affected).toHaveLength(20)
+		expect(result.affectedCount).toBe(25)
+	})
+
+	it("CFG-INTEG-02 keeps available failures failing alongside unavailable datasets", () => {
+		const state = {
+			dataset: "firewall_events",
+			zoneName: "example.com",
+			lastSuccessAt: null,
+			lastErrorAt: NOW - HOUR,
+			lastError: "real upstream error",
+		}
+		const result = check(
+			runSetupAudit(
+				inputs({
+					cloudflareAnalytics: [
+						{ ...state, settingsJson: JSON.stringify({ enabled: false }) },
+						{
+							...state,
+							dataset: "http_requests",
+							settingsJson: JSON.stringify({ enabled: true, maxDuration: 3600 }),
+						},
+					],
+				}),
+			),
+			"CFG-INTEG-02",
+		)
+		expect(result.status).toBe("fail")
+		expect(result.detail).toContain("1 Cloudflare dataset has failed")
+		expect(result.detail).toContain("1 dataset not included in the Cloudflare plan")
+		expect(result.affected).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					name: "http_requests · example.com",
+					// The grouped note leads with the error and appends the success age.
+					note: expect.stringContaining("real upstream error"),
+				}),
+				expect.objectContaining({
+					name: "firewall_events · example.com",
+					note: expect.stringContaining("unavailable"),
+				}),
+			]),
+		)
+	})
+
+	it.each([null, "invalid json", "{}", '{"enabled":"false"}', '{"maxDuration":null}'])(
+		"CFG-INTEG-02 does not suppress an error for unknown settings %s",
+		(settingsJson) => {
+			const result = check(
+				runSetupAudit(
+					inputs({
+						cloudflareAnalytics: [
+							{
+								dataset: "http_requests",
+								zoneName: null,
+								lastSuccessAt: null,
+								lastErrorAt: NOW - HOUR,
+								lastError: "real error",
+								settingsJson,
+							},
+						],
+					}),
+				),
+				"CFG-INTEG-02",
+			)
+			expect(result.status).toBe("fail")
+		},
+	)
 
 	it("CFG-INTEG-03 flags a repository whose sync errored", () => {
 		const report = runSetupAudit(

@@ -1,6 +1,7 @@
 import { EdgeCacheServiceLive } from "@maple/backend/platform/CacheBackendLive"
 import { Cause, Effect, Layer, Option } from "effect"
 import { EventBaseLive } from "@maple/backend/platform/DatabasePgLive"
+import { GithubAppClientSecret, GithubAppPrivateKey, GithubAppWebhookSecret } from "@maple/infra/secrets"
 
 import { VcsScheduledSyncService } from "@maple/backend/services/integrations/vcs/VcsScheduledSyncService"
 import {
@@ -25,6 +26,8 @@ import {
 import { CiTraceSinkLive } from "@maple/backend/services/integrations/ci-traces/CiTraceService"
 import { DependencyScanSinkLive } from "@maple/backend/services/dependency-scan/DependencyScanner"
 import { summarizeCause } from "@maple/backend/platform/describe-cause"
+import { AuditTrailEventSinkLive } from "@maple/backend/services/audit-trail/AuditTrailService"
+import { AuditEventsLive } from "./audit-events-runtime"
 import type { QueueBatch } from "@maple/backend/platform/queue-batch"
 import type { Message } from "@cloudflare/workers-types"
 import {
@@ -69,8 +72,19 @@ export const VcsSyncLive = VcsSyncService.layer.pipe(
 	Layer.provide(CiTraceSinkLive),
 	// Lockfile scans for known vulnerable dependencies, on pushes and installation syncs.
 	Layer.provide(DependencyScanSinkLive),
+	// Organization, member, repository and protection changes, written to the audit log.
+	Layer.provide(AuditTrailEventSinkLive.pipe(Layer.provide(AuditEventsLive))),
 	// No embedder here: the review's feedback filter runs where the review agent does.
-	Layer.provide(Layer.mergeAll(EventBaseLive, EdgeCacheServiceLive, FindingEmbedder.none)),
+	Layer.provide(
+		Layer.mergeAll(
+			EventBaseLive,
+			GithubAppPrivateKey.layer,
+			GithubAppClientSecret.layer,
+			GithubAppWebhookSecret.layer,
+			EdgeCacheServiceLive,
+			FindingEmbedder.none,
+		),
+	),
 )
 
 export const VcsScheduledLive = VcsScheduledSyncService.layer.pipe(Layer.provide(EventBaseLive))

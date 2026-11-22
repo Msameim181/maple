@@ -26,7 +26,7 @@ export const componentId = (n: number) =>
 	Schema.decodeSync(StatusPageComponentId)(`0199a011-0000-7000-8000-00000000000${n}`)
 export const incidentId = (n: number) =>
 	Schema.decodeSync(StatusPageIncidentId)(`0199a012-0000-7000-8000-00000000000${n}`)
-const updateId = (n: number) =>
+export const updateId = (n: number) =>
 	Schema.decodeSync(StatusPageIncidentUpdateId)(`0199a013-0000-7000-8000-00000000000${n}`)
 
 export const statusPage = (fields: Partial<V2StatusPage> = {}): V2StatusPage => ({
@@ -37,11 +37,16 @@ export const statusPage = (fields: Partial<V2StatusPage> = {}): V2StatusPage => 
 	description: null,
 	website_url: null,
 	logo_url: null,
+	logo_dark_url: null,
+	favicon_url: null,
+	support_url: null,
 	privacy_url: null,
 	terms_url: null,
 	theme: DEFAULT_STATUS_PAGE_THEME,
 	show_powered_by: true,
 	auto_incidents: "draft",
+	visibility: "public",
+	has_password: false,
 	draft: false,
 	break_glass_token_suffix: null,
 	revision: 3,
@@ -80,6 +85,7 @@ export const incident = (n: number, fields: Partial<V2StatusPageIncident> = {}):
 	published: true,
 	scheduled_start: null,
 	scheduled_end: null,
+	auto_complete: true,
 	started_at: iso(10 * MINUTE),
 	resolved_at: null,
 	component_ids: [componentId(1)],
@@ -108,6 +114,9 @@ export const statusPageConfig = (
 		description: page.description,
 		website_url: page.website_url,
 		logo_url: page.logo_url,
+		logo_dark_url: page.logo_dark_url,
+		favicon_url: page.favicon_url,
+		support_url: page.support_url,
 		privacy_url: page.privacy_url,
 		terms_url: page.terms_url,
 		show_powered_by: page.show_powered_by,

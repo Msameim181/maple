@@ -24,12 +24,13 @@ import {
 	IdentifySession,
 	SaveSessionToken,
 	WaitForAuthSettle,
+	WaitPageHold,
 	WaitPreloadDelay,
 	WriteSessionTimeRange,
 } from "./command"
 import { Message } from "./message"
 import { ClerkPhase, type Model, Session } from "./model"
-import { isRedirectOnlyRoute, rendersShell } from "./page/chrome"
+import { rendersShell } from "./page/chrome"
 import * as Onboarding from "./page/onboarding"
 import {
 	accessOf,
@@ -41,6 +42,7 @@ import {
 	planGate,
 } from "./page/onboarding/plan-gate"
 import { type PageContext, PageOutMessage, type RootToastAction } from "./page/contract"
+import * as PageHold from "./page/page-hold"
 import * as Preload from "./page/preload"
 import {
 	changeContext,
@@ -60,7 +62,9 @@ import {
 import * as SignIn from "./page/sign-in"
 import type { Resources } from "./platform/resources"
 import { ClerkSnapshot } from "./platform/clerk"
-import { identityOf, isSameIdentity } from "./platform/session-identity"
+import * as Policy from "@maple/domain/policy"
+import { identityOf, isSameIdentity, type SessionIdentity } from "./platform/session-identity"
+import { getActivePlan, hasSelectedPlan } from "./page/kit/billing/plan-gating"
 import {
 	AppRoute,
 	flaggedRouteRedirect,
@@ -68,6 +72,7 @@ import {
 	isPublicRoute,
 	type Redirect,
 	routeRedirect,
+	securityRouteRedirect,
 	urlToAppRoute,
 } from "./route"
 import { completeRangeOf, isWithin, withSessionRange } from "./route/session-time-range"
@@ -266,6 +271,25 @@ export const pageContextOf: (model: Model) => Option.Option<PageContext> = lastB
 								integrations: model.shell.integrations,
 								remembered: model.shell.rememberedSurfaces[orgId],
 							},
+							audience: Shell.shellAudience(shellClerkOf(model)),
+							hasProductAnalytics:
+								!isClerkAuthEnabled ||
+								Option.exists(
+									clerkOrganizationOf(model),
+									(organization) => organization.flags.productAnalytics,
+								),
+							hasProfiling:
+								!isClerkAuthEnabled ||
+								Option.exists(
+									clerkOrganizationOf(model),
+									(organization) => organization.flags.profiling,
+								),
+							hasCloudSecurity:
+								!isClerkAuthEnabled ||
+								Option.exists(
+									clerkOrganizationOf(model),
+									(organization) => organization.flags.cloudSecurity,
+								),
 						})),
 					),
 	}),
@@ -426,6 +450,13 @@ const writePage =
 		)
 			return { model }
 		const followed = actOnPageOut(model, transition.outMessage)
+		const pageHold = PageHold.written(
+			followed.model.pageHold,
+			followed.model.page,
+			transition.slot,
+			PageHold.isRevived(followed.model.parkedPages, transition.slot),
+		)
+		const startedHold = PageHold.startedHold(followed.model.pageHold, pageHold)
 		const held = Preload.held(
 			followed.model.preload,
 			pageIdentity(transition.slot),
@@ -436,6 +467,7 @@ const writePage =
 			model: modifyFields(followed.model, {
 				page: () => transition.slot,
 				parkedPages: (parked) => parkPages(parked, followed.model.page, transition.slot),
+				pageHold: () => pageHold,
 				pageInstances: (built) => Math.max(built, transition.slot?.instance ?? 0),
 				preload: () => held.model,
 			}),
@@ -447,6 +479,7 @@ const writePage =
 					transition.commands,
 					Command.mapMessage((message) => Message.GotPageMessage({ message })),
 				),
+				...(startedHold === null ? [] : [WaitPageHold({ instance: startedHold })]),
 				...followed.outCommands,
 				...followed.toastCommands,
 			],
@@ -459,10 +492,13 @@ const isPlanGated = (model: Model) => Option.exists(planGateOf(model), isRouteHe
 
 const loadPage: Step = (model) =>
 	Option.match(
-		// A flag-gated route is on its way home: no page, so nothing it would fetch.
+		// A flag- or role-gated route is on its way home: no page, so nothing it would fetch.
 		Option.filter(
 			pageContextOf(model),
-			() => !isPlanGated(model) && Option.isNone(flagRedirectOf(model)),
+			() =>
+				!isPlanGated(model) &&
+				Option.isNone(flagRedirectOf(model)) &&
+				Option.isNone(roleRedirectOf(model)),
 		),
 		{
 			// Leaving every page (signed out) releases what the last one held, like any page change.
@@ -516,6 +552,10 @@ export const shellClerkOf = (model: Model): Shell.ShellClerk | null =>
 					maybeOrganization: inputs.maybeOrganization,
 					memberships: inputs.memberships,
 					customer: customerOf(model.customer),
+					maybeRole: Option.flatMap(
+						Option.fromNullishOr(model.clerkSnapshot),
+						(snapshot) => snapshot.maybeRole,
+					),
 				}),
 			})
 		: null
@@ -762,6 +802,18 @@ const flagRedirectOf = (model: Model): Option.Option<Redirect> =>
 			)
 		: Option.none()
 
+/**
+ * A Security route opened by someone whose role lacks `security:manage` (a member). Waits for
+ * Clerk's membership read, so an admin is never bounced while it loads; the API refuses either way.
+ */
+const roleRedirectOf = (model: Model): Option.Option<Redirect> =>
+	isClerkAuthEnabled
+		? Option.flatMap(
+				Option.flatMap(Option.fromNullishOr(model.clerkSnapshot), (snapshot) => snapshot.maybeRole),
+				(role) => securityRouteRedirect(model.route, Policy.can([role], "security:manage")),
+			)
+		: Option.none()
+
 const followRedirects: Step = (model) => {
 	const maybeRedirect = Session.match(model.session, {
 		Resolving: () => Option.none<Redirect>(),
@@ -770,6 +822,7 @@ const followRedirects: Step = (model) => {
 			Option.orElse(routeRedirect(model.route), () => sessionRedirect(model)).pipe(
 				Option.orElse(() => Option.flatMap(planGateOf(model), (gate) => gate.redirect)),
 				Option.orElse(() => flagRedirectOf(model)),
+				Option.orElse(() => roleRedirectOf(model)),
 			),
 	})
 	return Option.match(maybeRedirect, {
@@ -833,10 +886,22 @@ const elapsedCustomerGrace = (model: Model, orgId: string): UpdateReturn =>
 			)
 
 /** A customer read for the current org settled: remember the access, then re-run the gates. */
-/** The quick start learns the plan is known: a save it loaded before the customer read settles. */
+/**
+ * The onboarding screen learns the plan is known: the quick start settles a save it loaded before the
+ * customer read, and either plan screen back from Stripe stops waiting once the plan shows.
+ */
 const withSettledPlan = (step: UpdateReturn): UpdateReturn => {
-	if (step.model.onboarding?.screen._tag !== "QuickStart") return step
-	const next = updateOnboarding(step.model, Onboarding.settledPlanMessage)
+	const screen = step.model.onboarding?.screen._tag
+	// App access fails open (a failed read, a lapsed plan); only a live subscription ends a checkout wait.
+	const isPlanActive = hasSelectedPlan(customerOf(step.model.customer))
+	const message =
+		screen === "QuickStart"
+			? Onboarding.settledPlanMessage(isPlanActive)
+			: screen === "SelectPlan"
+				? Onboarding.settledSelectPlanMessage(isPlanActive)
+				: null
+	if (message === null) return step
+	const next = updateOnboarding(step.model, message)
 	return { ...next, commands: [...(step.commands ?? []), ...(next.commands ?? [])] }
 }
 
@@ -845,15 +910,20 @@ const settledCustomer = (model: Model, orgId: string, data: CustomerSlot["data"]
 	const next = modifyFields(model, { customer: () => ({ orgId, data }) })
 	const access = accessOf(next.customer)
 	const settled = withSettledPlan(settle(next))
-	return access === "app" || access === "onboarding"
-		? {
-				model: settled.model,
-				commands: [
-					...(settled.commands ?? []),
-					SaveSelectedPlanKnown({ orgId, mayRenderApp: access === "app" }),
-				],
-			}
-		: settled
+	const known = sessionIdentityOf(model)
+	const identity = sessionIdentityOf(next)
+	return {
+		model: settled.model,
+		commands: [
+			...(known === undefined || identity === undefined || isSameIdentity(known, identity)
+				? []
+				: [IdentifySession({ identity })]),
+			...(settled.commands ?? []),
+			...(access === "app" || access === "onboarding"
+				? [SaveSelectedPlanKnown({ orgId, mayRenderApp: access === "app" })]
+				: []),
+		],
+	}
 }
 
 /** The signed-in org, on a shell route. */
@@ -946,13 +1016,25 @@ const changedClerkSession = (model: Model, snapshot: ClerkSnapshot): UpdateRetur
 		? { model }
 		: appliedClerkSnapshot(snapshot, false)(model)
 
+/** The active org's Autumn plan id, once its own customer read (not another org's) found one. */
+const activePlanIdOf = (model: Model, snapshot: ClerkSnapshot): string | null =>
+	Option.getOrNull(snapshot.maybeOrgId) === model.customer.orgId
+		? (getActivePlan(customerOf(model.customer))?.planId ?? null)
+		: null
+
+/** The identity the model names; `undefined` before Clerk's first answer. */
+const sessionIdentityOf = (model: Model): SessionIdentity | null | undefined =>
+	model.clerkSnapshot === null
+		? undefined
+		: identityOf(model.clerkSnapshot, activePlanIdOf(model, model.clerkSnapshot))
+
 /** `useClerkAuthSettled`: a signed-out first answer waits for a refreshing session, except on public pages. */
 const appliedClerkSnapshot =
 	(snapshot: ClerkSnapshot, isFirstAnswer: boolean): Step =>
 	(previous) => {
 		const model = modifyFields(previous, { clerkSnapshot: () => snapshot })
-		const identity = identityOf(snapshot)
-		const known = previous.clerkSnapshot === null ? undefined : identityOf(previous.clerkSnapshot)
+		const identity = identityOf(snapshot, activePlanIdOf(model, snapshot))
+		const known = sessionIdentityOf(previous)
 		const identify =
 			known !== undefined && isSameIdentity(known, identity) ? [] : [IdentifySession({ identity })]
 		if (Option.isSome(snapshot.maybeUserId)) {
@@ -1019,9 +1101,8 @@ const changedUrlStep = (model: Model, changedUrl: Url): UpdateReturn => {
 		route: () => nextRoute,
 		signIn: (signIn) => (isEnteringSignIn ? SignIn.init() : signIn),
 	})
-	const hasTopBar = rendersShell(nextRoute) && !isRedirectOnlyRoute(model.route)
 	return Update.combine([
-		foldShellStep(Shell.routeChanged(model.route._tag === nextRoute._tag, hasTopBar)),
+		foldShellStep(Shell.routeChanged(model.route._tag === nextRoute._tag, rendersShell(nextRoute))),
 		settle,
 		...(isEnteringSignIn ? [enterSignIn] : []),
 	])(routed)
@@ -1097,6 +1178,12 @@ const foldMessage = (model: Model, message: Message) =>
 		FailedLoadCustomer: ({ orgId }) =>
 			settledCustomer(model, orgId, CustomerData.Failure({ error: "Failed" })),
 		ElapsedCustomerGrace: ({ orgId }) => elapsedCustomerGrace(model, orgId),
+		ElapsedPageHold: ({ instance }) => {
+			const pageHold = PageHold.elapsed(model.pageHold, instance, model.page)
+			return pageHold === model.pageHold
+				? { model }
+				: { model: modifyFields(model, { pageHold: () => pageHold }) }
+		},
 		CompletedSaveSelectedPlanKnown: () => ({ model }),
 		CompletedSignOutOfClerk: () => ({ model }),
 		CompletedIdentifySession: () => ({ model }),

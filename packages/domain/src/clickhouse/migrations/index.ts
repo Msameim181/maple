@@ -61,6 +61,13 @@ import { migration_0059_service_overview_slo_latency_ladder } from "./0059_servi
 import { migration_0060_search_console_daily } from "./0060_search_console_daily"
 import { migration_0061_error_events_blank_event_fingerprint } from "./0061_error_events_blank_event_fingerprint"
 import { migration_0062_scanner_autonomous_agents } from "./0062_scanner_autonomous_agents"
+import { migration_0063_cost_daily } from "./0063_cost_daily"
+import { migration_0064_audit_trail_events } from "./0064_audit_trail_events"
+import { migration_0065_user_activity_identity } from "./0065_user_activity_identity"
+import { migration_0066_aws_metrics_hourly } from "./0066_aws_metrics_hourly"
+import { migration_0067_profiles } from "./0067_profiles"
+import { migration_0068_service_usage_profiles } from "./0068_service_usage_profiles"
+import { migration_0069_error_fingerprint_v5 } from "./0069_error_fingerprint_v5"
 import { Array as Arr } from "effect"
 
 /**
@@ -155,6 +162,13 @@ export const migrations: ReadonlyArray<ClickHouseMigration> = [
 	migration_0060_search_console_daily,
 	migration_0061_error_events_blank_event_fingerprint,
 	migration_0062_scanner_autonomous_agents,
+	migration_0063_cost_daily,
+	migration_0064_audit_trail_events,
+	migration_0065_user_activity_identity,
+	migration_0066_aws_metrics_hourly,
+	migration_0067_profiles,
+	migration_0068_service_usage_profiles,
+	migration_0069_error_fingerprint_v5,
 ] as const
 
 /** Highest migration `version` bundled — i.e. the schema level a fully-applied

@@ -8,12 +8,15 @@ import {
 	AWS_ROLE_TAGS,
 	AWS_TEMPLATE_VERSION,
 	awsConnectionResourceNames,
+	awsGrantsMatch,
+	awsModuleGranted,
 	awsModuleOfPolicyName,
 	awsOidcIssuer,
 	awsOidcSubject,
 	awsRoleArn,
 	type AwsMetricStream,
 	awsSetupPlan,
+	awsModuleRolloutFlag,
 	isAwsModuleAvailable,
 } from "@maple/domain/aws"
 import {
@@ -23,6 +26,7 @@ import {
 	IntegrationsPersistenceError,
 	IntegrationsValidationError,
 } from "@maple/domain/http"
+import type { OrganizationFeatureFlags } from "@maple/domain/organization-feature-flags"
 import {
 	AWS_MODULES,
 	type AwsAccountId,
@@ -31,7 +35,8 @@ import {
 	type OrgId,
 	type UserId,
 } from "@maple/primitives"
-import { Cause, Clock, Context, Effect, Layer, Option, Array as Arr } from "effect"
+import { Clock, Context, Effect, Layer, Option, Array as Arr } from "effect"
+import { isolatePollFailure } from "./poll-fleet"
 import { FetchHttpClient, HttpClient } from "effect/http"
 import { ingestKeyLookupHmacKey } from "@maple/backend/platform/Crypto"
 import { openSecret, sealSecret, secretKeyringFromEnv } from "@maple/backend/platform/SecretBox"
@@ -40,6 +45,7 @@ import { Database } from "@maple/backend/platform/DatabaseLive"
 import { makeDbExecute, makePersistenceErrorMapper } from "@maple/backend/platform/db-execute"
 import { Env } from "@maple/backend/platform/Env"
 import { ingestBaseUrl } from "@maple/backend/services/ingest/ingest-sender"
+import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/OrganizationFeatureFlagsService"
 import {
 	createIntegrationSource,
 	deleteSourcesOf,
@@ -47,9 +53,11 @@ import {
 	type PollOutcome,
 	reportPoll,
 } from "@maple/backend/services/integrations/integration-sources"
+import { reconcileAwsCostSources } from "../cost/aws-cost-sources"
 import { AwsApiError, checkRole } from "./aws/api"
 import { type AwsOidcSigner, makeAwsOidcSigner } from "./aws/oidc"
 import { renderAwsCleanupScript, renderAwsSetup } from "./aws/setup"
+import { awsEventsKey, awsEventsPath, mintAwsEventsKeySalt } from "../cloud-security/events-key"
 
 export interface AwsConnection {
 	readonly id: AwsConnectionId
@@ -94,6 +102,10 @@ export interface AwsSetup {
 	/** The metric stream's stack, deployed to each of its regions. Null without a stream. */
 	readonly metricsStackName: string | null
 	readonly metricsCloudformationTemplate: string | null
+	/** Whether the scripts carry the events key: true with the security module on. */
+	readonly containsEventsKey: boolean
+	/** Whether the scripts carry the stream access key: true with a metric stream set. */
+	readonly containsStreamKey: boolean
 }
 
 export interface AwsCheckSweep {
@@ -147,6 +159,14 @@ export interface AwsConnectionServiceApi {
 		AwsSetup,
 		IntegrationsNotFoundError | AwsIntegrationUnavailableError | IntegrationsPersistenceError
 	>
+	/**
+	 * Replaces the events key. The deployed stack sends the old one, which is refused from now on,
+	 * until the stack from `setup` is deployed again.
+	 */
+	readonly rotateEventsKey: (
+		orgId: OrgId,
+		connectionId: AwsConnectionId,
+	) => Effect.Effect<AwsConnection, IntegrationsNotFoundError | IntegrationsPersistenceError>
 	/** Assumes the role now. A failed check is recorded on the connection, not failed with. */
 	readonly check: (
 		orgId: OrgId,
@@ -193,9 +213,6 @@ const SWEEP_BUDGET_MS = 10 * 60_000
  */
 const SWEEP_CONCURRENCY = 2
 
-const sameModules = (a: ReadonlyArray<AwsModule>, b: ReadonlyArray<AwsModule>) =>
-	a.length === b.length && Arr.every(a, (module) => b.includes(module))
-
 /** Modules in their canonical order, without repeats. */
 const normalizeModules = (modules: ReadonlyArray<AwsModule>) =>
 	Arr.filter(AWS_MODULES, (module) => modules.includes(module))
@@ -213,7 +230,8 @@ const toConnection = (issuer: string, row: AwsConnectionRow): AwsConnection => {
 		templateVersion: row.templateVersion,
 		setupOutdated:
 			row.grantedModules !== null &&
-			(row.templateVersion !== AWS_TEMPLATE_VERSION || !sameModules(row.modules, row.grantedModules)),
+			(row.templateVersion !== AWS_TEMPLATE_VERSION ||
+				!awsGrantsMatch(row.modules, row.grantedModules)),
 		verifiedAt: row.verifiedAt,
 		lastCheckedAt: row.lastCheckedAt,
 		lastCheckError: row.lastCheckError,
@@ -225,24 +243,31 @@ const toConnection = (issuer: string, row: AwsConnectionRow): AwsConnection => {
 	}
 }
 
-const MODULE_INFO: ReadonlyArray<AwsModuleInfo> = Arr.map(AWS_MODULES, (module) => ({
-	module,
-	title: AWS_MODULE_SPECS[module].title,
-	summary: AWS_MODULE_SPECS[module].summary,
-	available: isAwsModuleAvailable(module),
-}))
+/** The modules as an org with these rollout flags is offered them. */
+const moduleInfo = (flags: OrganizationFeatureFlags): ReadonlyArray<AwsModuleInfo> =>
+	Arr.map(AWS_MODULES, (module) => ({
+		module,
+		title: AWS_MODULE_SPECS[module].title,
+		summary: AWS_MODULE_SPECS[module].summary,
+		available: isAwsModuleAvailable(module, flags),
+	}))
 
 const validateModules = (
 	modules: ReadonlyArray<AwsModule>,
+	flags: OrganizationFeatureFlags,
 ): Effect.Effect<ReadonlyArray<AwsModule>, ModulesError> => {
-	const planned = Arr.filter(modules, (module) => !isAwsModuleAvailable(module))
-	return planned.length === 0
-		? Effect.succeed(normalizeModules(modules))
-		: Effect.fail(
-				new IntegrationsValidationError({
-					message: `Maple does not read ${Arr.join(planned, ", ")} from AWS yet.`,
-				}),
-			)
+	const refused = Arr.filter(modules, (module) => !isAwsModuleAvailable(module, flags))
+	if (refused.length === 0) return Effect.succeed(normalizeModules(modules))
+	// A module behind a rollout flag is built: the org is outside its rollout, not early.
+	const planned = Arr.filter(refused, (module) => awsModuleRolloutFlag(module) === undefined)
+	return Effect.fail(
+		new IntegrationsValidationError({
+			message:
+				planned.length > 0
+					? `Maple does not read ${Arr.join(planned, ", ")} from AWS yet.`
+					: `Reading ${Arr.join(refused, ", ")} from AWS is not enabled for this organization yet.`,
+		}),
+	)
 }
 
 interface CheckResult {
@@ -279,7 +304,7 @@ const interpretCheck = (
 				return module === undefined ? [] : [module]
 			}),
 		)
-		const missing = Arr.filter(row.modules, (module) => !granted.includes(module))
+		const missing = Arr.filter(row.modules, (module) => !awsModuleGranted(granted, module))
 		const error =
 			missing.length === 0
 				? null
@@ -344,6 +369,7 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 			const database = yield* Database
 			const env = yield* Env
 			const httpClient = yield* HttpClient.HttpClient
+			const featureFlags = yield* OrganizationFeatureFlagsService
 			const dbExecute = makeDbExecute(database, "AwsConnectionService", toPersistenceError)
 			const persistence = (message: string) => new IntegrationsPersistenceError({ message })
 			const keyring = yield* secretKeyringFromEnv(env, persistence)
@@ -409,9 +435,10 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 							.orderBy(["createdAt", "asc"], ["id", "asc"]),
 					),
 				)
+				const flags = yield* featureFlags.flags(orgId)
 				return {
 					available: signer !== undefined,
-					modules: MODULE_INFO,
+					modules: moduleInfo(flags),
 					connections: Arr.map(rows, connectionOf),
 				}
 			})
@@ -427,7 +454,8 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 			) {
 				yield* Effect.annotateCurrentSpan({ orgId, "maple.aws.account_id": input.accountId })
 				if (signer === undefined) return yield* unavailable()
-				const modules = yield* validateModules(input.modules)
+				const flags = yield* featureFlags.flags(orgId)
+				const modules = yield* validateModules(input.modules, flags)
 				const id = AwsConnectionId.make(randomUUID())
 				const streamSecret = yield* mintStreamSecret({ orgId, id })
 				const now = yield* Clock.currentTimeMillis
@@ -453,6 +481,7 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 										metricStreamChangedAt:
 											(input.metricStream ?? null) === null ? null : now,
 										...streamSecret,
+										eventsKeySalt: mintAwsEventsKeySalt(),
 										createdBy: userId,
 										createdAt: now,
 										updatedAt: now,
@@ -484,8 +513,9 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 				},
 			) {
 				yield* Effect.annotateCurrentSpan({ orgId, "maple.aws.connection_id": connectionId })
+				const flags = yield* featureFlags.flags(orgId)
 				const modules =
-					patch.modules === undefined ? undefined : yield* validateModules(patch.modules)
+					patch.modules === undefined ? undefined : yield* validateModules(patch.modules, flags)
 				const updatedAt = yield* Clock.currentTimeMillis
 				const changes = {
 					...(modules !== undefined && { modules }),
@@ -502,6 +532,10 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 						streamSecretTag: null,
 						streamSecretHash: null,
 					}),
+					// The security module turned off: the key its stack sends is replaced, so turning
+					// it back on hands the next setup a new one.
+					...(modules !== undefined &&
+						!Arr.contains(modules, "security") && { eventsKeySalt: mintAwsEventsKeySalt() }),
 				}
 				// @effect-diagnostics-next-line preferEffectRecord:off -- not a record type; Rec.keys would need a cast
 				if (Object.keys(changes).length === 0) {
@@ -509,11 +543,18 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 					return connectionOf(current)
 				}
 				const [row] = yield* dbExecute((db) =>
-					db.run(
-						PG.update(AwsConnections)
-							.set({ ...changes, updatedAt })
-							.where(($) => [$.orgId.eq(orgId), $.id.eq(connectionId)])
-							.returning(),
+					db.transaction(
+						Effect.gen(function* () {
+							const rows = yield* db.run(
+								PG.update(AwsConnections)
+									.set({ ...changes, updatedAt })
+									.where(($) => [$.orgId.eq(orgId), $.id.eq(connectionId)])
+									.returning(),
+							)
+							// Cost turned on or off shows on the Cost page at once, not at the next sync tick.
+							if (modules !== undefined) yield* reconcileAwsCostSources(db, updatedAt, orgId)
+							return rows
+						}),
 					),
 				)
 				if (row === undefined) return yield* notFound()
@@ -578,7 +619,33 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 								endpoint: `${ingestBase}/v1/firehose/aws/${row.id}`,
 								accessKey: yield* streamAccessKey(row),
 							}
-				return yield* renderAwsSetup(row.id, row.accountId, plan, stream)
+				// The security module's findings also arrive as events, through the stack's API destination.
+				const events = Arr.contains(row.modules, "security")
+					? {
+							endpoint: new URL(awsEventsPath(row.id), env.MAPLE_API_BASE_URL).toString(),
+							key: awsEventsKey(lookupHmacKey, row.id, row.eventsKeySalt),
+						}
+					: null
+				const rendered = yield* renderAwsSetup(row.id, row.accountId, plan, stream, events)
+				return { ...rendered, containsEventsKey: events !== null, containsStreamKey: stream !== null }
+			})
+
+			const rotateEventsKey = Effect.fn("AwsConnectionService.rotateEventsKey")(function* (
+				orgId: OrgId,
+				connectionId: AwsConnectionId,
+			) {
+				yield* Effect.annotateCurrentSpan({ orgId, "maple.aws.connection_id": connectionId })
+				const updatedAt = yield* Clock.currentTimeMillis
+				const [row] = yield* dbExecute((db) =>
+					db.run(
+						PG.update(AwsConnections)
+							.set({ eventsKeySalt: mintAwsEventsKeySalt(), updatedAt })
+							.where(($) => [$.orgId.eq(orgId), $.id.eq(connectionId)])
+							.returning(),
+					),
+				)
+				if (row === undefined) return yield* notFound()
+				return connectionOf(row)
 			})
 
 			/** Assumes the row's role and writes what it found, on the row and on its source. */
@@ -614,6 +681,8 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 										.returning(),
 								)
 								if (outcome !== null) yield* reportPoll(db, row.sourceId, outcome, now)
+								// A check can grant or lose cost: its source follows now, not at the next sync tick.
+								yield* reconcileAwsCostSources(db, now, row.orgId)
 								return rows
 							}),
 						),
@@ -713,15 +782,12 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 							Effect.withSpan("AwsConnectionService.checkDue.connection", {
 								attributes: { orgId: row.orgId, "maple.aws.connection_id": row.id },
 							}),
-							// One connection's failure, expected or not, is that connection's alone.
-							Effect.catchCause((cause) =>
-								Effect.logWarning("AWS connection check failed").pipe(
-									Effect.annotateLogs({
-										"maple.aws.connection_id": row.id,
-										cause: Cause.pretty(cause),
-									}),
-									Effect.as(false),
-								),
+							// One connection's failure, expected or not, is that connection's alone. An
+							// interruption is not a failure: it stops the sweep.
+							isolatePollFailure(
+								"AWS connection check failed",
+								{ "maple.aws.connection_id": row.id },
+								false,
 							),
 						),
 					{ concurrency: SWEEP_CONCURRENCY },
@@ -772,6 +838,7 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 					accountId: current.accountId,
 					stackName: names.stackName,
 					metricsStackName: names.metricsStackName,
+					eventsStackName: names.eventsStackName,
 					oidcProvider: awsSetupPlan({
 						connectionId: current.id,
 						accountId: current.accountId,
@@ -789,6 +856,8 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 									.returning(),
 							)
 							yield* deleteSourcesOf(db, orgId, deleted, "aws")
+							const now = yield* Clock.currentTimeMillis
+							yield* reconcileAwsCostSources(db, now, orgId)
 							return deleted
 						}),
 					),
@@ -802,6 +871,7 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 				create,
 				update,
 				setup,
+				rotateEventsKey,
 				check,
 				checkDue,
 				delete: deleteConnection,
@@ -809,5 +879,7 @@ export class AwsConnectionService extends Context.Service<AwsConnectionService, 
 		}),
 	},
 ) {
-	static readonly layer = Layer.effect(this, this.make).pipe(Layer.provide(FetchHttpClient.layer))
+	static readonly layer = Layer.effect(this, this.make).pipe(
+		Layer.provide([FetchHttpClient.layer, OrganizationFeatureFlagsService.layer]),
+	)
 }

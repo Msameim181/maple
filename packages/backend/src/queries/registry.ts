@@ -35,6 +35,12 @@ import type {
 	RailwayInfraServiceTimeseriesRequest,
 	ServiceCloudflareStatsRequest,
 	SpanDetailRequest,
+	VercelInfraBreakdownRequest,
+	VercelInfraFunctionTimeseriesRequest,
+	VercelInfraProjectDetailRequest,
+	VercelInfraProjectsRequest,
+	VercelInfraTimeseriesRequest,
+	VercelInfraWindowRequest,
 	SupabaseInfraProjectsRequest,
 	SupabaseInfraProjectTimeseriesRequest,
 	SupabaseLogIssuesRequest,
@@ -260,6 +266,298 @@ const railwayInfraServiceTimeseries = defineQuery({
 		}),
 })
 
+const vercelWindow = (payload: { startTime: string; endTime: string }, orgId: OrgId) => ({
+	orgId,
+	startTime: payload.startTime,
+	endTime: payload.endTime,
+})
+
+/** The request filter a payload carries, when it names both the dimension and the value. */
+const requestFilter = (payload: {
+	readonly filterBy?: Integrations.VercelBreakdownDimension
+	readonly filterValue?: string
+}): Integrations.VercelRequestFilter | undefined =>
+	payload.filterBy === undefined || payload.filterValue === undefined
+		? undefined
+		: { dimension: payload.filterBy, value: payload.filterValue }
+
+const speedInsightsFilter = (
+	payload: VercelInfraWindowRequest,
+): Integrations.VercelSpeedInsightsFilter | undefined =>
+	payload.filterValue === undefined || (payload.filterBy !== "route" && payload.filterBy !== "device")
+		? undefined
+		: { dimension: payload.filterBy, value: payload.filterValue }
+
+const webAnalyticsFilter = (
+	payload: VercelInfraWindowRequest,
+): Integrations.VercelWebAnalyticsFilter | undefined =>
+	payload.filterValue === undefined ||
+	(payload.filterBy !== "page" && payload.filterBy !== "referrer" && payload.filterBy !== "country")
+		? undefined
+		: { dimension: payload.filterBy, value: payload.filterValue }
+
+const vercelBucketed = (payload: VercelInfraTimeseriesRequest, orgId: OrgId) => ({
+	...vercelWindow(payload, orgId),
+	bucketSeconds: Math.max(60, Math.floor(payload.bucketSeconds)),
+})
+
+const vercelInfraProjectRequests = defineQuery({
+	id: "vercelInfraProjectRequests",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraProjectsRequest, orgId: OrgId) =>
+		CH.compile(Integrations.vercelProjectRequestsSQL(), vercelWindow(payload, orgId)),
+})
+
+const vercelInfraProjectLatency = defineQuery({
+	id: "vercelInfraProjectLatency",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraProjectsRequest, orgId: OrgId) =>
+		CH.compile(Integrations.vercelProjectLatencySQL(), vercelWindow(payload, orgId)),
+})
+
+const vercelInfraRequestTimeseries = defineQuery({
+	id: "vercelInfraRequestTimeseries",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraTimeseriesRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelRequestTimeseriesSQL({
+				projectId: payload.projectId,
+				filter: requestFilter(payload),
+			}),
+			vercelBucketed(payload, orgId),
+		),
+})
+
+const vercelInfraEdgeLatencyTimeseries = defineQuery({
+	id: "vercelInfraEdgeLatencyTimeseries",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraTimeseriesRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelEdgeLatencyTimeseriesSQL({ projectId: payload.projectId }),
+			vercelBucketed(payload, orgId),
+		),
+})
+
+const vercelInfraFunctionTimeseries = defineQuery({
+	id: "vercelInfraFunctionTimeseries",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraTimeseriesRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelFunctionTimeseriesSQL({ projectId: payload.projectId }),
+			vercelBucketed(payload, orgId),
+		),
+})
+
+const vercelInfraBreakdown = defineQuery({
+	id: "vercelInfraBreakdown",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraBreakdownRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelProjectBreakdownSQL(
+				payload.dimension,
+				payload.status ?? "all",
+				requestFilter(payload),
+			),
+			{
+				...vercelWindow(payload, orgId),
+				projectId: payload.projectId,
+			},
+		),
+})
+
+const vercelInfraTopPaths = defineQuery({
+	id: "vercelInfraTopPaths",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraProjectDetailRequest, orgId: OrgId) =>
+		CH.compile(Integrations.vercelProjectTopPathsSQL(), {
+			...vercelWindow(payload, orgId),
+			projectId: payload.projectId,
+		}),
+})
+
+const vercelInfraErrorLogs = defineQuery({
+	id: "vercelInfraErrorLogs",
+	profile: "list",
+	cache: 15,
+	compile: (payload: VercelInfraProjectDetailRequest, orgId: OrgId) =>
+		CH.compile(Integrations.vercelProjectErrorLogsSQL(), {
+			...vercelWindow(payload, orgId),
+			projectId: payload.projectId,
+		}),
+})
+
+const vercelAiGatewaySummary = defineQuery({
+	id: "vercelAiGatewaySummary",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraTimeseriesRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelAiGatewaySummarySQL({ projectId: payload.projectId }),
+			vercelWindow(payload, orgId),
+		),
+})
+
+const vercelAiGatewayByModel = defineQuery({
+	id: "vercelAiGatewayByModel",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraTimeseriesRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelAiGatewayByModelSQL({ projectId: payload.projectId }),
+			vercelWindow(payload, orgId),
+		),
+})
+
+const vercelAiGatewayByProject = defineQuery({
+	id: "vercelAiGatewayByProject",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraTimeseriesRequest, orgId: OrgId) =>
+		CH.compile(Integrations.vercelAiGatewayByProjectSQL(), vercelWindow(payload, orgId)),
+})
+
+const vercelAiGatewayTimeseries = defineQuery({
+	id: "vercelAiGatewayTimeseries",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraTimeseriesRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelAiGatewayTimeseriesSQL({ projectId: payload.projectId }),
+			vercelBucketed(payload, orgId),
+		),
+})
+
+const vercelInfraProjectFunctions = defineQuery({
+	id: "vercelInfraProjectFunctions",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraProjectsRequest, orgId: OrgId) =>
+		CH.compile(Integrations.vercelProjectFunctionsSQL(), vercelWindow(payload, orgId)),
+})
+
+const vercelInfraFunctionRoutes = defineQuery({
+	id: "vercelInfraFunctionRoutes",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraProjectDetailRequest, orgId: OrgId) =>
+		CH.compile(Integrations.vercelFunctionRoutesSQL(), {
+			...vercelWindow(payload, orgId),
+			projectId: payload.projectId,
+		}),
+})
+
+const vercelInfraRouteTimeseries = defineQuery({
+	id: "vercelInfraRouteTimeseries",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraFunctionTimeseriesRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelFunctionRouteTimeseriesSQL({ route: payload.route, host: payload.host }),
+			{
+				...vercelBucketed(payload, orgId),
+				projectId: payload.projectId,
+			},
+		),
+})
+
+const vercelInfraDependencies = defineQuery({
+	id: "vercelInfraDependencies",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraProjectDetailRequest, orgId: OrgId) =>
+		CH.compile(Integrations.vercelProjectDependenciesSQL(), {
+			...vercelWindow(payload, orgId),
+			projectId: payload.projectId,
+		}),
+})
+
+const vercelSpeedInsightsMetrics = defineQuery({
+	id: "vercelSpeedInsightsMetrics",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraWindowRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelSpeedInsightsSQL(
+				"metric",
+				{ projectId: payload.projectId },
+				speedInsightsFilter(payload),
+			),
+			vercelWindow(payload, orgId),
+		),
+})
+
+const vercelSpeedInsightsRoutes = defineQuery({
+	id: "vercelSpeedInsightsRoutes",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraWindowRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelSpeedInsightsSQL(
+				"route",
+				{ projectId: payload.projectId },
+				speedInsightsFilter(payload),
+			),
+			vercelWindow(payload, orgId),
+		),
+})
+
+const vercelSpeedInsightsDevices = defineQuery({
+	id: "vercelSpeedInsightsDevices",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraWindowRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelSpeedInsightsSQL(
+				"device",
+				{ projectId: payload.projectId },
+				speedInsightsFilter(payload),
+			),
+			vercelWindow(payload, orgId),
+		),
+})
+
+const vercelWebAnalyticsSummary = defineQuery({
+	id: "vercelWebAnalyticsSummary",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: VercelInfraWindowRequest, orgId: OrgId) =>
+		CH.compile(
+			Integrations.vercelWebAnalyticsSummarySQL(
+				{ projectId: payload.projectId },
+				webAnalyticsFilter(payload),
+			),
+			vercelWindow(payload, orgId),
+		),
+})
+
+const vercelWebAnalyticsTop = (id: string, dimension: Integrations.VercelWebAnalyticsDimension) =>
+	defineQuery({
+		id,
+		profile: "aggregation",
+		cache: 15,
+		compile: (payload: VercelInfraWindowRequest, orgId: OrgId) =>
+			CH.compile(
+				Integrations.vercelWebAnalyticsTopSQL(
+					dimension,
+					{ projectId: payload.projectId },
+					webAnalyticsFilter(payload),
+				),
+				vercelWindow(payload, orgId),
+			),
+	})
+
+const vercelWebAnalyticsPages = vercelWebAnalyticsTop("vercelWebAnalyticsPages", "page")
+const vercelWebAnalyticsReferrers = vercelWebAnalyticsTop("vercelWebAnalyticsReferrers", "referrer")
+const vercelWebAnalyticsCountries = vercelWebAnalyticsTop("vercelWebAnalyticsCountries", "country")
+const vercelWebAnalyticsEvents = vercelWebAnalyticsTop("vercelWebAnalyticsEvents", "event")
+
 // /infra/supabase: gauges and counter rates are separate reads (metrics_gauge, metrics_sum),
 // merged per project or bucket by the handler.
 const supabaseInfraProjectGauges = defineQuery({
@@ -388,7 +686,16 @@ const awsInfraMetrics = defineQuery({
 	profile: "aggregation",
 	cache: 15,
 	compile: (payload: AwsInfraMetricsRequest, orgId: OrgId) =>
-		CH.compile(Integrations.awsInfraMetricsSQL(payload.kind), windowParams(payload, orgId)),
+		CH.compile(Integrations.awsInfraMetricsSQL(payload.kind, "hourly"), windowParams(payload, orgId)),
+})
+
+/** `awsInfraMetrics` on a cluster without `aws_metrics_hourly` (migration 0066). */
+const awsInfraMetricsRaw = defineQuery({
+	id: "awsInfraMetricsRaw",
+	profile: "aggregation",
+	cache: 15,
+	compile: (payload: AwsInfraMetricsRequest, orgId: OrgId) =>
+		CH.compile(Integrations.awsInfraMetricsSQL(payload.kind, "raw"), windowParams(payload, orgId)),
 })
 
 const awsInfraSparklines = defineQuery({
@@ -987,6 +1294,30 @@ export const Queries = {
 	planetscaleInfraTimeseries,
 	railwayInfraServices,
 	railwayInfraServiceTimeseries,
+	vercelInfraProjectRequests,
+	vercelInfraProjectLatency,
+	vercelInfraRequestTimeseries,
+	vercelInfraEdgeLatencyTimeseries,
+	vercelInfraFunctionTimeseries,
+	vercelInfraBreakdown,
+	vercelInfraTopPaths,
+	vercelInfraErrorLogs,
+	vercelAiGatewaySummary,
+	vercelAiGatewayByModel,
+	vercelAiGatewayByProject,
+	vercelAiGatewayTimeseries,
+	vercelInfraProjectFunctions,
+	vercelInfraFunctionRoutes,
+	vercelInfraRouteTimeseries,
+	vercelInfraDependencies,
+	vercelSpeedInsightsMetrics,
+	vercelSpeedInsightsRoutes,
+	vercelSpeedInsightsDevices,
+	vercelWebAnalyticsSummary,
+	vercelWebAnalyticsPages,
+	vercelWebAnalyticsReferrers,
+	vercelWebAnalyticsCountries,
+	vercelWebAnalyticsEvents,
 	supabaseInfraProjectGauges,
 	supabaseInfraProjectCpu,
 	supabaseInfraProjectGaugeSeries,
@@ -1000,6 +1331,7 @@ export const Queries = {
 	supabaseLogIssues,
 	awsInfraPresence,
 	awsInfraMetrics,
+	awsInfraMetricsRaw,
 	awsInfraSparklines,
 	awsInfraTimeseries,
 	gcpInfraPresence,

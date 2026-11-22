@@ -23,6 +23,9 @@ export const HERO_SENTENCE = {
 	major_outage: "We're experiencing a major outage",
 } as const satisfies Record<StatusPageComponentStatus, string>
 
+/** The page's title: its browser tab, feeds and search results. */
+export const pageTitle = (name: string): string => `${name} status`
+
 export const INCIDENT_STATUS_LABEL = {
 	investigating: "Investigating",
 	identified: "Identified",
@@ -72,6 +75,17 @@ export const formatAge = (ageMs: number): string => {
 	return `${Math.floor(hours / 24)} d ago`
 }
 
+/** How long an incident lasted: `under 1 min`, `45 min`, `1 h 15 min`, `2 d 3 h`. */
+export const formatDuration = (durationMs: number): string => {
+	const minutes = Math.floor(Math.max(0, durationMs) / 60_000)
+	if (minutes < 1) return "under 1 min"
+	if (minutes < 60) return `${minutes} min`
+	const hours = Math.floor(minutes / 60)
+	if (hours < 24) return minutes % 60 === 0 ? `${hours} h` : `${hours} h ${minutes % 60} min`
+	const days = Math.floor(hours / 24)
+	return hours % 24 === 0 ? `${days} d` : `${days} d ${hours % 24} h`
+}
+
 /** Floors so a day with any downtime never reads as 100%. */
 export const formatPercent = (percent: number): string => {
 	// Rounds off float error first: 99.84 must not floor from 99.83999999999999.
@@ -81,20 +95,31 @@ export const formatPercent = (percent: number): string => {
 
 export const DAY_STATE_LABEL = {
 	none: "No data",
-	ok: "No downtime",
-	degraded: "Some checks failed",
-	down: "Downtime recorded",
+	ok: "Operational",
+	maintenance: "Maintenance",
+	degraded: "Degraded",
+	down: "Outage",
 } as const satisfies Record<StatusPageDayState, string>
 
-/** The tooltip of one bar: the day and what happened on it. */
-export const dayTitle = (bar: StatusPageDayBar, state: StatusPageDayState): string => {
-	const detail =
-		state === "none"
+/**
+ * The tooltip of one bar: the day, what its checks recorded, and the incident or maintenance
+ * marked on it. The counts are stated as they are; the colour carries the verdict.
+ */
+export const dayTitle = (
+	bar: StatusPageDayBar,
+	entry: { readonly tone: string; readonly title: string } | undefined,
+): string => {
+	const checks =
+		bar.checks === 0
 			? DAY_STATE_LABEL.none
-			: state === "ok"
-				? `${DAY_STATE_LABEL.ok}, ${bar.checks} checks`
-				: state === "degraded"
+			: bar.downChecks > 0
+				? `Down during ${bar.downChecks} of ${bar.checks} checks`
+				: bar.failures > 0
 					? `${bar.failures} of ${bar.checks} checks failed`
-					: `Down during ${bar.downChecks} of ${bar.checks} checks`
-	return `${formatDay(bar.day)}: ${detail}`
+					: `No downtime, ${bar.checks} checks`
+	const marked =
+		entry === undefined
+			? ""
+			: ` · ${entry.tone === "maintenance" ? "Maintenance" : "Incident"}: ${entry.title}`
+	return `${formatDay(bar.day)}: ${checks}${marked}`
 }

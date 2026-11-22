@@ -1,9 +1,11 @@
 import { readClock } from "@maple/views/data/timing"
-import { StatusPagePreviewParams, V2StatusPageCreateParams } from "@maple/domain/http/v2"
+import { StatusPagePreviewParams, V2StatusPage, V2StatusPageCreateParams } from "@maple/domain/http/v2"
+import { UptimeMonitorKind } from "@maple/primitives"
 import { Duration, Effect, Schema } from "effect"
 import { Command, Dom, Mount } from "foldkit"
+import { trackProduct } from "../../../data/analytics"
 import { listMonitors, saveMonitor } from "../../kit/uptime/commands"
-import { createPage, previewPage } from "../shared/commands"
+import { createPage, previewPage, setCustomDomain } from "../shared/commands"
 import { monitorPayloadFor } from "../shared/picker"
 import { Message } from "./message"
 import { SubmitMode } from "./model"
@@ -67,6 +69,31 @@ export const CreateBuilderPage = Command.define("CreateStatusPage", {
 			Effect.result,
 			Effect.map((result) => Message.CompletedCreate({ mode, result })),
 		),
+})
+
+/** The custom domain typed in the builder, set on the page it just created. */
+export const SetBuilderCustomDomain = Command.define("SetStatusPageBuilderCustomDomain", {
+	args: { page: V2StatusPage, hostname: Schema.String },
+	messages: [Message.CompletedSetCustomDomain],
+	execute: ({ page, hostname }) =>
+		setCustomDomain(page.id, hostname).pipe(
+			Effect.result,
+			Effect.map((result) => Message.CompletedSetCustomDomain({ page, result })),
+		),
+})
+
+/** A created page is the `status_page_created` product event. */
+export const TrackPageCreated = Command.define("TrackStatusPageCreated", {
+	messages: [Message.CompletedTrackProduct],
+	execute: trackProduct("status_page_created").pipe(Effect.as(Message.CompletedTrackProduct())),
+})
+
+/** A monitor created from the picker is the `uptime_monitor_created` product event. */
+export const TrackMonitorCreated = Command.define("TrackStatusPageMonitorCreated", {
+	args: { kind: UptimeMonitorKind },
+	messages: [Message.CompletedTrackProduct],
+	execute: ({ kind }) =>
+		trackProduct("uptime_monitor_created", { kind }).pipe(Effect.as(Message.CompletedTrackProduct())),
 })
 
 export const FocusBuilderField = Command.define("FocusStatusPageBuilderField", {

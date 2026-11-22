@@ -1,4 +1,4 @@
-import { type AlertIncidentId, isManagedSignalType } from "@maple/domain/http"
+import type { AlertIncidentId } from "@maple/domain/http"
 import type { AlertsOverviewReady } from "@maple/web-data/alerts/overview"
 import { makeClientErrorBody } from "@maple/web-data/lib/error-messages"
 import { Option, Array as Arr } from "effect"
@@ -10,7 +10,7 @@ import { cn } from "@maple/ui/lib/utils"
 import { confirmDialog } from "@maple/views/ui/confirm-dialog"
 import { errorState } from "@maple/views/ui/error-state"
 import { icon, type IconName } from "@maple/views/ui/icon"
-import type { MenuEntry } from "@maple/views/ui/menu-view"
+import type { MenuEntry, MenuItemEntry } from "@maple/views/ui/menu-view"
 import * as MenuView from "@maple/views/ui/menu-view"
 import { skeleton, skeletonList } from "@maple/views/ui/skeleton"
 import type { PageViewInputs } from "../../contract"
@@ -25,6 +25,7 @@ import {
 	anomalyOverviewOf,
 	destinationsOf,
 	isAboutService,
+	isFirstRun,
 	overviewOf,
 	resolveIncidentStatus,
 	resolveSignal,
@@ -50,7 +51,7 @@ import { slosTab } from "./view-slos"
 import { deleteScheduleDialog, hasSchedules, oncallTab, whoIsOnCallStrip } from "./view-oncall"
 import { hstack, vstack } from "@maple/views/ui/stack"
 import { typography } from "@maple/views/ui/typography"
-import { canManageAlerts } from "../../kit/session-grants"
+import { canManageAlerts, canRespondToIncidents, denialReason, gatedControl } from "../../kit/session-grants"
 
 type H = HtmlBuilder<Message>
 
@@ -80,18 +81,24 @@ const newRuleItem = (
 	label: string,
 	iconName: IconName,
 	description: string,
-): MenuEntry => ({
-	_tag: "Item",
-	value,
-	label,
-	content: [
-		icon(h, iconName, { className: "mt-0.5 self-start" }),
-		vstack(h, { gap: "0.5", shrink: true, as: "span" }, [
-			typography(h, { size: "sm" }, [label]),
-			typography(h, { size: "xs", tone: "muted", className: "whitespace-normal" }, [description]),
-		]),
-	],
-})
+	lockedReason?: string,
+): MenuEntry => {
+	const entry: MenuItemEntry = {
+		_tag: "Item",
+		value,
+		label,
+		content: [
+			icon(h, iconName, { className: "mt-0.5 self-start" }),
+			vstack(h, { gap: "0.5", shrink: true, as: "span" }, [
+				typography(h, { size: "sm" }, [label]),
+				typography(h, { size: "xs", tone: "muted", className: "whitespace-normal" }, [description]),
+			]),
+		],
+	}
+	return lockedReason === undefined
+		? entry
+		: { ...entry, isDisabled: true, tooltip: { content: [lockedReason] } }
+}
 
 /** The Inbox's and Rules' split create button: a telemetry rule, and behind the chevron every kind. */
 const newRuleButton = (h: H, model: Model): Html => {
@@ -126,25 +133,23 @@ const newRuleButton = (h: H, model: Model): Html => {
 						"PulseIcon",
 						"Route what Maple's anomaly detector finds for some services, environments or signals.",
 					),
-					// Uptime monitors are admin-only to create; the API refuses members too.
-					...(canManageAlerts(model)
-						? [
-								newRuleItem(
-									h,
-									"uptime",
-									"Uptime check",
-									"GlobeIcon",
-									"Check a URL, port, DNS record or cron job from outside.",
-								),
-								newRuleItem(
-									h,
-									"slo",
-									"SLO",
-									"GaugeIcon",
-									"An error budget on a service's availability or latency, with burn-rate alerts.",
-								),
-							]
-						: []),
+					// Uptime monitors and SLOs are for org admins and engineers; the API refuses members too.
+					newRuleItem(
+						h,
+						"uptime",
+						"Uptime check",
+						"GlobeIcon",
+						"Check a URL, port, DNS record or cron job from outside.",
+						manageLock(model),
+					),
+					newRuleItem(
+						h,
+						"slo",
+						"SLO",
+						"GaugeIcon",
+						"An error budget on a service's availability or latency, with burn-rate alerts.",
+						manageLock(model),
+					),
 				],
 				align: "end",
 				className: "w-80",
@@ -172,25 +177,24 @@ const newRuleButton = (h: H, model: Model): Html => {
 const hasRows = <A>(rows: Option.Option<ReadonlyArray<A>>): boolean =>
 	Option.exists(rows, (list) => list.length > 0)
 
-const primaryLink = (h: H, href: string, label: string): Html =>
-	linkButton(h, { size: "sm", href }, [icon(h, "PlusIcon"), label])
+/** The denial a create item shows to a viewer who may not manage alerts, else none. */
+const manageLock = (model: Model): string | undefined =>
+	canManageAlerts(model) ? undefined : denialReason("alerts:manage")
 
-const primaryButton = (h: H, onClick: Message, label: string, isDisabled = false): Html =>
-	button(h, { size: "sm", isDisabled, attributes: [h.OnClick(onClick)] }, [icon(h, "PlusIcon"), label])
-
-/**
- * The first-run empty state fills the section: no rules yet, and on the Inbox nothing else to list
- * (an org with only monitors or SLOs has no visible rules but may have incidents to show).
- */
-const isFirstRun = (model: Model, data: AlertsOverviewReady, tab: "inbox" | "rules"): boolean => {
-	if (data.rules.length > 0) return false
-	if (tab === "rules") return true
-	return (
-		resolveSignal(model.search.signal) === null &&
-		!Arr.some(data.openIncidents, (incident) => isManagedSignalType(incident.signalType)) &&
-		!Arr.some(data.incidents, (incident) => incident.signalType === "anomaly")
+const primaryLink = (h: H, model: Model, href: string, label: string): Html =>
+	gatedControl(h, model, "alerts:manage", (isDisabled) =>
+		isDisabled
+			? button(h, { size: "sm", isDisabled }, [icon(h, "PlusIcon"), label])
+			: linkButton(h, { size: "sm", href }, [icon(h, "PlusIcon"), label]),
 	)
-}
+
+const primaryButton = (h: H, model: Model, onClick: Message, label: string, isBusy = false): Html =>
+	gatedControl(h, model, "alerts:manage", (isLocked) =>
+		button(h, { size: "sm", isDisabled: isLocked || isBusy, attributes: [h.OnClick(onClick)] }, [
+			icon(h, "PlusIcon"),
+			label,
+		]),
+	)
 
 /**
  * The header's one primary action: what the open section lists. A section whose empty state
@@ -201,34 +205,36 @@ const headerActions = (
 	model: Model,
 	tab: AlertsTab,
 	overview: Option.Option<AlertsOverviewReady>,
+	audience: PageViewInputs["context"]["audience"],
 ): Html | undefined => {
+	// An analyst follows incidents and sets nothing up.
+	if (audience === "analyst") return undefined
 	if (tab === "inbox" || tab === "rules")
 		// The first-run empty state offers the templates and "Start from scratch" to who can create.
 		return canManageAlerts(model) && Option.exists(overview, (data) => isFirstRun(model, data, tab))
 			? undefined
 			: newRuleButton(h, model)
-	if (!canManageAlerts(model)) return undefined
 	const serviceName = model.search.serviceName
 	switch (tab) {
 		case "uptime":
 			return hasRows(AsyncData.getData(model.monitors.data))
-				? primaryLink(h, newMonitorHref({ serviceName }), "New monitor")
+				? primaryLink(h, model, newMonitorHref({ serviceName }), "New monitor")
 				: undefined
 		case "slos":
 			return hasRows(AsyncData.getData(model.slos.data))
-				? primaryLink(h, newSloHref({ serviceName }), "New SLO")
+				? primaryLink(h, model, newSloHref({ serviceName }), "New SLO")
 				: undefined
 		case "silences":
-			return primaryButton(h, Message.ClickedNewSilence(), "New silence")
+			return primaryButton(h, model, Message.ClickedNewSilence(), "New silence")
 		case "maintenance":
 			return hasWindows(model)
-				? primaryButton(h, Message.ClickedNewWindow(), "New window", model.nowMs === null)
+				? primaryButton(h, model, Message.ClickedNewWindow(), "New window", model.nowMs === null)
 				: undefined
 		case "on-call":
-			return hasSchedules(model) ? primaryLink(h, newScheduleHref(), "New schedule") : undefined
+			return hasSchedules(model) ? primaryLink(h, model, newScheduleHref(), "New schedule") : undefined
 		case "routing":
 			return destinationsOf(model).length > 0
-				? primaryButton(h, Message.ClickedNewDestination(), "Add destination")
+				? primaryButton(h, model, Message.ClickedNewDestination(), "Add destination")
 				: undefined
 	}
 }
@@ -272,13 +278,15 @@ const hubBody = (
 				canEdit: canManageAlerts(model),
 				hasDestinations: destinations.length > 0,
 				serviceName: model.search.serviceName,
-				onAddDestination: canManageAlerts(model) ? Message.ClickedNewDestination() : undefined,
+				onAddDestination: Message.ClickedNewDestination(),
 			})
-			const acknowledge = {
-				onAcknowledge: (incidentId: AlertIncidentId, acknowledged: boolean) =>
-					Message.ClickedAcknowledgeIncident({ incidentId, acknowledged }),
-				pendingIds: model.acknowledgingIncidentIds,
-			}
+			const acknowledge = canRespondToIncidents(model)
+				? {
+						onAcknowledge: (incidentId: AlertIncidentId, acknowledged: boolean) =>
+							Message.ClickedAcknowledgeIncident({ incidentId, acknowledged }),
+						pendingIds: model.acknowledgingIncidentIds,
+					}
+				: null
 			if (tab === "inbox") {
 				const signal = resolveSignal(model.search.signal)
 				// A team can set up on-call before its first rule, so the strip shows on the empty inbox too.
@@ -309,7 +317,7 @@ const hubBody = (
 										acknowledge,
 									}),
 							})
-						: inboxTab(h, data, acknowledge)
+						: inboxTab(h, data, acknowledge, model.focusedIncidentId)
 				return h.div([h.Class("space-y-6")], [...whoIsOnCallStrip(h, model), ...filters, body])
 			}
 			return rulesTab(h, model, {
@@ -352,7 +360,7 @@ export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, 
 				h,
 				{
 					title: TAB_LABEL[tab],
-					actions: headerActions(h, model, tab, overview),
+					actions: headerActions(h, model, tab, overview, inputs.context.audience),
 				},
 				[
 					tab === "routing"

@@ -41,7 +41,10 @@ import Api from "./src/worker.ts"
 
 export default Alchemy.Stack(
 	"my-app",
-	{ providers: Layer.mergeAll(Cloudflare.providers(), Maple.providers()) },
+	{
+		providers: Layer.mergeAll(Cloudflare.providers(), Maple.providers()),
+		state: Cloudflare.state(),
+	},
 	Effect.gen(function* () {
 		yield* Api
 	}),
@@ -123,7 +126,10 @@ import { localProviders } from "@maple-dev/alchemy/local"
 
 export default Alchemy.Stack(
 	"my-app",
-	{ providers: Layer.mergeAll(Cloudflare.providers(), localProviders()) },
+	{
+		providers: Layer.mergeAll(Cloudflare.providers(), localProviders()),
+		state: Cloudflare.state(),
+	},
 	Effect.gen(function* () {
 		const local = yield* Observability
 		const api = yield* Api
@@ -144,7 +150,7 @@ To use the same stack for hosted deploys, also pass `ingestKey` (or `endpoint`):
 | Prop           | Default                            | Notes                                                                          |
 | -------------- | ---------------------------------- | ------------------------------------------------------------------------------ |
 | `dataDir`      | `.alchemy/maple-local/<hash>/data` | One store per stack, stage and resource; it persists across `alchemy dev` runs |
-| `port`         | `4318`                             | An occupied port fails startup                                                 |
+| `port`         | `4318`                             | Unset, a free port is used when 4318 is taken. A port you set must be free     |
 | `onDirtyStore` | `"fail"`                           | `"wipe"` discards a store left unclean by a crashed server and starts fresh    |
 
 The first run downloads the chDB library Maple pins (the same release the `maple` CLI ships), verifies its checksum and caches it in `~/.maple/cache/libchdb` (about 330 MB, shared across projects). Set `MAPLE_LIBCHDB` to point at a copy you already have. Run `alchemy dev` with Bun, on macOS or Linux.
@@ -165,7 +171,10 @@ import Api from "./src/worker.ts"
 
 export default Alchemy.Stack(
 	"my-app",
-	{ providers: Layer.mergeAll(Cloudflare.providers(), Maple.providers()) },
+	{
+		providers: Layer.mergeAll(Cloudflare.providers(), Maple.providers()),
+		state: Cloudflare.state(),
+	},
 	Effect.gen(function* () {
 		yield* Api
 
@@ -203,7 +212,9 @@ Change a threshold and redeploy, and the rule is updated in place. Remove it fro
 | [`Maple.Dashboard`](/docs/iac/alchemy-resources#mapledashboard)               | Dashboards, their widgets, sections and variables                                                 |
 | [`Maple.AlertDestination`](/docs/iac/alchemy-resources#maplealertdestination) | PagerDuty, incident.io, webhook, Discord, Telegram, Google Chat, Teams, email and Linear channels |
 | [`Maple.AlertRule`](/docs/iac/alchemy-resources#maplealertrule)               | Alert rules on any signal, delivering to destinations                                             |
-| [`Maple.ApiKey`](/docs/iac/alchemy-resources#mapleapikey)                     | Scoped API keys, with in-place rotation                                                           |
+| [`Maple.UptimeMonitor`](/docs/iac/alchemy-resources#mapleuptimemonitor)       | HTTP, TCP, DNS, multi-step and heartbeat monitors                                                 |
+| [`Maple.StatusPage`](/docs/iac/alchemy-resources#maplestatuspage)             | Status pages: settings, theme, components, visibility, password and custom domain                 |
+| [`Maple.ApiKey`](/docs/iac/alchemy-resources#mapleapikey)                     | Scoped API keys, with rotation                                                                    |
 | [`Maple.IngestKeys`](/docs/iac/alchemy-resources#mapleingestkeys)             | Your organization's ingest keys, as outputs (read-only)                                           |
 
 Every prop and output is in [Alchemy resources](/docs/iac/alchemy-resources).
@@ -219,12 +230,16 @@ Every prop and output is in [Alchemy resources](/docs/iac/alchemy-resources).
 
 The key needs these permissions, depending on which resources the stack declares:
 
-| Resource                                    | Scope              | Org admin key |
-| ------------------------------------------- | ------------------ | ------------- |
-| `Maple.IngestKeys` (used by `Telemetry`)    | `ingest_keys:read` | Yes           |
-| `Maple.Dashboard`                           | `dashboards:write` | No            |
-| `Maple.AlertRule`, `Maple.AlertDestination` | `alerts:write`     | Yes           |
-| `Maple.ApiKey`                              | `api_keys:write`   | Yes           |
+| Resource                                    | Scope                   | Org admin key |
+| ------------------------------------------- | ----------------------- | ------------- |
+| `Maple.IngestKeys` (used by `Telemetry`)    | `ingest_keys:read`      | Yes           |
+| `Maple.Dashboard`                           | `dashboards:write`      | No            |
+| `Maple.AlertRule`, `Maple.AlertDestination` | `alerts:write`          | Yes           |
+| `Maple.UptimeMonitor`                       | `uptime_monitors:write` | No            |
+| `Maple.StatusPage`                          | `status_pages:write`    | No            |
+| `Maple.ApiKey`                              | `api_keys:write`        | Yes           |
+
+Uptime monitors and status pages also need a key whose role is engineer or above.
 
 A key with no scopes has full access. See [API keys and scopes](/docs/reference/api#authentication).
 

@@ -13,10 +13,9 @@ import { pageTitle } from "@maple/views/ui/page-layout"
 import { platformMeta } from "../kit/platforms"
 import { Message } from "./message"
 import type { FlowHost, Model } from "./model"
-import { createSourceForm } from "./view-form"
 import { integrationStep } from "./view-integration"
 import { integrationMeta, platformPicker } from "./view-picker"
-import { tokenStep } from "./view-token"
+import { pushStep } from "./view-push"
 import { trail } from "./view-trail"
 import { hstack } from "@maple/views/ui/stack"
 
@@ -67,14 +66,16 @@ export const titleContent = (h: H, model: Model, titleId?: string): Html => {
 }
 
 const cancel = (h: H): Html =>
-	linkButton(h, { href: hrefOf(AppRoute.Sources()), size: "sm", variant: "ghost" }, ["Cancel"])
+	linkButton(h, { href: hrefOf(AppRoute.Sources({ search: {} })), size: "sm", variant: "ghost" }, [
+		"Cancel",
+	])
 
-/** The current step: the token once a source exists, the push form, an integration's step, or the picker. */
+/** The current step: a push source's page (the created one wins), an integration's step, or the picker. */
 export const stepBody = (h: H, model: Model, timeZone: string, host: FlowHost): Html =>
 	model.created !== null
-		? tokenStep(h, model, model.created, host)
+		? pushStep(h, model, model.created.source.platform, model.created, host)
 		: model.platform !== null
-			? createSourceForm(h, model, model.platform)
+			? pushStep(h, model, model.platform, null, host)
 			: model.integration !== null
 				? integrationStep(h, model, model.integration, timeZone, host)
 				: platformPicker(h, model)
@@ -91,9 +92,11 @@ const notPermitted = (h: H): Html =>
 					"Ask one of them to connect it, or browse the sources already sending data.",
 				]),
 			]),
-			linkButton(h, { href: hrefOf(AppRoute.Sources()), size: "sm", variant: "outline" }, [
-				"View sources",
-			]),
+			linkButton(
+				h,
+				{ href: hrefOf(AppRoute.Sources({ search: {} })), size: "sm", variant: "outline" },
+				["View sources"],
+			),
 		],
 		"py-8",
 	)
@@ -114,13 +117,17 @@ export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, 
 		// A member has no steps to take, so no trail either.
 		isRefused(model)
 			? { title: titleOf(model), actions: cancel(h) }
-			: { titleContent: titleContent(h, model), actions: cancel(h) },
+			: // On Go live the source exists already, so there is nothing left to cancel.
+				{
+					titleContent: titleContent(h, model),
+					actions: model.integration !== null && model.stage === "live" ? undefined : cancel(h),
+				},
 		[pageBody(h, model, inputs.context.timeZone)],
 	),
 )
 
 export const breadcrumbsOf = (model: Model): ReadonlyArray<BreadcrumbEntry> => [
-	{ label: "Sources", href: hrefOf(AppRoute.Sources()) },
+	{ label: "Sources", href: hrefOf(AppRoute.Sources({ search: {} })) },
 	{
 		label:
 			model.platform !== null

@@ -23,7 +23,7 @@ import { presetLabel } from "@maple/ui/lib/time-preset"
 import * as TimeRangePicker from "../../kit/time-range-picker"
 import { linkTabStrip } from "../../kit/underline-tabs"
 import type { McpFilters, McpWindow } from "../view-kit"
-import { MCP_CHART_TOKENS, scopeText } from "../view-kit"
+import { MCP_CHART_TOKENS, clientIcon, scopeText } from "../view-kit"
 import { listBody } from "../view-list"
 import { serverBody } from "../view-server"
 import { sessionBody, sessionCalls, sessionsBody } from "../view-sessions"
@@ -164,6 +164,7 @@ const toolbar = (
 		options: Arr.map(clients, (client) => ({ name: client.name, count: client.calls })),
 		model: model.clientSelect,
 		toMessage: (message) => Message.GotSelectMessage({ facet: "client", message }),
+		optionIcon: (name) => clientIcon(h, name),
 	})
 	const kindSelect = facetSelect(h, {
 		label: "kind",
@@ -240,7 +241,8 @@ const serverTitle = (h: H, name: string, description: Description): Html =>
 		pageTitle(h, { title: name, className: "leading-8" }, [
 			serviceDot(h, {
 				serviceName: name,
-				className: "relative -top-px mr-2.5 inline-block size-3 align-middle",
+				size: "lg",
+				className: "relative -top-px mr-2.5 inline-block align-middle",
 			}),
 			name,
 		]),

@@ -1,5 +1,5 @@
 import * as Policy from "@maple/domain/policy"
-import type { ApiKeyKind } from "@maple/domain/http"
+import type { CreatableApiKeyKind } from "@maple/domain/http"
 import { Array, Option, Result } from "effect"
 import { Command } from "foldkit"
 import { PageOutMessage, type PageReturn } from "../../contract"
@@ -10,7 +10,7 @@ import * as Select from "@maple/views/ui/select"
 import { RevokeApiKey } from "./command"
 import * as CreateDialog from "./create-dialog"
 import { Message } from "./message"
-import { canManage, KeyStatusFilter, type Model } from "./model"
+import { canCreateApiKey, KeyStatusFilter, type Model } from "./model"
 import * as RollDialog from "./roll-dialog"
 
 type Return = PageReturn<Model, Message>
@@ -70,8 +70,8 @@ const liftRoll = (model: Model, step: ReturnType<typeof RollDialog.update>): Ret
 			: toast(step.outMessage.type, step.outMessage.title, step.outMessage.description),
 })
 
-export const openCreate = (model: Model, kind: ApiKeyKind): Return =>
-	liftCreate(model, CreateDialog.open(model.create, kind))
+export const openCreate = (model: Model, kind: CreatableApiKeyKind): Return =>
+	liftCreate(model, CreateDialog.open(model.create, kind, model.grants))
 
 /** A row menu's pick: roll or revoke the key it belongs to. */
 const pickedRowAction = (model: Model, menuId: string, value: string): Return => {
@@ -140,7 +140,7 @@ export const update = (model: Model, message: Message): Return =>
 		},
 		ChangedSearch: ({ value }) => ({ model: { ...model, search: value } }),
 		ClickedClearSearch: () => ({ model: { ...model, search: "" } }),
-		ClickedCreateKey: () => openCreate(model, canManage(model) ? "standard" : "mcp"),
+		ClickedCreateKey: () => openCreate(model, canCreateApiKey(model) ? "standard" : "mcp"),
 		GotCreateMenuMessage: ({ message: child }) =>
 			updateMenu(
 				model,

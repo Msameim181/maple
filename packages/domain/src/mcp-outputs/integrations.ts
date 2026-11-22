@@ -5,7 +5,7 @@ export const IntegrationProviderLiteral = Schema.Literals(INTEGRATION_PROVIDERS)
 export const IntegrationStatusLiteral = Schema.Literals(INTEGRATION_STATUSES)
 
 export const IntegrationResourceRow = Schema.Struct({
-	/** repository, zone, workers, logpush, hyperdrive, environment, database, scrape target, workspace. */
+	/** repository, zone, workers, logpush, hyperdrive, environment, database, project, logs, metrics, metric stream, role, scrape target, workspace. */
 	kind: Schema.String,
 	name: Schema.String,
 	status: IntegrationStatusLiteral,
@@ -55,6 +55,35 @@ export const SyncRailwayOutput = Schema.Struct({
 			lastError: Schema.NullOr(Schema.String),
 			/** Still no successful poll in the last 30 minutes after this sync: Railway returned nothing for it. */
 			stale: Schema.Boolean,
+		}),
+	),
+})
+
+const SyncVercelDrain = Schema.Struct({
+	status: Schema.String,
+	lastError: Schema.NullOr(Schema.String),
+})
+
+export const SyncVercelOutput = Schema.Struct({
+	connected: Schema.Boolean,
+	team: Schema.NullOr(Schema.String),
+	/** Vercel rejected the stored token; polling is paused until a new one is saved. */
+	authFailed: Schema.Boolean,
+	lastSyncedAt: Schema.NullOr(Schema.String),
+	lastError: Schema.NullOr(Schema.String),
+	/** Null when that drain is turned off. */
+	logDrain: Schema.NullOr(SyncVercelDrain),
+	traceDrain: Schema.NullOr(SyncVercelDrain),
+	aiGatewayDrain: Schema.NullOr(SyncVercelDrain),
+	speedInsightsDrain: Schema.NullOr(SyncVercelDrain),
+	webAnalyticsDrain: Schema.NullOr(SyncVercelDrain),
+	auditLogDrain: Schema.NullOr(SyncVercelDrain),
+	projects: Schema.Array(
+		Schema.Struct({
+			name: Schema.String,
+			forwarded: Schema.Boolean,
+			latestDeploymentState: Schema.NullOr(Schema.String),
+			latestDeploymentAt: Schema.NullOr(Schema.String),
 		}),
 	),
 })

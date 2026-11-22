@@ -24,10 +24,11 @@ import {
 } from "./command"
 import { countLabel } from "@maple/ui/lib/format"
 import * as TagEditor from "../kit/tag-editor"
-import { displayName, queryOf, tagsOf } from "./derive"
+import { displayName, queryOf, sectionsOf, tagsOf } from "./derive"
+import { focusedIndexOf, listKeyAction, scrollFocusedRowCommand } from "../../kit/list-keys"
 import * as Combobox from "@maple/views/ui/combobox"
 import { INITIAL_LOCALE } from "@maple/views/lib/locale"
-import { Message, type WriteFailure } from "./message"
+import { type CreatedDashboard, Message, type WriteFailure } from "./message"
 import type { ListDashboard, Model } from "./model"
 
 export type Return = PageReturn<Model, Message>
@@ -35,6 +36,7 @@ type Search = typeof DashboardsSearch.Type
 type Route = Readonly<{ search: Search }>
 
 export const SORT_MENU_ID = "dashboards-sort-menu"
+const IMPORT_REPORT_DIALOG_ID = "dashboard-import-report-dialog"
 export const TAG_FILTER_ID = "dashboards-tag-filter"
 export const rowMenuIdOf = (id: string): string => `dashboard-row-menu-${id}`
 
@@ -60,7 +62,10 @@ export const init = (route: Route, _context: PageContext): Return => ({
 		tagFilter: Combobox.init(TAG_FILTER_ID, "multiple", { selected: tagsOf(route.search) }),
 		persistenceError: null,
 		isCreating: false,
+		importReport: null,
+		importReportDialog: Dialog.init(IMPORT_REPORT_DIALOG_ID, "alert-dialog"),
 		fallback: { _tag: "Idle" },
+		focusedId: null,
 	},
 	commands: [ReadClock(), LoadPreferences()],
 })
@@ -72,6 +77,8 @@ export const routeChanged = (model: Model, route: Route): Return => {
 		model: {
 			...model,
 			search: route.search,
+			// A new search, tag, scope or sort is a new row set: the focus starts over.
+			focusedId: null,
 			searchDraft: query === Str.trim(model.searchDraft) ? model.searchDraft : query,
 			tagFilter: { ...model.tagFilter, selected: tagsOf(route.search) },
 		},
@@ -112,6 +119,31 @@ export const isLoadFailed = (model: Model): boolean =>
 	model.dashboards === null && model.fallback._tag === "Failed"
 
 export const isReadOnly = (model: Model): boolean => model.persistenceError !== null || isDegraded(model)
+
+/** The rows on screen, starred first: what the list keys step over. */
+export const focusableOf = (model: Model): ReadonlyArray<ListDashboard> => {
+	const listed = listedOf(model)
+	if (listed === null || model.nowMs === null || !model.isPrefsLoaded) return []
+	const sections = sectionsOf(model, listed)
+	return [...sections.favorited, ...sections.others]
+}
+
+export const ScrollFocusedRow = scrollFocusedRowCommand(
+	"ScrollDashboardsFocusedRow",
+	Message.CompletedScrollFocusedRow,
+)
+
+/** Enter follows the focused row's link. */
+const pressedListKey = (model: Model, key: string): Return => {
+	const ids = Arr.map(focusableOf(model), (dashboard) => dashboard.id)
+	const action = listKeyAction(key, focusedIndexOf(ids, model.focusedId), ids.length)
+	if (action._tag === "Focus") {
+		const focusedId = action.index === null ? null : (ids[action.index] ?? null)
+		return { model: { ...model, focusedId }, commands: focusedId === null ? [] : [ScrollFocusedRow()] }
+	}
+	const id = action._tag === "Open" ? ids[action.index] : undefined
+	return id === undefined ? { model } : navigateTo(model, dashboardHref(id))
+}
 
 const navigateWithToast = (model: Model, url: string, title: string): Return => ({
 	model,
@@ -161,6 +193,7 @@ const closeDialog = (dialog: Dialog.Model, wrap: (message: Dialog.Message) => Me
 }
 
 const wrapDelete = (message: Dialog.Message) => Message.GotDeleteDialogMessage({ message })
+const wrapImportReport = (message: Dialog.Message) => Message.GotImportReportDialogMessage({ message })
 const wrapTags = (message: TagEditor.Message) => Message.GotTagEditorMessage({ message })
 
 /** A row menu item picked: export, duplicate, edit tags, delete. */
@@ -244,6 +277,38 @@ const warningsToast = (warnings: ReadonlyArray<string>): WarningToast => ({
 	description: `${Arr.join(warnings.slice(0, 3), "\n")}${warnings.length > 3 ? `\n+${warnings.length - 3} more` : ""}`,
 })
 
+const IMPORT_SOURCE_LABEL = { perses: "Perses", grafana: "Grafana" } as const
+
+/**
+ * A Grafana import that changed something stays on the list with a report of what changed;
+ * any other import opens the new dashboard, its warnings in a follow-up toast.
+ */
+const importSucceeded = (model: Model, created: CreatedDashboard): Return => {
+	const stats = created.stats
+	if (stats !== null && (created.warnings.length > 0 || stats.converted < stats.panels)) {
+		const opened = openDialog(model.importReportDialog, wrapImportReport)
+		return {
+			model: {
+				...model,
+				importReport: { id: created.id, name: created.name, warnings: created.warnings, ...stats },
+				importReportDialog: opened.dialog,
+			},
+			commands: opened.commands,
+		}
+	}
+	const navigation = navigateWithToast(
+		model,
+		dashboardHref(created.id),
+		created.importedFrom === null
+			? `Dashboard "${created.name}" imported`
+			: `Dashboard "${created.name}" imported from ${IMPORT_SOURCE_LABEL[created.importedFrom]}`,
+	)
+	const out = navigation.outMessage
+	return created.warnings.length === 0 || out?._tag !== "RequestedNavigation"
+		? navigation
+		: { ...navigation, outMessage: { ...out, followUpToast: warningsToast(created.warnings) } }
+}
+
 /**
  * A refused write (a taken name, a stale edit) only toasts. A store failure turns the list read-only;
  * the banner says so, so no toast repeats it. A list still waiting on live sync reads the HTTP snapshot
@@ -313,6 +378,8 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 				? { model }
 				: navigateSearch(model, { q: trimmed === "" ? undefined : trimmed })
 		},
+		PressedListKey: ({ key }) => pressedListKey(model, key),
+		CompletedScrollFocusedRow: () => ({ model }),
 		ChangedScope: ({ scope }) => navigateSearch(model, { scope: scope === "all" ? undefined : scope }),
 		ClickedClearSearch: () => navigateSearch({ ...model, searchDraft: "" }, { q: undefined }),
 		ClickedShowAllTags: () => navigateSearch(model, { tags: undefined }),
@@ -340,23 +407,31 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 		CompletedImportDashboard: ({ result }) =>
 			Result.match(result, {
 				onFailure: (error) => toastFailure(model, error),
-				onSuccess: (created) => {
-					const navigation = navigateWithToast(
-						model,
-						dashboardHref(created.id),
-						created.isPerses
-							? `Dashboard "${created.name}" imported from Perses`
-							: `Dashboard "${created.name}" imported`,
-					)
-					const out = navigation.outMessage
-					return created.warnings.length === 0 || out?._tag !== "RequestedNavigation"
-						? navigation
-						: {
-								...navigation,
-								outMessage: { ...out, followUpToast: warningsToast(created.warnings) },
-							}
-				},
+				onSuccess: (created) => importSucceeded(model, created),
 			}),
+		GotImportReportDialogMessage: ({ message: inner }) =>
+			dialogStep(
+				model,
+				model.importReportDialog,
+				inner,
+				// The report was read in the dialog; once it closes, nothing keeps it.
+				(importReportDialog) =>
+					importReportDialog.isOpen
+						? { importReportDialog }
+						: { importReportDialog, importReport: null },
+				wrapImportReport,
+			),
+		ClickedOpenImportedDashboard: () => {
+			if (model.importReport === null) return { model }
+			const closed = closeDialog(model.importReportDialog, wrapImportReport)
+			return {
+				...navigateTo(
+					{ ...model, importReportDialog: closed.dialog },
+					dashboardHref(model.importReport.id),
+				),
+				commands: closed.commands,
+			}
+		},
 		ToggledFavorite: ({ id }) => {
 			const favorites = model.favorites.includes(id)
 				? Arr.filter(model.favorites, (favorite) => favorite !== id)

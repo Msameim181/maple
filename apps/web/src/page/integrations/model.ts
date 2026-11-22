@@ -2,9 +2,11 @@ import * as Policy from "@maple/domain/policy"
 import {
 	BillingCustomer,
 	CloudflareIntegrationStatus,
+	FleetIntegrationStatus,
 	GithubIntegrationStatus,
 	LinearIntegrationStatus,
 	RailwayIntegrationStatus,
+	VercelIntegrationStatus,
 	SearchConsoleIntegrationStatus,
 	SupabaseIntegrationStatus,
 } from "@maple/domain/http"
@@ -27,6 +29,7 @@ import { CloudflareCardModel } from "../infra-integrations/cloudflare/integratio
 import { GithubCardModel } from "./github"
 import { PrometheusCardModel } from "./prometheus"
 import { RailwayCardModel } from "../infra-integrations/railway/integration/railway"
+import { LinearCardModel } from "./linear"
 import { PlanetscaleCardModel } from "../infra-integrations/planetscale/integration/planetscale"
 import { GcpCardModel } from "../infra-integrations/gcp/integration/gcp"
 import { AwsCardModel } from "../infra-integrations/aws/integration/aws"
@@ -34,6 +37,8 @@ import { SupabaseCardModel } from "../infra-integrations/supabase/integration/su
 import { SearchConsoleCardModel } from "./search-console"
 import { ConnectModel } from "./connect"
 import { HubFilter } from "./catalog"
+import { FleetCardModel } from "./fleet/fleet"
+import { VercelCardModel } from "../infra-integrations/vercel/integration/vercel-schema"
 
 const keyed = <A, AI>(schema: Schema.Codec<A, AI>) => KeyedSchema(schema, LoadFailure)
 
@@ -41,6 +46,7 @@ const keyed = <A, AI>(schema: Schema.Codec<A, AI>) => KeyedSchema(schema, LoadFa
 export const Statuses = Schema.Struct({
 	cloudflare: keyed(CloudflareIntegrationStatus),
 	railway: keyed(RailwayIntegrationStatus),
+	vercel: keyed(VercelIntegrationStatus),
 	planetscale: keyed(V2PlanetScaleIntegration),
 	planetscaleDatabases: keyed(V2PlanetScaleDatabaseList),
 	gcp: keyed(V2GcpIntegration),
@@ -49,6 +55,7 @@ export const Statuses = Schema.Struct({
 	linear: keyed(LinearIntegrationStatus),
 	github: keyed(GithubIntegrationStatus),
 	searchConsole: keyed(SearchConsoleIntegrationStatus),
+	fleet: keyed(FleetIntegrationStatus),
 	chat: keyed(V2ChatConnectorList),
 	scrapeTargets: keyed(Schema.Array(V2ScrapeTarget)),
 	/** The org's data sources, read only while the `dataSources` flag is on. */
@@ -73,18 +80,25 @@ export const Model = Schema.Struct({
 	/** The page's disconnect confirmation and its in-flight flag (one integration shows at a time). */
 	disconnect: Schema.Struct({ dialog: Dialog.Model, isPending: Schema.Boolean }),
 	chatCard: ChatCardModel,
+	linearCard: LinearCardModel,
 	githubCard: GithubCardModel,
 	cloudflareCard: CloudflareCardModel,
 	prometheusCard: PrometheusCardModel,
 	railwayCard: RailwayCardModel,
+	vercelCard: VercelCardModel,
 	planetscaleCard: PlanetscaleCardModel,
 	gcpCard: GcpCardModel,
 	awsCard: AwsCardModel,
 	supabaseCard: SupabaseCardModel,
 	searchConsoleCard: SearchConsoleCardModel,
+	fleetCard: FleetCardModel,
 })
 export type Model = typeof Model.Type
 
 /** The viewer may connect, disconnect and change integrations (`integrations:manage`). */
 export const canManage = (model: Pick<Model, "grants">): boolean =>
 	Policy.has(model.grants, "integrations:manage")
+
+/** Why this viewer's integration switches are locked; undefined when they may flip them. */
+export const manageLock = (model: Pick<Model, "grants">): string | undefined =>
+	canManage(model) ? undefined : Policy.denialFor("integrations:manage").message

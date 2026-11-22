@@ -16,13 +16,14 @@ import { resolveColor, type ThemeColors } from "@maple/views/charts/theme-colors
 import { badge } from "@maple/views/ui/display"
 import { eyebrow } from "@maple/views/ui/eyebrow"
 import { meter } from "@maple/views/ui/meter"
-import { middleTruncate } from "@maple/views/ui/middle-truncate"
 import { pressable } from "@maple/views/ui/pressable"
 import { segmentedSelect } from "@maple/views/ui/segmented-select"
 import { skeleton } from "@maple/views/ui/skeleton"
 import { table, tableBody, tableCell, tableHead, tableHeader, tableRow } from "@maple/views/ui/table"
 import { tableSkeleton } from "@maple/views/ui/table-skeleton"
-import { errorRateValue, latencyValue, serviceDot } from "@maple/views/ui/values"
+import { serviceLabel } from "@maple/views/ui/service-label"
+import { errorRateValue, latencyValue } from "@maple/views/ui/values"
+import { rowFocusAttributes } from "@maple/views/ui/row-focus"
 import { signalEmptyState } from "../../kit/signal-empty-state"
 import { presenceOf } from "@maple/views/data/signal-presence"
 import {
@@ -36,6 +37,7 @@ import {
 	type HealthSummary,
 	healthOf,
 	NO_NAMESPACE,
+	orderedServices,
 	resolveGroupBy,
 	type ServiceHealth,
 } from "./derive"
@@ -197,6 +199,7 @@ const serviceRow = (
 	subtitle: string,
 	baselines: ReturnType<typeof baselineMapOf> | undefined,
 	groupPath: string,
+	isFocused: boolean,
 ): Html => {
 	const health = healthOf(ctx.summary, service)
 	const series = FoldkitAsyncData.getData(ctx.model.sparklines.data).pipe(
@@ -230,12 +233,17 @@ const serviceRow = (
 						attributes: [h.Title(service.serviceName)],
 					},
 					[
-						serviceDot(h, { serviceName: service.serviceName }),
-						typography(h, { truncate: true, className: "min-w-0" }, [service.serviceName]),
-						isUnnamedService(service.serviceName)
-							? unnamedServiceHint(h, ctx.overlays?.tooltip("unnamed", rowIdOf(service)) ?? [])
-							: null,
-						healthDot(h, health),
+						serviceLabel(h, { serviceName: service.serviceName }, [
+							...(isUnnamedService(service.serviceName)
+								? [
+										unnamedServiceHint(
+											h,
+											ctx.overlays?.tooltip("unnamed", rowIdOf(service)) ?? [],
+										),
+									]
+								: []),
+							healthDot(h, health),
+						]),
 					],
 				),
 				...(subtitle !== ""
@@ -345,6 +353,7 @@ const serviceRow = (
 		),
 		[
 			h.Key(rowKey),
+			...rowFocusAttributes(h, isFocused),
 			h.Tabindex(0),
 			h.OnClick(open),
 			h.OnKeyDownPreventDefault((key) =>
@@ -423,6 +432,8 @@ const desktopTable = (
 		Option.map(FoldkitAsyncData.getData(ctx.model.baseline.data), baselineMapOf),
 	)
 	const subtitleFor = (service: ServiceRow) => (mode === "namespace" ? "" : service.serviceNamespace)
+	const focused =
+		ctx.model.focusedIndex === null ? undefined : orderedServices(services, mode)[ctx.model.focusedIndex]
 	const body =
 		services.length === 0
 			? [tableRow(h, [tableCell(h, [emptyState(h, ctx)], "p-0", [h.Attribute("colspan", "7")])])]
@@ -472,6 +483,7 @@ const desktopTable = (
 								subtitleFor(service),
 								baselines,
 								`${namespace}/${environment}`,
+								service === focused,
 							),
 						),
 					]),
@@ -498,8 +510,10 @@ const mobileList = (
 	ctx: TableContext,
 	services: ReadonlyArray<ServiceRow>,
 	mode: "namespace" | "environment",
-): Html =>
-	h.div(
+): Html => {
+	const focused =
+		ctx.model.focusedIndex === null ? undefined : orderedServices(services, mode)[ctx.model.focusedIndex]
+	return h.div(
 		[h.Class("overflow-hidden rounded-md border md:hidden")],
 		services.length === 0
 			? [emptyState(h, ctx)]
@@ -557,6 +571,7 @@ const mobileList = (
 												h,
 												{
 													isSelected: false,
+													isFocused: service === focused,
 													href: serviceHref(ctx.model, service),
 													className:
 														"flex min-h-11 items-center justify-between gap-3 border-b px-3 py-2.5 last:border-b-0 hover:bg-surface-sunken active:bg-surface-sunken focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring",
@@ -570,31 +585,30 @@ const mobileList = (
 													h.div(
 														[h.Class("min-w-0 flex-1")],
 														[
-															hstack(
+															serviceLabel(
 																h,
 																{
-																	gap: "1.5",
-																	align: "center",
-																	className:
-																		"text-sm font-medium text-foreground",
+																	serviceName: service.serviceName,
+																	size: "sm",
+																	tone: "foreground",
+																	weight: "medium",
+																	truncate: "middle",
 																},
 																[
-																	serviceDot(h, {
-																		serviceName: service.serviceName,
-																	}),
-																	middleTruncate(h, {
-																		text: service.serviceName,
-																		tail: 12,
-																	}),
-																	isUnnamedService(service.serviceName)
-																		? unnamedServiceHint(
-																				h,
-																				ctx.overlays?.tooltip(
-																					"unnamed",
-																					rowIdOf(service, true),
-																				) ?? [],
-																			)
-																		: null,
+																	...(isUnnamedService(service.serviceName)
+																		? [
+																				unnamedServiceHint(
+																					h,
+																					ctx.overlays?.tooltip(
+																						"unnamed",
+																						rowIdOf(
+																							service,
+																							true,
+																						),
+																					) ?? [],
+																				),
+																			]
+																		: []),
 																	healthDot(
 																		h,
 																		healthOf(ctx.summary, service),
@@ -680,7 +694,7 @@ const mobileList = (
 																	className: "block",
 																}),
 															}),
-															eyebrow(h, { as: "div" }, ["err"]),
+															eyebrow(h, { as: "div" }, ["Errors"]),
 														],
 													),
 												],
@@ -693,6 +707,7 @@ const mobileList = (
 					),
 				),
 	)
+}
 
 const SKELETON_COLUMNS = [
 	{ header: "Service", skeleton: "w-32" },

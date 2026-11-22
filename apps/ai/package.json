@@ -5,6 +5,7 @@
 	"scripts": {
 		"eval": "vitest run --config vitest.eval.config.ts",
 		"eval:tools": "vitest run --config vitest.eval.config.ts src/evals/tools",
+		"eval:config": "vitest run --config vitest.eval.config.ts src/evals/config",
 		"eval:compare": "bun run scripts/eval-compare.ts",
 		"eval:check": "bun run scripts/eval-runtime-check.ts",
 		"eval:widgets": "bun run scripts/grade-widget-eval.ts",
@@ -47,7 +48,7 @@
 		"@effect/vitest": "catalog:effect",
 		"@types/node": "catalog:tooling",
 		"@yielded/agent-testing": "0.1.0-beta.192",
-		"gpt-tokenizer": "^4.1.0",
+		"gpt-tokenizer": "^4.1.2",
 		"typescript": "catalog:tooling",
 		"vitest": "catalog:"
 	}

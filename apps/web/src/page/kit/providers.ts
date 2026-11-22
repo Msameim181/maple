@@ -14,11 +14,13 @@ export type ProviderId =
 	| "gcp"
 	| "aws"
 	| "railway"
+	| "vercel"
 	| "supabase"
 	| "warpstream"
 	| "linear"
 	| "github"
 	| "google-search-console"
+	| "fleet"
 
 export interface Provider {
 	readonly id: ProviderId
@@ -86,6 +88,15 @@ export const PROVIDERS = {
 		docsUrl: docsUrl("railway"),
 		infraHref: "/infra/railway",
 	},
+	vercel: {
+		id: "vercel",
+		name: "Vercel",
+		icon: "VercelIcon",
+		accent: "#000000",
+		iconClassName: "text-foreground",
+		docsUrl: docsUrl("vercel"),
+		infraHref: "/infra/vercel",
+	},
 	supabase: {
 		id: "supabase",
 		name: "Supabase",
@@ -115,6 +126,13 @@ export const PROVIDERS = {
 		name: "Google Search Console",
 		icon: "GoogleIcon",
 		accent: "#4285F4",
+	},
+	fleet: {
+		id: "fleet",
+		name: "Fleet",
+		icon: "FleetIcon",
+		backerIcon: "FleetMonoIcon",
+		accent: "#192147",
 	},
 } as const satisfies { readonly [K in ProviderId]: Provider & { readonly id: K } }
 

@@ -6,8 +6,13 @@ import { SOURCE_HEALTH_STATUSES, type SourceHealthStatus } from "./source-health
 export const INTEGRATION_PROVIDERS = [
 	"github",
 	"cloudflare",
+	"gcp",
+	"aws",
 	"railway",
+	"fleet",
+	"vercel",
 	"planetscale",
+	"supabase",
 	"prometheus",
 	"chat",
 	"search_console",

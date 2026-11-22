@@ -95,6 +95,11 @@ export const toUpstreamError = (message: string, status?: number, cause?: unknow
 		...(!(cause === undefined) ? { cause } : undefined),
 	})
 
+/** Which stored token a revoke call carries, in RFC 7009's `token_type_hint` terms. */
+export type StoredTokenKind = "refresh_token" | "access_token"
+
+const accepted = (status: number) => status >= 200 && status < 300
+
 /** The token-endpoint slice of a provider's resolved OAuth config. */
 export interface OAuthTokenEndpointConfig {
 	readonly tokenUrl: string
@@ -404,6 +409,51 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 			),
 		)
 
+		/**
+		 * Revokes the org's stored tokens through `revoke`: the refresh token first (it mints new
+		 * access tokens), then the access token. Fails when the vendor refuses one; nothing stored
+		 * succeeds.
+		 */
+		const revokeStoredTokens = Effect.fn("OAuthConnectionHelpers.revokeStoredTokens")(function* (
+			orgId: OrgId,
+			revoke: (
+				token: string,
+				kind: StoredTokenKind,
+			) => Effect.Effect<{ readonly status: number }, IntegrationsUpstreamError>,
+		) {
+			const row = yield* loadConnection(orgId)
+			if (row === null) return
+			const refused = (kind: StoredTokenKind, status: number) =>
+				toUpstreamError(`${providerLabel} refused to revoke the ${kind} with HTTP ${status}`, status)
+			const sealedRefreshToken =
+				row.refreshTokenCiphertext !== null &&
+				row.refreshTokenIv !== null &&
+				row.refreshTokenTag !== null
+					? {
+							ciphertext: row.refreshTokenCiphertext,
+							iv: row.refreshTokenIv,
+							tag: row.refreshTokenTag,
+						}
+					: null
+			if (sealedRefreshToken !== null) {
+				const refreshToken = yield* openRefreshToken(row.orgId, sealedRefreshToken)
+				const answer = yield* revoke(refreshToken, "refresh_token")
+				if (!accepted(answer.status)) return yield* refused("refresh_token", answer.status)
+			}
+			const accessToken = yield* openAccessToken(row.orgId, {
+				ciphertext: row.accessTokenCiphertext,
+				iv: row.accessTokenIv,
+				tag: row.accessTokenTag,
+			})
+			const answer = yield* revoke(accessToken, "access_token")
+			// A 400 or 401 once the refresh token is gone: the vendor ended the access token with it.
+			const diedWithRefreshToken =
+				sealedRefreshToken !== null && (answer.status === 400 || answer.status === 401)
+			if (!accepted(answer.status) && !diedWithRefreshToken) {
+				return yield* refused("access_token", answer.status)
+			}
+		})
+
 		const parseTokenPayload = (text: string) =>
 			decodeJsonUnknown(text).pipe(
 				Effect.mapError(() =>
@@ -698,13 +748,16 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 
 		/**
 		 * Run `use` with the org's access token (a stamped grant fails first). A rejected token forces
-		 * one refresh and a retry; a rejected fresh token stamps the grant revoked.
+		 * one refresh and a retry; a rejected fresh token stamps the grant revoked. `stampRevoked:
+		 * false` fails the same way without the stamp, for a caller whose endpoint may refuse a
+		 * healthy grant: the grant is shared, and its other readers must not stop on that evidence.
 		 */
 		const withRejectedTokenRetry = <A, E, Rejected extends E & { readonly message: string }>(
 			config: OAuthTokenEndpointConfig,
 			orgId: OrgId,
 			isRejected: (error: E) => error is Rejected,
 			use: (accessToken: string) => Effect.Effect<A, E>,
+			options: { readonly stampRevoked?: boolean } = {},
 		) =>
 			Effect.gen(function* () {
 				const { accessToken } = yield* getValidConnectionToken(config, orgId, { failIfRevoked: true })
@@ -714,7 +767,10 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 							const refreshed = yield* refreshRejectedToken(config, orgId, accessToken)
 							return yield* use(refreshed.accessToken).pipe(
 								Effect.catchIf(isRejected, (rejected) =>
-									markRejectedTokenRevoked(orgId, refreshed.accessToken).pipe(
+									(options.stampRevoked === false
+										? Effect.succeed(false)
+										: markRejectedTokenRevoked(orgId, refreshed.accessToken)
+									).pipe(
 										Effect.tap((stamped) =>
 											Effect.annotateCurrentSpan(
 												`maple.${provider}.grant_revoked`,
@@ -751,6 +807,7 @@ export const makeOAuthConnectionHelpers = (options: MakeOAuthConnectionHelpersOp
 			deleteConnection,
 			markConnectionRevoked,
 			markRejectedTokenRevoked,
+			revokeStoredTokens,
 			postForm,
 			exchangeAuthorizationCode,
 			refreshAccessToken,

@@ -9,13 +9,14 @@ import * as Field from "@maple/views/ui/field"
 import { icon } from "@maple/views/ui/icon"
 import { input } from "@maple/views/ui/input"
 import {
+	connectionTabItem,
+	CHANGE_LATER_NOTE,
 	type CheckRow,
 	choiceTiles,
 	flowColumns,
 	flowRail,
 	foundChips,
 	liveChecklist,
-	savedBanner,
 	statusRow,
 	stepCard,
 	whereToFind,
@@ -30,6 +31,9 @@ import {
 	planetscaleStatusOf,
 } from "./flow-planetscale"
 import { Message } from "../../../integrations/message"
+import { PlanetscaleMessage } from "./planetscale"
+import { toHub } from "./view-planetscale-parts"
+import { planetscaleFeatureChoice } from "./view-planetscale-features"
 import type { Model } from "../../../integrations/model"
 import type { PlanetscaleMetricsMethod } from "./planetscale"
 import { branchFields, branchPreviewOf, orgChoices } from "./view-planetscale-picker"
@@ -146,7 +150,7 @@ const tokenField = (
 				h.Autocomplete("off"),
 				h.Placeholder(options.placeholder),
 				...Field.controlAttributes(h, fieldModel, (message) =>
-					Message.GotPlanetscaleTokenField({ field, message }),
+					toHub(PlanetscaleMessage.GotTokenField({ field, message })),
 				),
 				h.AriaLabelledBy(ids.label),
 			],
@@ -162,7 +166,7 @@ const tokenForm = (h: H, model: Model, status: V2PlanetScaleIntegration, isAttac
 			? "https://app.planetscale.com"
 			: `https://app.planetscale.com/${encodeURIComponent(status.organization)}/settings/service-tokens`
 	return h.form(
-		[h.Class(vstackClass({ gap: "4" })), h.OnSubmit(Message.SubmittedPlanetscaleToken())],
+		[h.Class(vstackClass({ gap: "4" })), h.OnSubmit(toHub(PlanetscaleMessage.SubmittedToken()))],
 		[
 			hstack(
 				h,
@@ -206,7 +210,7 @@ const tokenForm = (h: H, model: Model, status: V2PlanetScaleIntegration, isAttac
 								{
 									variant: "outline",
 									isDisabled: card.isSavingToken,
-									attributes: [h.OnClick(Message.ClickedPlanetscaleReplaceToken())],
+									attributes: [h.OnClick(toHub(PlanetscaleMessage.ClickedReplaceToken()))],
 								},
 								["Cancel"],
 							),
@@ -221,7 +225,7 @@ const metricsPart = (h: H, model: Model, status: V2PlanetScaleIntegration): Html
 	const isAttached = metricsAuthOf(status) === "service_token"
 	const method = metricsMethodOf(model, status)
 	const select = (next: PlanetscaleMetricsMethod) =>
-		isAttached ? undefined : Message.SelectedPlanetscaleMetricsMethod({ method: next })
+		isAttached ? undefined : toHub(PlanetscaleMessage.SelectedMetricsMethod({ method: next }))
 	return vstack(h, { gap: "3", className: "border-t border-border pt-5" }, [
 		heading(h, { level: 3, variant: "subsection" }, ["Branch metrics"]),
 		choiceTiles(h, [
@@ -252,7 +256,7 @@ const metricsPart = (h: H, model: Model, status: V2PlanetScaleIntegration): Html
 								{
 									variant: "outline",
 									size: "sm",
-									attributes: [h.OnClick(Message.ClickedPlanetscaleReplaceToken())],
+									attributes: [h.OnClick(toHub(PlanetscaleMessage.ClickedReplaceToken()))],
 								},
 								["Use a different token"],
 							),
@@ -417,11 +421,32 @@ const chooseStep = (h: H, model: Model): Html => {
 						className: "w-fit",
 						isDisabled: !canSave,
 						isLoading: card.isSelecting,
-						attributes: [h.OnClick(Message.SubmittedOrganization())],
+						attributes: [h.OnClick(toHub(PlanetscaleMessage.SubmittedOrganization()))],
 					},
 					[isBound ? "Save" : "Start collecting"],
 				),
 			]),
+			stepCard(
+				h,
+				{ icon: "ChartBarIcon", title: "Choose what to collect", note: CHANGE_LATER_NOTE },
+				status !== null && status.connected
+					? [
+							planetscaleFeatureChoice(h, model, status),
+							...(card.features.error === null
+								? []
+								: [
+										statusRow(h, {
+											tone: "error",
+											text: `Couldn't save: ${card.features.error}`,
+										}),
+									]),
+						]
+					: [
+							typography(h, { size: "sm", tone: "muted", as: "p" }, [
+								"Branch metrics and events are both on. Switch either off here once the organization is saved.",
+							]),
+						],
+			),
 			chooseStatus(h, model, status),
 		],
 		chooseRail(h, model, status),
@@ -442,7 +467,7 @@ const showsUpRail = (h: H): Html =>
 				title: "Service map",
 				detail: "Databases linked to the services that query them",
 			},
-			{ icon: "GearIcon", title: "Source page", detail: "Edit data, Reconnect, Disconnect" },
+			connectionTabItem("Edit data, Reconnect, Disconnect"),
 		],
 		timeNote: "First metrics within 10 minutes",
 		docs: DOCS,
@@ -465,12 +490,8 @@ const liveStep = (h: H, model: Model): Html => {
 	return flowColumns(
 		h,
 		[
-			savedBanner(
-				h,
-				"Saved as a source. Safe to leave; collection keeps running.",
-				"Nothing to install in PlanetScale",
-			),
 			liveChecklist(h, {
+				saved: "Saved as a source. Safe to leave; collection keeps running.",
 				title: setup?.live === "healthy" ? "PlanetScale is live" : "Checking the connection",
 				rows,
 			}),

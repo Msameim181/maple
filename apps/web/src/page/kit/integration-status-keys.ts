@@ -5,6 +5,7 @@ import { type RequestKey, requestKey } from "@maple/views/data/request-key"
 export const INTEGRATION_STATUS_OPERATION = {
 	cloudflare: "integrations.cloudflareStatus",
 	railway: "integrations.railwayStatus",
+	vercel: "integrations.vercelStatus",
 	planetscale: "planetscaleIntegration.status",
 	planetscaleDatabases: "planetscaleIntegration.databases",
 	gcp: "gcpIntegration.status",
@@ -13,6 +14,7 @@ export const INTEGRATION_STATUS_OPERATION = {
 	linear: "integrations.linearStatus",
 	github: "integrations.githubStatus",
 	searchConsole: "integrations.searchConsoleStatus",
+	fleet: "integrations.fleetStatus",
 	chat: "chatIntegration.connectors",
 	scrapeTargets: "scrapeTargets.list",
 	dataSources: "dataSources.list",

@@ -11,12 +11,25 @@ import { summarizeCause } from "@maple/backend/platform/describe-cause"
 import { Cause, Clock, Duration, Effect } from "effect"
 import type { AgentCompletion, AgentDefinition } from "./agents"
 import type { AutonomousOutcome, PhaseKind } from "./autonomous-outcome"
+import { CLOSE_OUT_MAX_DURATION } from "./budgets"
 import { withToolTranscript } from "./close-out"
 import { reviewFailureReason } from "./review/failure"
 import type { ChatRunOutcome } from "./run"
 
 /** A phase with less than this much of the pass's clock left is not started. */
 const MIN_CONTINUE_MS = 2 * 60 * 1000
+
+/** The session's agent on the close-out's own clock, so a long pass cannot push the turn past its watchdog. */
+export const closeOutAgent = (agent: AgentDefinition): AgentDefinition => ({
+	...agent,
+	budget: {
+		...agent.budget,
+		maxDuration: Duration.min(
+			Duration.fromInputUnsafe(agent.budget.maxDuration),
+			Duration.fromInputUnsafe(CLOSE_OUT_MAX_DURATION),
+		),
+	},
+})
 
 /** One run of the turn. */
 export interface PhaseTurn {
@@ -120,11 +133,31 @@ export const runAutonomousPhases = <E, R>(input: AutonomousPhasesInput<E, R>): E
 			}
 			if (!outcome.submitted() && outcome.failure() === undefined) outcome.fail("answered_in_prose")
 		}
+		// A provider error mid-response (an upstream 500 after reasoning had streamed) is past the
+		// engine's own retry. The pass, or its continuation, resumes once from its transcript.
+		const resumePrompt = completion.resumePrompt
+		if (
+			resumePrompt !== undefined &&
+			!outcome.submitted() &&
+			outcome.failure() === "provider_unavailable" &&
+			holdsTurn()
+		) {
+			const remaining = yield* remainingAgent
+			if (remaining !== undefined) {
+				const resumed = yield* phase("continue", {
+					text: `${resumePrompt}\n\n${text}`,
+					history: withToolTranscript(input.transcript()),
+					agent: remaining,
+				})
+				yield* Effect.annotateCurrentSpan("maple.pr_review.resumed", resumed.submitted)
+			}
+		}
 		if (!outcome.submitted() && holdsTurn()) {
 			const closeOut = yield* phase("close-out", {
 				text: completion.closeOutPrompt,
 				history: withToolTranscript(input.transcript()),
 				closeOut: true,
+				agent: closeOutAgent(agent),
 			})
 			yield* Effect.annotateCurrentSpan(completion.closedOutAttribute, closeOut.submitted)
 		}

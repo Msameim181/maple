@@ -10,7 +10,7 @@ import {
 	ScrapeTargetId,
 	UpdateScrapeTargetRequest,
 } from "@maple/domain/http"
-import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import { runScrapeCheckRetention } from "@maple/backend/services/integrations/scrape-check-retention"
 import {
 	cleanupTestDbs,
@@ -73,7 +73,7 @@ const makeLayer = (testDb: TestDb) => {
 			),
 		),
 		Layer.provide(testDb.layer),
-		Layer.provide(Env.layer),
+		Layer.provide(EnvTestLive),
 		Layer.provide(makeConfig()),
 	)
 }
@@ -1107,6 +1107,50 @@ describe("ScrapeTargetsService", () => {
 				.pipe(Effect.flip)
 			assert.strictEqual(error._tag, "@maple/http/errors/ScrapeTargetValidationError")
 			assert.include(error.message, "only valid for PlanetScale targets")
+		}).pipe(Effect.provide(makeLayer(testDb)))
+	})
+
+	it.effect("keeps the stored URL when an update sends back one with hidden query values", () => {
+		const testDb = createTestDb(trackedDbs)
+		return Effect.gen(function* () {
+			const service = yield* ScrapeTargetsService
+			const orgId = asOrgId("org_1")
+			const stored = "https://metrics.example.com/metrics?token=s3cr3t"
+			const target = yield* service.create(
+				orgId,
+				new CreateScrapeTargetRequest({ name: "Node Exporter", url: stored }),
+			)
+
+			const errors = yield* Effect.forEach(
+				[
+					"https://metrics.example.com/metrics?token=[redacted]",
+					"https://metrics.example.com/metrics?token=%5Bredacted%5D",
+				],
+				(url) =>
+					service
+						.update(orgId, target.id, new UpdateScrapeTargetRequest({ url }))
+						.pipe(Effect.flip),
+			)
+			assert.deepStrictEqual(
+				Arr.map(errors, (error) => error._tag),
+				[
+					"@maple/http/errors/ScrapeTargetValidationError",
+					"@maple/http/errors/ScrapeTargetValidationError",
+				],
+			)
+			assert.strictEqual((yield* service.get(orgId, target.id)).url, stored)
+
+			const created = yield* service
+				.create(
+					orgId,
+					new CreateScrapeTargetRequest({
+						name: "Copied",
+						url: "https://metrics.example.com/metrics?token=[redacted]",
+					}),
+				)
+				.pipe(Effect.flip)
+			assert.strictEqual(created._tag, "@maple/http/errors/ScrapeTargetValidationError")
+			assert.lengthOf((yield* service.list(orgId)).targets, 1)
 		}).pipe(Effect.provide(makeLayer(testDb)))
 	})
 })

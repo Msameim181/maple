@@ -1,12 +1,13 @@
 import { OrgId } from "@maple/domain"
 import { Result, Schema, Array as Arr } from "effect"
-import { expect as expectView, given, Mount, scene, text, withViewInputs } from "foldkit/scene"
+import { expect as expectView, given, Mount, role, scene, text, withViewInputs } from "foldkit/scene"
 import { ResolveThemeColors, ThemeMessage } from "@maple/views/charts/theme-colors"
 import { describe, expect, test } from "vitest"
 import { toLoadFailure } from "@maple/views/data/load-failure"
 import { PageOutMessage, type PageContext } from "../contract"
 import { Message } from "./message"
-import type { Breakdowns, Model, Summary } from "./model"
+import type { Breakdowns } from "../kit/analytics-filter-rail"
+import type { Model, Summary } from "./model"
 import { init, panelOf, routeChanged, update } from "./update"
 import { view as pageView } from "./view"
 
@@ -210,6 +211,95 @@ describe("web analytics", () => {
 			resolveTheme,
 			expectView(text("www.google.com")).toExist(),
 			expectView(text("Clear all")).toExist(),
+		)
+	})
+
+	test("the events card links to Product analytics only for an org in that rollout", () => {
+		const model = settled(settled(windowed({ timePreset: "7d" }), "breakdowns", breakdowns), "events", [
+			{ name: "add_to_cart", events: 12, sessions: 4 },
+		])
+		scene(
+			{ update: pageUpdate, view },
+			given(model),
+			resolveTheme,
+			expectView(text("add_to_cart")).toExist(),
+			expectView(text("Funnels and paths")).not.toExist(),
+		)
+		scene(
+			{
+				update: pageUpdate,
+				view: withViewInputs(pageView, { context: { ...context, hasProductAnalytics: true } })(),
+			},
+			given(model),
+			resolveTheme,
+			expectView(role("link", { name: "Funnels and paths" })).toHaveAttr(
+				"href",
+				"/product-analytics?timePreset=7d",
+			),
+		)
+	})
+
+	const searchConsole = (connected: boolean) => ({
+		configured: true,
+		connected,
+		accountEmail: null,
+		connectedByUserId: null,
+		revoked: false,
+		sites: [],
+	})
+
+	const overviewWith = (referrerHosts: Breakdowns["referrerHosts"], connected: boolean): Model => {
+		const loaded = settled(settled(windowed(), "summary", summary), "breakdowns", {
+			...breakdowns,
+			referrerHosts,
+		})
+		return pageUpdate(
+			loaded,
+			Message.CompletedFetch({
+				slot: "searchStatus",
+				key: loaded.searchStatus.key ?? "",
+				result: Result.succeed(searchConsole(connected)),
+			}),
+		).model
+	}
+
+	test("Google's search visits point to the Search tab, where Search Console connects", () => {
+		// Gmail is Google too, but not a search: its sessions stay out of the count.
+		const model = overviewWith(
+			[
+				{ name: "www.google.com", count: 63 },
+				{ name: "www.google.de", count: 4 },
+				{ name: "mail.google.com", count: 9 },
+			],
+			false,
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(model),
+			resolveTheme,
+			expectView(text("67 sessions from Google Search")).toExist(),
+			expectView(role("link", { name: "Connect Search Console" })).toHaveAttr(
+				"href",
+				"/analytics?tab=search",
+			),
+		)
+	})
+
+	test("without visits from Google's search there is nothing to point at", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(overviewWith([{ name: "news.ycombinator.com", count: 9 }], false)),
+			resolveTheme,
+			expectView(text("Connect Search Console")).not.toExist(),
+		)
+	})
+
+	test("a card with one row counts it in the singular", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(overviewWith([{ name: "news.ycombinator.com", count: 9 }], false)),
+			resolveTheme,
+			expectView(text("1 referrer")).toExist(),
 		)
 	})
 

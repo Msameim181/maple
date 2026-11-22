@@ -180,7 +180,7 @@ export const USER_DETAIL: UserDetail = {
 			{ service: "web", namespace: "storefront", signals: 1_140 },
 			{ service: "api", namespace: "storefront", signals: 640 },
 			{ service: "billing", namespace: "payments", signals: 210 },
-			{ service: "search", namespace: "data", signals: 150 },
+			{ service: "search-indexer-worker", namespace: "data", signals: 150 },
 			{ service: "maple-ai", namespace: "storefront", signals: 96 },
 			{ service: "docs-mcp", namespace: "data", signals: 58 },
 		],
@@ -274,11 +274,11 @@ export const USER_DETAIL: UserDetail = {
 			href: null,
 		},
 		{
-			service: "search",
+			service: "search-indexer-worker",
 			kind: "request",
 			atMs: ago(27 * HOUR),
 			title: "GET /reports/:id slow, 3.2s",
-			detail: "search · route p95 900ms",
+			detail: "search-indexer-worker · route p95 900ms",
 			tone: "warn",
 			href: null,
 		},
@@ -427,7 +427,7 @@ export const USER_DETAIL: UserDetail = {
 			href: "/traces/e40f17",
 			atMs: ago(27 * HOUR),
 			rootSpan: "GET /reports/:id",
-			service: "search",
+			service: "search-indexer-worker",
 			durationMs: 3_200,
 			status: "Ok",
 			isError: false,
@@ -475,7 +475,7 @@ export const USER_DETAIL: UserDetail = {
 		{
 			atMs: ago(27 * HOUR),
 			severity: "WARN",
-			service: "search",
+			service: "search-indexer-worker",
 			body: "query exceeded soft budget 2000ms",
 			href: null,
 		},
@@ -558,3 +558,38 @@ export const USER_DETAIL: UserDetail = {
 		},
 	],
 }
+
+/** A sole founder: their own group of one, one namespace, and the long ids Clerk hands out. */
+export const SOLO_DETAIL: UserDetail = {
+	...USER_DETAIL,
+	profile: {
+		...USER_DETAIL.profile,
+		userId: "user_3K6ZePbFWFCULtlI1CLq8wXrT2b",
+		name: "Brandon Stubbs",
+		email: "brandon@solo.dev",
+		groupId: "org_3K6ZgHuDSTHrIl0Ca88BzP4mQ1x",
+		groupName: "solo",
+		namespaces: ["core"],
+		traits: [
+			["plan", "startup"],
+			["role", "org:admin"],
+		],
+		services: [
+			{ service: "maple-web", namespace: "core", signals: 2_600 },
+			{ service: "maple-ai", namespace: "core", signals: 524 },
+			{ service: "maple-landing", namespace: "core", signals: 26 },
+		],
+		devices: [{ browser: "Chrome", os: "macOS", sessions: 28 }],
+		location: "US",
+		sessions: 28,
+	},
+}
+
+/** The solo user's group over the window: only them. */
+export const SOLO_GROUP = {
+	users: 1,
+	activeToday: 1,
+	withErrors: 0,
+	sessions: 28,
+	requests: 2_600,
+} as const

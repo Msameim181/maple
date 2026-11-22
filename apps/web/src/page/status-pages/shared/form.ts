@@ -14,6 +14,7 @@ import type {
 	V2StatusPageComponentCreateParams,
 	V2StatusPageIncident,
 	V2StatusPageIncidentCreateParams,
+	V2StatusPageIncidentPostUpdateParams,
 	V2StatusPageIncidentUpdateParams,
 	V2StatusPageUpdateParams,
 } from "@maple/domain/http/v2"
@@ -26,6 +27,10 @@ import {
 	type StatusPageTheme,
 	themeContrastIssue,
 	STATUS_PAGE_MAX_URL_LENGTH,
+	STATUS_PAGE_UPDATE_MAX_LENGTH,
+	STATUS_PAGE_IMAGE_TYPES,
+	STATUS_PAGE_MAX_IMAGE_BYTES,
+	isStatusPageImageDataUrl,
 } from "@maple/domain/status-page"
 import { DateTime, Option, Schema, Array as Arr, Record as Rec, String as Str } from "effect"
 import { closingStatus, STATUSES_OF_KIND } from "./derive"
@@ -78,7 +83,8 @@ export const componentFormOf = (component: V2StatusPageComponent): ComponentForm
 	showUptime: component.show_uptime,
 })
 
-const orNull = (value: string): string | null => (Str.trim(value) === "" ? null : Str.trim(value))
+/** A typed value trimmed, or `null` when nothing is left. */
+export const orNull = (value: string): string | null => (Str.trim(value) === "" ? null : Str.trim(value))
 const decodeMonitorId = Schema.decodeUnknownOption(UptimeMonitorId)
 const decodeComponentStatus = Schema.decodeUnknownOption(StatusPageComponentStatus)
 
@@ -101,6 +107,7 @@ export const IncidentTextField = Schema.Literals([
 	"body",
 	"scheduledStart",
 	"scheduledEnd",
+	"startedAt",
 ])
 export type IncidentTextField = typeof IncidentTextField.Type
 
@@ -111,11 +118,15 @@ export const IncidentForm = Schema.Struct({
 	status: StatusPageIncidentStatus,
 	componentIds: Schema.Array(StatusPageComponentId),
 	body: Schema.String,
-	/** `false` saves a draft visitors do not see. */
+	/** `false` saves a draft visitors do not see; set by the button that sends it. */
 	isPublished: Schema.Boolean,
 	/** Maintenance only: the window as `datetime-local` values, in the viewer's time zone. */
 	scheduledStart: Schema.String,
 	scheduledEnd: Schema.String,
+	/** Maintenance only: completes on its own when the window ends. */
+	autoComplete: Schema.Boolean,
+	/** Incident only: when it began, as a `datetime-local` value; blank is when it is posted. */
+	startedAt: Schema.String,
 })
 export type IncidentForm = typeof IncidentForm.Type
 
@@ -129,6 +140,8 @@ export const emptyIncidentForm = (kind: StatusPageIncidentKind): IncidentForm =>
 	isPublished: true,
 	scheduledStart: "",
 	scheduledEnd: "",
+	autoComplete: true,
+	startedAt: "",
 })
 
 const LOCAL_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/u
@@ -144,24 +157,78 @@ export const localToIso = (value: string, timeZone: string): Option.Option<strin
 	)
 }
 
-/** What stops the incident from being sent, in reading order; empty when it can go. */
-export const incidentIssues = (form: IncidentForm, timeZone: string): ReadonlyArray<string> => {
+/** An instant as a `datetime-local` value in `timeZone`; `""` for none. */
+export const isoToLocal = (value: string | null, timeZone: string): string =>
+	value === null
+		? ""
+		: Option.match(DateTime.makeZoned(value, { timeZone }), {
+				onNone: () => "",
+				onSome: (zoned) => Str.slice(0, 16)(DateTime.formatIsoOffset(zoned)),
+			})
+
+const UPDATE_MAX_LENGTH_LABEL = STATUS_PAGE_UPDATE_MAX_LENGTH.toLocaleString("en-US")
+
+/** An update message longer than the API takes, or `null`. */
+export const updateBodyLengthIssue = (body: string): string | null => {
+	const length = Str.trim(body).length
+	return length > STATUS_PAGE_UPDATE_MAX_LENGTH
+		? `Keep it under ${UPDATE_MAX_LENGTH_LABEL} characters (${length.toLocaleString("en-US")} now).`
+		: null
+}
+
+/** A typed instant after `nowMs`, which the API refuses for when something started or ended. */
+const isFuture = (iso: string, nowMs: number): boolean => iso > new Date(nowMs).toISOString()
+
+/**
+ * Maintenance takes its status from its window: scheduled until it starts, in progress once its
+ * start has come, so what visitors see never contradicts the times.
+ */
+export const withMaintenanceStatus = (form: IncidentForm, timeZone: string, nowMs: number): IncidentForm =>
+	form.kind !== "maintenance"
+		? form
+		: {
+				...form,
+				status: Option.exists(localToIso(form.scheduledStart, timeZone), (start) =>
+					isFuture(start, nowMs),
+				)
+					? "scheduled"
+					: "in_progress",
+			}
+
+/** What stops the incident from being sent, by field; `null` where nothing does. */
+export type IncidentIssues = Readonly<{
+	title: string | null
+	body: string | null
+	window: string | null
+	started: string | null
+}>
+
+export const incidentIssues = (form: IncidentForm, timeZone: string, nowMs: number): IncidentIssues => {
 	const start = localToIso(form.scheduledStart, timeZone)
 	const end = localToIso(form.scheduledEnd, timeZone)
-	const windowIssue =
-		form.kind !== "maintenance"
-			? null
-			: Option.isNone(start) || Option.isNone(end)
-				? "Set when the maintenance starts and ends."
-				: start.value >= end.value
-					? "The maintenance must end after it starts."
-					: null
-	return [
-		...(Str.trim(form.title) === "" ? ["Add a title."] : []),
-		...(Str.trim(form.body) === "" ? ["Write the first update."] : []),
-		...(windowIssue === null ? [] : [windowIssue]),
-	]
+	return {
+		title: Str.trim(form.title) === "" ? "Add a title." : null,
+		body: Str.trim(form.body) === "" ? "Write the first update." : updateBodyLengthIssue(form.body),
+		window:
+			form.kind !== "maintenance"
+				? null
+				: Option.isNone(start) || Option.isNone(end)
+					? "Set when the maintenance starts and ends."
+					: start.value >= end.value
+						? "The maintenance must end after it starts."
+						: isFuture(end.value, nowMs)
+							? null
+							: "The maintenance must end in the future.",
+		started:
+			form.kind === "incident" &&
+			Option.exists(localToIso(form.startedAt, timeZone), (started) => isFuture(started, nowMs))
+				? "It can't start in the future."
+				: null,
+	}
 }
+
+export const hasIncidentIssues = (issues: IncidentIssues): boolean =>
+	Arr.some(Rec.values(issues), (issue) => issue !== null)
 
 export const incidentPayload = (
 	form: IncidentForm,
@@ -178,43 +245,134 @@ export const incidentPayload = (
 		component_ids: form.componentIds,
 		published: form.isPublished,
 	}
-	if (form.kind !== "maintenance") return base
+	if (form.kind !== "maintenance")
+		return Option.match(localToIso(form.startedAt, timeZone), {
+			onNone: () => base,
+			onSome: (startedAt) => ({ ...base, started_at: startedAt }),
+		})
 	return Option.match(
 		Option.all([localToIso(form.scheduledStart, timeZone), localToIso(form.scheduledEnd, timeZone)]),
 		{
 			onNone: () => base,
-			onSome: ([start, end]) => ({ ...base, scheduled_start: start, scheduled_end: end }),
+			onSome: ([start, end]) => ({
+				...base,
+				scheduled_start: start,
+				scheduled_end: end,
+				auto_complete: form.autoComplete,
+			}),
 		},
 	)
 }
 
 // INCIDENT DETAILS
 
-export const IncidentEditField = Schema.Literals(["title", "impact"])
+export const IncidentEditField = Schema.Literals(["title", "impact", "start", "end"])
 export type IncidentEditField = typeof IncidentEditField.Type
 
-/** An incident's title, impact and components, edited without posting an update. */
+/** An incident's title, impact, times and components, edited without posting an update. */
 export const IncidentEditForm = Schema.Struct({
 	incidentId: StatusPageIncidentId,
 	kind: StatusPageIncidentKind,
+	status: StatusPageIncidentStatus,
 	title: Schema.String,
 	impact: StatusPageIncidentImpact,
 	componentIds: Schema.Array(StatusPageComponentId),
+	/**
+	 * `datetime-local` values in the viewer's zone: the window for maintenance, when it started
+	 * and ended for an incident (`""` while open).
+	 */
+	start: Schema.String,
+	end: Schema.String,
+	/** Maintenance only. */
+	autoComplete: Schema.Boolean,
 })
 export type IncidentEditForm = typeof IncidentEditForm.Type
 
-export const incidentEditFormOf = (incident: V2StatusPageIncident): IncidentEditForm => ({
-	incidentId: incident.id,
-	kind: incident.kind,
-	title: incident.title,
-	impact: incident.impact,
-	componentIds: incident.component_ids,
-})
+/** The times an incident's Edit details shows: the maintenance window, or started and ended. */
+const savedTimes = (incident: V2StatusPageIncident) =>
+	incident.kind === "maintenance"
+		? { start: incident.scheduled_start, end: incident.scheduled_end }
+		: { start: incident.started_at, end: incident.resolved_at }
 
-/** Maintenance has no impact to pick, so only an incident sends one. */
-export const incidentEditPayload = (form: IncidentEditForm): V2StatusPageIncidentUpdateParams => {
+export const incidentEditFormOf = (incident: V2StatusPageIncident, timeZone: string): IncidentEditForm => {
+	const times = savedTimes(incident)
+	return {
+		incidentId: incident.id,
+		kind: incident.kind,
+		status: incident.status,
+		title: incident.title,
+		impact: incident.impact,
+		componentIds: incident.component_ids,
+		start: isoToLocal(times.start, timeZone),
+		end: isoToLocal(times.end, timeZone),
+		autoComplete: incident.auto_complete,
+	}
+}
+
+/** Which times Edit details offers: an open maintenance window, an incident's start, a closed one's end. */
+export const editableTimes = (
+	form: Pick<IncidentEditForm, "kind" | "status">,
+): Readonly<{ start: boolean; end: boolean }> =>
+	form.kind === "maintenance"
+		? { start: form.status !== "completed", end: form.status !== "completed" }
+		: { start: true, end: form.status === "resolved" }
+
+/** What stops the edit from being saved, by field; `null` where nothing does. */
+export const incidentEditIssues = (
+	form: IncidentEditForm,
+	timeZone: string,
+	nowMs: number,
+): Readonly<{ title: string | null; times: string | null }> => {
+	const editable = editableTimes(form)
+	const start = localToIso(form.start, timeZone)
+	const end = localToIso(form.end, timeZone)
+	const times = (): string | null => {
+		if (form.kind === "maintenance") {
+			if (!editable.start) return null
+			if (Option.isNone(start) || Option.isNone(end)) return "Set when the maintenance starts and ends."
+			return end.value > start.value ? null : "The maintenance must end after it starts."
+		}
+		if (Option.isNone(start)) return "Set when it started."
+		if (isFuture(start.value, nowMs)) return "It can't start in the future."
+		if (!editable.end) return null
+		if (Option.isNone(end)) return "Set when it ended."
+		if (isFuture(end.value, nowMs)) return "It can't end in the future."
+		return end.value < start.value ? "It can't end before it started." : null
+	}
+	return { title: Str.trim(form.title) === "" ? "Add a title." : null, times: times() }
+}
+
+/**
+ * Title and components always; impact for an incident; a time only when it was changed, so a
+ * value saved to the second is not rounded to the minute by an unrelated edit.
+ */
+export const incidentEditPayload = (
+	form: IncidentEditForm,
+	incident: V2StatusPageIncident,
+	timeZone: string,
+): V2StatusPageIncidentUpdateParams => {
+	const saved = incidentEditFormOf(incident, timeZone)
+	const editable = editableTimes(form)
+	const changed = (field: "start" | "end"): Option.Option<string> =>
+		editable[field] && form[field] !== saved[field] ? localToIso(form[field], timeZone) : Option.none()
+	const start = Option.getOrUndefined(changed("start"))
+	const end = Option.getOrUndefined(changed("end"))
 	const base = { title: Str.trim(form.title), component_ids: form.componentIds }
-	return form.kind === "incident" ? { ...base, impact: form.impact } : base
+	return form.kind === "maintenance"
+		? {
+				...base,
+				...(start === undefined ? undefined : { scheduled_start: start }),
+				...(end === undefined ? undefined : { scheduled_end: end }),
+				...(form.autoComplete === incident.auto_complete
+					? undefined
+					: { auto_complete: form.autoComplete }),
+			}
+		: {
+				...base,
+				impact: form.impact,
+				...(start === undefined ? undefined : { started_at: start }),
+				...(end === undefined ? undefined : { resolved_at: end }),
+			}
 }
 
 // UPDATES
@@ -224,6 +382,8 @@ export const UpdateForm = Schema.Struct({
 	kind: StatusPageIncidentKind,
 	status: StatusPageIncidentStatus,
 	body: Schema.String,
+	/** With the closing status: when it ended, as a `datetime-local` value; blank is when it is posted. */
+	endedAt: Schema.String,
 })
 export type UpdateForm = typeof UpdateForm.Type
 
@@ -248,7 +408,38 @@ export const updateFormFor = (
 				? "This incident has been resolved."
 				: "The maintenance is complete."
 			: "",
+		endedAt: "",
 	}
+}
+
+/** A typed end in the future or before the incident started, which the API refuses; `null` otherwise. */
+export const endedIssue = (
+	form: UpdateForm,
+	startedAt: string,
+	timeZone: string,
+	nowMs: number,
+): string | null =>
+	form.status !== closingStatus(form.kind)
+		? null
+		: Option.match(localToIso(form.endedAt, timeZone), {
+				onNone: () => null,
+				onSome: (ended) =>
+					isFuture(ended, nowMs)
+						? "It can't end in the future."
+						: ended < startedAt
+							? "It can't end before it started."
+							: null,
+			})
+
+/** The end time goes only with the closing status, and only once typed. */
+export const updatePayload = (form: UpdateForm, timeZone: string): V2StatusPageIncidentPostUpdateParams => {
+	const base = { status: form.status, body: Str.trim(form.body) }
+	return form.status !== closingStatus(form.kind)
+		? base
+		: Option.match(localToIso(form.endedAt, timeZone), {
+				onNone: () => base,
+				onSome: (resolved_at) => ({ ...base, resolved_at }),
+			})
 }
 
 // SETTINGS
@@ -260,10 +451,30 @@ export const SettingsTextField = Schema.Literals([
 	"websiteUrl",
 	"privacyUrl",
 	"termsUrl",
+	"supportUrl",
 	"logoUrl",
+	"logoDarkUrl",
+	"faviconUrl",
 	"autoIncidents",
 ])
 export type SettingsTextField = typeof SettingsTextField.Type
+
+/** The page fields the Appearance tab edits; the rest are on the Settings tab. */
+export const BRANDING_FIELDS = ["logoUrl", "logoDarkUrl", "faviconUrl"] as const
+/** A logo or favicon field: an https URL or an uploaded image. */
+export const BrandingField = Schema.Literals(BRANDING_FIELDS)
+export type BrandingField = typeof BrandingField.Type
+
+/** The page fields Appearance edits (what visitors see besides the name); the rest are Basic settings. */
+const APPEARANCE_FIELDS: ReadonlyArray<SettingsTextField> = [
+	...BRANDING_FIELDS,
+	"websiteUrl",
+	"privacyUrl",
+	"termsUrl",
+	"supportUrl",
+]
+const isAppearanceField = (field: SettingsTextField): boolean =>
+	Arr.some(APPEARANCE_FIELDS, (appearance) => appearance === field)
 
 /** The theme's colour inputs, as typed; blank means the preset's colour. */
 export const ThemeColorField = Schema.Literals(["accent", "background", "text", "card", "border"])
@@ -292,7 +503,10 @@ export const SettingsForm = Schema.Struct({
 	websiteUrl: Schema.String,
 	privacyUrl: Schema.String,
 	termsUrl: Schema.String,
+	supportUrl: Schema.String,
 	logoUrl: Schema.String,
+	logoDarkUrl: Schema.String,
+	faviconUrl: Schema.String,
 	showPoweredBy: Schema.Boolean,
 	autoIncidents: StatusPageAutoIncidents,
 	theme: ThemeForm,
@@ -315,7 +529,10 @@ export const settingsFormOf = (page: V2StatusPage): SettingsForm => ({
 	websiteUrl: page.website_url ?? "",
 	privacyUrl: page.privacy_url ?? "",
 	termsUrl: page.terms_url ?? "",
+	supportUrl: page.support_url ?? "",
 	logoUrl: page.logo_url ?? "",
+	logoDarkUrl: page.logo_dark_url ?? "",
+	faviconUrl: page.favicon_url ?? "",
 	showPoweredBy: page.show_powered_by,
 	autoIncidents: page.auto_incidents,
 	theme: themeFormOf(page.theme),
@@ -341,7 +558,10 @@ const normalizedSettings = (form: SettingsForm): SettingsForm => ({
 	websiteUrl: Str.trim(form.websiteUrl),
 	privacyUrl: Str.trim(form.privacyUrl),
 	termsUrl: Str.trim(form.termsUrl),
+	supportUrl: Str.trim(form.supportUrl),
 	logoUrl: Str.trim(form.logoUrl),
+	logoDarkUrl: Str.trim(form.logoDarkUrl),
+	faviconUrl: Str.trim(form.faviconUrl),
 	theme: themeFormOf(themeOf(form.theme)),
 })
 
@@ -356,7 +576,10 @@ const sameNormalized = (a: SettingsForm, b: SettingsForm): boolean =>
 	a.websiteUrl === b.websiteUrl &&
 	a.privacyUrl === b.privacyUrl &&
 	a.termsUrl === b.termsUrl &&
+	a.supportUrl === b.supportUrl &&
 	a.logoUrl === b.logoUrl &&
+	a.logoDarkUrl === b.logoDarkUrl &&
+	a.faviconUrl === b.faviconUrl &&
 	a.showPoweredBy === b.showPoweredBy &&
 	a.autoIncidents === b.autoIncidents &&
 	sameTheme(a.theme, b.theme)
@@ -372,7 +595,7 @@ const sameTheme = (a: ThemeForm, b: ThemeForm): boolean =>
 	a.radius === b.radius &&
 	a.font === b.font
 /** The service's rule: a URL `URL` can parse, over https. Checked here so Save never sends what it refuses. */
-const httpsIssue = (value: string): string | null => {
+export const httpsIssue = (value: string): string | null => {
 	const url = Str.trim(value)
 	if (url === "") return null
 	if (url.length > STATUS_PAGE_MAX_URL_LENGTH)
@@ -380,6 +603,18 @@ const httpsIssue = (value: string): string | null => {
 	if (!URL.canParse(url)) return "Use a valid URL, like https://acme.example."
 	return new URL(url).protocol === "https:" ? null : "Use an https URL."
 }
+
+/** An upload is checked on read (`imageUploadIssue`); a typed value must be an https URL. */
+const imageIssue = (value: string): string | null =>
+	isStatusPageImageDataUrl(Str.trim(value)) ? null : httpsIssue(value)
+
+/** Why a picked file cannot be a logo or favicon, or `null`: the API's type and size rule. */
+export const imageUploadIssue = (file: { readonly type: string; readonly size: number }): string | null =>
+	!Arr.some(STATUS_PAGE_IMAGE_TYPES, (type) => type === file.type)
+		? "Use a PNG, JPEG, WebP, GIF, SVG or ICO image."
+		: file.size > STATUS_PAGE_MAX_IMAGE_BYTES
+			? `Keep the image under ${STATUS_PAGE_MAX_IMAGE_BYTES / 1024} KB.`
+			: null
 
 /** Each field's problem, or `null`: the API refuses the same values. */
 export const settingsIssues = (form: SettingsForm): Readonly<Record<SettingsTextField, string | null>> => ({
@@ -389,7 +624,10 @@ export const settingsIssues = (form: SettingsForm): Readonly<Record<SettingsText
 	websiteUrl: httpsIssue(form.websiteUrl),
 	privacyUrl: httpsIssue(form.privacyUrl),
 	termsUrl: httpsIssue(form.termsUrl),
-	logoUrl: httpsIssue(form.logoUrl),
+	supportUrl: httpsIssue(form.supportUrl),
+	logoUrl: imageIssue(form.logoUrl),
+	logoDarkUrl: imageIssue(form.logoDarkUrl),
+	faviconUrl: imageIssue(form.faviconUrl),
 	autoIncidents: null,
 })
 
@@ -413,17 +651,23 @@ export const themeContrastOf = (theme: ThemeForm): string | null =>
 		? null
 		: themeContrastIssue(themeOf(theme))
 
-/** A problem in the page fields, which the Settings tab shows. */
-export const hasPageFieldIssues = (form: SettingsForm): boolean =>
-	Arr.some(Rec.values(settingsIssues(form)), (issue) => issue !== null)
+const hasFieldIssues = (form: SettingsForm, onAppearanceTab: boolean): boolean =>
+	Arr.some(
+		Rec.toEntries(settingsIssues(form)),
+		([field, issue]) => issue !== null && isAppearanceField(field) === onAppearanceTab,
+	)
 
-/** A problem in the colours, which the Appearance tab shows. */
-export const hasThemeIssues = (form: SettingsForm): boolean =>
+/** A problem in the page fields, which the Settings tab shows. */
+export const hasPageFieldIssues = (form: SettingsForm): boolean => hasFieldIssues(form, false)
+
+/** A problem in the branding or colours, which the Appearance tab shows. */
+export const hasAppearanceIssues = (form: SettingsForm): boolean =>
+	hasFieldIssues(form, true) ||
 	Arr.some(Rec.values(themeColorIssues(form.theme)), (issue) => issue !== null) ||
 	themeContrastOf(form.theme) !== null
 
 export const hasSettingsIssues = (form: SettingsForm): boolean =>
-	hasPageFieldIssues(form) || hasThemeIssues(form)
+	hasPageFieldIssues(form) || hasAppearanceIssues(form)
 
 export const settingsPayload = (form: SettingsForm): V2StatusPageUpdateParams => ({
 	name: Str.trim(form.name),
@@ -432,7 +676,10 @@ export const settingsPayload = (form: SettingsForm): V2StatusPageUpdateParams =>
 	website_url: orNull(form.websiteUrl),
 	privacy_url: orNull(form.privacyUrl),
 	terms_url: orNull(form.termsUrl),
+	support_url: orNull(form.supportUrl),
 	logo_url: orNull(form.logoUrl),
+	logo_dark_url: orNull(form.logoDarkUrl),
+	favicon_url: orNull(form.faviconUrl),
 	theme: themeOf(form.theme),
 	show_powered_by: form.showPoweredBy,
 	auto_incidents: form.autoIncidents,

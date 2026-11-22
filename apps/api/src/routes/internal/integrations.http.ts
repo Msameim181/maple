@@ -15,6 +15,7 @@ import {
 	GithubDisconnectResponse,
 	GithubIntegrationStatus,
 	GithubSetCiTracesResponse,
+	GithubSetAuditLogResponse,
 	GithubSetPrReviewResponse,
 	GithubPrReviewConfigResponse,
 	GithubPrReviewSettingsResponse,
@@ -23,6 +24,7 @@ import {
 	GithubSelectInstallationResponse,
 	InfraSurfaceLiteral,
 	IntegrationsForbiddenError,
+	IntegrationsNotConnectedError,
 	IntegrationsUpstreamError,
 	LinearDisconnectResponse,
 	LinearIntegrationStatus,
@@ -30,7 +32,12 @@ import {
 	LinearTeamsListResponse,
 	IntegrationsValidationError,
 	MapleInternalApi,
+	mergePrReviewConfig,
+	OrgId,
+	prReviewConfigNeedsAutoApprove,
+	prReviewDefaultsNeedAutoApprove,
 	RailwayDisconnectResponse,
+	FleetDisconnectResponse,
 	RoleName,
 	SearchConsoleAvailableSitesResponse,
 	SearchConsoleDisconnectResponse,
@@ -48,6 +55,8 @@ import {
 	VcsCommitRangeResponse,
 	VcsCommitRangesResponse,
 	VcsPullRequestsResponse,
+	VercelDeploymentsResponse,
+	VercelDisconnectResponse,
 } from "@maple/domain/http"
 import { EdgeCacheService } from "@maple/cache"
 import { Effect, Option, Schema, Array as Arr, Record as Rec, String as Str } from "effect"
@@ -69,7 +78,9 @@ import { PlanetScaleConnectionService } from "@maple/backend/services/integratio
 import { makeQueryRunners } from "@maple/backend/queries/query-runner"
 import { QueryEngineService } from "@maple/backend/services/warehouse/QueryEngineService"
 import { WarehouseQueryService } from "@maple/backend/services/warehouse/WarehouseQueryService"
+import { FleetConnectionService } from "@maple/backend/services/integrations/FleetConnectionService"
 import { RailwayMetricsService } from "@maple/backend/services/integrations/RailwayMetricsService"
+import { VercelIntegrationService } from "@maple/backend/services/integrations/VercelIntegrationService"
 import { SupabaseConnectionService } from "@maple/backend/services/integrations/SupabaseConnectionService"
 import { SupabaseInsightsService } from "@maple/backend/services/integrations/SupabaseInsightsService"
 import { SupabaseLogsService } from "@maple/backend/services/integrations/SupabaseLogsService"
@@ -139,6 +150,24 @@ const requirePermission = (roles: ReadonlyArray<RoleName>, permission: Policy.Pe
 export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "integrations", (handlers) =>
 	Effect.gen(function* () {
 		const linear = yield* LinearOAuthService
+		const linearStatus = Effect.fn("HttpIntegrations.linearStatus")(function* (orgId: OrgId) {
+			const status = yield* linear.getStatus(orgId)
+			return status.connected
+				? new LinearIntegrationStatus({
+						connected: true,
+						workspaceName: status.workspaceName,
+						connectedByUserId: status.connectedByUserId,
+						revoked: status.revoked,
+						features: status.features,
+					})
+				: new LinearIntegrationStatus({
+						connected: false,
+						workspaceName: null,
+						connectedByUserId: null,
+						revoked: false,
+						features: yield* linear.getFeatures(orgId),
+					})
+		})
 		const google = yield* GoogleOAuthService
 		const searchConsole = yield* SearchConsoleService
 		const searchConsoleImport = yield* SearchConsoleImportService
@@ -148,6 +177,8 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 		const cloudflare = yield* CloudflareOAuthService
 		const cloudflareAnalytics = yield* CloudflareAnalyticsService
 		const railway = yield* RailwayMetricsService
+		const fleet = yield* FleetConnectionService
+		const vercel = yield* VercelIntegrationService
 		const supabaseOAuth = yield* SupabaseOAuthService
 		const supabase = yield* SupabaseConnectionService
 		const supabaseLogs = yield* SupabaseLogsService
@@ -189,20 +220,25 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 				.handle("linearStatus", () =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
-						const status = yield* linear.getStatus(tenant.orgId)
-						return status.connected
-							? new LinearIntegrationStatus({
-									connected: true,
-									workspaceName: status.workspaceName,
-									connectedByUserId: status.connectedByUserId,
-									revoked: status.revoked,
-								})
-							: new LinearIntegrationStatus({
-									connected: false,
-									workspaceName: null,
-									connectedByUserId: null,
-									revoked: false,
-								})
+						return yield* linearStatus(tenant.orgId)
+					}),
+				)
+				.handle("linearFeatures", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						// Like Cloudflare's: switches are set on a connected integration only.
+						const current = yield* linear.getStatus(tenant.orgId)
+						if (!current.connected) {
+							return yield* new IntegrationsNotConnectedError({
+								message: "Linear is not connected",
+							})
+						}
+						const features = yield* linear.setFeatures(tenant.orgId, tenant.userId, payload)
+						yield* recordHttpAudit("linear_integration.features_updated", {
+							metadata: { ...features },
+						})
+						return yield* linearStatus(tenant.orgId)
 					}),
 				)
 				.handle("linearStart", ({ payload }) =>
@@ -220,6 +256,10 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 				.handle("linearTeams", () =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
+						// A live read of the workspace, for the alert destination picker: either manager may.
+						if (!Policy.can(tenant.roles, "alerts:manage")) {
+							yield* requirePermission(tenant.roles, "integrations:manage")
+						}
 						const teams = yield* linear.listTeams(tenant.orgId)
 						return new LinearTeamsListResponse({ teams })
 					}),
@@ -254,6 +294,8 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 				.handle("searchConsoleSites", () =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
+						// A live read of every property the Google account holds, for the manager's picker.
+						yield* requirePermission(tenant.roles, "integrations:manage")
 						const sites = yield* searchConsole.listAvailableSites(tenant.orgId)
 						return new SearchConsoleAvailableSitesResponse({ sites })
 					}),
@@ -308,6 +350,7 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 							),
 							cloudflare: connected(cloudflareAnalytics.getIntegrationStatus(tenant.orgId)),
 							railway: connected(railway.getStatus(tenant.orgId)),
+							vercel: connected(vercel.getStatus(tenant.orgId)),
 							planetscale: connected(planetscale.getStatus(tenant.orgId)),
 							// Google Cloud counts only with metrics on: the page reads metrics, not logs.
 							gcp: Effect.map(gcp.status(tenant.orgId), (status) =>
@@ -558,6 +601,21 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 						return yield* cloudflareAnalytics.getIntegrationStatus(tenant.orgId)
 					}),
 				)
+				.handle("cloudflareFeatures", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						const features = yield* cloudflareAnalytics.setFeatures(
+							tenant.orgId,
+							tenant.userId,
+							payload,
+						)
+						yield* recordHttpAudit("cloudflare_integration.features_updated", {
+							metadata: { ...features },
+						})
+						return yield* cloudflareAnalytics.getIntegrationStatus(tenant.orgId)
+					}),
+				)
 				.handle("cloudflareDisconnect", () =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
@@ -618,6 +676,28 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 						return new RailwayDisconnectResponse(disconnected)
 					}),
 				)
+				.handle("fleetStatus", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						return yield* fleet.getStatus(tenant.orgId)
+					}),
+				)
+				.handle("fleetConnect", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						return yield* fleet.connect(tenant.orgId, tenant.userId, payload)
+					}),
+				)
+				.handle("fleetDisconnect", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						return new FleetDisconnectResponse({
+							disconnected: yield* fleet.disconnect(tenant.orgId),
+						})
+					}),
+				)
 				// Any member may read the status; every change needs integrations:manage, as for Railway.
 				.handle("supabaseStatus", () =>
 					Effect.gen(function* () {
@@ -675,6 +755,95 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 						return new SupabaseDisconnectResponse(disconnected)
 					}),
 				)
+				.handle("vercelStatus", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						return yield* vercel.getStatus(tenant.orgId)
+					}),
+				)
+				.handle("vercelDiscover", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						return yield* vercel.discover(payload.token, payload.teamId)
+					}),
+				)
+				.handle("vercelConnect", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						const status = yield* vercel.connect(tenant.orgId, tenant.userId, payload)
+						yield* recordHttpAudit("vercel_integration.connected", {
+							metadata: {
+								teamId: payload.teamId,
+								projectScope: payload.projectScope,
+								projectCount: payload.projectIds.length,
+								samplingRate: payload.samplingRate,
+								logsEnabled: payload.logsEnabled,
+								tracesEnabled: payload.tracesEnabled,
+								aiGatewayEnabled: status.aiGatewayEnabled,
+								speedInsightsEnabled: status.speedInsightsEnabled,
+								webAnalyticsEnabled: status.webAnalyticsEnabled,
+								auditLogEnabled: status.auditLogEnabled,
+							},
+						})
+						return status
+					}),
+				)
+				.handle("vercelSettings", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						const status = yield* vercel.updateSettings(tenant.orgId, payload)
+						yield* recordHttpAudit("vercel_integration.updated", {
+							metadata: {
+								projectScope: status.projectScope,
+								projectCount: status.projectIds.length,
+								samplingRate: status.samplingRate,
+								logsEnabled: status.logsEnabled,
+								tracesEnabled: status.tracesEnabled,
+								aiGatewayEnabled: status.aiGatewayEnabled,
+								speedInsightsEnabled: status.speedInsightsEnabled,
+								webAnalyticsEnabled: status.webAnalyticsEnabled,
+								auditLogEnabled: status.auditLogEnabled,
+							},
+						})
+						return status
+					}),
+				)
+				.handle("vercelSync", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						// Spends the token's per-user Vercel rate limit, so it needs integrations:manage like connect.
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						return yield* vercel.sync(tenant.orgId)
+					}),
+				)
+				.handle("vercelDisconnect", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						const result = yield* vercel.disconnect(tenant.orgId)
+						if (result.disconnected) {
+							yield* recordHttpAudit("vercel_integration.disconnected", {
+								metadata: { drainsRemoved: result.drainsRemoved },
+							})
+						}
+						return new VercelDisconnectResponse(result)
+					}),
+				)
+				.handle("vercelDeployments", ({ query }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						return new VercelDeploymentsResponse({
+							deployments: yield* vercel.deployments(
+								tenant.orgId,
+								query.projectId,
+								query.limit ?? 20,
+							),
+						})
+					}),
+				)
 				.handle("gcpResources", ({ query }) =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
@@ -693,6 +862,7 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 							accountType: status.accountType,
 							repositorySelection: status.repositorySelection,
 							ciTracesEnabled: status.ciTracesEnabled,
+							auditLogEnabled: status.auditLogEnabled,
 							repositoryDiscovery: status.repositoryDiscovery,
 							repositories: status.repositories,
 						})
@@ -762,14 +932,38 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 						return new GithubSetCiTracesResponse(result)
 					}),
 				)
+				.handle("githubSetAuditLog", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* requirePermission(tenant.roles, "integrations:manage")
+						const result = yield* github.setAuditLogEnabled(tenant.orgId, payload.enabled)
+						return new GithubSetAuditLogResponse(result)
+					}),
+				)
 				.handle("githubSetPrReview", ({ params, payload }) =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
 						yield* requirePermission(tenant.roles, "code_review:configure")
+						// Switching review on for a repository that approves gives Maple that say there.
+						const [settings, stored] = yield* Effect.all([
+							github.getPrReviewSettings(tenant.orgId),
+							github.getPrReviewConfig(tenant.orgId, params.repositoryId),
+						])
+						const autoApprove =
+							mergePrReviewConfig(settings.defaults, stored).autoApprove === true
+						if (payload.enabled && autoApprove) {
+							yield* requirePermission(tenant.roles, "code_review:auto_approve")
+						}
 						const result = yield* github.setPrReviewEnabled(
 							tenant.orgId,
 							params.repositoryId,
 							payload.enabled,
+						)
+						yield* recordHttpAudit(
+							result.enabled
+								? "code_review.repository_enabled"
+								: "code_review.repository_disabled",
+							{ metadata: { repository_id: params.repositoryId, auto_approve: autoApprove } },
 						)
 						return new GithubSetPrReviewResponse(result)
 					}),
@@ -786,11 +980,33 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
 						yield* requirePermission(tenant.roles, "code_review:configure")
+						const [settings, stored] = yield* Effect.all([
+							github.getPrReviewSettings(tenant.orgId),
+							github.getPrReviewConfig(tenant.orgId, params.repositoryId),
+						])
+						if (
+							prReviewConfigNeedsAutoApprove({
+								defaults: settings.defaults,
+								stored,
+								next: payload.config,
+							})
+						) {
+							yield* requirePermission(tenant.roles, "code_review:auto_approve")
+						}
 						const config = yield* github.setPrReviewConfig(
 							tenant.orgId,
 							params.repositoryId,
 							payload.config,
 						)
+						yield* recordHttpAudit("code_review.repository_rules_updated", {
+							metadata: {
+								repository_id: params.repositoryId,
+								auto_approve:
+									mergePrReviewConfig(settings.defaults, config).autoApprove === true,
+								auto_approve_was:
+									mergePrReviewConfig(settings.defaults, stored).autoApprove === true,
+							},
+						})
 						return new GithubPrReviewConfigResponse({ config })
 					}),
 				)
@@ -805,11 +1021,30 @@ export const HttpIntegrationsLive = HttpApiBuilder.group(MapleInternalApi, "inte
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
 						yield* requirePermission(tenant.roles, "code_review:configure")
+						const stored = yield* github.getPrReviewSettings(tenant.orgId)
+						if (
+							prReviewDefaultsNeedAutoApprove({
+								stored: stored.defaults,
+								next: payload.settings.defaults,
+								repositoryApproves: yield* github.anyReviewedRepositoryAutoApproves(
+									tenant.orgId,
+								),
+							})
+						) {
+							yield* requirePermission(tenant.roles, "code_review:auto_approve")
+						}
 						const settings = yield* github.setPrReviewSettings(
 							tenant.orgId,
 							payload.settings,
 							tenant.userId,
 						)
+						yield* recordHttpAudit("code_review.settings_updated", {
+							metadata: {
+								auto_approve: settings.defaults?.autoApprove === true,
+								auto_approve_was: stored.defaults?.autoApprove === true,
+								...(settings.model === undefined ? undefined : { model: settings.model }),
+							},
+						})
 						return new GithubPrReviewSettingsResponse({ settings })
 					}),
 				)

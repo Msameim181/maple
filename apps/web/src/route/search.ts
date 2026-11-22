@@ -18,7 +18,16 @@ import {
 	VcsRepositoryId,
 } from "@maple/domain/http"
 import { PushSourcePlatform } from "@maple/primitives"
-import { QUERY_BUILDER_METRIC_TYPES } from "@maple/query-model"
+import {
+	FunnelBreakdownBy,
+	FunnelKeyBy,
+	FunnelPopulationFilters,
+	FunnelStep,
+	FunnelVariant,
+	PathsAnchor,
+	PathsDirection,
+	QUERY_BUILDER_METRIC_TYPES,
+} from "@maple/query-model"
 import { TOOL_METRICS, TOOL_PERCENTILES } from "@maple/web-data/lib/tool-analytics"
 import { VARIABLE_PARAM_PREFIX } from "./dashboard-controls"
 import { HUB_SORTS, HUB_VIEWS, LEGACY_HUB_VIEWS, SEVERITY_FILTERS } from "../page/errors/hub/hub-params"
@@ -188,7 +197,7 @@ const planetscaleFilterSearchFields = {
 	branchContains: StringParam,
 }
 
-// Tab sets of the account, settings (plus retired settings tabs), issue and investigation navs
+// Tab sets of the account, settings, issue and investigation navs
 export const accountTabValues = [
 	"profile",
 	"emails",
@@ -203,6 +212,8 @@ export const accountTabValues = [
 export const settingsTabValues = [
 	"general",
 	"members",
+	"domains",
+	"sso",
 	"billing",
 	"audit-log",
 	"keys",
@@ -213,17 +224,6 @@ export const settingsTabValues = [
 	"data-sources",
 	"setup-health",
 	"automation",
-] as const
-export const legacySettingsTabValues = [
-	"organization",
-	"api-keys",
-	"ai-provider",
-	"setup-audit",
-	"notifications",
-	"connectors",
-	"integrations",
-	"escalations",
-	"developer",
 ] as const
 
 export const ISSUE_TABS = ["overview", "occurrences", "activity"] as const
@@ -290,7 +290,7 @@ export const SelectPlanSearch = Schema.Struct({
 })
 
 export const ServiceMapSearch = Schema.Struct({
-	view: Schema.optional(Schema.Literals(["2d", "3d"])),
+	view: Schema.optional(Schema.Literals(["2d", "3d", "tiles"])),
 	environment: StringParam,
 	focusService: StringParam,
 	focusHops: Schema.optional(Schema.Literals([1, 2])),
@@ -298,8 +298,7 @@ export const ServiceMapSearch = Schema.Struct({
 	...TimeRangeSearchFields,
 })
 
-export const SettingsSearch = Schema.Struct({
-	tab: Schema.optional(Schema.Literals([...settingsTabValues, ...legacySettingsTabValues])),
+const settingsSearchFields = {
 	checkout: Schema.optional(Schema.Literal("complete")),
 	range: StringParam,
 	since: StringParam,
@@ -317,7 +316,22 @@ export const SettingsSearch = Schema.Struct({
 	// Data sources deep links from `/integrations`: one source, or the connect form of a kind.
 	source: StringParam,
 	connect: Schema.optional(Schema.Literals(DATA_SOURCE_KINDS)),
+}
+
+export const SettingsTab = Schema.Literals(settingsTabValues)
+
+/**
+ * `/settings/<tab>`: `tab` is the path segment; `legacyTab` is a retired `?tab=` link, which
+ * `routeRedirect` moves to its path.
+ */
+export const SettingsSearch = Schema.Struct({
+	tab: Schema.optional(SettingsTab),
+	legacyTab: StringParam,
+	...settingsSearchFields,
 })
+
+/** The query string of `/settings`: `tab` here is only ever an old link's. */
+export const SettingsQuery = Schema.Struct({ tab: StringParam, ...settingsSearchFields })
 
 export const SignInSearch = Schema.Struct({
 	redirect_url: StringParam,
@@ -393,9 +407,22 @@ export const AlertsStatusPageSearch = Schema.Struct({
 	tab: StringParam,
 })
 
-/** `/status-pages/$pageId`: `view` is `appearance`, `settings`, `json` or `live`; none is the page itself. */
+/**
+ * `/status-pages/$pageId`: `view` is `incidents`, `maintenance`, `settings` or `live` (just
+ * published); none is the live page. `section` picks the Settings section.
+ */
 export const StatusPageSearch = Schema.Struct({
 	view: StringParam,
+	section: StringParam,
+})
+
+/** How `/status-pages/new` sets the page up: a coding agent over the MCP, or the builder. */
+export const StatusPageSetupMethod = Schema.Literals(["agent", "manual"])
+export type StatusPageSetupMethod = typeof StatusPageSetupMethod.Type
+
+/** `/status-pages/new`: none is the choice between the two `setup` methods. */
+export const StatusPageNewSearch = Schema.Struct({
+	setup: Schema.optional(StatusPageSetupMethod),
 })
 
 export const CodeReviewCiSearch = Schema.Struct(CodeReviewCiSearchFields)
@@ -414,7 +441,12 @@ export const DashboardSearch = Schema.StructWithRest(
 	[variableSearchRest],
 )
 
-// Sources: new and detail (`SOURCE_TABS`)
+// Sources: list, new and detail (`SOURCE_TABS`)
+export const SourcesSearch = Schema.Struct({
+	/** Prefills the list's search, e.g. an integration's name from its hub row. */
+	q: StringParam,
+})
+
 export const SourcesNewSearch = Schema.Struct({
 	platform: Schema.optional(PushSourcePlatform),
 	/** A data integration's connect step. A plain string: OAuth callbacks return here, so an unknown id falls back to the picker. */
@@ -438,11 +470,25 @@ export const InvestigationSearch = Schema.Struct({
 	action: Schema.optional(Schema.Unknown),
 })
 
+export const MetricSearchAggregation = Schema.Literals([
+	"avg",
+	"sum",
+	"min",
+	"max",
+	"count",
+	"latest",
+	"rate",
+	"increase",
+	"p50",
+	"p75",
+	"p90",
+	"p95",
+	"p99",
+])
+
 export const MetricSearch = Schema.Struct({
 	type: Schema.optional(Schema.Literals(QUERY_BUILDER_METRIC_TYPES)),
-	agg: Schema.optional(
-		Schema.Literals(["avg", "sum", "min", "max", "count", "latest", "rate", "increase"]),
-	),
+	agg: Schema.optional(MetricSearchAggregation),
 	where: StringParam,
 	groupBy: StringParam,
 	step: StringParam,
@@ -464,6 +510,10 @@ export const ServiceSearch = Schema.Struct({
 	tab: StringParam,
 	/** The API tab's open endpoint drawer, by normalized span name ("GET /users/{id}"). */
 	endpoint: StringParam,
+	/** The Overview's open deploy drawer, by commit sha. */
+	deploy: StringParam,
+	/** The open deploy's environment, when its commit shipped to several. */
+	deployEnv: StringParam,
 	environments: OptionalStringArrayParam,
 	...TimeRangeSearchFields,
 })
@@ -555,6 +605,22 @@ export const AnalyticsSearch = Schema.Struct({
 	site: StringParam,
 })
 
+/** `/product-analytics`: the population filters, the tab, and the funnel and paths definitions. */
+export const ProductAnalyticsSearch = Schema.Struct({
+	...FunnelPopulationFilters.fields,
+	...TimeRangeSearchFields,
+	tab: Schema.optional(Schema.String),
+	steps: Schema.optional(Schema.Array(FunnelStep)),
+	keyBy: Schema.optional(FunnelKeyBy),
+	within: NumberParam,
+	view: Schema.optional(FunnelVariant),
+	breakdown: Schema.optional(FunnelBreakdownBy),
+	anchor: Schema.optional(PathsAnchor),
+	direction: Schema.optional(PathsDirection),
+	depth: NumberParam,
+	branches: NumberParam,
+})
+
 /**
  * `/anomalies`, retired: it only redirects to the Alerts Inbox's Anomalies view. Old links spelled
  * the filters several ways (`services=["a"]`, `services=a`, `service=a`), so every value is read
@@ -567,6 +633,47 @@ export const AnomaliesSearch = Schema.Struct({
 })
 
 export const CodeReviewSearch = Schema.Struct(CodeReviewSearchFields)
+
+/** The dimensions `/cost` groups by and filters on (a subset of `CostDimension`). */
+export const COST_GROUP_BYS = [
+	"cloud_service",
+	"provider",
+	"service_category",
+	"region",
+	"resource",
+	"account",
+] as const
+
+/**
+ * `/cost`: the day range, the grouping (`cloud_service` when absent), the table's order (`cost`
+ * when absent), and one value list per dimension a row click narrowed to.
+ */
+export const CostSearch = Schema.Struct({
+	...TimeRangeSearchFields,
+	groupBy: Schema.optional(Schema.Literals(COST_GROUP_BYS)),
+	sort: Schema.optional(Schema.Literals(["cost", "change"])),
+	cloud_service: OptionalStringArrayParam,
+	provider: OptionalStringArrayParam,
+	service_category: OptionalStringArrayParam,
+	region: OptionalStringArrayParam,
+	resource: OptionalStringArrayParam,
+	account: OptionalStringArrayParam,
+})
+
+/**
+ * `/cost/budgets/new`: `budgetId` edits that budget. The rest prefill a new one with the slice of
+ * spend the Cost page was filtered to, one value list per dimension.
+ */
+export const CostBudgetNewSearch = Schema.Struct({
+	budgetId: StringParam,
+	cloud_service: OptionalStringArrayParam,
+	provider: OptionalStringArrayParam,
+	service_category: OptionalStringArrayParam,
+	region: OptionalStringArrayParam,
+	resource: OptionalStringArrayParam,
+	account: OptionalStringArrayParam,
+})
+export type CostBudgetNewSearch = typeof CostBudgetNewSearch.Type
 
 export const DashboardsSearch = Schema.Struct({
 	q: StringParam,
@@ -641,13 +748,8 @@ export const MetricsSearch = Schema.Struct({
 	...TimeRangeSearchFields,
 })
 
-export const ReleasesSearch = Schema.Struct({
-	environments: OptionalStringArrayParam,
-	excludedEnvironments: OptionalStringArrayParam,
-	services: OptionalStringArrayParam,
-	impact: Schema.optional(Schema.Literals(["regressed", "watch", "rolling", "healthy"])),
-	...TimeRangeSearchFields,
-})
+/** Retired: `routeRedirect` sends `/releases` to the services, keeping the window. */
+export const ReleasesSearch = Schema.Struct({ ...TimeRangeSearchFields })
 
 export const ReplaysSearch = Schema.Struct({
 	service: StringParam,
@@ -778,6 +880,50 @@ export const InfraRailwayServiceSearch = Schema.Struct({
 	environmentId: LenientString,
 })
 
+export const VercelProjectTab = Schema.Literals(["traffic", "functions", "builds", "users", "aiGateway"])
+export type VercelProjectTab = typeof VercelProjectTab.Type
+
+/** Tabs folded into others; old links still decode: `dependencies` → functions, the event drains → users. */
+export const RetiredVercelProjectTab = Schema.Literals(["dependencies", "speedInsights", "webAnalytics"])
+export type RetiredVercelProjectTab = typeof RetiredVercelProjectTab.Type
+
+/** What the traffic tab's breakdown groups a project's requests by. */
+export const VercelBreakdownBy = Schema.Literals([
+	"path",
+	"host",
+	"region",
+	"source",
+	"cache",
+	"waf",
+	"status",
+])
+export type VercelBreakdownBy = typeof VercelBreakdownBy.Type
+
+export const InfraVercelProjectSearch = Schema.Struct({
+	/** `traffic` when absent. */
+	tab: Schema.optional(
+		Schema.Literals([...VercelProjectTab.literals, ...RetiredVercelProjectTab.literals]),
+	),
+	/** The breakdown's grouping; `path` when absent. */
+	by: Schema.optional(VercelBreakdownBy),
+	/** Narrows the breakdown to failing requests. */
+	status: Schema.optional(Schema.Literals(["4xx", "5xx"])),
+	/** Narrows the functions tab's charts to one route (the edge request's `http.route`). */
+	route: StringParam,
+	/** Narrows the functions tab's charts to invocations that called this host. */
+	host: StringParam,
+	/** Narrows the traffic tab to one breakdown value: the dimension, then `filterValue`. */
+	filterBy: Schema.optional(VercelBreakdownBy),
+	filterValue: StringParam,
+	/** Narrows Speed Insights to one route or device type. */
+	vitalsBy: Schema.optional(Schema.Literals(["route", "device"])),
+	vitalsValue: StringParam,
+	/** Narrows Web Analytics to one page, referrer or country. */
+	visitsBy: Schema.optional(Schema.Literals(["page", "referrer", "country"])),
+	visitsValue: StringParam,
+	...TimeRangeSearchFields,
+})
+
 export const InfraSupabaseProjectSearch = Schema.Struct({
 	...TimeRangeSearchFields,
 })
@@ -864,6 +1010,19 @@ export const InfraPlanetscaleSearch = Schema.Struct({
 
 export const InfraRailwaySearch = Schema.Struct({
 	q: StringParam,
+	...TimeRangeSearchFields,
+})
+
+/** The overview's health filters on the projects table. */
+export const VercelProjectScope = Schema.Literals(["erroring", "failedDeploys", "slow", "coldStarts"])
+export type VercelProjectScope = typeof VercelProjectScope.Type
+
+export const InfraVercelSearch = Schema.Struct({
+	q: StringParam,
+	/** Retired: the overview and projects list are one page now. Old links still decode. */
+	view: Schema.optional(Schema.Literals(["projects", "aiGateway"])),
+	/** A health filter on the projects table. */
+	scope: Schema.optional(VercelProjectScope),
 	...TimeRangeSearchFields,
 })
 
@@ -975,8 +1134,17 @@ export const InfraKubernetesWorkloadParams = Schema.Struct({
 	workloadName: Schema.String,
 })
 
+/** The Findings tab's status filter: a finding's lifecycle state, or every one. */
+export const SecurityFindingStatusTab = Schema.Literals([
+	"open",
+	"fixed",
+	"dismissed",
+	"accepted_risk",
+	"all",
+])
+
 export const SecurityFindingsSearch = Schema.Struct({
-	status: Schema.optional(Schema.Literals(["open", "fixed", "dismissed", "accepted_risk", "all"])),
+	status: Schema.optional(SecurityFindingStatusTab),
 	/** A severity, or the unscored leads: the tiles' one filter. */
 	severity: Schema.optional(
 		Schema.Literals(["critical", "high", "medium", "low", "informational", "needs_validation"]),
@@ -995,6 +1163,53 @@ export const SecurityDependenciesSearch = Schema.Struct({
 	/** The repositories or advisories table; absent shows the matrix, or a repository's upgrade plan. */
 	view: Schema.optional(Schema.Literals(["repositories", "advisories"])),
 })
+
+/** The Security hub's audit log filters; each absent one shows everything. */
+export const SecurityAuditLogSearch = Schema.Struct({
+	/** The platform the events came from (`maple`, `vercel`, `gcp`). */
+	provider: StringParam,
+	category: StringParam,
+	outcome: StringParam,
+	/** An actor's id or email on the platform the event came from. */
+	actor: StringParam,
+})
+export type SecurityAuditLogSearch = typeof SecurityAuditLogSearch.Type
+
+/** The Security hub's Cloud findings filters; each absent one shows everything (status: active). */
+export const SecurityCloudSearch = Schema.Struct({
+	status: StringParam,
+	severity: StringParam,
+	source: StringParam,
+	account: StringParam,
+	region: StringParam,
+	/** Matched against a finding's title, type and resource id. */
+	q: StringParam,
+})
+export type SecurityCloudSearch = typeof SecurityCloudSearch.Type
+
+/** One cloud finding: its connection, region, service and the service's id for it. */
+export const SecurityCloudFindingSearch = Schema.Struct({
+	connection: StringParam,
+	region: StringParam,
+	source: StringParam,
+	id: StringParam,
+})
+export type SecurityCloudFindingSearch = typeof SecurityCloudFindingSearch.Type
+
+/**
+ * `/security/detections/new`: `detectionId` edits that detection. The rest prefill a new one: a
+ * ready-made `template`, or the audit log's filters. The form drops a value it has no name for.
+ */
+export const SecurityDetectionNewSearch = Schema.Struct({
+	detectionId: StringParam,
+	template: StringParam,
+	provider: StringParam,
+	category: StringParam,
+	outcome: StringParam,
+	/** The platform's own action name, matched exactly. */
+	action: StringParam,
+})
+export type SecurityDetectionNewSearch = typeof SecurityDetectionNewSearch.Type
 
 export type SecurityFindingsSearch = typeof SecurityFindingsSearch.Type
 export type SecurityRunsSearch = typeof SecurityRunsSearch.Type

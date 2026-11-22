@@ -319,7 +319,11 @@ export const serviceUsage = defineDatasource("service_usage", {
 		HistogramMetricSizeBytes: t.uint64(),
 		ExpHistogramMetricCount: t.uint64(),
 		ExpHistogramMetricSizeBytes: t.uint64(),
+		// Continuous profiling (migration 0068, appended last). Hours written before it hold 0.
+		ProfileRowCount: t.uint64().default(0),
+		ProfileSizeBytes: t.uint64().default(0),
 	},
+	// A rebuild refills from the live table: the source tables keep 14 to 90 days, this one 365.
 	forwardQuery: `SELECT *`,
 	engine: engine.summingMergeTree({
 		sortingKey: ["OrgId", "ServiceName", "Hour"],
@@ -1488,7 +1492,7 @@ export type ServiceRuntimesHourlyRow = InferRow<typeof serviceRuntimesHourly>
 export const userActivityHourly = defineDatasource("user_activity_hourly", {
 	tenantColumn: "OrgId",
 	description:
-		"Hourly per end user (user.id, else enduser.id), service and service.namespace: span, request and error counts, distinct traces and sessions, request latency t-digest, top routes, log counts, first/last seen and web/mobile request counts. Populated by materialized views from traces and logs.",
+		"Hourly per end user (user.id, else enduser.id), service and service.namespace: span, request and error counts, distinct traces and sessions, request latency t-digest, top routes, log counts, first/last seen, web/mobile request counts and the latest user.name and user.email. Populated by materialized views from traces and logs.",
 	jsonPaths: false,
 	schema: {
 		OrgId: t.string().lowCardinality().brand(OrgId),
@@ -1518,6 +1522,13 @@ export const userActivityHourly = defineDatasource("user_activity_hourly", {
 		ClassifiedRequestCount: t.simpleAggregateFunction("sum", t.uint64()).default(0),
 		WebRequestCount: t.simpleAggregateFunction("sum", t.uint64()).default(0),
 		MobileRequestCount: t.simpleAggregateFunction("sum", t.uint64()).default(0),
+		// The latest non-empty `user.name` / `user.email` (migration 0065, appended last), keyed by
+		// epoch seconds; read with `argMaxIfMerge`. `*At` is that key, so readers rank identities
+		// across sources by when they were carried. Hours written before 0065 hold empty states and 0.
+		UserName: t.aggregateFunction("argMaxIf", t.string(), t.uint32(), t.uint8()),
+		UserEmail: t.aggregateFunction("argMaxIf", t.string(), t.uint32(), t.uint8()),
+		UserNameAt: t.simpleAggregateFunction("max", t.uint32()).default(0),
+		UserEmailAt: t.simpleAggregateFunction("max", t.uint32()).default(0),
 	},
 	engine: engine.aggregatingMergeTree({
 		partitionKey: "toDate(Hour)",
@@ -1930,6 +1941,50 @@ export const metricCatalog = defineDatasource("metric_catalog", {
 export type MetricCatalogRow = InferRow<typeof metricCatalog>
 
 /**
+ * The CloudWatch stream's `aws.*` points per series and hour, from `metrics_sum` and
+ * `metrics_gauge`, with region and account lifted out of `ResourceAttributes`. The AWS infra
+ * reads take whole hours from here instead of scanning raw points and their resource maps.
+ * Cardinality: AWS series (metric x dimension set x resource) x hours, no fan-out.
+ */
+export const awsMetricsHourly = defineDatasource("aws_metrics_hourly", {
+	tenantColumn: "OrgId",
+	description:
+		"Hourly per AWS metric series (metric, table, service, point attributes, cloud.region, cloud.account.id): sum, count, max and newest point of the CloudWatch metric stream's aws.* metrics. Populated by materialized views from metrics_sum and metrics_gauge.",
+	jsonPaths: false,
+	schema: {
+		OrgId: t.string().lowCardinality().brand(OrgId),
+		// `sum` or `gauge`: the raw table the series came from.
+		MetricType: t.string().lowCardinality(),
+		MetricName: t.string().lowCardinality(),
+		Hour: utcDateTime(),
+		ServiceName: t.string().lowCardinality(),
+		Attributes: t.map(t.string().lowCardinality(), t.string()),
+		CloudRegion: t.string().lowCardinality(),
+		CloudAccountId: t.string().lowCardinality(),
+		Total: t.simpleAggregateFunction("sum", t.float64()),
+		Samples: t.simpleAggregateFunction("sum", t.uint64()),
+		Peak: t.simpleAggregateFunction("max", t.float64()),
+		LastSeen: t.simpleAggregateFunction("max", utcDateTime()),
+	},
+	engine: engine.aggregatingMergeTree({
+		partitionKey: "toDate(Hour)",
+		sortingKey: [
+			"OrgId",
+			"MetricType",
+			"MetricName",
+			"Hour",
+			"ServiceName",
+			"Attributes",
+			"CloudRegion",
+			"CloudAccountId",
+		],
+		ttl: "toDate(Hour) + INTERVAL 90 DAY",
+	}),
+})
+
+export type AwsMetricsHourlyRow = InferRow<typeof awsMetricsHourly>
+
+/**
  * Pre-aggregated attribute keys with hourly usage counts.
  * Fed by MVs from traces (span + resource), logs, and metrics tables.
  */
@@ -2101,6 +2156,56 @@ export const auditLog = defineDatasource("audit_log", {
 })
 
 export type AuditLogRow = InferRow<typeof auditLog>
+
+/**
+ * Audit events from every connected platform, and Maple's own changes and refusals, in one shape.
+ * Written only by provider adapters, never from OTLP. `''` is absent; `Raw` is the payload as JSON.
+ */
+export const auditTrailEvents = defineDatasource("audit_trail_events", {
+	tenantColumn: "OrgId",
+	description:
+		"Audit events from connected platforms and Maple itself, normalized to one shape: who did what to which target, with what outcome. Admin-only; read through the Security hub.",
+	schema: {
+		OrgId: t.string().lowCardinality().brand(OrgId),
+		// A hash of Provider, Account and ProviderEventId: a redelivery writes the same key.
+		Id: t.string(),
+		OccurredAt: utcDateTime64(3),
+		// When Maple stored the row. Detections window on it: a polled event arrives late.
+		IngestedAt: utcDateTime64(3),
+		Provider: t.string().lowCardinality(),
+		Account: t.string(),
+		ProviderEventId: t.string(),
+		ActorType: t.string().lowCardinality(),
+		ActorId: t.string(),
+		ActorName: t.string(),
+		ActorEmail: t.string(),
+		Action: t.string().lowCardinality(),
+		Category: t.string().lowCardinality(),
+		Outcome: t.string().lowCardinality(),
+		// Why it failed or was refused, in the platform's words.
+		OutcomeReason: t.string(),
+		TargetType: t.string().lowCardinality(),
+		TargetId: t.string(),
+		TargetName: t.string(),
+		OriginIp: t.string(),
+		OriginCountry: t.string().lowCardinality(),
+		UserAgent: t.string(),
+		Raw: t.string(),
+		// Falls as IngestedAt rises, so a merge keeps the first write: a redelivered event keeps
+		// its first IngestedAt and never moves into a later detection window.
+		Version: t.uint64(),
+	},
+	indexes: [{ name: "idx_ingested_at", expr: "IngestedAt", type: "minmax", granularity: 1 }],
+	engine: engine.replacingMergeTree({
+		partitionKey: "toYYYYMM(OccurredAt)",
+		sortingKey: ["OrgId", "OccurredAt", "Id"],
+		ver: "Version",
+		// Thirteen months: a year of history plus a month to compare against.
+		ttl: "toDate(OccurredAt) + INTERVAL 400 DAY",
+	}),
+})
+
+export type AuditTrailEventsRow = InferRow<typeof auditTrailEvents>
 
 /**
  * Minute-grain operation metrics used by the service-detail Operations panel.
@@ -3022,3 +3127,135 @@ export const searchConsoleDaily = defineDatasource("search_console_daily", {
 })
 
 export type SearchConsoleDailyRow = InferRow<typeof searchConsoleDaily>
+
+/** Two years and a month, so a month always has the same month a year earlier beside it. */
+const COST_DAILY_TTL_DAYS = 760
+
+/**
+ * Cloud cost per (source, UTC day, cloud service, usage type, region, resource), from the cost sync.
+ * `ServiceName` is the telemetry service a resource resolves to ('' when none); the provider's own
+ * service is `CloudService`. `EffectiveCost` spreads upfront commitments over their term.
+ * Each pull writes a source's whole day under one `IngestedAt`: readers keep rows whose IngestedAt
+ * is the max per (SourceId, Date), since providers restate recent days and can drop keys.
+ */
+export const costDaily = defineDatasource("cost_daily", {
+	tenantColumn: "OrgId",
+	description:
+		"Cloud cost per day, cloud service, usage type, region and resource, per connected cost source. Pulled from each provider's billing data; recent days are restated and Estimated = 1 until the provider finalizes them.",
+	schema: {
+		OrgId: t.string().lowCardinality().brand(OrgId),
+		SourceId: t.string().lowCardinality(),
+		Provider: t.string().lowCardinality(),
+		AccountId: t.string().lowCardinality(),
+		Date: utcDateTime(),
+		CloudService: t.string().lowCardinality(),
+		ServiceCategory: t.string().lowCardinality(),
+		UsageType: t.string().lowCardinality(),
+		Region: t.string().lowCardinality(),
+		ResourceId: t.string(),
+		ResourceType: t.string().lowCardinality(),
+		ServiceName: t.string().lowCardinality(),
+		ChargeCategory: t.string().lowCardinality(),
+		Basis: t.string().lowCardinality(),
+		Currency: t.string().lowCardinality(),
+		BilledCost: t.float64(),
+		EffectiveCost: t.float64(),
+		ListCost: t.float64(),
+		ConsumedQuantity: t.float64(),
+		ConsumedUnit: t.string().lowCardinality(),
+		Tags: t.map(t.string().lowCardinality(), t.string()),
+		Estimated: t.uint8(),
+		IngestedAt: utcDateTime64(3),
+	},
+	engine: engine.replacingMergeTree({
+		partitionKey: "toYYYYMM(Date)",
+		sortingKey: [
+			"OrgId",
+			"SourceId",
+			"Date",
+			"CloudService",
+			"UsageType",
+			"Region",
+			"ResourceId",
+			"ChargeCategory",
+			// Rows of one pull that differ only in these are different charges, not copies.
+			"AccountId",
+			"ServiceName",
+			"Currency",
+		],
+		ver: "IngestedAt",
+		ttl: `toDate(Date) + INTERVAL ${COST_DAILY_TTL_DAYS} DAY`,
+	}),
+})
+
+export type CostDailyRow = InferRow<typeof costDaily>
+
+export const PROFILES_TTL_DAYS = 14
+
+/**
+ * Continuous profiling: one row per distinct stack per exported profile, the producer's samples of
+ * that stack summed. Flattened at ingest from the pprof-shaped OTLP payload, so the dictionary
+ * never reaches the warehouse and a proto change stays an ingest change.
+ *
+ * `Frames` runs root first (the wire runs leaf first), so `arraySlice(Frames, 1, n)` is a common
+ * prefix and the leaf is `Frames[-1]`. `FrameFiles` and `FrameLines` are parallel to it.
+ */
+export const profiles = defineDatasource("profiles", {
+	tenantColumn: "OrgId",
+	description:
+		"Continuous profiling samples: one row per distinct call stack per exported profile, with the summed value (CPU nanoseconds, allocated bytes) and the span it ran under when the producer linked one. Powers flame graphs and top functions.",
+	schema: {
+		OrgId: column(t.string().lowCardinality().brand(OrgId), {
+			jsonPath: "$.resource_attributes.maple_org_id",
+		}),
+		/** Start of the profile's window, or of the linked span's slice of it. */
+		Timestamp: column(utcDateTime64(9), { jsonPath: "$.timestamp" }),
+		ServiceName: column(t.string().lowCardinality(), { jsonPath: "$.service_name" }),
+		/** Real columns: a release diff and an environment filter must not read the attribute map. */
+		ServiceVersion: column(t.string().lowCardinality().default(""), {
+			jsonPath: "$.service_version",
+		}),
+		Environment: column(t.string().lowCardinality().default(""), { jsonPath: "$.environment" }),
+		ServiceInstanceId: column(t.string().default(""), { jsonPath: "$.service_instance_id" }),
+		ResourceAttributes: column(t.map(t.string().lowCardinality(), t.string()), {
+			jsonPath: "$.resource_attributes",
+		}),
+		ProfileId: column(t.string().default(""), { jsonPath: "$.profile_id" }),
+		/** `cpu` | `wall` | `alloc_space` | `alloc_objects` | whatever the producer named it. */
+		SampleType: column(t.string().lowCardinality(), { jsonPath: "$.sample_type" }),
+		/** `nanoseconds` | `bytes` | `count`. */
+		SampleUnit: column(t.string().lowCardinality(), { jsonPath: "$.sample_unit" }),
+		Value: column(t.int64(), { jsonPath: "$.value" }),
+		/** How many of the producer's samples `Value` sums. */
+		Samples: column(t.uint64().default(0), { jsonPath: "$.samples" }),
+		/** Length of the window the profile covers: `sum(Value) / DurationNano` is cores for CPU. */
+		DurationNano: column(t.uint64().default(0), { jsonPath: "$.duration_nano" }),
+		Frames: column(t.array(t.string().lowCardinality()), { jsonPath: "$.frames[:]" }),
+		/** `''` where the producer had no file (native and eBPF frames). */
+		FrameFiles: column(t.array(t.string().lowCardinality()), { jsonPath: "$.frame_files[:]" }),
+		/** 0 where unknown. */
+		FrameLines: column(t.array(t.int32()), { jsonPath: "$.frame_lines[:]" }),
+		TraceId: column(t.string().default(""), { jsonPath: "$.trace_id" }),
+		SpanId: column(t.string().default(""), { jsonPath: "$.span_id" }),
+		SampleAttributes: column(t.map(t.string().lowCardinality(), t.string()), {
+			jsonPath: "$.sample_attributes",
+		}),
+		/**
+		 * Computed by the warehouse, so the gateway and Maple Local cannot disagree on it. No
+		 * `jsonPath`: the insert never names it. Wrap it in `toString()` in every SELECT.
+		 */
+		StackHash: t.uint64().defaultExpr("cityHash64(Frames, FrameFiles, FrameLines)"),
+	},
+	indexes: [
+		// The span panel looks samples up by span alone; near-unique values and `''` on most rows.
+		{ name: "idx_span_id", expr: "SpanId", type: "bloom_filter(0.01)", granularity: 1 },
+		{ name: "idx_trace_id", expr: "TraceId", type: "bloom_filter(0.01)", granularity: 1 },
+	],
+	engine: engine.mergeTree({
+		partitionKey: "toDate(Timestamp)",
+		sortingKey: ["OrgId", "ServiceName", "SampleType", "toStartOfHour(Timestamp)", "StackHash"],
+		ttl: `toDate(Timestamp) + INTERVAL ${PROFILES_TTL_DAYS} DAY`,
+	}),
+})
+
+export type ProfilesRow = InferRow<typeof profiles>

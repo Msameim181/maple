@@ -2,8 +2,8 @@ import {
 	SearchConsoleIntegrationStatus,
 	SearchConsoleLandingPage,
 	SearchConsoleOverview,
-	SearchConsolePageRow,
 	SearchConsolePoint,
+	SearchConsoleSortKey,
 	SearchConsoleQueryRow,
 } from "@maple/domain/http"
 import { Schema } from "effect"
@@ -18,27 +18,10 @@ import * as Dialog from "@maple/views/ui/dialog"
 import * as FilterSections from "@maple/views/ui/filters/filter-sections"
 import { SignalPresenceData } from "@maple/views/data/signal-presence"
 import * as TimeRangePicker from "../kit/time-range-picker"
+import { Breakdowns } from "../kit/analytics-filter-rail"
 import { SortDir } from "../kit/table-sort"
 
 export type Search = typeof AnalyticsSearch.Type
-
-const FacetRow = Schema.Struct({ name: Schema.String, count: Schema.Number })
-
-export const Breakdowns = Schema.Struct({
-	referrerHosts: Schema.Array(FacetRow),
-	countries: Schema.Array(FacetRow),
-	deviceTypes: Schema.Array(FacetRow),
-	browsers: Schema.Array(FacetRow),
-	operatingSystems: Schema.Array(FacetRow),
-	languages: Schema.Array(FacetRow),
-	utmSources: Schema.Array(FacetRow),
-	utmMediums: Schema.Array(FacetRow),
-	utmCampaigns: Schema.Array(FacetRow),
-	entryPaths: Schema.Array(FacetRow),
-	exitPaths: Schema.Array(FacetRow),
-	hosts: Schema.Array(FacetRow),
-})
-export type Breakdowns = typeof Breakdowns.Type
 
 export const AnalyticsEvent = Schema.Struct({
 	name: Schema.String,
@@ -139,7 +122,8 @@ export const SearchSortKey = Schema.Literals(["name", "clicks", "impressions", "
 export type SearchSortKey = typeof SearchSortKey.Type
 export const SearchSort = Schema.Struct({ key: SearchSortKey, dir: SortDir })
 export type SearchSort = typeof SearchSort.Type
-export const SearchTable = Schema.Literals(["queries", "pages", "landing"])
+/** The Search tab's two tables. */
+export const SearchTable = Schema.Literals(["queries", "pages"])
 export type SearchTable = typeof SearchTable.Type
 
 /** One breakdown card's own state: the picked tab (else the first populated), filter, sort. */
@@ -174,10 +158,11 @@ export const Model = Schema.Struct({
 	searchOverview: KeyedSchema(SearchConsoleOverview, LoadFailure),
 	searchTimeseries: KeyedSchema(Schema.Array(SearchConsolePoint), LoadFailure),
 	searchQueries: KeyedSchema(Schema.Array(SearchConsoleQueryRow), LoadFailure),
-	searchPages: KeyedSchema(Schema.Array(SearchConsolePageRow), LoadFailure),
 	searchLanding: KeyedSchema(Schema.Array(SearchConsoleLandingPage), LoadFailure),
 	/** The Search tab's table sorts; a metric sort is part of its read's request. */
 	searchSorts: Schema.Record(Schema.String, SearchSort),
+	/** The Search tab's picked tile, which its chart draws; `null` until someone picks (clicks). */
+	searchMetric: Schema.NullOr(SearchConsoleSortKey),
 	presence: SignalPresenceData.schema,
 	/** The tile picked in the strip; `null` until someone picks. */
 	pickedMetric: Schema.NullOr(Schema.String),

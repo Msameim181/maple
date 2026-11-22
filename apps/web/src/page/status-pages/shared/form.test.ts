@@ -1,13 +1,22 @@
 import { DEFAULT_STATUS_PAGE_THEME } from "@maple/domain/status-page"
 import { describe, expect, it } from "vitest"
 import {
+	emptyIncidentForm,
+	endedIssue,
+	hasAppearanceIssues,
+	hasPageFieldIssues,
 	hasSettingsIssues,
+	incidentEditIssues,
+	incidentIssues,
 	isSameSettings,
 	type SettingsForm,
 	settingsIssues,
+	imageUploadIssue,
 	settingsPayload,
 	themeFormOf,
+	updateFormFor,
 } from "./form"
+import { incidentId } from "./test-pages"
 import { String as Str } from "effect"
 
 const saved: SettingsForm = {
@@ -17,7 +26,10 @@ const saved: SettingsForm = {
 	websiteUrl: "https://acme.example",
 	privacyUrl: "",
 	termsUrl: "",
+	supportUrl: "",
 	logoUrl: "",
+	logoDarkUrl: "",
+	faviconUrl: "",
 	showPoweredBy: true,
 	autoIncidents: "off",
 	theme: themeFormOf({ ...DEFAULT_STATUS_PAGE_THEME, accent: "#aabbcc" }),
@@ -62,6 +74,16 @@ describe("footer links", () => {
 		expect(hasSettingsIssues({ ...saved, termsUrl: "https://acme.example/terms" })).toBe(false)
 	})
 
+	it("takes an uploaded logo, and checks a picked file's type and size", () => {
+		expect(settingsIssues({ ...saved, logoUrl: "data:image/png;base64,iVBORw0KGgo=" }).logoUrl).toBeNull()
+		expect(settingsIssues({ ...saved, logoUrl: "data:text/html;base64,PHNjcmlwdD4=" }).logoUrl).toBe(
+			"Use an https URL.",
+		)
+		expect(imageUploadIssue({ type: "image/svg+xml", size: 2048 })).toBeNull()
+		expect(imageUploadIssue({ type: "application/pdf", size: 2048 })).not.toBeNull()
+		expect(imageUploadIssue({ type: "image/png", size: 10 * 1024 * 1024 })).not.toBeNull()
+	})
+
 	it("sees a changed link as unsaved", () => {
 		expect(isSameSettings({ ...saved, termsUrl: "https://acme.example/terms" }, saved)).toBe(false)
 		expect(isSameSettings({ ...saved, termsUrl: " " }, saved)).toBe(true)
@@ -81,6 +103,30 @@ describe("URL fields", () => {
 		expect(issues.privacyUrl).toBe("Use a valid URL, like https://acme.example.")
 		expect(issues.termsUrl).toBeNull()
 		expect(issues.logoUrl).toBeNull()
+	})
+
+	it("marks bad branding and page links in Appearance and a bad address in Basic settings", () => {
+		const badLogo = { ...saved, logoDarkUrl: "http://acme.example/dark.svg" }
+		expect(hasAppearanceIssues(badLogo)).toBe(true)
+		expect(hasPageFieldIssues(badLogo)).toBe(false)
+		const badSupport = { ...saved, supportUrl: "mailto:help@acme.example" }
+		expect(hasAppearanceIssues(badSupport)).toBe(true)
+		expect(hasPageFieldIssues(badSupport)).toBe(false)
+		const badSlug = { ...saved, slug: "Not A Slug" }
+		expect(hasPageFieldIssues(badSlug)).toBe(true)
+		expect(hasAppearanceIssues(badSlug)).toBe(false)
+	})
+
+	it("sends the branding links trimmed and blank ones as null", () => {
+		const payload = settingsPayload({
+			...saved,
+			logoDarkUrl: " https://acme.example/dark.svg ",
+			faviconUrl: " ",
+			supportUrl: "https://acme.example/help",
+		})
+		expect(payload.logo_dark_url).toBe("https://acme.example/dark.svg")
+		expect(payload.favicon_url).toBeNull()
+		expect(payload.support_url).toBe("https://acme.example/help")
 	})
 
 	it("refuses a link longer than the service stores", () => {
@@ -108,5 +154,71 @@ describe("theme settings", () => {
 		const lowContrast = { ...saved.theme, text: "#777777", background: "#ffffff" }
 		expect(hasSettingsIssues({ ...saved, theme: { ...lowContrast, appearance: "light" } })).toBe(true)
 		expect(hasSettingsIssues({ ...saved, theme: lowContrast })).toBe(false)
+	})
+})
+
+describe("times the API would refuse as in the future", () => {
+	const nowMs = Date.UTC(2026, 9, 1, 12)
+
+	it("refuses an incident started after now, but not one started this minute or a maintenance window", () => {
+		const incident = emptyIncidentForm("incident")
+		expect(incidentIssues({ ...incident, startedAt: "2026-10-01T12:01" }, "UTC", nowMs).started).toBe(
+			"It can't start in the future.",
+		)
+		expect(
+			incidentIssues({ ...incident, startedAt: "2026-10-01T12:00" }, "UTC", nowMs).started,
+		).toBeNull()
+		expect(incidentIssues({ ...incident, startedAt: "" }, "UTC", nowMs).started).toBeNull()
+		const maintenance = {
+			...emptyIncidentForm("maintenance"),
+			scheduledStart: "2026-10-02T09:00",
+			scheduledEnd: "2026-10-02T10:00",
+		}
+		expect(incidentIssues(maintenance, "UTC", nowMs).window).toBeNull()
+	})
+
+	it("reads the typed time in the viewer's zone", () => {
+		// 13:30 in Berlin is 11:30 UTC, before 12:00 UTC.
+		const form = { ...emptyIncidentForm("incident"), startedAt: "2026-10-01T13:30" }
+		expect(incidentIssues(form, "Europe/Berlin", nowMs).started).toBeNull()
+		expect(incidentIssues(form, "UTC", nowMs).started).toBe("It can't start in the future.")
+	})
+
+	it("refuses a closing update that ended after now", () => {
+		const resolving = updateFormFor({ id: incidentId(1), kind: "incident", status: "identified" }, true)
+		const startedAt = "2026-10-01T11:00:00.000Z"
+		expect(endedIssue({ ...resolving, endedAt: "2026-10-01T12:30" }, startedAt, "UTC", nowMs)).toBe(
+			"It can't end in the future.",
+		)
+		expect(endedIssue({ ...resolving, endedAt: "2026-10-01T11:30" }, startedAt, "UTC", nowMs)).toBeNull()
+	})
+
+	it("refuses an edited incident start or end after now, but leaves a maintenance window to the API", () => {
+		const edit = {
+			incidentId: incidentId(1),
+			kind: "incident" as const,
+			status: "resolved" as const,
+			title: "Elevated errors",
+			impact: "minor" as const,
+			componentIds: [],
+			start: "2026-10-01T11:00",
+			end: "2026-10-01T11:30",
+			autoComplete: true,
+		}
+		expect(incidentEditIssues(edit, "UTC", nowMs).times).toBeNull()
+		expect(incidentEditIssues({ ...edit, start: "2026-10-01T12:05" }, "UTC", nowMs).times).toBe(
+			"It can't start in the future.",
+		)
+		expect(incidentEditIssues({ ...edit, end: "2026-10-01T12:05" }, "UTC", nowMs).times).toBe(
+			"It can't end in the future.",
+		)
+		const window = {
+			...edit,
+			kind: "maintenance" as const,
+			status: "scheduled" as const,
+			start: "2026-10-02T09:00",
+			end: "2026-10-02T10:00",
+		}
+		expect(incidentEditIssues(window, "UTC", nowMs).times).toBeNull()
 	})
 })

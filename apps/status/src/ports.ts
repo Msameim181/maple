@@ -1,3 +1,4 @@
+import type { StatusOgCard } from "@maple/status-page"
 import { Schema } from "effect"
 import type { Effect } from "effect"
 
@@ -12,12 +13,21 @@ export class StatusStorageError extends Schema.TaggedError<StatusStorageError>()
 	},
 ) {}
 
+/** The link preview could not be drawn (renderer, wasm or cache). */
+export class StatusOgImageError extends Schema.TaggedError<StatusOgImageError>()(
+	"@maple/status/OgImageError",
+	{
+		message: Schema.String,
+		cause: Schema.optionalKey(Schema.Defect()),
+	},
+) {}
+
 export interface CachedValue {
 	readonly value: string
 	readonly storedAt: number
 }
 
-/** Everything the status Worker reads or writes: KV, R2, the per-colo cache and a rate limiter. */
+/** Everything the status Worker reads or writes: KV, R2, the per-colo cache and the rate limiters. */
 export interface StatusStorage {
 	readonly kvGet: (key: string) => Effect.Effect<string | null, StatusStorageError>
 	readonly kvPut: (key: string, value: string) => Effect.Effect<void, StatusStorageError>
@@ -29,8 +39,10 @@ export interface StatusStorage {
 	readonly r2Get: (key: string) => Effect.Effect<string | null, StatusStorageError>
 	readonly cacheGet: (key: string) => Effect.Effect<CachedValue | null, StatusStorageError>
 	readonly cachePut: (key: string, entry: CachedValue) => Effect.Effect<void, StatusStorageError>
-	/** True when the request may proceed. */
+	/** True when the request may proceed; the per-client budget. */
 	readonly rateLimit: (key: string) => Effect.Effect<boolean, StatusStorageError>
+	/** True when the request may proceed; the larger budget one page's password form shares. */
+	readonly pageRateLimit: (key: string) => Effect.Effect<boolean, StatusStorageError>
 }
 
 /** Per-request inputs: storage, the clock and a random source, so handling is deterministic in tests. */
@@ -38,4 +50,14 @@ export interface StatusEnv {
 	readonly storage: StatusStorage
 	readonly nowMs: number
 	readonly randomId: () => string
+	/** Maple's own hosts for this Worker (its domain, workers.dev, local dev), which serve `/s/<org key>/<slug>`. */
+	readonly isSharedHost: (hostname: string) => boolean
+	/** The PNG for a card; `key` names one page's card version, so equal keys may share a render. */
+	readonly ogImage: (key: string, card: StatusOgCard) => Effect.Effect<StatusOgImage, StatusOgImageError>
+}
+
+/** `complete: false` is a stand-in (the logo was unreachable or undrawable) that must not be cached. */
+export interface StatusOgImage {
+	readonly png: Uint8Array<ArrayBuffer>
+	readonly complete: boolean
 }

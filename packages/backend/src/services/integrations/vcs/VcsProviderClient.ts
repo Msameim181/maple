@@ -72,6 +72,22 @@ export interface VcsSourceFile {
 	readonly content: string
 }
 
+/**
+ * What a provider answered for one month of an account's billed usage. A refusal is an answer,
+ * not a failure: most installations lack the permission, and a failed span would put each in
+ * error tracking. `NotGranted`: the installation never accepted it, so nothing was asked.
+ */
+export type VcsBillingUsageAnswer =
+	| { readonly _tag: "Usage"; readonly body: string }
+	| { readonly _tag: "NotGranted" }
+	| { readonly _tag: "Refused"; readonly status: number; readonly body: string }
+
+/** A calendar month, 1 to 12. */
+export interface VcsBillingMonth {
+	readonly year: number
+	readonly month: number
+}
+
 export interface VcsProviderClient {
 	readonly id: VcsProviderId
 
@@ -205,13 +221,16 @@ export interface VcsProviderClient {
 		| VcsRateLimitedError
 	>
 
-	/** Every file of one pull request's diff, with the provider's unified patch where it gives one. */
+	/**
+	 * Every file of one pull request's diff, with the provider's unified patch where it gives one.
+	 * `truncated` says the provider stopped listing before the end, so `files` is not the whole diff.
+	 */
 	readonly fetchPullRequestFiles: (
 		installation: VcsInstallation,
 		repo: VcsRepositoryRef,
 		number: number,
 	) => Effect.Effect<
-		ReadonlyArray<PullRequestFile>,
+		{ readonly files: ReadonlyArray<PullRequestFile>; readonly truncated: boolean },
 		| VcsProviderError
 		| VcsInstallationGoneError
 		| VcsRepoUnavailableError
@@ -409,6 +428,28 @@ export interface VcsProviderClient {
 	>
 
 	/**
+	 * Dismiss every approval this App gave the pull request that still stands, saying why. For a
+	 * repository with `autoApprove` on: a new head leaves an earlier approval about other code.
+	 * Answers `unsupported` when the provider cannot tell its own reviews apart.
+	 */
+	readonly withdrawPullRequestApprovals: (
+		installation: VcsInstallation,
+		repo: VcsRepositoryRef,
+		/**
+		 * `keepHead`: the head the event is about. An approval of it is spared, and nothing is
+		 * withdrawn (`stale`) when the pull request has moved past it.
+		 */
+		input: { readonly number: number; readonly reason: string; readonly keepHead?: string },
+	) => Effect.Effect<
+		"withdrawn" | "unsupported" | "stale",
+		| VcsProviderError
+		| VcsInstallationGoneError
+		| VcsRepoUnavailableError
+		| VcsRepositoryBlockedError
+		| VcsRateLimitedError
+	>
+
+	/**
 	 * Show the review as a check run on the head: running while its turn works, completed when it
 	 * ends without a result. `publishPullRequestReview` completes the same run with the result.
 	 */
@@ -569,4 +610,21 @@ export interface VcsProviderClient {
 		boolean,
 		VcsProviderError | VcsInstallationGoneError | VcsRepoUnavailableError | VcsRepositoryBlockedError
 	>
+
+	/**
+	 * One month of what the provider billed the installation's account, as the provider's own
+	 * report (the cost sync reads it). Only an organization account has one.
+	 */
+	readonly fetchBillingUsage: (
+		installation: Pick<VcsInstallation, "externalInstallationId" | "accountLogin">,
+		month: VcsBillingMonth,
+	) => Effect.Effect<
+		VcsBillingUsageAnswer,
+		VcsProviderError | VcsInstallationGoneError | VcsRateLimitedError
+	>
+
+	/** Where the installation's account accepts the permissions the provider's app asks for. */
+	readonly installationSettingsUrl: (
+		installation: Pick<VcsInstallation, "externalInstallationId" | "accountLogin" | "accountType">,
+	) => string
 }

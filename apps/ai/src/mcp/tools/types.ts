@@ -1,9 +1,15 @@
 import type { Effect } from "effect"
 import { Schema } from "effect"
 import type { McpToolSurface } from "@maple/domain/mcp-manifest"
-import type { McpToolName, McpToolOutputs } from "@maple/domain/mcp-outputs"
+import type {
+	McpToolFamilyActions,
+	McpToolFamilyName,
+	McpToolName,
+	McpToolOutputs,
+} from "@maple/domain/mcp-outputs"
 import type { McpToolRequirements } from "./runtime-services"
 import type { ToolDoc } from "../lib/tool-doc"
+import * as Policy from "@maple/domain/policy"
 
 export class McpAuthMissingError extends Schema.TaggedError<McpAuthMissingError>()(
 	"@maple/mcp/errors/McpAuthMissingError",
@@ -123,15 +129,39 @@ export const FEEDBACK_TOOL = "send_maple_feedback"
 export const refusesReadOnlyCredential = (name: string, readOnly: boolean): boolean =>
 	!readOnly && name !== FEEDBACK_TOOL
 
+/** The tools that build dashboards: the only changes an analyst's role reaches. */
+export const DASHBOARD_AUTHORING_TOOLS: ReadonlySet<string> = new Set([
+	"create_dashboard",
+	"update_dashboard",
+	"delete_dashboard",
+	"add_dashboard_widget",
+	"update_dashboard_widget",
+	"remove_dashboard_widget",
+	"reorder_dashboard_widgets",
+	"replace_dashboard_widgets",
+])
+
+/** The tools that read an org's connected data sources: absent for an org without that feature. */
+export const DATA_SOURCE_TOOLS: ReadonlySet<string> = new Set(["list_data_sources", "query_data_source"])
+
+/** Whether an analyst is refused this tool: one that changes data and does not build a dashboard. */
+export const refusesAnalyst = (name: string, readOnly: boolean): boolean =>
+	refusesReadOnlyCredential(name, readOnly) && !DASHBOARD_AUTHORING_TOOLS.has(name)
+
+/** Why this caller is refused the tool, and so never shown it: their key, their role, or nothing. */
+export const refusalFor = (
+	tenant: { readonly readOnly?: true; readonly roles: ReadonlyArray<string> },
+	name: string,
+	readOnly: boolean,
+): "analyst" | "read_only_key" | undefined => {
+	if (Policy.isAnalyst(tenant.roles) && refusesAnalyst(name, readOnly)) return "analyst"
+	if (tenant.readOnly === true && refusesReadOnlyCredential(name, readOnly)) return "read_only_key"
+	return undefined
+}
+
 /**
- * Who a tool is for.
- *
- * `public` tools are listed on and callable from every surface, the MCP transport
- * included. `agent` tools exist for Maple's own agents, the chat-platform bot included,
- * and the public transport neither lists nor executes them. `internal` tools are
- * narrower still: the in-product agents only. Declared at registration, so a tool
- * cannot reach a third-party MCP client by the mere fact of being in the registry:
- * until this existed, registering was publishing, and `sandbox_exec` shipped as a public tool.
+ * Who a tool is for: `public` everywhere (the MCP transport included), `agent` Maple's own agents
+ * and the bot, `internal` the in-product agents only. Declared at registration, never inferred.
  */
 export type McpToolAudience = "public" | "agent" | "internal"
 
@@ -143,9 +173,10 @@ export type McpToolAudience = "public" | "agent" | "internal"
 export type McpToolPhrases = readonly [string, ...Array<string>]
 
 /**
- * The surfaces an `agent` tool is offered on: every Maple agent, the bot included.
+ * The surfaces an `agent` tool is offered on: every Maple agent, the bot included when it
+ * answers a linked Maple user.
  *
- * The bot answers into a channel anyone in it can read, under an org-level actor. The sandbox
+ * The bot answers into a channel anyone in it can read, as the Maple user who asked. The sandbox
  * tools are fit for that: the checkout is the same source `read_source_file` already serves the
  * bot, and `sandbox_exec` runs unprivileged, read-only, with no network and an empty environment,
  * so its output is the repository and what can be computed from it.
@@ -159,8 +190,63 @@ const AGENT_SURFACES: ReadonlySet<McpToolSurface> = new Set<McpToolSurface>(["ch
  */
 const INTERNAL_SURFACES: ReadonlySet<McpToolSurface> = new Set<McpToolSurface>(["chat", "workflow"])
 
+/** The bot answering someone Maple cannot name: a connector with no account linking. */
+const ANONYMOUS_SURFACE: McpToolSurface = "bot_anonymous"
+
+/**
+ * Everything {@link ANONYMOUS_SURFACE} is offered: the org's telemetry and alerting state. A tool
+ * is absent there until it is named here, so one that reads a connected system, source, SQL,
+ * session records or agent transcripts never arrives by default.
+ */
+const ANONYMOUS_TOOLS: ReadonlySet<string> = new Set([
+	"audit_setup",
+	"compare_log_patterns",
+	"compare_operations",
+	"compare_periods",
+	"db_query_volume",
+	"diagnose_service",
+	"error_detail",
+	"explore_attributes",
+	"find_errors",
+	"find_slow_traces",
+	"get_alert_rule",
+	"get_error_notification_policy",
+	"get_incident_timeline",
+	"get_instrumentation_recommendations",
+	"get_service_top_operations",
+	"get_status_page",
+	"ingest_freshness",
+	"ingest_usage",
+	"inspect_slo",
+	"inspect_span",
+	"inspect_trace",
+	"list_alert_checks",
+	"list_alert_incidents",
+	"list_alert_rules",
+	"list_alert_silences",
+	"list_dashboards",
+	"list_error_incidents",
+	"list_error_issues",
+	"list_escalation_chains",
+	"list_maintenance_windows",
+	"list_metrics",
+	"list_oncall_schedules",
+	"list_services",
+	"list_slos",
+	"list_uptime_monitors",
+	"mine_log_patterns",
+	"profile_hotspots",
+	"query_data",
+	"route_usage",
+	"search_logs",
+	"search_traces",
+	"service_deployments",
+	"service_map",
+	"who_is_on_call",
+] satisfies ReadonlyArray<McpToolName>)
+
 /** Whether a surface may see and call a tool of this audience. */
-export const audienceAdmits = (audience: McpToolAudience, surface: McpToolSurface): boolean => {
+const audienceAdmits = (audience: McpToolAudience, surface: McpToolSurface): boolean => {
 	switch (audience) {
 		case "public":
 			return true
@@ -170,6 +256,21 @@ export const audienceAdmits = (audience: McpToolAudience, surface: McpToolSurfac
 			return INTERNAL_SURFACES.has(surface)
 	}
 }
+
+/**
+ * Whether a surface may see and call this tool. Where nobody is named it must also be listed in
+ * {@link ANONYMOUS_TOOLS} and change nothing: a change is only ever applied as a Maple user.
+ */
+export const surfaceAdmits = (
+	tool: {
+		readonly name: string
+		readonly audience: McpToolAudience
+		readonly hints: Pick<McpToolHints, "readOnly">
+	},
+	surface: McpToolSurface,
+): boolean =>
+	audienceAdmits(tool.audience, surface) &&
+	(surface !== ANONYMOUS_SURFACE || (ANONYMOUS_TOOLS.has(tool.name) && tool.hints.readOnly))
 
 /**
  * A tool, declared as data: typed input, typed output, how the output reads to a model, and what
@@ -191,10 +292,10 @@ export interface McpToolSpec<
 	/** Defaults to `public`. */
 	readonly audience?: McpToolAudience
 	/**
-	 * A v2 scope family a scoped API key must also hold (read for read-only tools, else write), as
+	 * The v2 scope families a scoped API key must also hold (read for read-only tools, else write), as
 	 * the matching `/v2/<family>` routes require. For data outside the toolset's baseline families.
 	 */
-	readonly scopeFamily?: string
+	readonly scopeFamily?: string | ReadonlyArray<string>
 	readonly phrases: McpToolPhrases
 	/** Retired parameter names mapped to their current name. Accepted, never published. */
 	readonly aliases?: Readonly<Record<string, string>>
@@ -208,6 +309,11 @@ export interface McpToolSpec<
 	 * documents that replace state, where a dropped typo would reset a field to its default.
 	 */
 	readonly rejectUnknownKeys?: true
+	/**
+	 * The result shows text the monitored systems wrote (log bodies, error messages, span names,
+	 * attribute values): every non-empty result then carries the untrusted-data notice.
+	 */
+	readonly untrustedOutput?: true
 	readonly handler: (params: P["Type"]) => Effect.Effect<McpToolOutput<N>["Type"], McpToolError, R>
 	/** The model-facing text, derived from the output alone so the two cannot disagree. */
 	readonly render: (output: McpToolOutput<N>["Type"]) => ToolDoc
@@ -215,6 +321,60 @@ export interface McpToolSpec<
 
 /** A tool's output schema: the domain catalog's entry for its name. */
 export type McpToolOutput<N extends McpToolName> = (typeof McpToolOutputs)[N]
+
+/**
+ * One action of a tool family: what a tool of its own would declare, less what the family holds
+ * for all of them (name, title, audience, scope, phrases). Every action of a family changes data.
+ */
+export interface McpToolActionSpec<
+	P extends Schema.Codec<unknown, unknown, never, unknown>,
+	O,
+	R extends McpToolRequirements,
+> {
+	/** What this action does, in the family's description after `action=<name>:`. */
+	readonly description: string
+	readonly parameters: P
+	readonly hints: McpToolHints
+	/** In place of the family's, for an action a narrower key may run on its own. */
+	readonly scopeFamily?: string | ReadonlyArray<string>
+	readonly aliases?: Readonly<Record<string, string>>
+	readonly valueAliases?: Readonly<Record<string, Readonly<Record<string, string>>>>
+	readonly rejectUnknownKeys?: true
+	readonly untrustedOutput?: true
+	readonly handler: (params: P["Type"]) => Effect.Effect<O, McpToolError, R>
+	readonly render: (output: O) => ToolDoc
+}
+
+/** What each action of a family returns. */
+export type McpToolFamilyActionOutputs<N extends McpToolFamilyName> = (typeof McpToolFamilyActions)[N]
+
+/**
+ * One resource's write actions as a single tool: `manage_slo` with `action` create, update or
+ * delete, where three tools would each repeat the resource's parameters in `tools/list`.
+ */
+export interface McpToolFamilySpec<N extends McpToolFamilyName> {
+	readonly name: N
+	readonly title: string
+	/** What the family manages, in a sentence. Each action's own description follows it. */
+	readonly description: string
+	readonly audience?: McpToolAudience
+	/** The scope every action needs, unless an action names its own. */
+	readonly scopeFamily?: string | ReadonlyArray<string>
+	/** For every action: a chat status line names the tool, not what it was asked to do. */
+	readonly phrases: McpToolPhrases
+}
+
+export interface McpToolFamilyBuilder<N extends McpToolFamilyName> {
+	/** Adds an action. Every action the domain catalog lists for the family must be added. */
+	action<
+		K extends keyof McpToolFamilyActionOutputs<N> & string,
+		P extends Schema.Codec<unknown, unknown, never, unknown>,
+		R extends McpToolRequirements,
+	>(
+		name: K,
+		spec: McpToolActionSpec<P, Schema.Schema.Type<McpToolFamilyActionOutputs<N>[K]>, R>,
+	): McpToolFamilyBuilder<N>
+}
 
 export interface McpToolRegistrar {
 	define<
@@ -224,4 +384,11 @@ export interface McpToolRegistrar {
 	>(
 		spec: McpToolSpec<P, N, R>,
 	): void
+	family<N extends McpToolFamilyName>(spec: McpToolFamilySpec<N>): McpToolFamilyBuilder<N>
+}
+
+/** `family` for a registrar that captures standalone tools only: a test reading one tool's spec. */
+export const ignoreFamily = <N extends McpToolFamilyName>(): McpToolFamilyBuilder<N> => {
+	const builder: McpToolFamilyBuilder<N> = { action: () => builder }
+	return builder
 }

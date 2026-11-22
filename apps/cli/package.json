@@ -1,6 +1,6 @@
 {
 	"name": "@maple/cli",
-	"version": "0.3.5",
+	"version": "0.4.0",
 	"private": true,
 	"bin": {
 		"maple": "./src/bin.ts"
@@ -19,6 +19,7 @@
 		"@maple/domain": "workspace:*",
 		"@maple/eventing-core": "workspace:*",
 		"@maple/local-server": "workspace:*",
+		"@maple/promql": "workspace:*",
 		"@maple/query-engine": "workspace:*",
 		"effect": "catalog:effect"
 	},

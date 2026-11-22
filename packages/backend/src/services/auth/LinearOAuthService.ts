@@ -4,12 +4,28 @@ import {
 	IntegrationsRevokedError,
 	IntegrationsUpstreamError,
 	IntegrationsValidationError,
+	LinearFeatureSwitches,
+	type LinearFeatureSettingsRequest,
 	OrgId,
 	type UserId,
 } from "@maple/domain/http"
-import { Clock, Context, Effect, Layer, Option, Redacted, Schema, String as Str, Array as Arr } from "effect"
+import * as PG from "@maple-dev/effect-orm/postgres"
+import { LinearFeatureSettings } from "@maple/db/tables"
+import {
+	Clock,
+	Context,
+	Effect,
+	Layer,
+	Option,
+	Redacted,
+	Schema,
+	String as Str,
+	Array as Arr,
+	Record as Rec,
+} from "effect"
 import { FetchHttpClient, HttpClient } from "effect/http"
 import { Env, type EnvConfig } from "@maple/backend/platform/Env"
+import { LinearOAuthClientSecret } from "@maple/infra/secrets"
 import { Database } from "@maple/backend/platform/DatabaseLive"
 import {
 	isNotFound,
@@ -29,6 +45,22 @@ const SCOPES = "read,write"
 
 const decodeOrgId = Schema.decodeUnknownSync(OrgId)
 
+/** Every feature on: an org that never changed a switch. */
+const switchesOf = (row: PG.SelectRowOf<typeof LinearFeatureSettings>) =>
+	new LinearFeatureSwitches({
+		openIssuesEnabled: row.openIssuesEnabled,
+		updateCommentsEnabled: row.updateCommentsEnabled,
+		reopenIssuesEnabled: row.reopenIssuesEnabled,
+		resolveCommentsEnabled: row.resolveCommentsEnabled,
+	})
+
+export const ALL_LINEAR_FEATURES = new LinearFeatureSwitches({
+	openIssuesEnabled: true,
+	updateCommentsEnabled: true,
+	reopenIssuesEnabled: true,
+	resolveCommentsEnabled: true,
+})
+
 const ViewerSchema = Schema.Struct({
 	organization: Schema.Struct({ id: Schema.String, name: Schema.String }),
 })
@@ -45,24 +77,22 @@ const TeamsSchema = Schema.Struct({
 
 const resolveConfig = (
 	env: EnvConfig,
+	configuredSecret: Option.Option<Redacted.Redacted>,
 ): Effect.Effect<
 	OAuthTokenEndpointConfig & { readonly clientSecret: Redacted.Redacted },
 	IntegrationsValidationError
 > =>
-	Option.match(
-		Option.all({ clientId: env.LINEAR_OAUTH_CLIENT_ID, clientSecret: env.LINEAR_OAUTH_CLIENT_SECRET }),
-		{
-			onNone: () =>
-				Effect.fail(
-					new IntegrationsValidationError({
-						message:
-							"LINEAR_OAUTH_CLIENT_ID and LINEAR_OAUTH_CLIENT_SECRET are required to use Linear",
-					}),
-				),
-			onSome: ({ clientId, clientSecret }) =>
-				Effect.succeed({ tokenUrl: TOKEN_URL, clientId, clientSecret }),
-		},
-	)
+	Option.match(Option.all({ clientId: env.LINEAR_OAUTH_CLIENT_ID, clientSecret: configuredSecret }), {
+		onNone: () =>
+			Effect.fail(
+				new IntegrationsValidationError({
+					message:
+						"LINEAR_OAUTH_CLIENT_ID and LINEAR_OAUTH_CLIENT_SECRET are required to use Linear",
+				}),
+			),
+		onSome: ({ clientId, clientSecret }) =>
+			Effect.succeed({ tokenUrl: TOKEN_URL, clientId, clientSecret }),
+	})
 
 export interface LinearTeam {
 	readonly id: string
@@ -104,9 +134,18 @@ export interface LinearOAuthServiceApi {
 				readonly workspaceName: string | null
 				readonly connectedByUserId: UserId
 				readonly revoked: boolean
+				readonly features: LinearFeatureSwitches
 		  },
 		IntegrationsPersistenceError
 	>
+	/** The org's switches; every feature is on until someone changes one. */
+	readonly getFeatures: (orgId: OrgId) => Effect.Effect<LinearFeatureSwitches, IntegrationsPersistenceError>
+	/** Saves the switches the update names; the others keep their value. */
+	readonly setFeatures: (
+		orgId: OrgId,
+		userId: UserId,
+		update: LinearFeatureSettingsRequest,
+	) => Effect.Effect<LinearFeatureSwitches, IntegrationsPersistenceError>
 	/**
 	 * Run `use` with the org's Linear token. A token Linear rejects is refreshed
 	 * once and retried; a rejected fresh token marks the connection revoked.
@@ -118,9 +157,14 @@ export interface LinearOAuthServiceApi {
 	readonly listTeams: (orgId: OrgId) => Effect.Effect<ReadonlyArray<LinearTeam>, LinearAccessError>
 	/** One team by id, or null when the workspace has no such team the app can see. */
 	readonly getTeam: (orgId: OrgId, teamId: string) => Effect.Effect<LinearTeam | null, LinearAccessError>
-	readonly disconnect: (
-		orgId: OrgId,
-	) => Effect.Effect<{ readonly disconnected: boolean }, IntegrationsPersistenceError>
+	readonly disconnect: (orgId: OrgId) => Effect.Effect<
+		{
+			readonly disconnected: boolean
+			/** False when a stored grant was not revoked at the vendor; the local grant is dropped anyway. */
+			readonly grantRevoked: boolean
+		},
+		IntegrationsPersistenceError
+	>
 }
 
 export class LinearOAuthService extends Context.Service<LinearOAuthService, LinearOAuthServiceApi>()(
@@ -129,6 +173,7 @@ export class LinearOAuthService extends Context.Service<LinearOAuthService, Line
 		make: Effect.gen(function* () {
 			const database = yield* Database
 			const env = yield* Env
+			const clientSecret = yield* LinearOAuthClientSecret
 			const httpClient = yield* HttpClient.HttpClient
 			const oauth = yield* makeOAuthConnectionHelpers({
 				provider: LINEAR_PROVIDER,
@@ -142,7 +187,7 @@ export class LinearOAuthService extends Context.Service<LinearOAuthService, Line
 				userId: UserId,
 				options: { readonly callbackUrl: string; readonly returnTo?: string },
 			) {
-				const config = yield* resolveConfig(env)
+				const config = yield* resolveConfig(env, clientSecret)
 				const state = yield* newOAuthState
 				yield* oauth.saveState(
 					state,
@@ -167,7 +212,7 @@ export class LinearOAuthService extends Context.Service<LinearOAuthService, Line
 				state: string,
 				initiator: OAuthFlowInitiator,
 			) {
-				const config = yield* resolveConfig(env)
+				const config = yield* resolveConfig(env, clientSecret)
 				const stateRow = yield* oauth.consumeStateRow(state, initiator)
 				const tokens = yield* oauth.exchangeAuthorizationCode(config, code, stateRow.redirectUri)
 				const viewer = yield* linearGraphql(
@@ -202,6 +247,64 @@ export class LinearOAuthService extends Context.Service<LinearOAuthService, Line
 				return { orgId, returnTo: stateRow.returnTo ?? null }
 			})
 
+			const getFeatures = Effect.fn("LinearOAuthService.getFeatures")(function* (orgId: OrgId) {
+				const rows = yield* oauth.dbExecute((db) =>
+					db.run(
+						PG.from(LinearFeatureSettings)
+							.select()
+							.where(($) => [$.orgId.eq(orgId)])
+							.limit(1),
+					),
+				)
+				const row = rows[0]
+				return row === undefined ? ALL_LINEAR_FEATURES : switchesOf(row)
+			})
+
+			const setFeatures = Effect.fn("LinearOAuthService.setFeatures")(function* (
+				orgId: OrgId,
+				userId: UserId,
+				update: LinearFeatureSettingsRequest,
+			) {
+				yield* Effect.annotateCurrentSpan({ orgId })
+				// Only the switches sent: a concurrent save of another one keeps its value.
+				const set = {
+					...(update.openIssuesEnabled !== undefined && {
+						openIssuesEnabled: update.openIssuesEnabled,
+					}),
+					...(update.updateCommentsEnabled !== undefined && {
+						updateCommentsEnabled: update.updateCommentsEnabled,
+					}),
+					...(update.reopenIssuesEnabled !== undefined && {
+						reopenIssuesEnabled: update.reopenIssuesEnabled,
+					}),
+					...(update.resolveCommentsEnabled !== undefined && {
+						resolveCommentsEnabled: update.resolveCommentsEnabled,
+					}),
+				}
+				if (Rec.isEmptyRecord<string, unknown>(set)) return yield* getFeatures(orgId)
+				const now = yield* Clock.currentTimeMillis
+				const rows = yield* oauth.dbExecute((db) =>
+					db.run(
+						PG.insertInto(LinearFeatureSettings)
+							.values({
+								orgId,
+								...ALL_LINEAR_FEATURES,
+								...set,
+								createdAt: now,
+								updatedAt: now,
+								updatedBy: userId,
+							})
+							.onConflictDoUpdate({
+								target: ["orgId"],
+								set: () => ({ ...set, updatedAt: now, updatedBy: userId }),
+							})
+							.returning(),
+					),
+				)
+				const row = rows[0]
+				return row === undefined ? yield* getFeatures(orgId) : switchesOf(row)
+			})
+
 			const getStatus = Effect.fn("LinearOAuthService.getStatus")(function* (orgId: OrgId) {
 				const row = yield* oauth.loadConnection(orgId)
 				if (row === null) return { connected: false } as const
@@ -210,6 +313,7 @@ export class LinearOAuthService extends Context.Service<LinearOAuthService, Line
 					workspaceName: row.externalAccountName,
 					connectedByUserId: row.connectedByUserId,
 					revoked: row.revokedAt !== null,
+					features: yield* getFeatures(orgId),
 				} as const
 			})
 
@@ -218,7 +322,7 @@ export class LinearOAuthService extends Context.Service<LinearOAuthService, Line
 				use: (accessToken: string) => Effect.Effect<A, E | IntegrationsRevokedError>,
 			): Effect.Effect<A, E | LinearAccessError> =>
 				Effect.gen(function* () {
-					const config = yield* resolveConfig(env)
+					const config = yield* resolveConfig(env, clientSecret)
 					return yield* oauth.withRejectedTokenRetry(
 						config,
 						orgId,
@@ -261,30 +365,39 @@ export class LinearOAuthService extends Context.Service<LinearOAuthService, Line
 				return (yield* linearData(TeamSchema, "team lookup")(result)).team
 			})
 
-			/** Best effort: the grant is dropped on Maple's side whatever Linear answers. */
+			/**
+			 * Revokes the stored refresh and access tokens at Linear and answers whether Linear took it.
+			 * Best effort: a failure is logged, and the grant is dropped on Maple's side either way.
+			 */
 			const revokeAtLinear = Effect.fn("LinearOAuthService.revokeAtLinear")(
-				function* (orgId: OrgId) {
-					const row = yield* oauth.loadConnection(orgId)
-					if (row === null) return
-					const accessToken = yield* oauth.openAccessToken(row.orgId, {
-						ciphertext: row.accessTokenCiphertext,
-						iv: row.accessTokenIv,
-						tag: row.accessTokenTag,
-					})
-					yield* oauth.postForm(REVOKE_URL, { token: accessToken, token_type_hint: "access_token" })
-				},
-				(effect) => Effect.ignore(effect),
+				(orgId: OrgId) =>
+					oauth
+						.revokeStoredTokens(orgId, (token, kind) =>
+							oauth.postForm(REVOKE_URL, { token, token_type_hint: kind }),
+						)
+						.pipe(Effect.as(true)),
+				(effect, orgId) =>
+					Effect.catch(effect, (error) =>
+						Effect.logWarning("Linear grant revoke failed; dropping the local grant anyway", {
+							orgId,
+							error: error.message,
+						}).pipe(Effect.as(false)),
+					),
 			)
 
 			const disconnect = Effect.fn("LinearOAuthService.disconnect")(function* (orgId: OrgId) {
-				yield* revokeAtLinear(orgId)
-				return yield* oauth.deleteConnection(orgId)
+				const grantRevoked = yield* revokeAtLinear(orgId)
+				yield* Effect.annotateCurrentSpan({ orgId, "maple.linear.revoked_upstream": grantRevoked })
+				const deleted = yield* oauth.deleteConnection(orgId)
+				return { ...deleted, grantRevoked }
 			})
 
 			return {
 				startConnect,
 				completeConnect,
 				getStatus,
+				getFeatures,
+				setFeatures,
 				withAccessToken,
 				listTeams,
 				getTeam,

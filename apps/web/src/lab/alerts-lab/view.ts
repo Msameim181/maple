@@ -15,6 +15,7 @@ import { button } from "@maple/views/ui/button"
 import { icon } from "@maple/views/ui/icon"
 import type { Model } from "./model"
 import { Array as Arr } from "effect"
+import { canManageAlerts, canRespondToIncidents, gatedControl } from "../../page/kit/session-grants"
 
 type AlertsTab = "inbox" | "rules" | "routing"
 
@@ -44,7 +45,13 @@ export const section = <M>(
 	)
 
 /** The `/alerts` header and tab strip around one tab's body, at a desktop width. */
-const alertsFrame = <M>(h: HtmlBuilder<M>, tab: AlertsTab, data: AlertsOverviewReady, child: Html): Html => {
+const alertsFrame = <M>(
+	h: HtmlBuilder<M>,
+	hub: HubModel,
+	tab: AlertsTab,
+	data: AlertsOverviewReady,
+	child: Html,
+): Html => {
 	const counts = new Map<AlertsTab, number>([
 		["inbox", data.openIncidents.length],
 		["rules", data.rules.length],
@@ -60,10 +67,12 @@ const alertsFrame = <M>(h: HtmlBuilder<M>, tab: AlertsTab, data: AlertsOverviewR
 						[h.Class("flex items-center justify-between gap-4")],
 						[
 							h.p([h.Class("text-sm font-medium")], ["Alerts"]),
-							button(h, { size: "sm" }, [
-								icon(h, "PlusIcon"),
-								tab === "routing" ? "Add destination" : "New rule",
-							]),
+							gatedControl(h, hub, "alerts:manage", (isDisabled) =>
+								button(h, { size: "sm", isDisabled }, [
+									icon(h, "PlusIcon"),
+									tab === "routing" ? "Add destination" : "New rule",
+								]),
+							),
 						],
 					),
 					underlineTabStrip(
@@ -110,11 +119,15 @@ type HubInputs = Readonly<{
 	nowMs: number
 }>
 
-const inboxAcknowledge = (hub: HubModel) => ({
-	onAcknowledge: (incidentId: AlertIncidentId, acknowledged: boolean) =>
-		HubMessageUnion.ClickedAcknowledgeIncident({ incidentId, acknowledged }),
-	pendingIds: hub.acknowledgingIncidentIds,
-})
+/** As the hub passes it: `null` for a viewer who may not respond, whose rows carry no button. */
+const inboxAcknowledge = (hub: HubModel) =>
+	canRespondToIncidents(hub)
+		? {
+				onAcknowledge: (incidentId: AlertIncidentId, acknowledged: boolean) =>
+					HubMessageUnion.ClickedAcknowledgeIncident({ incidentId, acknowledged }),
+				pendingIds: hub.acknowledgingIncidentIds,
+			}
+		: null
 
 /** The sections the hub's views draw, run against the lab's hub Model. */
 export const hubSections = Submodel.defineView<HubModel, HubMessage, HubInputs>((hub, inputs, h) => {
@@ -126,17 +139,25 @@ export const hubSections = Submodel.defineView<HubModel, HubMessage, HubInputs>(
 			section(h, "inbox", "Inbox: one firing, one acknowledged, one held", [
 				alertsFrame(
 					h,
+					hub,
 					"inbox",
 					fixture.overview,
 					inboxTab(h, fixture.overview, inboxAcknowledge(hub)),
 				),
 			]),
 			section(h, "inbox-quiet", "Inbox: nothing firing, two blind spots", [
-				alertsFrame(h, "inbox", fixture.quiet, inboxTab(h, fixture.quiet, inboxAcknowledge(hub))),
+				alertsFrame(
+					h,
+					hub,
+					"inbox",
+					fixture.quiet,
+					inboxTab(h, fixture.quiet, inboxAcknowledge(hub)),
+				),
 			]),
 			section(h, "rules", "Rules", [
 				alertsFrame(
 					h,
+					hub,
 					"rules",
 					fixture.overview,
 					rulesTab(h, hub, {
@@ -144,7 +165,7 @@ export const hubSections = Submodel.defineView<HubModel, HubMessage, HubInputs>(
 						destinations: fixture.destinations,
 						status: inputs.status ?? undefined,
 						emptyState: alertsEmptyState(h, {
-							canEdit: true,
+							canEdit: canManageAlerts(hub),
 							hasDestinations: true,
 							serviceName: undefined,
 							onAddDestination: undefined,
@@ -155,6 +176,7 @@ export const hubSections = Submodel.defineView<HubModel, HubMessage, HubInputs>(
 			section(h, "routing", "Routing: destinations and delivery health", [
 				alertsFrame(
 					h,
+					hub,
 					"routing",
 					fixture.overview,
 					h.div(

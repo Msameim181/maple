@@ -1,6 +1,7 @@
 /**
  * The status Worker: serves customer status pages from edge storage alone (KV, R2, the colo
- * cache), so a page keeps its last known state while every other part of Maple is down.
+ * cache), so a page keeps its last known state while every other part of Maple is down. Custom
+ * domains reach it through a Worker route per hostname (docs/status-page-custom-domains.md).
  * No service bindings or Hyperdrive: serving never calls Maple. Traces export to Maple's ingest after
  * the response, best effort, so an outage loses them without touching the page.
  */
@@ -11,27 +12,35 @@ import {
 	StatusSnapshotsKv,
 } from "@maple/infra/cloudflare"
 import { selfObservabilityEnv } from "@maple/infra/env"
+import { resolveWorkerEnv } from "@maple/infra/secret-guard"
 import { dischargeRuntimeContext } from "@maple/infra/worker-runtime"
 import { WorkerTelemetry } from "@maple/infra/worker-telemetry"
 import * as Cloudflare from "@alchemy.run/cloudflare"
 import { Clock, Effect } from "effect"
 import * as SecureRandom from "effect/crypto/SecureRandom"
-import { HttpServerRequest, HttpServerResponse } from "effect/http"
-import { handleRequest } from "./handler"
+import { FetchHttpClient, HttpClient, HttpServerRequest, HttpServerResponse } from "effect/http"
+import { handleRequest, sharedHostMatcher } from "./handler"
+import { nativeOgImage } from "./og-image"
 import { nativeStorage } from "./storage"
 
 /** `__ALCHEMY_RUNTIME__` folds to `true` in the bundle, so the stack-side branch is tree-shaken. */
 const props = Effect.gen(function* () {
 	if (globalThis.__ALCHEMY_RUNTIME__) return { main: import.meta.url }
 	const stack = yield* MapleStack
-	const env = yield* selfObservabilityEnv(stack.stage, stack.region)
+	const env = yield* resolveWorkerEnv("status", selfObservabilityEnv(stack.stage, stack.region))
 	return {
 		main: import.meta.url,
 		...mapleWorkerProps("status", stack),
-		env,
-		// Pages are served at `/s/<slug>`; previews get a domain, prd stays on workers.dev until it has one.
+		// The status domain serves `/s/<org key>/<slug>`; every other host but workers.dev is a custom domain.
+		env: {
+			...env,
+			...(stack.domains.status === undefined ? undefined : { MAPLE_STATUS_HOST: stack.domains.status }),
+		},
+		// Pages are served at `/s/<org key>/<slug>`; prd and previews on their status domain, dev stages on workers.dev.
 		domain: stack.domains.status,
 		workersDev: true,
+		// The link preview's fonts, as Data modules: this Worker has no static assets.
+		rules: [{ globs: ["**/*.ttf"] }],
 	}
 })
 
@@ -46,25 +55,39 @@ export default class StatusWorker extends Cloudflare.Worker<StatusWorker>()(
 			namespaceId: 2026102801,
 			simple: { limit: 10, period: 60 },
 		})
+		// Password attempts on one page from every address together.
+		const pageLimiter = yield* Cloudflare.RateLimit("STATUS_PAGE_ACCESS_RATE_LIMITER", {
+			namespaceId: 2026111702,
+			simple: { limit: 100, period: 60 },
+		})
+		// Fetches the page's logo for its link preview; nothing in Maple.
+		const httpClient = yield* HttpClient.HttpClient
 
 		return {
 			fetch: Effect.gen(function* () {
 				const request = yield* HttpServerRequest.HttpServerRequest
 				const web = yield* HttpServerRequest.toWeb(request).pipe(Effect.orDie)
-				const [kvBinding, bucketBinding, limiterBinding] = yield* dischargeRuntimeContext(
-					Effect.all([kv.raw, bucket.raw, limiter.raw]),
-				)
+				const [kvBinding, bucketBinding, limiterBinding, pageLimiterBinding] =
+					yield* dischargeRuntimeContext(
+						Effect.all([kv.raw, bucket.raw, limiter.raw, pageLimiter.raw]),
+					)
 				const storage = nativeStorage({
 					kv: kvBinding,
 					bucket: bucketBinding,
 					limiter: limiterBinding,
+					pageLimiter: pageLimiterBinding,
 					cache: caches.open("status-snapshots"),
 				})
 				const nowMs = yield* Clock.currentTimeMillis
+				const workerEnv = yield* Cloudflare.WorkerEnvironment
 				const response = yield* handleRequest(web, {
 					storage,
 					nowMs,
 					randomId: () => SecureRandom.uuidV4Unsafe(),
+					ogImage: nativeOgImage(caches.open("status-og"), httpClient),
+					isSharedHost: sharedHostMatcher(
+						typeof workerEnv.MAPLE_STATUS_HOST === "string" ? workerEnv.MAPLE_STATUS_HOST : null,
+					),
 				})
 				yield* Effect.annotateCurrentSpan("http.response.status_code", response.status)
 				return HttpServerResponse.fromWeb(response)
@@ -75,6 +98,7 @@ export default class StatusWorker extends Cloudflare.Worker<StatusWorker>()(
 			Cloudflare.KV.ReadWriteNamespaceBinding,
 			Cloudflare.R2.ReadBucketBinding,
 			Cloudflare.Workers.RateLimitBinding,
+			FetchHttpClient.layer,
 			WorkerTelemetry({ serviceName: "status" }),
 		]),
 	),

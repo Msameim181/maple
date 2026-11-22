@@ -37,6 +37,36 @@ const names = (files: ReadonlyArray<PullRequestFile>) =>
 	Arr.map(detectMergeSteps(files).names, (candidate) => `${candidate.kind}:${candidate.name}`)
 
 describe("detectMergeSteps", () => {
+	it("reads a secret declared through a generic factory, on one line or wrapped by the formatter", () => {
+		assert.deepEqual(
+			Arr.map(
+				detectMergeSteps([
+					file(
+						"packages/infra/src/secrets.ts",
+						Arr.join(
+							[
+								"@@ -10,1 +10,7 @@",
+								'+export class BillingToken extends Secret<BillingToken>()("BILLING_TOKEN", {',
+								'+\tissuer: "billing",',
+								"+}) {}",
+								"+export class WebhookSigning extends Secret<WebhookSigning>()(",
+								'+\t"MAPLE_BILLING_WEBHOOK_SIGNING",',
+								'+\t{ issuer: "maple", consumers: ["api"] },',
+								"+) {}",
+							],
+							"\n",
+						),
+					),
+				]).names,
+				(candidate) => [candidate.kind, candidate.name, candidate.line],
+			),
+			[
+				["secret", "BILLING_TOKEN", 10],
+				["secret", "MAPLE_BILLING_WEBHOOK_SIGNING", 14],
+			],
+		)
+	})
+
 	it("reads secrets and env vars from config helpers and runtime reads, with head line numbers", () => {
 		const detected = detectMergeSteps([
 			file(
@@ -302,6 +332,7 @@ describe("the Before merge section", () => {
 			partial: false,
 			headSha: Schema.decodeSync(GitCommitSha)(Str.repeat(40)("a")),
 			repositoryUrl: "https://github.com/acme/shop",
+			isPrivate: true,
 		})
 		assert.include(body, "### Before merge")
 		assert.include(
@@ -406,6 +437,7 @@ describe("ticks on the comment", () => {
 			partial: false,
 			headSha: Schema.decodeSync(GitCommitSha)(Str.repeat(40)("a")),
 			repositoryUrl: "https://github.com/acme/shop",
+			isPrivate: true,
 		})
 
 	it("tags each task with its key and renders a done step ticked", () => {

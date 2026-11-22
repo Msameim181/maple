@@ -4,6 +4,7 @@ import { Message } from "./chart"
 import type { ChartBounds } from "@tanstack/charts"
 import type { ChartHost, CreateChartHost, TimeAxis } from "./chart-host-base"
 import { CHART_LABEL_ATTRIBUTE, CHART_SPEC_ATTRIBUTE, decodeChartSpec } from "./chart-spec"
+import { encodePlotTimeAxis, PLOT_TIME_AXIS_ATTRIBUTE } from "./plot-time-axis"
 
 /** `PlotFrame`'s `FALLBACK_HEIGHT`: drawn at until the plot box has been measured. */
 const FALLBACK_HEIGHT = 320
@@ -35,12 +36,23 @@ interface ChartHostModule {
 }
 
 /** Hosts other than the full one (`./chart-host`, every definition), by name. */
-export const ChartHostName = Schema.Literals(["lab", "logs-volume"])
+export const ChartHostName = Schema.Literals([
+	"lab",
+	"logs-volume",
+	"bar",
+	"area",
+	"occurrences",
+	"analytics-traffic",
+])
 export type ChartHostName = typeof ChartHostName.Type
 
-/** The landing's host ships here; the `/lab/charts` host lives with the app, which registers it. */
+/** The landing's hosts ship here; the `/lab/charts` host lives with the app, which registers it. */
 const namedHosts = new Map<ChartHostName, () => Promise<ChartHostModule>>([
 	["logs-volume", () => import("./logs-volume-host")],
+	["bar", () => import("./bar-host")],
+	["area", () => import("./area-host")],
+	["occurrences", () => import("./occurrences-host")],
+	["analytics-traffic", () => import("./analytics-traffic-host")],
 ])
 
 /** The first registration of a name wins; a later one is ignored. */
@@ -99,6 +111,8 @@ export const MountChart = Mount.defineStream("MountChart", {
 
 								// The last geometry sent: `onRender` runs on every pointer tick, a Message only on change.
 								const sent = { key: "" }
+								// The time axis last written on the anchor, for the same reason.
+								const axisSent = { value: "" }
 								// A chart without a time x scale (a pie) reports its rect with an empty domain.
 								const NO_AXIS = {
 									domainStartMs: 0,
@@ -155,6 +169,22 @@ export const MountChart = Mount.defineStream("MountChart", {
 													anchor.style.transform = `translate(${bounds.x}px, ${bounds.y}px)`
 													anchor.style.width = `${bounds.width}px`
 													anchor.style.height = `${bounds.height}px`
+													const encoded = Option.match(timeAxis, {
+														onNone: () => "",
+														onSome: (axis) =>
+															encodePlotTimeAxis({
+																domainStartMs: axis.domainStartMs,
+																domainEndMs: axis.domainEndMs,
+																startPx: axis.rangeStart - bounds.x,
+																endPx: axis.rangeEnd - bounds.x,
+															}),
+													})
+													if (encoded === axisSent.value) return
+													axisSent.value = encoded
+													if (encoded === "")
+														anchor.removeAttribute(PLOT_TIME_AXIS_ATTRIBUTE)
+													else
+														anchor.setAttribute(PLOT_TIME_AXIS_ATTRIBUTE, encoded)
 												},
 											},
 										}),
@@ -167,13 +197,18 @@ export const MountChart = Mount.defineStream("MountChart", {
 											return { update: () => false, destroy: () => undefined }
 										},
 									)
-								// NOTE: mounted at the fallback height and then corrected (chart first, then the frame's
-								// measurement); the first scene shapes the canvas state.
-								host.style.height = `${FALLBACK_HEIGHT}px`
+								// Fixed-height sparklines are measurable before drawing. Other charts
+								// keep the fallback to establish their flex minimum before measurement.
+								const initialMeasured =
+									initialSpec.value._tag === "Sparkline"
+										? Math.round(element.getBoundingClientRect().height)
+										: 0
+								const initialHeight = initialMeasured > 0 ? initialMeasured : FALLBACK_HEIGHT
+								host.style.height = `${initialHeight}px`
 								// The live handle and what it was last drawn from; local to this Mount's lifetime.
 								const state = {
-									height: FALLBACK_HEIGHT,
-									chart: create(initialSpec.value, FALLBACK_HEIGHT),
+									height: initialHeight,
+									chart: create(initialSpec.value, initialHeight),
 								}
 								// Measured with the fallback drawn: a flex item's
 								// automatic minimum then holds a fixed-height box at its height instead of shrinking.
@@ -184,7 +219,7 @@ export const MountChart = Mount.defineStream("MountChart", {
 									state.chart.destroy()
 									state.chart = create(spec, state.height)
 								}
-								if (measured > 0 && measured !== FALLBACK_HEIGHT) {
+								if (measured > 0 && measured !== state.height) {
 									state.height = measured
 									host.style.height = `${measured}px`
 									redraw(initialSpec.value)

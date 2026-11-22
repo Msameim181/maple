@@ -11,16 +11,17 @@ import {
 import { META_CHIP_CLASS, severityToneFor, TRIAGE_STATUS_CHIP } from "@maple/views/lib/anomaly-display"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { button } from "@maple/views/ui/button"
+import { gatedBy } from "../../kit/gated-controls"
 import { detailRailGroup, detailRailRow } from "@maple/views/ui/detail-rail"
 import { badge } from "@maple/views/ui/display"
 import { icon } from "@maple/views/ui/icon"
-import { serviceDot } from "@maple/views/ui/values"
+import { serviceLabel } from "@maple/views/ui/service-label"
 import { relativeTime } from "../../kit/relative-time"
 import { anomalyFingerprintRow } from "../../kit/anomaly-evidence"
 import { shortIssueId } from "@maple/ui/lib/ids"
 import { Message } from "./message"
 import { typography, typographyClass } from "@maple/views/ui/typography"
-import { hstack, vstack } from "@maple/views/ui/stack"
+import { vstack } from "@maple/views/ui/stack"
 import { Array as Arr } from "effect"
 
 type H = HtmlBuilder<Message>
@@ -28,6 +29,8 @@ type H = HtmlBuilder<Message>
 export type SidebarInput = Readonly<{
 	incident: AnomalyIncidentDocument
 	isBusy: boolean
+	/** The viewer may resolve the anomaly and link an issue (`incidents:respond`). */
+	canRespond: boolean
 	nowMs: number
 	timeZone: string
 }>
@@ -37,6 +40,37 @@ const row = (h: H, label: string, children: ReadonlyArray<Html | string>, title?
 
 const mono = (h: H, value: string, className: string): Html =>
 	h.span([h.Class(cn(typographyClass({ size: "sm", mono: true, numeric: true }), className))], [value])
+
+/** Resolve the anomaly, and link it to an error issue or take the link away. */
+const actionsGroup = (h: H, input: SidebarInput): Html => {
+	const { incident } = input
+	// Locked for a viewer without `incidents:respond`: shown disabled with who can.
+	const action = (onClick: Message, children: ReadonlyArray<Html | string>): Html =>
+		gatedBy(
+			h,
+			input.canRespond,
+			"incidents:respond",
+			(isLocked) =>
+				button(
+					h,
+					{
+						size: "sm",
+						variant: "outline",
+						className: "w-full",
+						isDisabled: isLocked || input.isBusy,
+						attributes: [h.OnClick(onClick)],
+					},
+					children,
+				),
+			{ className: "w-full" },
+		)
+	return detailRailGroup(h, "Actions", [
+		...(incident.status === "open" ? [action(Message.ClickedResolve(), ["Resolve anomaly"])] : []),
+		incident.errorIssueId === null
+			? action(Message.ClickedLinkIssue(), [icon(h, "LinkIcon"), "Link issue"])
+			: action(Message.ClickedUnlink(), ["Unlink ", shortIssueId(incident.errorIssueId)]),
+	])
+}
 
 export const anomalySidebar = (h: H, input: SidebarInput): Html => {
 	const { incident } = input
@@ -50,46 +84,7 @@ export const anomalySidebar = (h: H, input: SidebarInput): Html => {
 	const time = (value: string, className?: string) =>
 		relativeTime(h, { value, nowMs: input.nowMs, timeZone: input.timeZone, className })
 	return vstack(h, {}, [
-		detailRailGroup(h, "Actions", [
-			...(isOpen
-				? [
-						button(
-							h,
-							{
-								size: "sm",
-								variant: "outline",
-								className: "w-full",
-								isDisabled: input.isBusy,
-								attributes: [h.OnClick(Message.ClickedResolve())],
-							},
-							["Resolve anomaly"],
-						),
-					]
-				: []),
-			incident.errorIssueId === null
-				? button(
-						h,
-						{
-							size: "sm",
-							variant: "outline",
-							className: "w-full",
-							isDisabled: input.isBusy,
-							attributes: [h.OnClick(Message.ClickedLinkIssue())],
-						},
-						[icon(h, "LinkIcon"), "Link issue"],
-					)
-				: button(
-						h,
-						{
-							size: "sm",
-							variant: "outline",
-							className: "w-full",
-							isDisabled: input.isBusy,
-							attributes: [h.OnClick(Message.ClickedUnlink())],
-						},
-						["Unlink ", shortIssueId(incident.errorIssueId)],
-					),
-		]),
+		actionsGroup(h, input),
 		detailRailGroup(h, "Details", [
 			row(h, "State", [
 				h.span(
@@ -127,12 +122,12 @@ export const anomalySidebar = (h: H, input: SidebarInput): Html => {
 				h,
 				"Service",
 				[
-					hstack(h, { gap: "2", shrink: true, as: "span" }, [
-						serviceDot(h, { serviceName: incident.serviceName, size: "sm" }),
-						typography(h, { size: "sm", tone: "foreground", truncate: true }, [
-							incident.serviceName,
-						]),
-					]),
+					serviceLabel(h, {
+						serviceName: incident.serviceName,
+						dot: "sm",
+						size: "sm",
+						tone: "foreground",
+					}),
 				],
 				incident.serviceName,
 			),

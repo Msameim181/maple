@@ -145,6 +145,25 @@ export interface ClerkInvitationResource {
 	readonly createdAt: Date
 	readonly revoke: Write
 }
+export type ClerkEnrollmentMode = "manual_invitation" | "automatic_invitation" | "automatic_suggestion"
+/** A domain the organization claims; verified by a code sent to an address on it. */
+export interface ClerkOrganizationDomainResource {
+	readonly id: string
+	readonly name: string
+	readonly enrollmentMode: ClerkEnrollmentMode
+	readonly verification: { readonly status: "unverified" | "verified" } | null
+	readonly affiliationEmailAddress: string | null
+	readonly prepareAffiliationVerification: Write<
+		{ affiliationEmailAddress: string },
+		ClerkOrganizationDomainResource
+	>
+	readonly attemptAffiliationVerification: Write<{ code: string }, ClerkOrganizationDomainResource>
+	readonly updateEnrollmentMode: Write<
+		{ enrollmentMode: ClerkEnrollmentMode; deletePending?: boolean },
+		ClerkOrganizationDomainResource
+	>
+	readonly delete: Write
+}
 interface ClerkPage<A> {
 	readonly data: ReadonlyArray<A>
 	readonly total_count: number
@@ -169,6 +188,11 @@ export interface ClerkOrganizationResource {
 	readonly update: Write<{ name: string }>
 	readonly setLogo: Write<{ file: Blob | null }>
 	readonly inviteMember: Write<{ emailAddress: string; role: string }>
+	readonly getDomains: (params: {
+		initialPage?: number
+		pageSize?: number
+	}) => Promise<ClerkPage<ClerkOrganizationDomainResource>>
+	readonly createDomain: Write<string, ClerkOrganizationDomainResource>
 	/** Re-reads the org, so its new public metadata reaches the listeners. */
 	readonly reload: () => Promise<ClerkOrganizationResource>
 }
@@ -214,10 +238,11 @@ export const ClerkOrganization = Schema.Struct({
 	isRegionOpen: Schema.Boolean,
 	flags: Schema.Struct({
 		aiAutoTriage: Schema.Boolean,
+		cloudSecurity: Schema.Boolean,
 		dataSources: Schema.Boolean,
-		releases: Schema.Boolean,
+		productAnalytics: Schema.Boolean,
+		profiling: Schema.Boolean,
 		securityAudit: Schema.Boolean,
-		statusPages: Schema.Boolean,
 	}),
 })
 export type ClerkOrganization = typeof ClerkOrganization.Type
@@ -245,6 +270,8 @@ export const ClerkSnapshot = Schema.Struct({
 	maybeOrganization: Schema.Option(ClerkOrganization),
 	/** `useOrganizationList({ userMemberships })`, the first page. */
 	memberships: Schema.Array(ClerkOrganization),
+	/** The user's membership role in the active org (`org:admin`), for the session's traits. */
+	maybeRole: Schema.Option(Schema.String),
 	/** The API treats a pending session as signed out, so the app shows the task instead. */
 	maybePendingTask: Schema.Option(PendingSessionTask),
 })
@@ -279,6 +306,13 @@ const toSnapshot = (resources: ClerkResources): Effect.Effect<ClerkSnapshot> =>
 		),
 		memberships: Arr.map(resources.user?.organizationMemberships ?? [], (membership) =>
 			toOrganization(membership.organization, nowMs),
+		),
+		maybeRole: Option.flatMap(
+			Arr.findFirst(
+				resources.user?.organizationMemberships ?? [],
+				(membership) => membership.organization.id === resources.organization?.id,
+			),
+			(membership) => Option.fromNullishOr(membership.role),
 		),
 		maybePendingTask: Option.filter(
 			Option.fromNullishOr(

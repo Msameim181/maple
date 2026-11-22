@@ -1,3 +1,4 @@
+import { getSeverityInk } from "@maple/ui/lib/severity"
 import { cn } from "@maple/ui/lib/utils"
 import { Option, Array as Arr } from "effect"
 import type { Html, HtmlBuilder } from "foldkit/html"
@@ -54,6 +55,12 @@ const SEVERITY_ROW = new Map([
 	["WARN", "before:bg-severity-warn"],
 	["WARNING", "before:bg-severity-warn"],
 ])
+/**
+ * A compact, unwrapped, collapsed row's height: its 22px message lane, `py-[calc(--spacing(2)-1px)]`
+ * (7px) above and below, and the 1px bottom border. A page that renders rows before the virtualizer
+ * measures them places them with it.
+ */
+export const COMPACT_ROW_HEIGHT = 37
 const QUIET_SEVERITIES = new Set(["DEBUG", "TRACE"])
 // Fatal reads one step past error: a filled label, not just a red word.
 const FILLED_SEVERITIES = new Set(["FATAL", "CRITICAL"])
@@ -220,7 +227,7 @@ export const logRow = <Message>(
 							? [row.timeMain]
 							: [
 									row.timeMain,
-									h.span([rowClass(h, "text-foreground-faint")], [row.timeFraction]),
+									h.span([rowClass(h, "text-foreground-subtle")], [row.timeFraction]),
 								],
 					),
 					h.span(
@@ -235,7 +242,7 @@ export const logRow = <Message>(
 							h.Style(
 								FILLED_SEVERITIES.has(row.severity)
 									? { "background-color": row.severityColor }
-									: { color: row.severityColor },
+									: { color: getSeverityInk(row.severity) },
 							),
 							h.Title(row.severity),
 						],

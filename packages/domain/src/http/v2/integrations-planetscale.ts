@@ -202,6 +202,20 @@ export const V2PlanetScaleIntegration = Schema.Struct({
 				"Webhook registration across the organization's databases, or `null` before one is bound.",
 		}),
 	),
+	metrics_enabled: Schema.optionalKey(
+		Schema.Boolean.annotate({
+			description:
+				"Whether Maple collects branch metrics. Off stops the metrics poller and the managed scrape target; metrics already collected stay.",
+			examples: [true],
+		}),
+	),
+	events_enabled: Schema.optionalKey(
+		Schema.Boolean.annotate({
+			description:
+				"Whether Maple collects deploy requests and branch changes. Off deletes the webhooks Maple registered and drops deliveries; events already recorded stay.",
+			examples: [true],
+		}),
+	),
 	last_inventory_at: Schema.NullOr(Timestamp).annotate({
 		description: "When the database/branch inventory last refreshed, or `null` before the first refresh.",
 	}),
@@ -242,6 +256,8 @@ export const V2PlanetScaleIntegration = Schema.Struct({
 				last_scrape_error: null,
 			},
 			webhooks: { state: "active", registered_databases: 3, databases: 3, last_error: null },
+			metrics_enabled: true,
+			events_enabled: true,
 			last_inventory_at: "2026-08-05T12:00:00.000Z",
 			last_inventory_error: null,
 			revoked_at: null,
@@ -373,6 +389,24 @@ export const V2PlanetScaleMetricsTokenRequest = Schema.Struct({
 	examples: [wireExample({ token_id: "abcdef123456", token_secret: "pscale_tkn_example" })],
 })
 export type V2PlanetScaleMetricsTokenRequest = Schema.Schema.Type<typeof V2PlanetScaleMetricsTokenRequest>
+
+export const V2PlanetScaleFeaturesRequest = Schema.Struct({
+	metrics_enabled: Schema.optionalKey(Schema.Boolean).annotate({
+		description: "Turn branch metrics on or off. Omit to keep the current setting.",
+		examples: [true],
+	}),
+	events_enabled: Schema.optionalKey(Schema.Boolean).annotate({
+		description:
+			"Turn deploy requests and branch changes on or off. Off deletes Maple's webhooks; on registers them again.",
+		examples: [false],
+	}),
+}).annotate({
+	identifier: "PlanetScaleFeaturesRequest",
+	title: "PlanetScale features",
+	description: "What Maple collects from PlanetScale. A field left out keeps its current setting.",
+	examples: [wireExample({ metrics_enabled: true, events_enabled: false })],
+})
+export type V2PlanetScaleFeaturesRequest = Schema.Schema.Type<typeof V2PlanetScaleFeaturesRequest>
 
 export const V2PlanetScaleDisconnectResponse = Schema.Struct({
 	object: Schema.Literal("planetscale_integration").annotate({
@@ -518,7 +552,7 @@ export const V2PlanetScaleWebhookConfig = Schema.Struct({
 	identifier: "PlanetScaleWebhookConfig",
 	title: "PlanetScale webhook configuration",
 	description:
-		"The material needed to register Maple as a webhook receiver in PlanetScale. Admin-only: the response carries the signing secret.",
+		"The material needed to register Maple as a webhook receiver in PlanetScale. Only for members who manage integrations: the response carries the signing secret.",
 	examples: [
 		wireExample({
 			object: "planetscale_integration.webhook_config",
@@ -901,7 +935,7 @@ export class V2PlanetScaleIntegrationsApiGroup extends HttpApiGroup.make("planet
 				identifier: "connectPlanetScaleIntegration",
 				summary: "Begin a PlanetScale connection",
 				description:
-					"Returns a PlanetScale OAuth authorize URL to redirect the user to. Browser-oriented: a headless caller cannot complete the redirect, so scripted setups should connect once from the dashboard and then drive `select_organization` and `metrics_token` over the API. Requires an org-admin role and the `integrations:write` scope.",
+					"Returns a PlanetScale OAuth authorize URL to redirect the user to. Browser-oriented: a headless caller cannot complete the redirect, so scripted setups should connect once from the dashboard and then drive `select_organization` and `metrics_token` over the API. The connection is bound to the person who starts it, so this takes a signed-in session and refuses an API key. Requires an org-admin or engineer role.",
 			}),
 		),
 	)
@@ -914,7 +948,7 @@ export class V2PlanetScaleIntegrationsApiGroup extends HttpApiGroup.make("planet
 				identifier: "listPlanetScaleOrganizations",
 				summary: "List reachable PlanetScale organizations",
 				description:
-					"Lists the PlanetScale organizations the stored OAuth grant can access — the candidates for `select_organization`. Requires an org-admin role and the `integrations:read` scope.",
+					"Lists the PlanetScale organizations the stored OAuth grant can access: the candidates for `select_organization`. Requires an org-admin or engineer role and the `integrations:read` scope.",
 			}),
 		),
 	)
@@ -928,7 +962,7 @@ export class V2PlanetScaleIntegrationsApiGroup extends HttpApiGroup.make("planet
 				identifier: "selectPlanetScaleOrganization",
 				summary: "Bind the connection to a PlanetScale organization",
 				description:
-					"Binds the stored OAuth grant to one PlanetScale organization, probes API permissions, and provisions (or adopts) the managed scrape target. Re-submitting is an upsert — use it to change organization or edit the scrape target's branch filters. Returns the refreshed integration status. Requires an org-admin role and the `integrations:write` scope.",
+					"Binds the stored OAuth grant to one PlanetScale organization, probes API permissions, and provisions (or adopts) the managed scrape target. Re-submitting is an upsert: use it to change organization or edit the scrape target's branch filters. Returns the refreshed integration status. Requires an org-admin or engineer role and the `integrations:write` scope.",
 			}),
 		),
 	)
@@ -949,7 +983,26 @@ export class V2PlanetScaleIntegrationsApiGroup extends HttpApiGroup.make("planet
 				identifier: "setPlanetScaleMetricsToken",
 				summary: "Attach a PlanetScale metrics service token",
 				description:
-					"Optional: branch metrics arrive without a token, polled from PlanetScale's metrics API on the OAuth grant. Attaches a service token carrying the single `read_metrics_endpoints` permission to the managed scrape target, switching the connection to Prometheus scraping instead. Maple validates the token against PlanetScale's metrics discovery endpoint before storing it: an invalid or under-permissioned token is rejected with `invalid_request_error` and nothing is written. Re-submitting rotates the token in place. Returns the refreshed integration status, whose `metrics_auth` becomes `service_token` on success. Requires an org-admin role and the `integrations:write` scope.",
+					"Optional: branch metrics arrive without a token, polled from PlanetScale's metrics API on the OAuth grant. Attaches a service token carrying the single `read_metrics_endpoints` permission to the managed scrape target, switching the connection to Prometheus scraping instead. Maple validates the token against PlanetScale's metrics discovery endpoint before storing it: an invalid or under-permissioned token is rejected with `invalid_request_error` and nothing is written. Re-submitting rotates the token in place. Returns the refreshed integration status, whose `metrics_auth` becomes `service_token` on success. Requires an org-admin or engineer role and the `integrations:write` scope.",
+			}),
+		),
+	)
+	.add(
+		HttpApiEndpoint.patch("updateFeatures", "/", {
+			payload: V2PlanetScaleFeaturesRequest,
+			success: V2PlanetScaleIntegration,
+			error: [
+				V2InsufficientPermissions.schema,
+				integrationNotConnected,
+				integrationPersistence,
+				scrapeTargetStoredConfigInvalid,
+			],
+		}).annotateMerge(
+			OpenApi.annotations({
+				identifier: "updatePlanetScaleIntegration",
+				summary: "Choose what Maple collects from PlanetScale",
+				description:
+					"Turns branch metrics and events on or off. Turning events off deletes the webhooks Maple registered on your databases; turning them on registers them again. Data already collected is kept. Returns the refreshed integration status. Requires an org-admin or engineer role and the `integrations:write` scope.",
 			}),
 		),
 	)
@@ -962,7 +1015,7 @@ export class V2PlanetScaleIntegrationsApiGroup extends HttpApiGroup.make("planet
 				identifier: "disconnectPlanetScaleIntegration",
 				summary: "Disconnect PlanetScale",
 				description:
-					"Removes the OAuth grant, the managed scrape target, and the stored metrics token. Polled inventory and recorded events are kept. Requires an org-admin role and the `integrations:write` scope.",
+					"Removes the OAuth grant, the managed scrape target, and the stored metrics token. Polled inventory and recorded events are kept. Requires an org-admin or engineer role and the `integrations:write` scope.",
 			}),
 		),
 	)
@@ -988,7 +1041,7 @@ export class V2PlanetScaleIntegrationsApiGroup extends HttpApiGroup.make("planet
 				identifier: "getPlanetScaleWebhookConfig",
 				summary: "Retrieve the PlanetScale webhook configuration (deprecated)",
 				description:
-					"Deprecated: Maple now registers a webhook on every database itself and verifies each delivery with the secret PlanetScale generated for it; see `webhooks` on the integration status. The URL and secret returned here no longer verify deliveries. Requires an org-admin role and the `integrations:read` scope.",
+					"Deprecated: Maple now registers a webhook on every database itself and verifies each delivery with the secret PlanetScale generated for it; see `webhooks` on the integration status. The URL and secret returned here no longer verify deliveries. The response contains the stored secret, so this requires an org-admin or engineer role and the `integrations:write` scope, although it is a GET. A read that returns the secret is recorded in the audit log.",
 			}),
 		),
 	)

@@ -1,7 +1,6 @@
-import { IntegrationsValidationError } from "@maple/domain/http"
+import { CloudflareFeatureSettingsRequest, IntegrationsValidationError } from "@maple/domain/http"
 // SAFETY-FILE: JSON in this test is emitted by the fixture or unit under test before its fields are asserted.
 import { randomUUID } from "node:crypto"
-import { Retry } from "@distilled.cloud/cloudflare"
 import { afterEach, assert, describe, it } from "@effect/vitest"
 import { OrgId, UserId } from "@maple/domain/http"
 import { clickHouseSchemaVersion } from "@maple/domain/clickhouse"
@@ -36,7 +35,7 @@ import { FetchHttpClient } from "effect/http"
 import { parseSecretKeyring, sealSecret } from "@maple/backend/platform/SecretBox"
 import { oauthAccessTokenSlot } from "@maple/backend/platform/secret-slots"
 import { Database } from "@maple/backend/platform/DatabaseLive"
-import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import {
 	cleanupTestDbs,
 	createTestDb,
@@ -222,6 +221,9 @@ interface HyperdriveConfigFixture {
 }
 
 interface FetchOptions {
+	settingsData?: unknown
+	zoneData?: unknown
+
 	readonly zones?: ReadonlyArray<typeof zoneFixture>
 	/**
 	 * When set, the `/zones` listing serves only the zones of the account whose id appears
@@ -288,6 +290,9 @@ const recordSpans = () => {
 	const named = (name: string) => Arr.filter(spans, (span) => span.name === name)
 	return { tracer, named }
 }
+
+const spanFailed = (span: Tracer.NativeSpan) =>
+	span.status._tag === "Ended" && span.status.exit._tag === "Failure"
 
 /** Holds the first GraphQL call until `release()`; `reached` resolves once a poll is parked there. */
 const gateFirstGraphql = () => {
@@ -365,12 +370,13 @@ const mockCloudflareFetch = (options: FetchOptions = {}): typeof globalThis.fetc
 			if (errors.length > 0) {
 				return jsonResponse({
 					data: null,
-					errors: options.graphqlFirstErrorOnly ? errors.slice(0, 1) : errors,
+					errors: options.graphqlFirstErrorOnly ? Arr.take(errors, 1) : errors,
 				})
 			}
 			if (Str.includes("MapleCfDatasetSettings")(body.query))
-				return jsonResponse({ data: settingsData })
-			if (Str.includes("MapleCfZoneAnalytics")(body.query)) return jsonResponse({ data: httpData })
+				return jsonResponse({ data: options.settingsData ?? settingsData })
+			if (Str.includes("MapleCfZoneAnalytics")(body.query))
+				return jsonResponse({ data: options.zoneData ?? httpData })
 			if (Str.includes("MapleCfAccountAnalytics")(body.query))
 				return jsonResponse({ data: workersData })
 			return jsonResponse({ data: null, errors: [{ message: "unknown query" }] })
@@ -380,7 +386,7 @@ const mockCloudflareFetch = (options: FetchOptions = {}): typeof globalThis.fetc
 				return jsonResponse(
 					{
 						success: false,
-						errors: [{ code: 10000, message: "Authentication error" }],
+						errors: [{ code: 9109, message: "Invalid access token" }],
 						messages: [],
 						result: null,
 					},
@@ -418,7 +424,7 @@ const mockCloudflareFetch = (options: FetchOptions = {}): typeof globalThis.fetc
 				return jsonResponse(
 					{
 						success: false,
-						errors: [{ code: 10000, message: "Authentication error" }],
+						errors: [{ code: 9109, message: "Invalid access token" }],
 						messages: [],
 						result: null,
 					},
@@ -540,12 +546,11 @@ const makeLayer = (
 		),
 		Layer.provideMerge(Layer.succeed(WarehouseQueryService, makeWarehouseStub(captured, queryStub))),
 		Layer.provideMerge(testDb.layer),
-		Layer.provideMerge(Env.layer),
+		Layer.provideMerge(EnvTestLive),
 		Layer.provideMerge(
 			ConfigProvider.layer(ConfigProvider.fromUnknown({ ...baseConfig, ...configOverrides })),
 		),
 		Layer.provideMerge(Layer.succeed(FetchHttpClient.Fetch, mockCloudflareFetch(fetchOptions))),
-		Layer.provideMerge(Layer.succeed(Retry.Retry, { while: () => false })),
 	)
 
 /**
@@ -1329,6 +1334,55 @@ describe("CloudflareAnalyticsService", () => {
 		}).pipe(Effect.provide(makeLayer(testDb, captured)))
 	})
 
+	it.effect("a paused unavailable zone does not reserve a busy sibling's call budget", () => {
+		const testDb = createTestDb(trackedDbs)
+		const IDLE = "acct-idle"
+		return Effect.gen(function* () {
+			yield* TestClock.setTime(T0)
+			yield* seedConnection(ANALYTICS_SCOPE, [
+				{ id: ACCOUNT_ID, name: "Busy Account" },
+				{ id: IDLE, name: "Idle Account" },
+			])
+			yield* seedBehindAccount(ACCOUNT_ID, 40, 6 * 60 * MIN)
+			yield* seedBehindAccount(IDLE, 1, 0)
+			const database = yield* Database
+			yield* database.execute((db) =>
+				db.run(
+					PG.update(CloudflareAnalyticsState)
+						.set({
+							enabled: false,
+							settingsJson: '{"enabled":false}',
+							settingsFetchedAt: T0 - 25 * 60 * MIN,
+						})
+						.where(($) => [$.orgId.eq(ORG), $.accountId.eq(IDLE), $.dataset.eq("http_requests")]),
+				),
+			)
+			yield* database.execute((db) =>
+				db.run(
+					PG.insertInto(CloudflareZoneSettings).values({
+						orgId: ORG,
+						accountId: IDLE,
+						watchNewZones: false,
+						zoneOverrides: {},
+						createdAt: T0,
+						updatedAt: T0,
+					}),
+				),
+			)
+			yield* seedGrantCap(20)
+			const result = yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+			assert.strictEqual(result.callsMade, 20)
+			const paused = Option.getOrThrow(
+				Arr.findFirst(
+					yield* loadStateRows,
+					(row) => row.accountId === IDLE && row.dataset === "http_requests",
+				),
+			)
+			assert.isFalse(paused.enabled)
+			assert.strictEqual(paused.settingsFetchedAt, T0 - 25 * 60 * MIN)
+		}).pipe(Effect.provide(makeLayer(testDb, [])))
+	})
+
 	it.effect("a caught-up account polls once 15 minutes are pending, not every tick", () => {
 		const testDb = createTestDb(trackedDbs)
 		const captured: CapturedIngest[] = []
@@ -1473,6 +1527,354 @@ describe("CloudflareAnalyticsService", () => {
 		}).pipe(Effect.provide(makeLayer(testDb, captured)))
 	})
 
+	for (const unavailable of [
+		{ enabled: false, maxDuration: 3600 },
+		{ enabled: true, maxDuration: 0 },
+	]) {
+		it.effect(
+			`cached unavailable ${JSON.stringify(unavailable)} survives discovery and clears stale connection error`,
+			() => {
+				const testDb = createTestDb(trackedDbs)
+				const queries: string[] = []
+				const enabledDuringRequests: boolean[] = []
+				return Effect.gen(function* () {
+					yield* TestClock.setTime(T0)
+					yield* seedConnection()
+					yield* seedStateRow({
+						dataset: "firewall_events",
+						enabled: unavailable.enabled,
+						zoneId: ZONE_ID,
+						zoneName: ZONE_NAME,
+						settingsJson: JSON.stringify(unavailable),
+						settingsFetchedAt: T0 - 5 * MIN,
+						lastError: "Cloudflare OAuth request timed out",
+						lastErrorAt: T0 - MIN,
+					})
+					const summary = yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+					const row = Option.getOrThrow(
+						Arr.findFirst(yield* loadStateRows, (row) => row.dataset === "firewall_events"),
+					)
+					assert.isFalse(row.enabled)
+					assert.isAbove(enabledDuringRequests.length, 0)
+					assert.isFalse(Arr.some(enabledDuringRequests, Boolean))
+					assert.isNull(row.lastError)
+					assert.isNull(row.lastErrorAt)
+					assert.isNull(row.lastSuccessAt)
+					assert.strictEqual(summary.failures.length, 0)
+					assert.isFalse(
+						Arr.some(
+							queries,
+							(query) =>
+								Str.includes("MapleCfZoneAnalytics")(query) &&
+								Str.includes("firewallEventsAdaptiveGroups")(query),
+						),
+					)
+				}).pipe(
+					Effect.provide(
+						makeLayer(testDb, [], {
+							graphqlQueries: queries,
+							onGraphql: async () => {
+								const row = await queryFirstRow<{ enabled: boolean }>(
+									testDb,
+									"SELECT enabled FROM cloudflare_analytics_state WHERE dataset = 'firewall_events'",
+								)
+								enabledDuringRequests.push(row!.enabled)
+							},
+						}),
+					),
+				)
+			},
+		)
+	}
+
+	it.effect(
+		"unavailable settings refresh after 24h resumes polling without discovery re-enabling the row",
+		() => {
+			const testDb = createTestDb(trackedDbs)
+			const queries: string[] = []
+			const options: FetchOptions = {
+				zoneData: { viewer: { zones: [{ zoneTag: ZONE_ID, firewall: [] }] } },
+				graphqlQueries: queries,
+				settingsData: {
+					viewer: {
+						...settingsData.viewer,
+						zones: [
+							{
+								zoneTag: ZONE_ID,
+								settings: {
+									...settingsData.viewer.zones[0].settings,
+									firewallEventsAdaptiveGroups: {
+										enabled: true,
+										maxDuration: 3600,
+										notOlderThan: 7200,
+									},
+								},
+							},
+						],
+					},
+				},
+			}
+			return Effect.gen(function* () {
+				yield* TestClock.setTime(T0)
+				yield* seedConnection()
+				yield* seedStateRow({
+					dataset: "workers_invocations",
+					discoveredAt: T0,
+					settingsFetchedAt: T0,
+				})
+				yield* seedStateRow({
+					dataset: "firewall_events",
+					zoneId: ZONE_ID,
+					zoneName: ZONE_NAME,
+					enabled: false,
+					settingsJson: JSON.stringify({ enabled: false, maxDuration: 0 }),
+					settingsFetchedAt: T0 - 25 * 60 * MIN,
+				})
+				yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+				const row = Option.getOrThrow(
+					Arr.findFirst(yield* loadStateRows, (row) => row.dataset === "firewall_events"),
+				)
+				assert.isTrue(row.enabled)
+				assert.strictEqual(row.lastSuccessAt, T0)
+				assert.isNotNull(row.watermarkAt)
+				assert.isTrue(Arr.some(queries, Str.includes("MapleCfDatasetSettings")))
+				assert.isTrue(
+					Arr.some(
+						queries,
+						(query) =>
+							Str.includes("MapleCfZoneAnalytics")(query) &&
+							Str.includes("firewallEventsAdaptiveGroups")(query),
+					),
+				)
+			}).pipe(Effect.provide(makeLayer(testDb, [], options)))
+		},
+	)
+
+	for (const next of [null, { enabled: false, maxDuration: 0 }, { enabled: true, maxDuration: 3600 }]) {
+		it.effect(`unavailable settings refresh preserves a paused zone ${JSON.stringify(next)}`, () => {
+			const testDb = createTestDb(trackedDbs)
+			const queries: string[] = []
+			return Effect.gen(function* () {
+				yield* TestClock.setTime(T0)
+				yield* seedConnection()
+				yield* seedStateRow({
+					dataset: "workers_invocations",
+					discoveredAt: T0,
+					settingsFetchedAt: T0,
+				})
+				yield* seedStateRow({
+					dataset: "firewall_events",
+					zoneId: ZONE_ID,
+					zoneName: ZONE_NAME,
+					enabled: false,
+					settingsJson: JSON.stringify({ enabled: false, maxDuration: 0 }),
+					settingsFetchedAt: T0 - 25 * 60 * MIN,
+				})
+				const database = yield* Database
+				yield* database.execute((db) =>
+					db.run(
+						PG.insertInto(CloudflareZoneSettings).values({
+							orgId: ORG,
+							accountId: ACCOUNT_ID,
+							watchNewZones: false,
+							zoneOverrides: {},
+							createdAt: T0,
+							updatedAt: T0,
+						}),
+					),
+				)
+				yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+				const row = Option.getOrThrow(
+					Arr.findFirst(yield* loadStateRows, (row) => row.dataset === "firewall_events"),
+				)
+				assert.isFalse(row.enabled)
+				assert.isFalse(Arr.some(queries, Str.includes("MapleCfZoneAnalytics")))
+			}).pipe(
+				Effect.provide(
+					makeLayer(testDb, [], {
+						graphqlQueries: queries,
+						settingsData: {
+							viewer: {
+								...settingsData.viewer,
+								zones: [
+									{ zoneTag: ZONE_ID, settings: { firewallEventsAdaptiveGroups: next } },
+								],
+							},
+						},
+					}),
+				),
+			)
+		})
+	}
+
+	it.effect("unavailable settings refresh does not resume on an unknown upstream settings node", () => {
+		const testDb = createTestDb(trackedDbs)
+		const queries: string[] = []
+		return Effect.gen(function* () {
+			yield* TestClock.setTime(T0)
+			yield* seedConnection()
+			yield* seedStateRow({ dataset: "workers_invocations", discoveredAt: T0, settingsFetchedAt: T0 })
+			yield* seedStateRow({
+				dataset: "firewall_events",
+				zoneId: ZONE_ID,
+				zoneName: ZONE_NAME,
+				enabled: false,
+				settingsJson: JSON.stringify({ enabled: false, maxDuration: 0 }),
+				settingsFetchedAt: T0 - 25 * 60 * MIN,
+			})
+			yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+			const row = Option.getOrThrow(
+				Arr.findFirst(yield* loadStateRows, (row) => row.dataset === "firewall_events"),
+			)
+			assert.include(row.settingsJson!, '"enabled":false')
+			assert.isFalse(row.enabled)
+			assert.isFalse(Arr.some(queries, Str.includes("MapleCfZoneAnalytics")))
+			// The probe is stamped, so the denied row waits a full TTL instead of costing a settings call every tick.
+			assert.strictEqual(row.settingsFetchedAt, T0)
+			const probes = Arr.filter(queries, Str.includes("MapleCfDatasetSettings")).length
+			yield* TestClock.adjust(10 * MIN)
+			yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+			assert.strictEqual(Arr.filter(queries, Str.includes("MapleCfDatasetSettings")).length, probes)
+		}).pipe(
+			Effect.provide(
+				makeLayer(testDb, [], {
+					graphqlQueries: queries,
+					settingsData: {
+						viewer: {
+							...settingsData.viewer,
+							zones: [{ zoneTag: ZONE_ID, settings: { firewallEventsAdaptiveGroups: null } }],
+						},
+					},
+				}),
+			),
+		)
+	})
+
+	it.effect(
+		"a denied account dataset keeps its denial on an indeterminate answer and recovers on a definitive one",
+		() => {
+			const testDb = createTestDb(trackedDbs)
+			const denied = JSON.stringify({
+				enabled: false,
+				notOlderThan: 0,
+				maxDuration: 0,
+				availableFields: [],
+			})
+			const answer = (enabled: boolean | null) => ({
+				viewer: {
+					...settingsData.viewer,
+					accounts: [
+						{
+							settings: {
+								workersInvocationsAdaptive: {
+									enabled,
+									notOlderThan: 7200,
+									maxDuration: 3600,
+									availableFields: [],
+								},
+							},
+						},
+					],
+				},
+			})
+			// One layer for the whole test; each tick swaps the settings answer it returns.
+			const options = { settingsData: answer(null) }
+			const workers = Effect.map(loadStateRows, (rows) =>
+				Option.getOrThrow(Arr.findFirst(rows, (row) => row.dataset === "workers_invocations")),
+			)
+			return Effect.gen(function* () {
+				yield* TestClock.setTime(T0)
+				yield* seedConnection()
+				yield* seedStateRow({
+					dataset: "workers_invocations",
+					discoveredAt: T0,
+					enabled: false,
+					settingsJson: denied,
+					settingsFetchedAt: T0 - 25 * 60 * MIN,
+				})
+
+				yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+				const held = yield* workers
+				assert.isFalse(held.enabled)
+				assert.strictEqual(held.settingsJson, denied)
+				assert.strictEqual(held.settingsFetchedAt, T0)
+
+				// Still eligible for the next daily refresh, which now answers definitively.
+				options.settingsData = answer(true)
+				yield* TestClock.adjust(25 * 60 * MIN)
+				yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+				const back = yield* workers
+				assert.isTrue(back.enabled)
+				assert.include(back.settingsJson!, '"enabled":true')
+			}).pipe(Effect.provide(makeLayer(testDb, [], options)))
+		},
+	)
+
+	it.effect("resuming a watched zone respects cached unavailable capability", () => {
+		const testDb = createTestDb(trackedDbs)
+		return Effect.gen(function* () {
+			yield* TestClock.setTime(T0)
+			yield* seedConnection()
+			yield* seedStateRow({
+				dataset: "firewall_events",
+				zoneId: ZONE_ID,
+				zoneName: ZONE_NAME,
+				enabled: false,
+				settingsJson: JSON.stringify({ enabled: false, maxDuration: 0 }),
+				settingsFetchedAt: T0,
+			})
+			const database = yield* Database
+			yield* database.execute((db) =>
+				db.run(
+					PG.insertInto(CloudflareZoneSettings).values({
+						orgId: ORG,
+						accountId: ACCOUNT_ID,
+						watchNewZones: false,
+						zoneOverrides: {},
+						createdAt: T0,
+						updatedAt: T0,
+					}),
+				),
+			)
+			yield* CloudflareAnalyticsService.use((service) =>
+				service.setZoneSettings(ORG, Schema.decodeSync(UserId)("user_1"), {
+					accountId: ACCOUNT_ID,
+					watchNewZones: true,
+					zones: [{ zoneId: ZONE_ID, watched: true }],
+				}),
+			)
+			const row = Option.getOrThrow(
+				Arr.findFirst(yield* loadStateRows, (row) => row.dataset === "firewall_events"),
+			)
+			assert.isFalse(row.enabled)
+		}).pipe(Effect.provide(makeLayer(testDb, [])))
+	})
+
+	it.effect("disappeared unavailable zones invalidate settings and remain unpolled", () => {
+		const testDb = createTestDb(trackedDbs)
+		const queries: string[] = []
+		return Effect.gen(function* () {
+			yield* TestClock.setTime(T0)
+			yield* seedConnection()
+			yield* seedStateRow({
+				dataset: "firewall_events",
+				zoneId: ZONE_ID,
+				zoneName: ZONE_NAME,
+				enabled: false,
+				settingsJson: JSON.stringify({ enabled: false, maxDuration: 0 }),
+				settingsFetchedAt: T0,
+			})
+			yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+			const row = Option.getOrThrow(
+				Arr.findFirst(yield* loadStateRows, (row) => row.dataset === "firewall_events"),
+			)
+			assert.isFalse(row.enabled)
+			assert.isNull(row.settingsJson)
+			assert.isNull(row.settingsFetchedAt)
+			assert.isFalse(Arr.some(queries, Str.includes("MapleCfZoneAnalytics")))
+		}).pipe(Effect.provide(makeLayer(testDb, [], { zones: [], graphqlQueries: queries })))
+	})
+
 	it.effect("pollOrg disables state rows for vanished zones", () => {
 		const testDb = createTestDb(trackedDbs)
 		const captured: CapturedIngest[] = []
@@ -1493,6 +1895,31 @@ describe("CloudflareAnalyticsService", () => {
 			assert.isFalse(gone.enabled)
 			assert.include(gone.lastError ?? "", "no longer present")
 		}).pipe(Effect.provide(makeLayer(testDb, captured)))
+	})
+
+	it.effect("an already-vanished zone row is not rewritten on later discoveries", () => {
+		const testDb = createTestDb(trackedDbs)
+		return Effect.gen(function* () {
+			yield* TestClock.setTime(T0)
+			yield* seedConnection()
+			const stampedAt = T0 - 3 * 60 * MIN
+			yield* seedStateRow({
+				dataset: "http_requests",
+				zoneId: "gone-zone",
+				zoneName: "gone.example.com",
+				enabled: false,
+				settingsJson: null,
+				settingsFetchedAt: null,
+				lastError: "Zone no longer present on the Cloudflare account",
+				lastErrorAt: stampedAt,
+			})
+			yield* CloudflareAnalyticsService.use((service) => service.pollOrg(ORG))
+			const gone = Option.getOrThrow(
+				Arr.findFirst(yield* loadStateRows, (row) => row.zoneId === "gone-zone"),
+			)
+			assert.isFalse(gone.enabled)
+			assert.strictEqual(gone.lastErrorAt, stampedAt)
+		}).pipe(Effect.provide(makeLayer(testDb, [])))
 	})
 
 	it.effect("pollOrg does NOT disable unseen zones when the zone listing is truncated", () => {
@@ -1521,6 +1948,201 @@ describe("CloudflareAnalyticsService", () => {
 			assert.isTrue(beyond.enabled)
 			assert.notInclude(beyond.lastError ?? "", "no longer present")
 		}).pipe(Effect.provide(makeLayer(testDb, captured, { zonesTotal: 201 })))
+	})
+
+	describe("feature switches", () => {
+		const ADMIN = Schema.decodeSync(UserId)("user_admin")
+
+		it.effect("a switched-off feature is never queried while the others still are", () => {
+			const testDb = createTestDb(trackedDbs)
+			const captured: CapturedIngest[] = []
+			const otlpCalls: OtlpCall[] = []
+			const graphqlQueries: string[] = []
+			return Effect.gen(function* () {
+				yield* TestClock.setTime(T0)
+				yield* seedConnection()
+				const service = yield* CloudflareAnalyticsService
+				yield* service.setFeatures(
+					ORG,
+					ADMIN,
+					new CloudflareFeatureSettingsRequest({ workersEnabled: false }),
+				)
+				const summary = yield* service.pollOrg(ORG)
+				assert.isNull(summary.skipped)
+
+				assert.isFalse(Arr.some(graphqlQueries, Str.includes("workersInvocationsAdaptive(")))
+				assert.isTrue(Arr.some(graphqlQueries, Str.includes("httpRequestsAdaptiveGroups(")))
+				const metrics = flattenOtlp(otlpCalls)
+				assert.isFalse(Arr.some(metrics, (m) => Str.startsWith("cloudflare.worker.")(m.name)))
+				assert.isTrue(Arr.some(metrics, (m) => m.name === "cloudflare.http.requests"))
+
+				const status = yield* service.getIntegrationStatus(ORG)
+				assert.strictEqual(status.features?.workersEnabled, false)
+				assert.strictEqual(status.features?.httpTrafficEnabled, true)
+				assert.strictEqual(status.workers?.enabled, false)
+			}).pipe(Effect.provide(makeLayer(testDb, captured, { otlpCalls, graphqlQueries })))
+		})
+
+		it.effect("two switches saved at once both stick", () => {
+			const testDb = createTestDb(trackedDbs)
+			const captured: CapturedIngest[] = []
+			return Effect.gen(function* () {
+				yield* TestClock.setTime(T0)
+				yield* seedConnection()
+				const service = yield* CloudflareAnalyticsService
+				// The first save inserts the row; the concurrent pair then race on the update path.
+				yield* service.setFeatures(
+					ORG,
+					ADMIN,
+					new CloudflareFeatureSettingsRequest({ dnsEnabled: true }),
+				)
+				yield* Effect.all(
+					[
+						service.setFeatures(
+							ORG,
+							ADMIN,
+							new CloudflareFeatureSettingsRequest({ dnsEnabled: false }),
+						),
+						service.setFeatures(
+							ORG,
+							ADMIN,
+							new CloudflareFeatureSettingsRequest({ workersEnabled: false }),
+						),
+					],
+					{ concurrency: "unbounded" },
+				)
+				const status = yield* service.getIntegrationStatus(ORG)
+				assert.strictEqual(status.features?.dnsEnabled, false)
+				assert.strictEqual(status.features?.workersEnabled, false)
+				assert.strictEqual(status.features?.httpTrafficEnabled, true)
+			}).pipe(Effect.provide(makeLayer(testDb, captured)))
+		})
+
+		it.effect("turning a feature back on keeps the other switches and polls it again", () => {
+			const testDb = createTestDb(trackedDbs)
+			const captured: CapturedIngest[] = []
+			const graphqlQueries: string[] = []
+			return Effect.gen(function* () {
+				yield* TestClock.setTime(T0)
+				yield* seedConnection()
+				const service = yield* CloudflareAnalyticsService
+				yield* service.setFeatures(
+					ORG,
+					ADMIN,
+					new CloudflareFeatureSettingsRequest({ workersEnabled: false, dnsEnabled: false }),
+				)
+				const next = yield* service.setFeatures(
+					ORG,
+					ADMIN,
+					new CloudflareFeatureSettingsRequest({ workersEnabled: true }),
+				)
+				assert.isTrue(next.workersEnabled)
+				assert.isFalse(next.dnsEnabled)
+
+				yield* service.pollOrg(ORG)
+				assert.isTrue(Arr.some(graphqlQueries, Str.includes("workersInvocationsAdaptive(")))
+				assert.isFalse(Arr.some(graphqlQueries, Str.includes("dnsAnalyticsAdaptiveGroups(")))
+			}).pipe(Effect.provide(makeLayer(testDb, captured, { graphqlQueries })))
+		})
+
+		it.effect("a feature turned back on resumes from now instead of reading the hours it was off", () => {
+			const testDb = createTestDb(trackedDbs)
+			const captured: CapturedIngest[] = []
+			const graphqlQueries: string[] = []
+			const workersQueried = () => Arr.some(graphqlQueries, Str.includes("workersInvocationsAdaptive("))
+			return Effect.gen(function* () {
+				yield* TestClock.setTime(T0)
+				yield* seedConnection()
+				const service = yield* CloudflareAnalyticsService
+				yield* service.pollOrg(ORG)
+				yield* service.setFeatures(
+					ORG,
+					ADMIN,
+					new CloudflareFeatureSettingsRequest({ workersEnabled: false }),
+				)
+				yield* TestClock.adjust("12 hours")
+				yield* service.pollOrg(ORG)
+
+				yield* service.setFeatures(
+					ORG,
+					ADMIN,
+					new CloudflareFeatureSettingsRequest({ workersEnabled: true }),
+				)
+				graphqlQueries.length = 0
+				yield* service.pollOrg(ORG)
+				assert.isFalse(workersQueried())
+
+				// Its first window after the switch is the one that opened at it.
+				yield* TestClock.adjust("20 minutes")
+				yield* service.pollOrg(ORG)
+				assert.isTrue(workersQueried())
+			}).pipe(Effect.provide(makeLayer(testDb, captured, { graphqlQueries })))
+		})
+
+		it.effect(
+			"with Workers off, discovery lists zones but no Worker scripts or Hyperdrive configs",
+			() => {
+				const testDb = createTestDb(trackedDbs)
+				const captured: CapturedIngest[] = []
+				const requestUrls: string[] = []
+				return Effect.gen(function* () {
+					yield* TestClock.setTime(T0)
+					yield* seedConnection()
+					const service = yield* CloudflareAnalyticsService
+					yield* service.setFeatures(
+						ORG,
+						ADMIN,
+						new CloudflareFeatureSettingsRequest({ workersEnabled: false }),
+					)
+					yield* service.pollOrg(ORG)
+
+					assert.isTrue(Arr.some(requestUrls, Str.includes("/zones")))
+					assert.isFalse(Arr.some(requestUrls, Str.includes("/workers/scripts")))
+					assert.isFalse(Arr.some(requestUrls, Str.includes("/hyperdrive/configs")))
+				}).pipe(Effect.provide(makeLayer(testDb, captured, { requestUrls })))
+			},
+		)
+
+		it.effect("with every feature off the org is skipped without a call to Cloudflare", () => {
+			const testDb = createTestDb(trackedDbs)
+			const captured: CapturedIngest[] = []
+			const requestUrls: string[] = []
+			return Effect.gen(function* () {
+				yield* TestClock.setTime(T0)
+				yield* seedConnection()
+				const service = yield* CloudflareAnalyticsService
+				yield* service.setFeatures(
+					ORG,
+					ADMIN,
+					new CloudflareFeatureSettingsRequest({
+						httpTrafficEnabled: false,
+						firewallEnabled: false,
+						dnsEnabled: false,
+						workersEnabled: false,
+						queuesEnabled: false,
+						durableObjectsEnabled: false,
+					}),
+				)
+				const summary = yield* service.pollOrg(ORG)
+				assert.strictEqual(summary.skipped, "every feature off")
+				assert.strictEqual(requestUrls.length, 0)
+			}).pipe(Effect.provide(makeLayer(testDb, captured, { requestUrls })))
+		})
+
+		it.effect("refuses to store switches for an org with no Cloudflare connection", () => {
+			const testDb = createTestDb(trackedDbs)
+			return Effect.gen(function* () {
+				const service = yield* CloudflareAnalyticsService
+				const result = yield* Effect.flip(
+					service.setFeatures(
+						ORG,
+						ADMIN,
+						new CloudflareFeatureSettingsRequest({ dnsEnabled: false }),
+					),
+				)
+				assert.strictEqual(result._tag, "@maple/http/errors/IntegrationsNotConnectedError")
+			}).pipe(Effect.provide(makeLayer(testDb, [])))
+		})
 	})
 
 	describe("zone selection", () => {
@@ -2038,9 +2660,10 @@ describe("CloudflareAnalyticsService", () => {
 		}).pipe(Effect.provide(makeLayer(testDb, captured, fetchOptions)))
 	})
 
-	it.effect("pollOrg surfaces a zone authz failure as an observable failure, not just a DB write", () => {
+	it.effect("a zone authz failure is the connection's health, not an exception event", () => {
 		const testDb = createTestDb(trackedDbs)
 		const captured: CapturedIngest[] = []
+		const { tracer, named } = recordSpans()
 		return Effect.gen(function* () {
 			yield* TestClock.setTime(T0)
 			yield* seedConnection()
@@ -2052,12 +2675,17 @@ describe("CloudflareAnalyticsService", () => {
 				settingsFetchedAt: T0 - 5 * MIN,
 			})
 			const service = yield* CloudflareAnalyticsService
-			const summary = yield* service.pollOrg(ORG)
+			const summary = yield* service.pollOrg(ORG).pipe(Effect.withTracer(tracer))
+			// The token's missing permission repeats every tick until the tenant reconnects, so it
+			// lands on the summary and the row, never as a failed span.
+			const observed = named("CloudflareAnalyticsService.datasetPollFailed")
+			assert.isAbove(observed.length, 0)
+			assert.deepStrictEqual(Arr.filter(observed, spanFailed), [])
 			// Regression for the invisible outage: a Cloudflare "not authorized" on the zone dataset
 			// used to be written ONLY to cloudflare_analytics_state.lastError with zero telemetry, so a
 			// fully-broken integration was invisible to find_errors/logs for hours. It must now be a
-			// classified, first-class failure on the summary (which the seam turns into an exception
-			// event + ERROR log through Maple's own error pipeline).
+			// classified, first-class failure on the summary (which the seam logs as a warning and
+			// the source's health shows).
 			const authz = Option.getOrThrow(
 				Arr.findFirst(
 					summary.failures,
@@ -2074,6 +2702,37 @@ describe("CloudflareAnalyticsService", () => {
 			Effect.provide(
 				makeLayer(testDb, captured, {
 					graphqlErrors: [{ message: "not authorized to access these fields" }],
+				}),
+			),
+		)
+	})
+
+	it.effect("an unrecognised GraphQL error still fails its span", () => {
+		const testDb = createTestDb(trackedDbs)
+		const captured: CapturedIngest[] = []
+		const { tracer, named } = recordSpans()
+		return Effect.gen(function* () {
+			yield* TestClock.setTime(T0)
+			yield* seedConnection()
+			yield* seedStateRow({
+				dataset: "http_requests",
+				zoneId: ZONE_ID,
+				zoneName: ZONE_NAME,
+				watermarkAt: T0 - 30 * MIN,
+				settingsFetchedAt: T0 - 5 * MIN,
+			})
+			const service = yield* CloudflareAnalyticsService
+			const summary = yield* service.pollOrg(ORG).pipe(Effect.withTracer(tracer))
+			assert.include(
+				Arr.map(summary.failures, (failure) => failure.kind),
+				"other",
+			)
+			const observed = named("CloudflareAnalyticsService.datasetPollFailed")
+			assert.isAbove(Arr.filter(observed, spanFailed).length, 0)
+		}).pipe(
+			Effect.provide(
+				makeLayer(testDb, captured, {
+					graphqlErrors: [{ message: "cannot parse filter argument" }],
 				}),
 			),
 		)

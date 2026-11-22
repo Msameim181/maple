@@ -1,6 +1,5 @@
 import { HttpServerRequest } from "effect/http"
 import { HttpApiBuilder } from "effect/http-api"
-import { CurrentAuditActor } from "@maple/backend/services/auth/audit-actor"
 import { CurrentTenant } from "@maple/domain/http"
 import type { V2ChatConnector, V2ChatWorkspace } from "@maple/domain/http/v2"
 import {
@@ -9,7 +8,7 @@ import {
 	V2CallbackHostUnavailable,
 	V2InsufficientPermissions,
 } from "@maple/domain/http/v2"
-import { Array as Arr, Effect } from "effect"
+import { Array as Arr, Effect, Record as Rec } from "effect"
 import { recordHttpAudit } from "@maple/backend/services/audit/AuditLogService"
 import * as Policy from "@maple/domain/policy"
 import { Env } from "@maple/backend/platform/Env"
@@ -23,6 +22,7 @@ import {
 	ChatWorkspaceService,
 } from "@maple/backend/services/integrations/ChatWorkspaceService"
 import { isTrustedCallbackOrigin, resolveRequestOrigin } from "./integrations.http"
+import { requirePerson } from "./require-person"
 
 const toWorkspace = (workspace: ChatWorkspaceSummary): V2ChatWorkspace => ({
 	id: workspace.id,
@@ -31,6 +31,9 @@ const toWorkspace = (workspace: ChatWorkspaceSummary): V2ChatWorkspace => ({
 	external_workspace_id: workspace.externalWorkspaceId,
 	name: workspace.name,
 	settings: workspace.settings,
+	alerts_enabled: workspace.features.alertsEnabled,
+	direct_messages_enabled: workspace.features.directMessagesEnabled,
+	assistant_enabled: workspace.features.assistantEnabled,
 	created_at: isoTimestamp(workspace.createdAt),
 })
 
@@ -55,29 +58,6 @@ const toConnector = (status: ChatConnectorStatus): V2ChatConnector => ({
 				},
 			}),
 })
-
-/**
- * Linking a chat account is a PERSONAL action, so it takes a personal credential.
- *
- * `tenant.userId` is only "whoever is calling" under a signed-in session. Under an API key it is
- * the human who *created* the key (`ApiKeysService.resolveByKey` reads `created_by`), so without
- * this a key scoped to `integrations:write` could bind an attacker's chat account to that human —
- * and every later approval from it would run with their roles, through the Durable Object where
- * the key's scopes are never consulted. Revoking the key would not undo it either; only leaving
- * the org clears a link.
- *
- * Deny by default: `undefined` means the request skipped the standard auth middlewares, and a
- * credential this route cannot identify is not a person.
- */
-export const requirePerson = Effect.flatMap(CurrentAuditActor, (info) =>
-	info?.type === "user"
-		? Effect.void
-		: Effect.fail(
-				V2InsufficientPermissions.make(
-					"Linking a chat account is a personal action — sign in to Maple to link one.",
-				),
-			),
-)
 
 export const HttpV2ChatIntegrationsLive = HttpApiBuilder.group(MapleApiV2, "chatIntegration", (handlers) =>
 	Effect.gen(function* () {
@@ -112,6 +92,8 @@ export const HttpV2ChatIntegrationsLive = HttpApiBuilder.group(MapleApiV2, "chat
 						yield* Policy.check(tenant.roles, "integrations:manage", (denial) =>
 							V2InsufficientPermissions.make(denial.message),
 						)
+						// The install is bound to `tenant.userId`, who must be the one finishing it.
+						yield* requirePerson
 						const req = yield* HttpServerRequest.HttpServerRequest
 						const origin = resolveRequestOrigin(req)
 						// The callback URL is persisted as `oauth_auth_states.redirectUri` and
@@ -194,15 +176,34 @@ export const HttpV2ChatIntegrationsLive = HttpApiBuilder.group(MapleApiV2, "chat
 						yield* Policy.check(tenant.roles, "integrations:manage", (denial) =>
 							V2InsufficientPermissions.make(denial.message),
 						)
-						const workspace = yield* chat.updateSettings(
-							tenant.orgId,
-							params.id,
-							payload.settings,
-						)
-						yield* recordHttpAudit("chat_integration.settings_updated", {
-							resourceId: workspace.id,
-							metadata: { connector: workspace.connector },
+						const features = {
+							...(payload.alerts_enabled !== undefined && {
+								alertsEnabled: payload.alerts_enabled,
+							}),
+							...(payload.direct_messages_enabled !== undefined && {
+								directMessagesEnabled: payload.direct_messages_enabled,
+							}),
+							...(payload.assistant_enabled !== undefined && {
+								assistantEnabled: payload.assistant_enabled,
+							}),
+						}
+						// One statement for both: a refused setting leaves the switches unsaved too.
+						const workspace = yield* chat.updateWorkspace(tenant.orgId, params.id, {
+							...(payload.settings !== undefined && { settings: payload.settings }),
+							features,
 						})
+						if (payload.settings !== undefined) {
+							yield* recordHttpAudit("chat_integration.settings_updated", {
+								resourceId: workspace.id,
+								metadata: { connector: workspace.connector },
+							})
+						}
+						if (!Rec.isEmptyRecord<string, unknown>(features)) {
+							yield* recordHttpAudit("chat_integration.features_updated", {
+								resourceId: workspace.id,
+								metadata: { connector: workspace.connector, ...workspace.features },
+							})
+						}
 						return toWorkspace(workspace)
 					}),
 				)

@@ -109,6 +109,8 @@ describe("MapleApiV2 OpenAPI", () => {
 			"DELETE /v2/status_pages/{id}",
 			"DELETE /v2/status_pages/{id}/break_glass",
 			"DELETE /v2/status_pages/{id}/components/{component_id}",
+			"DELETE /v2/status_pages/{id}/custom_domain",
+			"DELETE /v2/status_pages/{id}/password",
 			"DELETE /v2/uptime_monitors/{id}",
 			"DELETE /v2/widget_credentials/{installation_id}",
 			"GET /v2/agent_feedback",
@@ -182,6 +184,19 @@ describe("MapleApiV2 OpenAPI", () => {
 			"GET /v2/logs/{id}",
 			"GET /v2/mcp_connections",
 			"GET /v2/metrics",
+			"GET /v2/metrics/prometheus/api/v1/alerts",
+			"GET /v2/metrics/prometheus/api/v1/format_query",
+			"GET /v2/metrics/prometheus/api/v1/label/{name}/values",
+			"GET /v2/metrics/prometheus/api/v1/labels",
+			"GET /v2/metrics/prometheus/api/v1/metadata",
+			"GET /v2/metrics/prometheus/api/v1/query",
+			"GET /v2/metrics/prometheus/api/v1/query_exemplars",
+			"GET /v2/metrics/prometheus/api/v1/query_range",
+			"GET /v2/metrics/prometheus/api/v1/rules",
+			"GET /v2/metrics/prometheus/api/v1/series",
+			"GET /v2/metrics/prometheus/api/v1/status/buildinfo",
+			"GET /v2/metrics/prometheus/api/v1/status/config",
+			"GET /v2/metrics/prometheus/api/v1/status/flags",
 			"GET /v2/mobile_devices",
 			"GET /v2/onboarding/checklist",
 			"GET /v2/organization",
@@ -211,6 +226,8 @@ describe("MapleApiV2 OpenAPI", () => {
 			"GET /v2/status_pages/{id}",
 			"GET /v2/status_pages/{id}/components",
 			"GET /v2/status_pages/{id}/config",
+			"GET /v2/status_pages/{id}/custom_domain",
+			"GET /v2/status_pages/{id}/view",
 			"GET /v2/support/slack_channel",
 			"GET /v2/traces/{trace_id}",
 			"GET /v2/traces/{trace_id}/spans/{span_id}",
@@ -236,6 +253,7 @@ describe("MapleApiV2 OpenAPI", () => {
 			"PATCH /v2/integrations/aws/connections/{id}",
 			"PATCH /v2/integrations/chat_workspaces/{id}",
 			"PATCH /v2/integrations/gcp/connectors/{id}",
+			"PATCH /v2/integrations/planetscale",
 			"PATCH /v2/scrape_targets/{id}",
 			"PATCH /v2/slos/{id}",
 			"PATCH /v2/sources/{id}",
@@ -263,6 +281,7 @@ describe("MapleApiV2 OpenAPI", () => {
 			"POST /v2/api_keys/{id}/roll",
 			"POST /v2/attribute_mappings",
 			"POST /v2/dashboards",
+			"POST /v2/dashboards/import/grafana",
 			"POST /v2/dashboards/import/perses",
 			"POST /v2/dashboards/templates/{template_id}/instantiate",
 			"POST /v2/dashboards/templates/{template_id}/preview",
@@ -287,6 +306,7 @@ describe("MapleApiV2 OpenAPI", () => {
 			"POST /v2/instrumentation/recommendations/{id}/reopen",
 			"POST /v2/integrations/aws/connections",
 			"POST /v2/integrations/aws/connections/{id}/check",
+			"POST /v2/integrations/aws/connections/{id}/events_key/rotate",
 			"POST /v2/integrations/chat_connectors/{connector}/identity/link",
 			"POST /v2/integrations/chat_connectors/{connector}/install",
 			"POST /v2/integrations/gcp/connectors",
@@ -304,6 +324,12 @@ describe("MapleApiV2 OpenAPI", () => {
 			"POST /v2/logs/search",
 			"POST /v2/logs/timeseries",
 			"POST /v2/metrics/breakdown",
+			"POST /v2/metrics/prometheus/api/v1/format_query",
+			"POST /v2/metrics/prometheus/api/v1/labels",
+			"POST /v2/metrics/prometheus/api/v1/query",
+			"POST /v2/metrics/prometheus/api/v1/query_exemplars",
+			"POST /v2/metrics/prometheus/api/v1/query_range",
+			"POST /v2/metrics/prometheus/api/v1/series",
 			"POST /v2/metrics/timeseries",
 			"POST /v2/onboarding/checklist/claim",
 			"POST /v2/scrape_targets",
@@ -328,6 +354,7 @@ describe("MapleApiV2 OpenAPI", () => {
 			"POST /v2/status_pages/preview",
 			"POST /v2/status_pages/{id}/components",
 			"POST /v2/status_pages/{id}/components/reorder",
+			"POST /v2/status_pages/{id}/custom_domain/check",
 			"POST /v2/status_pages/{id}/publish",
 			"POST /v2/status_pages/{id}/rotate_break_glass",
 			"POST /v2/support/slack_channel/invite",
@@ -344,6 +371,8 @@ describe("MapleApiV2 OpenAPI", () => {
 			"PUT /v2/mobile_devices/{token}",
 			"PUT /v2/mobile_devices/{token}/live_activities/{incident_id}",
 			"PUT /v2/status_pages/{id}/config",
+			"PUT /v2/status_pages/{id}/custom_domain",
+			"PUT /v2/status_pages/{id}/password",
 			"PUT /v2/widget_credentials/{installation_id}",
 		])
 	})
@@ -559,6 +588,13 @@ describe("MapleApiV2 OpenAPI", () => {
 		).not.toThrow()
 		expect(mutation.properties.txid.$ref).toBe("#/components/schemas/_maple_PostgresTransactionId")
 		expect(operation("post", "/v2/alerts/destinations").responses["200"]).toBeDefined()
+	})
+
+	it("publishes a chat workspace's switches as always sent, and optional on update", () => {
+		const switches = ["alerts_enabled", "direct_messages_enabled", "assistant_enabled"]
+		expect(schemas["ChatWorkspace"].required).toEqual(expect.arrayContaining(switches))
+		const update: ReadonlyArray<string> = schemas["ChatWorkspaceUpdateParams"].required ?? []
+		expect(Arr.intersection(update, switches)).toEqual([])
 	})
 
 	it("gives every error response an exhaustive literal-tag union", () => {
@@ -856,6 +892,7 @@ describe("MapleApiV2 OpenAPI", () => {
 		for (const [method, path] of [
 			["delete", "/v2/dashboards/{id}"],
 			["post", "/v2/dashboards"],
+			["post", "/v2/dashboards/import/grafana"],
 			["post", "/v2/dashboards/import/perses"],
 			["post", "/v2/dashboards/templates/{template_id}/instantiate"],
 			["get", "/v2/dashboards/templates"],

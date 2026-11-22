@@ -9,6 +9,7 @@ import { describe, expect, test, vi } from "vitest"
 vi.hoisted(() => Object.assign(globalThis, { window: new EventTarget() }))
 import type { Message } from "./message"
 import { ClerkPhase, type Model, Session } from "./model"
+import * as PageHold from "./page/page-hold"
 import { initCustomer } from "./page/onboarding/plan-gate"
 import * as Preload from "./page/preload"
 import { pages } from "./page/registry"
@@ -26,6 +27,7 @@ const NOW = Date.parse("2026-10-01T12:00:00Z")
 /** One URL per page. A page added to the registry without one fails the coverage test below. */
 const SAMPLE_PATHS = [
 	"/settings/ingestion/rules/new",
+	"/settings/billing/ai-credits",
 	"/services",
 	"/",
 	"/metrics",
@@ -50,8 +52,12 @@ const SAMPLE_PATHS = [
 	"/alerts/escalation-chains/esc_gQtGH2s65G6a7sJmuayXL6",
 	"/alerts/uptime/upm_abc",
 	"/status-pages",
+	"/cost",
+	"/cost/budgets",
+	"/cost/budgets/new",
 	"/status-pages/new",
 	"/status-pages/stp_abc",
+	"/status-pages/stp_abc/view",
 	"/service-map",
 	"/infra/hosts",
 	"/infra/hosts/web-1",
@@ -67,6 +73,8 @@ const SAMPLE_PATHS = [
 	"/infra",
 	"/infra/railway",
 	"/infra/railway/svc_1?environmentId=%22env_1%22",
+	"/infra/vercel",
+	"/infra/vercel/prj_1",
 	"/infra/supabase",
 	"/infra/supabase/abcdefghijklmnop",
 	"/infra/planetscale",
@@ -89,6 +97,11 @@ const SAMPLE_PATHS = [
 	"/security/exposure",
 	"/security/runtimes",
 	"/security/dependencies",
+	"/security/audit-log",
+	"/security/cloud",
+	"/security/devices",
+	"/security/detections",
+	"/security/detections/new",
 	"/security/code/runs/run_1",
 	"/security/code/findings/00000000-0000-4000-8000-000000000005/fp_1",
 	"/agent-sessions",
@@ -101,8 +114,6 @@ const SAMPLE_PATHS = [
 	"/integrations",
 	"/recommendations/rec_1",
 	"/anomalies/00000000-0000-4000-8000-000000000004",
-	"/releases",
-	"/releases/abc123",
 	"/investigations",
 	"/investigations/inv_1",
 	"/settings",
@@ -118,6 +129,7 @@ const SAMPLE_PATHS = [
 	"/replays/session_1",
 	"/share/token_1",
 	"/analytics",
+	"/product-analytics",
 ]
 
 const entered = (path: string): Model =>
@@ -134,6 +146,7 @@ const entered = (path: string): Model =>
 		page: null,
 		pageInstances: 0,
 		parkedPages: [],
+		pageHold: PageHold.Model.None(),
 		onboarding: null,
 		clerkSnapshot: null,
 		customer: initCustomer(),

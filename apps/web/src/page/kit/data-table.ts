@@ -2,17 +2,17 @@ import { refreshingClass } from "@maple/ui/lib/refreshing"
 import { cn } from "@maple/ui/lib/utils"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { emptyMessage } from "@maple/views/ui/empty"
-import { divTableHead, sortButton } from "@maple/views/ui/table"
+import { ariaSort, divTableHead, sortButton } from "@maple/views/ui/table"
 import type { SortDir } from "./table-sort"
 import { hstack } from "@maple/views/ui/stack"
 import { typographyClass } from "@maple/views/ui/typography"
+import { infoHint } from "@maple/views/ui/info-hint"
 
 // A sortable data table: its column heads, numeric cells, row links, and empty and skeleton rows.
 
-/** A numeric cell's figure: xs mono tabular, right-aligned; the call site adds width and tone. */
+/** A numeric cell's figure: xs tabular, right-aligned; the call site adds width and tone. */
 export const NUMERIC_CELL = typographyClass({
 	size: "xs",
-	mono: true,
 	numeric: true,
 	className: "text-right",
 })
@@ -37,6 +37,11 @@ export type ColumnHeadOptions<M> = Readonly<{
 	sort?: Readonly<{ isActive: boolean; dir: SortDir; onSort?: M }>
 	align?: "left" | "right"
 	hidden?: string
+	/** What the column means: a question mark beside the label that explains it on hover (`infoHint`). */
+	tooltip?: string
+	className?: string
+	/** A head of a `dataTable` marked `isTable`: a column header that announces its sort. */
+	isTable?: boolean
 }>
 
 /** A column head in the kit's table-head type; a sortable one is the kit `sortButton`. */
@@ -50,11 +55,21 @@ export const columnHead = <M>(h: HtmlBuilder<M>, options: ColumnHeadOptions<M>):
 				options.align === "right" && "justify-end",
 				options.width,
 				options.hidden,
+				options.className,
 			),
+			attributes:
+				options.isTable === true
+					? [h.Role("columnheader"), ...ariaSort(h, sort?.isActive === true, sort?.dir ?? "desc")]
+					: [],
 		},
 		[
 			sort?.onSort === undefined
-				? h.span([], [options.label])
+				? options.tooltip === undefined
+					? h.span([], [options.label])
+					: hstack(h, { gap: "1", as: "span" }, [
+							h.span([], [options.label]),
+							infoHint(h, options.tooltip),
+						])
 				: sortButton(
 						h,
 						{
@@ -76,6 +91,11 @@ export type DataTableOptions = Readonly<{
 	maxHeight?: string
 	stickySurfaceClass?: string
 	className?: string
+	/**
+	 * Exposes the frame as a table to assistive tech. The caller then marks its heads `isTable`,
+	 * its rows `role="row"` and their cells `role="cell"`.
+	 */
+	isTable?: boolean
 }>
 
 /** The head row, then rows (or `dataTableEmpty`). */
@@ -95,6 +115,7 @@ export const dataTable = <M>(
 		[
 			h.Class(cn("border-y border-border-subtle", refreshingClass(isWaiting), options.className)),
 			h.AriaLabel(options.ariaLabel),
+			...(options.isTable === true ? [h.Role("table")] : []),
 			...(isWaiting ? [h.AriaBusy(true)] : []),
 		],
 		[
@@ -105,7 +126,18 @@ export const dataTable = <M>(
 						? []
 						: [h.Style({ "max-height": options.maxHeight })]),
 				],
-				[h.div([h.Class("min-w-fit")], [h.div([h.Class(headClass)], head), ...rows])],
+				[
+					h.div(
+						[h.Class("min-w-fit")],
+						[
+							h.div(
+								[h.Class(headClass), ...(options.isTable === true ? [h.Role("row")] : [])],
+								head,
+							),
+							...rows,
+						],
+					),
+				],
 			),
 		],
 	)

@@ -12,11 +12,12 @@ import { icon } from "@maple/views/ui/icon"
 import { meter } from "@maple/views/ui/meter"
 import { truncatedText } from "@maple/views/ui/truncated-text"
 import {
+	connectionTabItem,
+	CHANGE_LATER_NOTE,
 	type CheckRow,
 	flowColumns,
 	flowRail,
 	liveChecklist,
-	savedBanner,
 	statusRow,
 	stepCard,
 } from "../../../kit/connect-flow"
@@ -33,6 +34,7 @@ import { Message } from "../../../integrations/message"
 import type { Model } from "../../../integrations/model"
 import { typography } from "@maple/views/ui/typography"
 import { hstack, vstack } from "@maple/views/ui/stack"
+import { cloudflareFeatureChoice } from "./view-cloudflare-features"
 import { Array as Arr } from "effect"
 
 // Cloudflare in the connect flow: approve Maple on Cloudflare's consent screen, then watch the
@@ -77,9 +79,9 @@ const showsUpRail = (h: H): Html =>
 				title: "Service map",
 				detail: "Workers appear as nodes once they serve traffic",
 			},
-			{ icon: "GearIcon", title: "Source page", detail: "Reconnect, Disconnect" },
+			connectionTabItem("Reconnect, Disconnect"),
 		],
-		trust: "Nothing to apply in Cloudflare. Maple reads through the OAuth grant; no Logpush jobs, Workers or rules are created.",
+		trust: "Maple reads through the OAuth grant; no Logpush jobs, Workers or rules are created.",
 		timeNote: `First data within ${FIRST_DATA_MINUTES} minutes`,
 		docs: DOCS_HREF === undefined ? null : { label: "Docs", href: DOCS_HREF },
 	})
@@ -340,12 +342,8 @@ const liveStep = (h: H, model: Model): Html => {
 			...(status !== null && status.connected && !status.analyticsCapable
 				? [updateAccess(h, model)]
 				: []),
-			savedBanner(
-				h,
-				"Saved as a source. Safe to leave; collection keeps running.",
-				"Nothing to apply in Cloudflare",
-			),
 			liveChecklist(h, {
+				saved: "Saved as a source. Safe to leave; collection keeps running.",
 				title: isLive ? "Cloudflare is live" : "Going live",
 				rows:
 					status === null || !status.connected
@@ -362,5 +360,26 @@ const liveStep = (h: H, model: Model): Html => {
 	)
 }
 
+/** Choose data: the feature switches, saved as they flip. */
+const chooseStep = (h: H, model: Model): Html => {
+	const status = cloudflareStatusOf(model)
+	const error = model.cloudflareCard.features.error
+	return flowColumns(
+		h,
+		[
+			stepCard(h, { icon: "ChartBarIcon", title: "Choose what to collect", note: CHANGE_LATER_NOTE }, [
+				typography(h, { size: "sm", tone: "muted", as: "p" }, [
+					"Each feature is its own stream. Turning one off stops it and keeps what was already collected.",
+				]),
+				...(status === null || !status.connected
+					? [typography(h, { size: "sm", tone: "muted", as: "p" }, ["Authorize Cloudflare first."])]
+					: [cloudflareFeatureChoice(h, model, status)]),
+			]),
+			...(error === null ? [] : [statusRow(h, { tone: "error", text: `Couldn't save: ${error}` })]),
+		],
+		readsRail(h),
+	)
+}
+
 export const cloudflareFlowView = (h: H, model: Model, stage: FlowStage): Html =>
-	stage === "live" ? liveStep(h, model) : connectStep(h, model)
+	stage === "live" ? liveStep(h, model) : stage === "choose" ? chooseStep(h, model) : connectStep(h, model)

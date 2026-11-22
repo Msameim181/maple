@@ -21,6 +21,7 @@ import {
 	FetchIncidentActivity,
 	FetchIncidentEscalation,
 	SetIncidentAcknowledged,
+	TrackAcknowledged,
 } from "./command"
 import {
 	encodePublicId,
@@ -35,6 +36,7 @@ import { MountChart } from "@maple/views/charts/chart-mounts"
 import { ResolveThemeColors, ThemeMessage } from "@maple/views/charts/theme-colors"
 import { toLoadFailure } from "@maple/views/data/load-failure"
 import { PageOutMessage, type PageContext } from "../../contract"
+import { AppRoute, hrefOf } from "../../../route"
 import { sloHref, slosTabHref } from "../shared/slo-commands"
 import { checkoutSlo } from "../shared/slo-test-fixtures"
 import { monitorHref, uptimeTabHref } from "../../kit/uptime/commands"
@@ -59,6 +61,9 @@ const themeResolved = () =>
 const route = (incidentId = INCIDENT_ID) => ({ _tag: "AlertIncident" as const, incidentId, search: {} })
 
 const step = (model: Model, message: Message) => pageUpdate(model, message)
+
+/** The lowest role that may acknowledge an incident and start an investigation. */
+const MEMBER = Policy.grantsOf(["org:member"])
 
 describe("alert incident", () => {
 	test("entry reads the clock and loads the chart runtime; the incident's reads follow its row", () => {
@@ -285,6 +290,105 @@ describe("alert incident", () => {
 		)
 	})
 
+	test("an audit detection incident asks for no rule preview, offers no rule edit, and links the audit log for an admin", () => {
+		const auditIncident = incidentRow({
+			rule_name: "Members added",
+			signal_type: "audit",
+			comparator: "gte",
+			threshold: 3,
+			last_observed_value: 4,
+			group_key: "__total__",
+		})
+		const loaded = Arr.reduce(
+			[
+				Message.ReadClock({ nowMs: NOW }),
+				Message.UpdatedIncidents({ orgId: ORG, rows: [auditIncident] }),
+			],
+			init(route(), context).model,
+			(model, message) => step(model, message).model,
+		)
+		const withRule = step(
+			loaded,
+			Message.UpdatedRules({
+				orgId: ORG,
+				rows: [ruleRow(2, { signal_type: "audit", name: "Members added" })],
+			}),
+		)
+		expect(names(withRule.commands)).not.toContain("FetchAlertIncidentPreview")
+		expect(names(withRule.commands)).not.toContain("FetchAlertIncidentChecks")
+		scene(
+			{ update: pageUpdate, view },
+			given(withRule.model),
+			themeResolved(),
+			expectView(role("heading", { name: "Audit log 4" })).toExist(),
+			expectView(text(/__total__/u)).not.toExist(),
+			expectView(role("link", { name: "Edit rule" })).not.toExist(),
+			// Until the session answers there is no link, and no word yet on who may open the log.
+			expectView(role("link", { name: "Open audit log" })).not.toExist(),
+			expectView(text(/only org admins can open it/u)).not.toExist(),
+		)
+		const seenBy = (roles: ReadonlyArray<string>) =>
+			step(withRule.model, Message.CompletedFetchSession({ grants: Policy.grantsOf(roles) })).model
+		scene(
+			{ update: pageUpdate, view },
+			given(seenBy(["org:member"])),
+			themeResolved(),
+			expectView(text(/only org admins can open it/u)).toExist(),
+			expectView(role("link", { name: "Open audit log" })).not.toExist(),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(seenBy(["org:admin"])),
+			themeResolved(),
+			expectView(role("link", { name: "Open audit log" })).toHaveAttr(
+				"href",
+				hrefOf(AppRoute.SecurityAuditLog({ search: {} })),
+			),
+		)
+	})
+
+	test("a cost budget incident asks for no rule preview, offers no rule edit, and links the budgets", () => {
+		const budgetIncident = incidentRow({
+			rule_name: "AWS production",
+			signal_type: "cost_budget",
+			comparator: "gte",
+			threshold: 100,
+			last_observed_value: 120,
+			group_key: "__total__",
+		})
+		const loaded = Arr.reduce(
+			[
+				Message.ReadClock({ nowMs: NOW }),
+				Message.UpdatedIncidents({ orgId: ORG, rows: [budgetIncident] }),
+			],
+			init(route(), context).model,
+			(model, message) => step(model, message).model,
+		)
+		const withRule = step(
+			loaded,
+			Message.UpdatedRules({
+				orgId: ORG,
+				rows: [ruleRow(2, { signal_type: "cost_budget", name: "AWS production" })],
+			}),
+		)
+		expect(names(withRule.commands)).not.toContain("FetchAlertIncidentPreview")
+		expect(names(withRule.commands)).not.toContain("FetchAlertIncidentChecks")
+		scene(
+			{ update: pageUpdate, view },
+			given(withRule.model),
+			themeResolved(),
+			// The percent of the budget, not a bare number.
+			expectView(role("heading", { name: "Cost budget 120%" })).toExist(),
+			expectView(text(/__total__/u)).not.toExist(),
+			expectView(role("link", { name: "Edit rule" })).not.toExist(),
+			expectView(text(/This incident follows a cost budget/u)).toExist(),
+			expectView(role("link", { name: "Open budgets" })).toHaveAttr(
+				"href",
+				hrefOf(AppRoute.CostBudgets()),
+			),
+		)
+	})
+
 	test("an uptime incident links its monitor once known and keeps its rule's history, without a rule edit", () => {
 		const uptimeIncident = incidentRow({
 			rule_id: MONITOR_RULE,
@@ -433,6 +537,7 @@ describe("alert incident", () => {
 				Message.ReadClock({ nowMs: NOW }),
 				Message.UpdatedIncidents({ orgId: ORG, rows: [incidentRow()] }),
 				Message.UpdatedRules({ orgId: ORG, rows: [ruleRow(2)] }),
+				Message.CompletedFetchSession({ grants: MEMBER }),
 			],
 			init(route(), context).model,
 			(model, message) => step(model, message).model,
@@ -533,6 +638,7 @@ describe("alert incident", () => {
 			[
 				Message.ReadClock({ nowMs: NOW }),
 				Message.UpdatedIncidents({ orgId: ORG, rows: [incidentRow()] }),
+				Message.CompletedFetchSession({ grants: MEMBER }),
 			],
 			init(route(), context).model,
 			(model, message) => step(model, message).model,
@@ -551,6 +657,7 @@ describe("alert incident", () => {
 					result: Result.succeed(ackedIncident(ackedAt)),
 				}),
 			),
+			Command.resolve(TrackAcknowledged, Message.CompletedTrackAcknowledged()),
 			// The patched row's ack moved the history's key, so the history is read again and drawn.
 			Command.resolve(
 				FetchIncidentActivity,
@@ -623,6 +730,9 @@ describe("alert incident", () => {
 			title: "Couldn't acknowledge the incident",
 		})
 		expect(failed.model.isUpdatingAcknowledgement).toBe(false)
+		// Only an acknowledgement that landed is the product event.
+		expect(names(done.commands)).toContain("TrackIncidentAcknowledged")
+		expect(names(failed.commands)).not.toContain("TrackIncidentAcknowledged")
 	})
 
 	test("a resolved incident offers no acknowledge button", () => {
@@ -638,6 +748,7 @@ describe("alert incident", () => {
 						}),
 					],
 				}),
+				Message.CompletedFetchSession({ grants: MEMBER }),
 			],
 			init(route(), context).model,
 			(model, message) => step(model, message).model,
@@ -721,7 +832,7 @@ describe("alert incident, silences", () => {
 		)
 	})
 
-	test("offers Silence to managers once the rule is known, and never to members", () => {
+	test("offers Silence to managers once the rule is known, and locks it for members", () => {
 		scene(
 			{ update: pageUpdate, view },
 			given(loaded(["org:engineer"])),
@@ -738,7 +849,8 @@ describe("alert incident, silences", () => {
 			{ update: pageUpdate, view },
 			given(loaded(["org:member"])),
 			themeResolved(),
-			expectView(role("button", { name: "Silence" })).not.toExist(),
+			expectView(role("button", { name: "Silence" })).toBeDisabled(),
+			expectView(role("group", { name: "Only org admins and engineers can manage alerts." })).toExist(),
 		)
 		// Before rules load a click does nothing, so the group can't be silenced as the whole rule.
 		expect(step(loaded(["org:engineer"], false), Message.ClickedSilence()).commands ?? []).toEqual([])

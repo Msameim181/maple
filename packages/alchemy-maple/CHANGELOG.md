@@ -1,5 +1,33 @@
 # @maple-dev/alchemy
 
+## 0.7.0
+
+### Minor Changes
+
+- 264f67a: `Maple.StatusPage` declares a status page: its settings, theme, components, visibility, password and custom domain, applied through the page's config document. Components keep their IDs by name, an unset `manual_status` leaves a responder's override alone, and the `customDomain` output lists the DNS records to create.
+
+    `Maple.UptimeMonitor` declares an HTTP, TCP, DNS, multi-step or heartbeat monitor, so a status page component's `monitor_id` can come from the same stack.
+
+    `MapleApiContract` gains `put`; a custom `MapleApi` implementation needs to add it.
+
+### Patch Changes
+
+- Updated dependencies [817980c]
+- Updated dependencies [e604502]
+- Updated dependencies [b7842dd]
+- Updated dependencies [dcb4277]
+    - @maple-dev/effect-sdk@0.15.0
+
+## 0.6.1
+
+### Patch Changes
+
+- Updated dependencies [c022d7f]
+- Updated dependencies [613df48]
+- Updated dependencies [58c2b10]
+- Updated dependencies [04fd697]
+    - @maple-dev/effect-sdk@0.14.1
+
 ## 0.6.0
 
 ### Minor Changes

@@ -10,6 +10,7 @@ import { type MapleRegion, parseMapleRegion } from "@maple/domain/organization-r
 import { type SecretKeyring, secretKeyringFrom } from "./SecretBox"
 import { DEFAULT_AUTUMN_API_URL } from "@maple/backend/services/billing/autumn-api"
 import { ingestKeyLookupHmacKeyFrom } from "./credential-tokens"
+import { rootPasswordProblem } from "@maple/auth"
 
 /** Fatal misconfiguration discovered at startup: fails the layer build, so the worker refuses to boot. */
 class EnvValidationError extends Schema.TaggedError<EnvValidationError>()(
@@ -30,8 +31,12 @@ export interface EnvConfig {
 	readonly CLICKHOUSE_USER: string
 	readonly CLICKHOUSE_PASSWORD: Option.Option<Redacted.Redacted>
 	readonly CLICKHOUSE_DATABASE: string
+	/** A Cloudflare Access service token, for an env-level ClickHouse behind an Access application. */
+	readonly CLICKHOUSE_ACCESS_CLIENT_ID: Option.Option<string>
+	readonly CLICKHOUSE_ACCESS_CLIENT_SECRET: Option.Option<Redacted.Redacted>
 	readonly MAPLE_AUTH_MODE: string
 	readonly MAPLE_ROOT_PASSWORD: Option.Option<Redacted.Redacted>
+	readonly MAPLE_SESSION_SIGNING_SECRET: Option.Option<Redacted.Redacted>
 	readonly MAPLE_DEFAULT_ORG_ID: string
 	readonly MAPLE_INGEST_KEY_ENCRYPTION_KEY: Redacted.Redacted
 	/** Comma-separated keys accepted for opening stored secrets only (docs/secret-encryption.md). */
@@ -54,6 +59,15 @@ export interface EnvConfig {
 	 * `Host`/`X-Forwarded-*` headers, which a client controls.
 	 */
 	readonly MAPLE_API_BASE_URL: string
+	/**
+	 * Status page custom domains (Cloudflare for SaaS, docs/status-page-custom-domains.md): the
+	 * zone holding the custom hostnames, a token (`StatusDomainsApiToken`) that may edit its custom hostnames and Worker
+	 * routes, the hostname customers CNAME to, and the status Worker's script name for the
+	 * per-hostname route. Any of them unset: custom domains are unavailable on this deployment.
+	 */
+	readonly MAPLE_STATUS_DOMAINS_ZONE_ID: Option.Option<string>
+	readonly MAPLE_STATUS_DOMAINS_CNAME_TARGET: Option.Option<string>
+	readonly MAPLE_STATUS_WORKER_NAME: Option.Option<string>
 	/** Deployment environment (`production`, `pr-<n>`, `development`) — set by alchemy from the stage. */
 	readonly MAPLE_ENVIRONMENT: string
 	/** The regional instance this worker belongs to, derived by the stack from the stage (`prd-eu` → `eu`). */
@@ -63,36 +77,23 @@ export interface EnvConfig {
 	readonly CLERK_SECRET_KEY: Option.Option<Redacted.Redacted>
 	readonly CLERK_PUBLISHABLE_KEY: Option.Option<string>
 	readonly CLERK_JWT_KEY: Option.Option<Redacted.Redacted>
-	/** Svix signing secret (`whsec_…`) for `POST /webhooks/clerk`; the route answers 503 while unset. */
-	readonly CLERK_WEBHOOK_SECRET: Option.Option<Redacted.Redacted>
-	/** Shared access key for PR-preview sign-in; bound on `pr-<n>` stages only (`PreviewSignInService`). */
-	readonly PREVIEW_SIGNIN_KEY: Option.Option<Redacted.Redacted>
 	readonly MAPLE_ORG_ID_OVERRIDE: Option.Option<string>
 	/** Dev-only opt-in: the org pin admits a non-member with their session role. */
 	readonly MAPLE_ORG_ID_OVERRIDE_ADMITS_NONMEMBERS: boolean
 	readonly AUTUMN_SECRET_KEY: Option.Option<Redacted.Redacted>
 	readonly AUTUMN_API_URL: string
-	/** Svix signing secret (`whsec_…`) for `POST /webhooks/autumn`; the route answers 503 while unset. */
-	readonly AUTUMN_WEBHOOK_SECRET: Option.Option<Redacted.Redacted>
 	/**
 	 * Stripe secret (or restricted, Customers read/write) key for the billing
 	 * details the Autumn API has no surface for — company name, address and tax
 	 * IDs on the Stripe customer Autumn links. Unset → those routes answer
 	 * `BillingNotConfiguredError`; nothing else depends on it.
 	 */
-	readonly STRIPE_SECRET_KEY: Option.Option<Redacted.Redacted>
 	readonly STRIPE_API_URL: string
-	/**
-	 * Bot token in Maple's OWN Slack workspace, for creating customers' shared support channels
-	 * (scopes `channels:manage`, `channels:read`, `conversations.connect:write`, `chat:write`). Unset → the dashboard
-	 * reports the feature unavailable. Unrelated to the chat connector's per-workspace tokens.
-	 */
-	readonly MAPLE_SUPPORT_SLACK_BOT_TOKEN: Option.Option<Redacted.Redacted>
 	/** Comma-separated Slack user ids of the Maple team, added to every new support channel. */
 	readonly MAPLE_SUPPORT_SLACK_TEAM_USER_IDS: Option.Option<string>
 	/**
 	 * Channel in Maple's own workspace that plan-cancellation reports are posted to, with the
-	 * support bot token above (the bot must be in the channel). Unset → no report is produced.
+	 * support bot token, `SupportSlackBotToken` (the bot must be in the channel). Unset → no report is produced.
 	 */
 	readonly MAPLE_CANCELLATION_SLACK_CHANNEL_ID: Option.Option<string>
 	/**
@@ -112,18 +113,13 @@ export interface EnvConfig {
 	readonly MAPLE_INGEST_KEY: Option.Option<Redacted.Redacted>
 	/** Ingest gateway base URL for the SDK's OTLP export; product events reuse it, falling back to MAPLE_INGEST_PUBLIC_URL. */
 	readonly MAPLE_ENDPOINT: Option.Option<string>
-	/** Overrides MAPLE_INGEST_KEY for product events when the dogfood org differs from the tracing org. */
-	readonly MAPLE_PRODUCT_EVENTS_INGEST_KEY: Option.Option<Redacted.Redacted>
-	readonly SD_INTERNAL_TOKEN: Option.Option<Redacted.Redacted>
 	readonly INTERNAL_SERVICE_TOKEN: Option.Option<Redacted.Redacted>
 	/** The org Maple's own team and telemetry live in; the only one that reads agent feedback across orgs. */
 	readonly MAPLE_INTERNAL_ORG_ID: Option.Option<string>
 	readonly EMAIL_FROM: string
 	readonly LINEAR_OAUTH_CLIENT_ID: Option.Option<string>
-	readonly LINEAR_OAUTH_CLIENT_SECRET: Option.Option<Redacted.Redacted>
 	/** Google OAuth client for the Search Console integration; unset means it is unavailable. */
 	readonly GOOGLE_SEARCH_CONSOLE_CLIENT_ID: Option.Option<string>
-	readonly GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET: Option.Option<Redacted.Redacted>
 	/**
 	 * Resolved config for every chat connector the registry ships, keyed by the
 	 * name the connector declared. The catalog stays platform-neutral on purpose:
@@ -138,40 +134,22 @@ export interface EnvConfig {
 	 */
 	readonly CHAT_CONNECTOR_OUTBOUND_CONFIG: ConnectorConfig
 	/**
-	 * Dedicated bearer secret for the repository sandbox Worker, kept distinct
-	 * from `INTERNAL_SERVICE_TOKEN`:
-	 * that token lets its holder act as any organization, and this one reaches a
-	 * deployment whose job is running model-chosen commands. There is no fallback
-	 * — the sandbox tools report themselves unavailable while it is unset.
-	 */
-	readonly SANDBOX_INTERNAL_SERVICE_TOKEN: Option.Option<Redacted.Redacted>
-	/**
-	 * Apple Push Notification service — token auth for the iOS app. All three
-	 * must be set for push to be live; otherwise the fan-out is a no-op and
+	 * Apple Push Notification service — token auth for the iOS app. These two and
+	 * `ApnsPrivateKey` must be set for push to be live; otherwise the fan-out is a no-op and
 	 * device registration still works (so a later key drop needs no client
 	 * change).
 	 */
 	readonly APNS_TEAM_ID: Option.Option<string>
 	readonly APNS_KEY_ID: Option.Option<string>
-	/** The `.p8` contents, PEM. */
-	readonly APNS_PRIVATE_KEY: Option.Option<Redacted.Redacted>
 	readonly GITHUB_APP_ID: Option.Option<string>
 	readonly GITHUB_APP_SLUG: Option.Option<string>
-	readonly GITHUB_APP_PRIVATE_KEY: Option.Option<Redacted.Redacted>
 	readonly GITHUB_APP_CLIENT_ID: Option.Option<string>
-	readonly GITHUB_APP_CLIENT_SECRET: Option.Option<Redacted.Redacted>
-	readonly GITHUB_APP_WEBHOOK_SECRET: Option.Option<Redacted.Redacted>
 	readonly GITHUB_API_BASE_URL: string
 	/**
 	 * Maple's own Google service account. Customers grant it permission to impersonate the
 	 * metrics reader their setup script creates. Unset: the GCP integration is logs-only.
 	 */
 	readonly MAPLE_GCP_SERVICE_ACCOUNT_EMAIL: Option.Option<string>
-	/**
-	 * A key of that service account: its JSON key file, base64-encoded. The metrics and resource
-	 * poller signs in with it. Unset: nothing is polled.
-	 */
-	readonly MAPLE_GCP_SERVICE_ACCOUNT_KEY: Option.Option<Redacted.Redacted>
 	/**
 	 * Maple's AWS OIDC signing key (PKCS#8 PEM, RSA). Customer roles trust the tokens it signs for
 	 * the `{MAPLE_API_BASE_URL}/oidc/aws` issuer. Unset: AWS cannot be connected.
@@ -187,7 +165,6 @@ export interface EnvConfig {
 	/** Accept App Attest's `appattestdevelop` environment (Xcode builds). Never in production. */
 	readonly MAPLE_APP_ATTEST_ALLOW_DEVELOPMENT: boolean
 	readonly CLOUDFLARE_OAUTH_CLIENT_ID: Option.Option<string>
-	readonly CLOUDFLARE_OAUTH_CLIENT_SECRET: Option.Option<Redacted.Redacted>
 	readonly CLOUDFLARE_OAUTH_SCOPES: string
 	readonly CLOUDFLARE_OAUTH_AUTHORIZE_URL: string
 	readonly CLOUDFLARE_OAUTH_TOKEN_URL: string
@@ -201,8 +178,6 @@ export interface EnvConfig {
 	/** Base URL for PlanetScale's management API (overridable for tests). */
 	readonly MAPLE_PLANETSCALE_API_BASE_URL: string
 	readonly PLANETSCALE_OAUTH_CLIENT_ID: Option.Option<string>
-	/** Required alongside the client id — PlanetScale OAuth apps are confidential clients. */
-	readonly PLANETSCALE_OAUTH_CLIENT_SECRET: Option.Option<Redacted.Redacted>
 	readonly PLANETSCALE_OAUTH_AUTHORIZE_URL: string
 	readonly PLANETSCALE_OAUTH_TOKEN_URL: string
 	/** OAuth token introspection (`/oauth/token/info`) — consulted when the v1 API rejects a fresh token. */
@@ -218,7 +193,6 @@ export interface EnvConfig {
 	readonly PLANETSCALE_OAUTH_SCOPES: string
 	/** Supabase Management API OAuth app. Both unset: the integration reads as not configured. */
 	readonly SUPABASE_OAUTH_CLIENT_ID: Option.Option<string>
-	readonly SUPABASE_OAUTH_CLIENT_SECRET: Option.Option<Redacted.Redacted>
 	/** Base URL for the Supabase Management API, OAuth endpoints included (overridable for tests). */
 	readonly MAPLE_SUPABASE_API_BASE_URL: string
 	/**
@@ -249,11 +223,6 @@ export interface EnvConfig {
 	readonly MAPLE_OIDC_SESSION_TTL_SECONDS: number
 	/** Absolute lifetime of one OIDC sign-in, seconds (default 43200, clamped to 3600..604800). */
 	readonly MAPLE_OIDC_SESSION_MAX_LIFETIME_SECONDS: number
-	/**
-	 * HMAC key for self-hosted session tokens (root-password and OIDC). Unset: falls back to
-	 * `MAPLE_ROOT_PASSWORD`. Every Worker that verifies sessions must see the same value.
-	 */
-	readonly MAPLE_SESSION_SECRET: Option.Option<Redacted.Redacted>
 	/**
 	 * Keycloak Admin REST base for the realm (e.g. `http://keycloak:8080/admin/realms/maple`) and the
 	 * confidential service-account client that calls it; IT's resend/mark-verified need URL + secret.
@@ -290,8 +259,11 @@ const envConfig = Config.all({
 	CLICKHOUSE_USER: stringWithDefault("CLICKHOUSE_USER", "default"),
 	CLICKHOUSE_PASSWORD: optionalRedacted("CLICKHOUSE_PASSWORD"),
 	CLICKHOUSE_DATABASE: stringWithDefault("CLICKHOUSE_DATABASE", "default"),
+	CLICKHOUSE_ACCESS_CLIENT_ID: optionalString("CLICKHOUSE_ACCESS_CLIENT_ID"),
+	CLICKHOUSE_ACCESS_CLIENT_SECRET: optionalRedacted("CLICKHOUSE_ACCESS_CLIENT_SECRET"),
 	MAPLE_AUTH_MODE: stringWithDefault("MAPLE_AUTH_MODE", "self_hosted"),
 	MAPLE_ROOT_PASSWORD: optionalRedacted("MAPLE_ROOT_PASSWORD"),
+	MAPLE_SESSION_SIGNING_SECRET: optionalRedacted("MAPLE_SESSION_SIGNING_SECRET"),
 	MAPLE_DEFAULT_ORG_ID: stringWithDefault("MAPLE_DEFAULT_ORG_ID", "default"),
 	MAPLE_INGEST_KEY_ENCRYPTION_KEY: Config.Redacted("MAPLE_INGEST_KEY_ENCRYPTION_KEY"),
 	MAPLE_INGEST_KEY_DECRYPTION_KEYS: optionalRedacted("MAPLE_INGEST_KEY_DECRYPTION_KEYS"),
@@ -300,6 +272,9 @@ const envConfig = Config.all({
 	MAPLE_INGEST_PUBLIC_URL: stringWithDefault("MAPLE_INGEST_PUBLIC_URL", "http://127.0.0.1:3474"),
 	MAPLE_APP_BASE_URL: stringWithDefault("MAPLE_APP_BASE_URL", "http://127.0.0.1:3471"),
 	MAPLE_API_BASE_URL: stringWithDefault("MAPLE_API_BASE_URL", "http://127.0.0.1:3472"),
+	MAPLE_STATUS_DOMAINS_ZONE_ID: optionalString("MAPLE_STATUS_DOMAINS_ZONE_ID"),
+	MAPLE_STATUS_DOMAINS_CNAME_TARGET: optionalString("MAPLE_STATUS_DOMAINS_CNAME_TARGET"),
+	MAPLE_STATUS_WORKER_NAME: optionalString("MAPLE_STATUS_WORKER_NAME"),
 	MAPLE_ENVIRONMENT: stringWithDefault("MAPLE_ENVIRONMENT", "development"),
 	MAPLE_REGION: stringWithDefault("MAPLE_REGION", "us").pipe(Config.map(parseMapleRegion)),
 	MAPLE_IGNORE_ORG_CLICKHOUSE: stringWithDefault("MAPLE_IGNORE_ORG_CLICKHOUSE", "false").pipe(
@@ -308,8 +283,6 @@ const envConfig = Config.all({
 	CLERK_SECRET_KEY: optionalRedacted("CLERK_SECRET_KEY"),
 	CLERK_PUBLISHABLE_KEY: optionalString("CLERK_PUBLISHABLE_KEY"),
 	CLERK_JWT_KEY: optionalRedacted("CLERK_JWT_KEY"),
-	CLERK_WEBHOOK_SECRET: optionalRedacted("CLERK_WEBHOOK_SECRET"),
-	PREVIEW_SIGNIN_KEY: optionalRedacted("PREVIEW_SIGNIN_KEY"),
 	MAPLE_ORG_ID_OVERRIDE: optionalString("MAPLE_ORG_ID_OVERRIDE"),
 	MAPLE_ORG_ID_OVERRIDE_ADMITS_NONMEMBERS: stringWithDefault(
 		"MAPLE_ORG_ID_OVERRIDE_ADMITS_NONMEMBERS",
@@ -317,40 +290,27 @@ const envConfig = Config.all({
 	).pipe(Config.map((value) => value === "1" || value === "true")),
 	AUTUMN_SECRET_KEY: optionalRedacted("AUTUMN_SECRET_KEY"),
 	AUTUMN_API_URL: stringWithDefault("AUTUMN_API_URL", DEFAULT_AUTUMN_API_URL),
-	AUTUMN_WEBHOOK_SECRET: optionalRedacted("AUTUMN_WEBHOOK_SECRET"),
-	STRIPE_SECRET_KEY: optionalRedacted("STRIPE_SECRET_KEY"),
 	STRIPE_API_URL: stringWithDefault("STRIPE_API_URL", "https://api.stripe.com"),
-	MAPLE_SUPPORT_SLACK_BOT_TOKEN: optionalRedacted("MAPLE_SUPPORT_SLACK_BOT_TOKEN"),
 	MAPLE_SUPPORT_SLACK_TEAM_USER_IDS: optionalString("MAPLE_SUPPORT_SLACK_TEAM_USER_IDS"),
 	MAPLE_CANCELLATION_SLACK_CHANNEL_ID: optionalString("MAPLE_CANCELLATION_SLACK_CHANNEL_ID"),
 	MAPLE_CANCELLATION_HAZEL_CHANNEL_ID: optionalString("MAPLE_CANCELLATION_HAZEL_CHANNEL_ID"),
 	MAPLE_CLERK_DASHBOARD_URL: optionalString("MAPLE_CLERK_DASHBOARD_URL"),
 	MAPLE_INGEST_KEY: optionalRedacted("MAPLE_INGEST_KEY"),
 	MAPLE_ENDPOINT: optionalString("MAPLE_ENDPOINT"),
-	MAPLE_PRODUCT_EVENTS_INGEST_KEY: optionalRedacted("MAPLE_PRODUCT_EVENTS_INGEST_KEY"),
-	SD_INTERNAL_TOKEN: optionalRedacted("SD_INTERNAL_TOKEN"),
 	INTERNAL_SERVICE_TOKEN: optionalRedacted("INTERNAL_SERVICE_TOKEN"),
 	MAPLE_INTERNAL_ORG_ID: optionalString("MAPLE_INTERNAL_ORG_ID"),
 	EMAIL_FROM: stringWithDefault("EMAIL_FROM", "Maple <notifications@noreply.maple.dev>"),
 	LINEAR_OAUTH_CLIENT_ID: optionalString("LINEAR_OAUTH_CLIENT_ID"),
-	LINEAR_OAUTH_CLIENT_SECRET: optionalRedacted("LINEAR_OAUTH_CLIENT_SECRET"),
 	GOOGLE_SEARCH_CONSOLE_CLIENT_ID: optionalString("GOOGLE_SEARCH_CONSOLE_CLIENT_ID"),
-	GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET: optionalRedacted("GOOGLE_SEARCH_CONSOLE_CLIENT_SECRET"),
 	CHAT_CONNECTOR_CONFIG: chatConnectorConfig,
 	CHAT_CONNECTOR_OUTBOUND_CONFIG: chatConnectorOutboundConfig,
-	SANDBOX_INTERNAL_SERVICE_TOKEN: optionalRedacted("SANDBOX_INTERNAL_SERVICE_TOKEN"),
 	APNS_TEAM_ID: optionalString("APNS_TEAM_ID"),
 	APNS_KEY_ID: optionalString("APNS_KEY_ID"),
-	APNS_PRIVATE_KEY: optionalRedacted("APNS_PRIVATE_KEY"),
 	GITHUB_APP_ID: optionalString("GITHUB_APP_ID"),
 	GITHUB_APP_SLUG: optionalString("GITHUB_APP_SLUG"),
-	GITHUB_APP_PRIVATE_KEY: optionalRedacted("GITHUB_APP_PRIVATE_KEY"),
 	GITHUB_APP_CLIENT_ID: optionalString("GITHUB_APP_CLIENT_ID"),
-	GITHUB_APP_CLIENT_SECRET: optionalRedacted("GITHUB_APP_CLIENT_SECRET"),
-	GITHUB_APP_WEBHOOK_SECRET: optionalRedacted("GITHUB_APP_WEBHOOK_SECRET"),
 	GITHUB_API_BASE_URL: stringWithDefault("GITHUB_API_BASE_URL", "https://api.github.com"),
 	MAPLE_GCP_SERVICE_ACCOUNT_EMAIL: optionalString("MAPLE_GCP_SERVICE_ACCOUNT_EMAIL"),
-	MAPLE_GCP_SERVICE_ACCOUNT_KEY: optionalRedacted("MAPLE_GCP_SERVICE_ACCOUNT_KEY"),
 	MAPLE_AWS_OIDC_SIGNING_KEY: optionalRedacted("MAPLE_AWS_OIDC_SIGNING_KEY"),
 	MAPLE_DEVICE_TOKEN_SIGNING_KEY: optionalRedacted("MAPLE_DEVICE_TOKEN_SIGNING_KEY"),
 	MAPLE_IOS_BUNDLE_ID: stringWithDefault("MAPLE_IOS_BUNDLE_ID", "com.maple.mobile"),
@@ -358,7 +318,6 @@ const envConfig = Config.all({
 		Config.map((value) => value === "true"),
 	),
 	CLOUDFLARE_OAUTH_CLIENT_ID: optionalString("CLOUDFLARE_OAUTH_CLIENT_ID"),
-	CLOUDFLARE_OAUTH_CLIENT_SECRET: optionalRedacted("CLOUDFLARE_OAUTH_CLIENT_SECRET"),
 	// Cloudflare OAuth scope ids are DOT-delimited (mirroring API-token permission names;
 	// registry: GET /client/v4/oauth/scopes). The client may only request scopes it was
 	// created with — keep the OAuth client's granted set in sync with this list.
@@ -409,7 +368,6 @@ const envConfig = Config.all({
 		"https://api.planetscale.com",
 	),
 	PLANETSCALE_OAUTH_CLIENT_ID: optionalString("PLANETSCALE_OAUTH_CLIENT_ID"),
-	PLANETSCALE_OAUTH_CLIENT_SECRET: optionalRedacted("PLANETSCALE_OAUTH_CLIENT_SECRET"),
 	// CANONICAL authorize host per PlanetScale's own OAuth discovery doc
 	// (https://auth.planetscale.com/.well-known/oauth-authorization-server →
 	// authorization_endpoint). Their public docs cite auth.planetscale.com/oauth/authorize
@@ -437,12 +395,12 @@ const envConfig = Config.all({
 	// ambiguous. Default = the scopes the Maple OAuth app is provisioned with: a scope the app
 	// lacks fails every authorize, so the app gains a scope before this list does.
 	// `organization:write_databases` lets Maple register its webhook on each database.
+	// `organization:read_invoices` is what the Cost page reads the organization's invoices with.
 	PLANETSCALE_OAUTH_SCOPES: stringWithDefault(
 		"PLANETSCALE_OAUTH_SCOPES",
-		"user:read_organizations organization:read_organization organization:read_databases organization:write_databases organization:read_branches organization:read_backups organization:read_comments organization:read_deploy_requests branch:read_branch",
+		"user:read_organizations organization:read_organization organization:read_invoices organization:read_databases organization:write_databases organization:read_branches organization:read_backups organization:read_comments organization:read_deploy_requests branch:read_branch",
 	),
 	SUPABASE_OAUTH_CLIENT_ID: optionalString("SUPABASE_OAUTH_CLIENT_ID"),
-	SUPABASE_OAUTH_CLIENT_SECRET: optionalRedacted("SUPABASE_OAUTH_CLIENT_SECRET"),
 	MAPLE_SUPABASE_API_BASE_URL: stringWithDefault("MAPLE_SUPABASE_API_BASE_URL", "https://api.supabase.com"),
 	MAPLE_OIDC_AUTHORIZE_URL: optionalString("MAPLE_OIDC_AUTHORIZE_URL"),
 	MAPLE_OIDC_TOKEN_URL: optionalString("MAPLE_OIDC_TOKEN_URL"),
@@ -458,7 +416,6 @@ const envConfig = Config.all({
 		3600,
 		604800,
 	),
-	MAPLE_SESSION_SECRET: optionalRedacted("MAPLE_SESSION_SECRET"),
 	MAPLE_OIDC_ADMIN_URL: optionalString("MAPLE_OIDC_ADMIN_URL"),
 	MAPLE_OIDC_ADMIN_CLIENT_ID: stringWithDefault("MAPLE_OIDC_ADMIN_CLIENT_ID", "maple-admin"),
 	MAPLE_OIDC_ADMIN_CLIENT_SECRET: optionalRedacted("MAPLE_OIDC_ADMIN_CLIENT_SECRET"),
@@ -481,12 +438,53 @@ const makeEnv = Effect.gen(function* () {
 		})
 	}
 
+	if (
+		Option.isSome(env.CLICKHOUSE_ACCESS_CLIENT_ID) !== Option.isSome(env.CLICKHOUSE_ACCESS_CLIENT_SECRET)
+	) {
+		return yield* new EnvValidationError({
+			message:
+				"CLICKHOUSE_ACCESS_CLIENT_ID and CLICKHOUSE_ACCESS_CLIENT_SECRET must be configured together",
+		})
+	}
+	if (
+		Option.isSome(env.CLICKHOUSE_ACCESS_CLIENT_ID) &&
+		(Option.isNone(env.CLICKHOUSE_URL) || env.CLICKHOUSE_PROVIDER !== "clickhouse")
+	) {
+		return yield* new EnvValidationError({
+			message: "CLICKHOUSE_ACCESS_CLIENT_ID needs CLICKHOUSE_URL with CLICKHOUSE_PROVIDER=clickhouse",
+		})
+	}
+	// The service token rides every request, so it must never cross plain HTTP.
+	if (
+		Option.isSome(env.CLICKHOUSE_ACCESS_CLIENT_ID) &&
+		Option.isSome(env.CLICKHOUSE_URL) &&
+		!Str.startsWith("https://")(Str.toLowerCase(Str.trim(env.CLICKHOUSE_URL.value)))
+	) {
+		return yield* new EnvValidationError({
+			message: "CLICKHOUSE_URL must use https:// when CLICKHOUSE_ACCESS_CLIENT_ID is configured",
+		})
+	}
+
 	const hasTinybirdSigningKey = Option.isSome(env.TINYBIRD_SIGNING_KEY)
 	const hasTinybirdWorkspaceId = Option.isSome(env.TINYBIRD_WORKSPACE_ID)
 	if (hasTinybirdSigningKey !== hasTinybirdWorkspaceId) {
 		return yield* new EnvValidationError({
 			message:
 				"TINYBIRD_SIGNING_KEY and TINYBIRD_WORKSPACE_ID must be configured together for Tinybird raw SQL",
+		})
+	}
+
+	// At boot, not at the first query: with several orgs on one Tinybird workspace, every tenant read
+	// runs on an org-scoped token so Tinybird itself keeps it to its org. Single-org self-hosted has
+	// nothing to isolate and may leave the key unset.
+	if (
+		Str.toLowerCase(env.MAPLE_AUTH_MODE) !== "self_hosted" &&
+		managedReadsAreTinybird(env) &&
+		!hasTinybirdSigningKey
+	) {
+		return yield* new EnvValidationError({
+			message:
+				"A multi-org deployment reading Tinybird needs TINYBIRD_SIGNING_KEY and TINYBIRD_WORKSPACE_ID: every tenant read runs on an org-scoped token",
 		})
 	}
 
@@ -523,11 +521,14 @@ const makeEnv = Effect.gen(function* () {
 		})
 	}
 
-	if (
-		Option.isSome(env.MAPLE_ROOT_PASSWORD) &&
-		Str.trim(Redacted.value(env.MAPLE_ROOT_PASSWORD.value)).length === 0
-	) {
-		return yield* new EnvValidationError({ message: "MAPLE_ROOT_PASSWORD cannot be empty" })
+	if (authMode !== "clerk" && Option.isSome(env.MAPLE_ROOT_PASSWORD)) {
+		const problem = rootPasswordProblem(Redacted.value(env.MAPLE_ROOT_PASSWORD.value))
+		if (problem !== undefined) return yield* new EnvValidationError({ message: problem })
+		if (Option.isNone(env.MAPLE_SESSION_SIGNING_SECRET)) {
+			yield* Effect.logWarning(
+				"MAPLE_SESSION_SIGNING_SECRET is not set; session tokens are signed from the root password. Set it to `openssl rand -base64 32`.",
+			)
+		}
 	}
 
 	return Env.of({
@@ -541,6 +542,22 @@ const makeEnv = Effect.gen(function* () {
 		),
 	})
 })
+
+/**
+ * Whether the managed read backend is Tinybird (its query API, or its ClickHouse gateway) and not a
+ * vanilla ClickHouse. Only Tinybird has a per-org token, so only there do org-scoped reads apply.
+ */
+export const managedReadsAreTinybird = (
+	env: Pick<EnvConfig, "CLICKHOUSE_URL" | "CLICKHOUSE_PROVIDER">,
+): boolean => Option.isNone(env.CLICKHOUSE_URL) || env.CLICKHOUSE_PROVIDER === "tinybird"
+
+/**
+ * Whether a tenant read runs on an org-scoped token: managed reads are Tinybird and the signing key
+ * is set. Multi-org deployments must set it (checked at boot); single-org self-hosted may not.
+ */
+export const orgScopedReadsApply = (
+	env: Pick<EnvConfig, "CLICKHOUSE_URL" | "CLICKHOUSE_PROVIDER" | "TINYBIRD_SIGNING_KEY">,
+): boolean => managedReadsAreTinybird(env) && Option.isSome(env.TINYBIRD_SIGNING_KEY)
 
 /** The config, plus the keys every service that encrypts or hashes would otherwise parse itself. */
 export interface EnvApi extends EnvConfig {

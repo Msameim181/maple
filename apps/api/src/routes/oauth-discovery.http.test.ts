@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto"
 import { afterEach, describe, expect, it } from "@effect/vitest"
 import { OrgId, RoleName, UserId } from "@maple/domain/http"
-import { ConfigProvider, Context, Effect, Layer, ManagedRuntime, Schema } from "effect"
+import { ConfigProvider, Context, Effect, Layer, ManagedRuntime, Schema, String as Str } from "effect"
 import { HttpRouter } from "effect/http"
 import { Env } from "@maple/backend/platform/Env"
 import { cleanupTestDbs, createTestDb, type TestDb } from "@maple/backend/testing/test-pglite"
@@ -175,12 +175,67 @@ describe("MCP OAuth HTTP routes", () => {
 				}),
 				Context.empty(),
 			)
-			expect(authorize.status).toBe(302)
-			const location = new URL(authorize.headers.get("location")!)
-			expect(location.searchParams.get("error")).toBe("invalid_target")
+			expect(authorize.status).toBe(400)
+			expect(authorize.headers.get("location")).toBeNull()
+			expect(((await authorize.json()) as { error: string }).error).toBe("invalid_target")
 		} finally {
 			await harness.dispose()
 			await harness.runtime.dispose()
+		}
+	})
+
+	it("answers an invalid authorize request on Maple's host instead of redirecting to the client", async () => {
+		const harness = makeHarness()
+		try {
+			const registered = await harness.handler(
+				postJson("https://api.example.com/register", {
+					client_name: "Bad Request Client",
+					redirect_uris: ["https://client.example/callback"],
+				}),
+				Context.empty(),
+			)
+			const client = (await registered.json()) as { client_id: string }
+			const authorizeUrl = new URL("https://api.example.com/oauth/authorize")
+			authorizeUrl.search = new URLSearchParams({
+				client_id: client.client_id,
+				redirect_uri: "https://client.example/callback",
+				response_type: "token",
+				state: "s1",
+			}).toString()
+			const authorize = await harness.handler(new Request(authorizeUrl), Context.empty())
+			expect(authorize.status).toBe(400)
+			expect(authorize.headers.get("location")).toBeNull()
+			expect(((await authorize.json()) as { error: string }).error).toBe("unsupported_response_type")
+		} finally {
+			await harness.dispose()
+			await harness.runtime.dispose()
+		}
+	})
+
+	it("refuses a registration or token body past the size these requests ever need", async () => {
+		const harness = makeHarness()
+		try {
+			const padding = Str.repeat(70 * 1024)("x")
+			const registered = await harness.handler(
+				postJson("https://api.example.com/register", {
+					client_name: padding,
+					redirect_uris: ["http://127.0.0.1:49876/callback"],
+				}),
+				Context.empty(),
+			)
+			expect(registered.status).toBe(400)
+			expect(await registered.json()).toEqual({
+				error: "invalid_request",
+				error_description: "Request body is too large",
+			})
+			const token = await harness.handler(
+				postForm("https://api.example.com/oauth/token", { grant_type: padding }),
+				Context.empty(),
+			)
+			expect(token.status).toBe(400)
+			expect((await token.json()).error_description).toBe("Request body is too large")
+		} finally {
+			await harness.dispose()
 		}
 	})
 

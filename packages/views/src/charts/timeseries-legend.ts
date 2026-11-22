@@ -11,20 +11,34 @@ import { cn } from "@maple/ui/lib/utils"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { pressable } from "../ui/pressable"
 import { table, tableBody, tableCell, tableHead, tableHeader, tableRow } from "../ui/table"
-import { Message, type Model } from "./chart"
-import { bucketSecondsOf, normaliseRows, scaleRates, type SeriesDefinition } from "./timeseries"
+import { hiddenNamesIn, Message, type Model } from "./chart"
+import {
+	bucketSecondsOf,
+	normaliseRows,
+	type RateBasis,
+	scaleRates,
+	type SeriesDefinition,
+} from "./timeseries"
 import { hstack } from "../ui/stack"
 import { swatch } from "../ui/swatch"
 import { Array as Arr } from "effect"
 import { typography } from "../ui/typography"
+import { icon, type IconName } from "../ui/icon"
 
 // The timeseries legend: the compact legend or the Min/Max/Mean/Last table, below or beside the
 // plot; shared by the line, area and bar charts.
+
+/** A mark drawn beside a series' name: a provider's logo, a model vendor's, a category's glyph. */
+export interface SeriesMark {
+	readonly icon: IconName
+	readonly className?: string
+}
 
 export interface LegendSeries {
 	readonly key: string
 	readonly label: string
 	readonly color: string
+	readonly mark?: SeriesMark | undefined
 }
 
 type LegendLayout = Readonly<{ isRight: boolean; maxHeight: number | null }>
@@ -43,7 +57,7 @@ const compactLegend = (
 	hidden: ReadonlyArray<string>,
 	layout: LegendLayout,
 ): Html => {
-	const keys = Arr.map(series, (entry) => entry.key)
+	const keys = Arr.map(series, (entry) => entry.label)
 	return h.div(
 		[
 			...maxHeightStyle(h, layout),
@@ -58,14 +72,26 @@ const compactLegend = (
 			pressable(
 				h,
 				{
-					onClick: Message.ToggledLegendSeries({ key: entry.key, keys }),
+					onClick: Message.ToggledLegendSeries({ key: entry.label, keys }),
 					className: cn(
-						"hover:bg-surface-sunken active:bg-surface-sunken flex min-w-0 max-w-full items-center gap-1.5 rounded-sm px-1 py-0.5 select-none",
-						hidden.includes(entry.key) && "opacity-40",
+						// Labels sit one step under the card title, like the plot legend's; the hovered one reads full strength.
+						"text-muted-foreground hover:bg-surface-sunken hover:text-foreground active:bg-surface-sunken active:text-foreground flex min-w-0 max-w-full items-center gap-1.5 rounded-sm px-1 py-0.5 select-none",
+						hidden.includes(entry.label) && "opacity-40",
 					),
 					attributes: [h.Key(entry.key), h.Title(entry.label)],
 				},
-				[swatch(h, { color: entry.color }), typography(h, { truncate: true }, [entry.label])],
+				[
+					swatch(h, { color: entry.color }),
+					...(entry.mark === undefined
+						? []
+						: [
+								icon(h, entry.mark.icon, {
+									size: 12,
+									className: cn("shrink-0", entry.mark.className),
+								}),
+							]),
+					typography(h, { truncate: true }, [entry.label]),
+				],
 			),
 		),
 	)
@@ -87,7 +113,7 @@ const statsTable = (
 	unit: string | undefined,
 	layout: LegendLayout,
 ): Html => {
-	const keys = Arr.map(series, (entry) => entry.key)
+	const keys = Arr.map(series, (entry) => entry.label)
 	return h.div(
 		[
 			...maxHeightStyle(h, layout),
@@ -156,7 +182,7 @@ const statsTable = (
 														? [entryStats === null ? EMPTY_VALUE : "0"]
 														: [],
 													cn(
-														"px-2 py-0 text-right font-mono leading-4 tabular-nums text-foreground-subtle last:pr-0",
+														"px-2 py-0 text-right leading-4 tabular-nums text-foreground-subtle last:pr-0",
 														column.className,
 													),
 												)
@@ -164,7 +190,7 @@ const statsTable = (
 													h,
 													[formatValueByUnit(entryStats[column.field], unit)],
 													cn(
-														"px-2 py-0 text-right font-mono leading-4 tabular-nums last:pr-0",
+														"px-2 py-0 text-right leading-4 tabular-nums last:pr-0",
 														column.className,
 													),
 												),
@@ -172,11 +198,11 @@ const statsTable = (
 								],
 								cn(
 									"cursor-pointer select-none in-data-[variant=bare]:hover:bg-surface-sunken in-data-[variant=bare]:active:bg-surface-sunken",
-									hidden.includes(entry.key) && "opacity-40",
+									hidden.includes(entry.label) && "opacity-40",
 								),
 								[
 									h.Key(entry.key),
-									h.OnClick(Message.ToggledLegendSeries({ key: entry.key, keys })),
+									h.OnClick(Message.ToggledLegendSeries({ key: entry.label, keys })),
 								],
 							)
 						}),
@@ -187,11 +213,29 @@ const statsTable = (
 	)
 }
 
+/**
+ * The chart keys of the series the legend has hidden. The legend remembers names, so a series
+ * stays hidden across a refresh that reorders the keys, and a regroup hides nothing by accident.
+ */
+export const hiddenChartKeys = (
+	hiddenNames: ReadonlyArray<string>,
+	definitions: ReadonlyArray<SeriesDefinition>,
+): ReadonlyArray<string> => {
+	const hidden = hiddenNamesIn(
+		hiddenNames,
+		Arr.map(definitions, (definition) => definition.rawKey),
+	)
+	return Arr.flatMap(definitions, (definition) =>
+		hidden.includes(definition.rawKey) ? [definition.chartKey] : [],
+	)
+}
+
 export type TimeseriesLegendInputs = Readonly<{
 	series: ReadonlyArray<LegendSeries>
 	data: ReadonlyArray<Readonly<Record<string, unknown>>>
 	definitions: ReadonlyArray<SeriesDefinition>
 	unit: string | undefined
+	rateBasis: RateBasis
 	nowMs: number
 	legend: "hidden" | "visible" | "right" | undefined
 	seriesStats: boolean
@@ -208,7 +252,7 @@ export const timeseriesLegend = (
 	// Stats over the closed buckets only, so all-zero series sink to the bottom.
 	const keys = Arr.map(series, (entry) => entry.key)
 	const normalised = normaliseRows(inputs.data, inputs.definitions)
-	const rows = scaleRates(normalised, keys, inputs.unit, bucketSecondsOf(normalised))
+	const rows = scaleRates(normalised, keys, inputs.unit, bucketSecondsOf(normalised), inputs.rateBasis)
 	const first = findFirstPartialIndex(rows, { now: inputs.nowMs })
 	const stats = computeSeriesStats(first <= 0 ? rows : rows.slice(0, first), keys)
 	const sorted = sortZeroSeriesLast(series, stats)
@@ -216,7 +260,12 @@ export const timeseriesLegend = (
 		isRight: inputs.legend === "right",
 		maxHeight: inputs.legend === "right" && model.containerHeight > 0 ? model.containerHeight : null,
 	}
+	// The names the plot hides too, so an entry is dimmed exactly when its series is not drawn.
+	const hidden = hiddenNamesIn(
+		model.hiddenKeys,
+		Arr.map(series, (entry) => entry.label),
+	)
 	return inputs.seriesStats
-		? statsTable(h, sorted, stats, model.hiddenKeys, inputs.unit, layout)
-		: compactLegend(h, sorted, model.hiddenKeys, layout)
+		? statsTable(h, sorted, stats, hidden, inputs.unit, layout)
+		: compactLegend(h, sorted, hidden, layout)
 }

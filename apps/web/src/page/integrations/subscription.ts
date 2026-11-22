@@ -1,7 +1,6 @@
-import { Duration, Effect, Option, Queue, Schema, Stream, Array as Arr } from "effect"
+import { Duration, Effect, Option, Queue, Record as Rec, Schema, Stream, Array as Arr } from "effect"
 import { AsyncData, Subscription } from "foldkit"
 import { gcpConnectionState } from "../infra-integrations/gcp/connector-state"
-import { ingestPhaseOf } from "../infra-integrations/cloudflare/ingest"
 import type { Resources } from "../../platform/resources"
 import type { PageSubscriptionInput } from "../contract"
 import { integrationOfSearch } from "./catalog"
@@ -9,13 +8,8 @@ import { ConnectAttempt, ConnectProvider, currentReturnPath, PROVIDERS, startCon
 import { Message } from "./message"
 import { openerReturns, relayedReturns } from "./connect-returns"
 import type { Model } from "./model"
-import { unsyncedEnvironments } from "../infra-integrations/railway/integration/railway"
+import { type MountedProvider, PROVIDER_MODULES } from "./provider-modules"
 import { githubStatusOf } from "./update-github"
-import {
-	isAwaitingFirstMetrics,
-	isWatchExpired,
-} from "../infra-integrations/planetscale/integration/planetscale"
-import { planetscaleStatusOf } from "../infra-integrations/planetscale/integration/update-planetscale"
 import { CAPABILITIES, CAPABILITY_IDS } from "../infra-integrations/gcp/integration/gcp-configure-copy"
 import { runConfirmed } from "../infra-integrations/gcp/integration/gcp-configure-derive"
 import { configureConnector } from "../infra-integrations/gcp/integration/update-gcp-configure"
@@ -26,6 +20,9 @@ export class PopupDocumentError extends Schema.TaggedError<PopupDocumentError>()
 	"@maple/web/integrations/PopupDocumentError",
 	{ message: Schema.String, cause: Schema.Defect() },
 ) {}
+
+/** A Record entry with its key typed as a string. */
+const keyed = <A>(key: string, value: A): readonly [string, A] => [key, value]
 
 const one = (message: Message): Stream.Stream<Message> => Stream.make(message)
 
@@ -154,29 +151,23 @@ const FORCE_POLL_WINDOW_MS = 10_000
 const every = (millis: number, message: () => Message) =>
 	Stream.map(pollTicks(Duration.millis(millis)), message)
 
+/** A provider module's ticks while it is active: steady, or fast first then steady. */
+export const tickerStream = (ticker: NonNullable<MountedProvider["ticker"]>): Stream.Stream<Message> =>
+	ticker.fast === null
+		? every(ticker.everyMs, () => ticker.tick)
+		: backoffPollTicks(
+				Duration.millis(ticker.fast.everyMs),
+				ticker.fast.ticks,
+				Duration.millis(ticker.everyMs),
+			).pipe(Stream.map(() => ticker.tick))
+
 const after = (millis: number, message: () => Message) =>
 	Stream.fromEffect(Effect.delay(Effect.sync(message), Duration.millis(millis))).pipe(
 		Stream.concat(Stream.never),
 	)
 
-const CLOUDFLARE_INGEST_MS = 30_000
-
-const SUPABASE_CLOCK_MS = 60_000
 /** A metric stream delivers about every minute. */
 const AWS_WATCH_MS = 60_000
-
-const isSupabaseShown = (model: Model): boolean =>
-	integrationOfSearch(model.search.integration) === "supabase" &&
-	Option.match(AsyncData.getData(model.statuses.supabase.data), {
-		onNone: () => false,
-		onSome: (status) => status.connected,
-	})
-
-const isRailwaySettling = (model: Model): boolean => {
-	if (integrationOfSearch(model.search.integration) !== "railway") return false
-	const status = Option.getOrNull(AsyncData.getData(model.statuses.railway.data))
-	return status !== null && status.connected && !status.authFailed && unsyncedEnvironments(status) > 0
-}
 
 /** A setup is open for a connection whose stack Maple has not assumed yet. */
 const isAwsPending = (model: Model): boolean => {
@@ -203,17 +194,6 @@ const isAwsStreaming = (model: Model): boolean => {
 			status.connections,
 			(connection) => connection.verified_at !== null && connection.metric_stream !== null,
 		)
-	)
-}
-
-/** Polls at 5 s for the first 2 minutes, then every minute, until the watch runs out. */
-const PLANETSCALE_FAST_POLLS = 24
-
-const isWatchingPlanetscale = (model: Model): boolean => {
-	if (integrationOfSearch(model.search.integration) !== "planetscale") return false
-	return (
-		isAwaitingFirstMetrics(planetscaleStatusOf(model), model.nowMs) &&
-		!isWatchExpired(model.planetscaleCard, model.nowMs)
 	)
 }
 
@@ -250,15 +230,6 @@ const isAwaitingRun = (model: Model): boolean => {
 const isScrapePage = (model: Model): boolean => {
 	const integration = integrationOfSearch(model.search.integration)
 	return integration === "prometheus" || integration === "warpstream"
-}
-
-const isCloudflareSettling = (model: Model): boolean => {
-	if (integrationOfSearch(model.search.integration) !== "cloudflare") return false
-	const status = Option.getOrNull(AsyncData.getData(model.statuses.cloudflare.data))
-	const usageData = model.cloudflareCard.usage.data
-	const usage = AsyncData.isSuccess(usageData) || AsyncData.isRefreshing(usageData) ? usageData.data : null
-	const phase = ingestPhaseOf(status, usage, model.nowMs)
-	return phase !== null && phase.kind !== "live"
 }
 
 /** The popup is out, repository discovery is pending, or a repository is still syncing. */
@@ -343,17 +314,6 @@ export const subscriptions = Subscription.make<PageSubscriptionInput<Model>, Mes
 							),
 			},
 		),
-		/** Status and usage every 30 s while a fresh Cloudflare connection settles. */
-		cloudflareIngest: entry(
-			{ isSettling: Schema.Boolean },
-			{
-				modelToDependencies: ({ model }) => ({ isSettling: isCloudflareSettling(model) }),
-				dependenciesToStream: ({ isSettling }) =>
-					isSettling
-						? every(CLOUDFLARE_INGEST_MS, () => Message.TickedCloudflareIngest())
-						: Stream.empty,
-			},
-		),
 		/** The scrape target list every 30 s; the selected target's checks every 10 s. */
 		scrapeTargetsRefresh: entry(
 			{ isShown: Schema.Boolean },
@@ -373,14 +333,6 @@ export const subscriptions = Subscription.make<PageSubscriptionInput<Model>, Mes
 					selectedId === null ? Stream.empty : every(10_000, () => Message.TickedChecksRefresh()),
 			},
 		),
-		railwaySettle: entry(
-			{ isSettling: Schema.Boolean },
-			{
-				modelToDependencies: ({ model }) => ({ isSettling: isRailwaySettling(model) }),
-				dependenciesToStream: ({ isSettling }) =>
-					isSettling ? every(15_000, () => Message.TickedRailwaySettle()) : Stream.empty,
-			},
-		),
 		awsPending: entry(
 			{ isPending: Schema.Boolean },
 			{
@@ -395,28 +347,6 @@ export const subscriptions = Subscription.make<PageSubscriptionInput<Model>, Mes
 				modelToDependencies: ({ model }) => ({ isStreaming: isAwsStreaming(model) }),
 				dependenciesToStream: ({ isStreaming }) =>
 					isStreaming ? every(AWS_WATCH_MS, () => Message.TickedAwsWatch()) : Stream.empty,
-			},
-		),
-		/** The connected Supabase card's clock, so its metrics window and "Last data" ages advance. */
-		supabaseClock: entry(
-			{ isShown: Schema.Boolean },
-			{
-				modelToDependencies: ({ model }) => ({ isShown: isSupabaseShown(model) }),
-				dependenciesToStream: ({ isShown }) =>
-					isShown ? every(SUPABASE_CLOCK_MS, () => Message.TickedSupabaseClock()) : Stream.empty,
-			},
-		),
-		/** Watches for the first metrics; the card offers "Check again" once the watch runs out. */
-		planetscaleWatch: entry(
-			{ isWatching: Schema.Boolean },
-			{
-				modelToDependencies: ({ model }) => ({ isWatching: isWatchingPlanetscale(model) }),
-				dependenciesToStream: ({ isWatching }) =>
-					isWatching
-						? backoffPollTicks("5 seconds", PLANETSCALE_FAST_POLLS, "1 minute").pipe(
-								Stream.map(() => Message.TickedPlanetscaleWatch()),
-							)
-						: Stream.empty,
 			},
 		),
 		gcpRefresh: entry(
@@ -448,6 +378,29 @@ export const subscriptions = Subscription.make<PageSubscriptionInput<Model>, Mes
 				dependenciesToStream: ({ isWaiting }) =>
 					isWaiting ? every(10_000, () => Message.TickedGcpRefresh()) : Stream.empty,
 			},
+		),
+		/** Each provider module's tick (Railway's first-sync poll, Supabase's card clock). */
+		...Rec.fromEntries(
+			Arr.flatMap(PROVIDER_MODULES, (provider) => {
+				const ticker = provider.ticker
+				return ticker === null
+					? []
+					: [
+							keyed(
+								`${provider.id}Tick`,
+								entry(
+									{ isActive: Schema.Boolean },
+									{
+										modelToDependencies: ({ model }) => ({
+											isActive: ticker.isActive(model),
+										}),
+										dependenciesToStream: ({ isActive }) =>
+											isActive ? tickerStream(ticker) : Stream.empty,
+									},
+								),
+							),
+						]
+			}),
 		),
 		connectCallback: entry(
 			{ provider: Schema.NullOr(ConnectProvider) },

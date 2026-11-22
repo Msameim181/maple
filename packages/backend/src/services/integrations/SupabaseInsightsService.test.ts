@@ -1,10 +1,9 @@
 import { afterEach, assert, describe, it } from "@effect/vitest"
 import { ConfigProvider, Effect, Layer, Schema, Array as Arr, String as Str, Option } from "effect"
 import { TestClock } from "effect/testing"
-import { FetchHttpClient } from "effect/http"
 import { OrgId, UserId } from "@maple/domain/http"
 import { SupabaseProjectRef } from "@maple/primitives"
-import { Env } from "@maple/backend/platform/Env"
+import { EnvTestLive } from "@maple/backend/testing/env-test-support"
 import { cleanupTestDbs, createTestDb, type TestDb } from "@maple/backend/testing/test-pglite"
 import { SupabaseOAuthService } from "@maple/backend/services/auth/SupabaseOAuthService"
 import {
@@ -97,9 +96,9 @@ const makeLayer = (testDb: TestDb, world: World) =>
 		SupabaseOAuthService.layer,
 	).pipe(
 		Layer.provide(testDb.layer),
-		Layer.provide(Env.layer),
+		Layer.provide(EnvTestLive),
 		Layer.provide(ConfigProvider.layer(ConfigProvider.fromUnknown(config))),
-		Layer.merge(Layer.succeed(FetchHttpClient.Fetch, world.fetch)),
+		Layer.merge(world.layer),
 	)
 
 const connect = (world: World) =>
@@ -272,6 +271,14 @@ describe("SupabaseInsightsService", () => {
 				assert.strictEqual(result.advisorsCheckedAt, null)
 				assert.strictEqual(result.advisorsError, null)
 				assert.strictEqual(result.queriesCheckedAt, null)
+
+				// The rate limit holds the project: no call until the 5 minute hold runs out.
+				yield* TestClock.adjust("1 minute")
+				yield* insights.pollAllOrgs
+				assert.lengthOf(insightCalls(world), 1)
+				yield* TestClock.adjust("5 minutes")
+				yield* insights.pollAllOrgs
+				assert.lengthOf(insightCalls(world), 2)
 			}),
 		)
 	})

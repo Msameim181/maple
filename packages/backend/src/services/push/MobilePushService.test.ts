@@ -183,6 +183,31 @@ describe("renderIncidentPush", () => {
 		expect(resolved.alert.body).toBe("The anomaly ended after 12m.")
 	})
 
+	// A budget's value is a bare percent; the money is in its check's sentence.
+	it("puts a cost budget's own sentence in the body, opening and resolving", () => {
+		const budget = {
+			signalType: "cost_budget" as const,
+			signalDisplay: { label: "Cost budget", unit: "plain" as const },
+			comparator: "gte" as const,
+			threshold: 100,
+			value: 110,
+			detail: "Spent $1,100.00 of the $1,000.00 monthly budget (110%)",
+		}
+		expect(renderIncidentPush(event(budget)).alert.body).toBe(
+			"Spent $1,100.00 of the $1,000.00 monthly budget (110%).",
+		)
+		const resolved = renderIncidentPush(
+			event({
+				...budget,
+				eventType: "resolve",
+				value: 0,
+				detail: "Spent $0.00 of the $1,000.00 monthly budget (0%)",
+				openForMs: 20 * 86_400_000,
+			}),
+		)
+		expect(resolved.alert.body).toBe("Spent $0.00 of the $1,000.00 monthly budget (0%) after 20d 0h.")
+	})
+
 	it("keeps warnings out of Focus, and resolutions quiet and silent", () => {
 		expect(renderIncidentPush(event({ severity: "warning" })).interruptionLevel).toBe("active")
 		const resolved = renderIncidentPush(
@@ -213,6 +238,28 @@ describe("renderIncidentPush", () => {
 			"Traffic dropped for 32m with no breach observed; resolved after 6h.",
 		)
 		expect(resolved.interruptionLevel).toBe("passive")
+	})
+
+	it("calls an expiring certificate a heads-up, not an outage", () => {
+		const certificate = event({
+			signalType: "uptime",
+			severity: "warning",
+			ruleName: "Checkout health",
+			value: 0.5,
+			groupKey: "__tls_certificate__",
+			detail: "Certificate for checkout.example.com expires in 9 days (2026-11-24)",
+		})
+		const opened = renderIncidentPush(certificate)
+		const renewed = renderIncidentPush({ ...certificate, eventType: "resolve", value: 0 })
+		assert.deepStrictEqual(
+			[opened.alert.title, opened.alert.body, opened.interruptionLevel, renewed.alert.title],
+			[
+				"Certificate expiring · Checkout health",
+				"Certificate for checkout.example.com expires in 9 days (2026-11-24).",
+				"active",
+				"Certificate renewed · Checkout health",
+			],
+		)
 	})
 
 	it("says how long a repeat has been going on", () => {

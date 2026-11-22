@@ -1,4 +1,4 @@
-import { Array as Arr, Record as Rec, String as Str } from "effect"
+import { Array as Arr, Option, Record as Rec, String as Str } from "effect"
 import type { IconName } from "../ui/icon"
 
 // The AI vendors the ingest gateway stamps (`VENDORS` in apps/ingest/src/ai_session.rs): one record
@@ -61,6 +61,7 @@ const VENDORS = {
 		color: { light: "#BA8E00", dark: "#FFD21E" },
 	},
 	spring_ai: { label: "Spring AI", icon: "SpringIcon", color: { light: "#5EA32D", dark: "#6DB33F" } },
+	vercel_ai_gateway: { label: "Vercel AI Gateway", icon: "VercelIcon", color: MONOCHROME },
 	vercel_ai_sdk: { label: "Vercel AI SDK", icon: "VercelIcon", color: MONOCHROME },
 } satisfies Record<string, Vendor>
 
@@ -172,4 +173,15 @@ export const modelVendorIcon = (detected: {
  */
 export function modelVendorColor(detected: { readonly brandColor: BrandColor | null }): string | undefined {
 	return detected.brandColor === null ? undefined : brandColorCss(detected.brandColor)
+}
+
+/**
+ * The mark of a `vendor/model` slug as OpenRouter names models (`anthropic/claude-sonnet-4.5`):
+ * the model family's when its name has one, then the vendor's, then the generic mark.
+ */
+export const modelSlugIcon = (slug: string): IconName => {
+	const [vendor, ...rest] = Str.split("/")(Str.toLowerCase(slug))
+	const model = Arr.join(rest, "/")
+	const family = Arr.findFirst([...FAMILY_ICONS.keys()], (name) => Str.includes(name)(model))
+	return modelVendorIcon({ vendorSlug: vendor, family: Option.getOrNull(family) })
 }

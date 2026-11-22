@@ -4,7 +4,7 @@ import { toEpochMs } from "./time-format"
 
 // Imported, not re-exported straight through: the formatters below CALL these,
 // and a bare `export … from` binds nothing in this module's scope.
-import { formatDuration, formatNumber } from "@maple/domain/format"
+import { formatCurrency, formatDuration, formatNumber } from "@maple/domain/format"
 import type { WIDGET_UNITS } from "@maple/domain/http"
 
 export { formatDuration, formatNumber }
@@ -211,12 +211,64 @@ const isZonedMidnight = (date: Date, timeZone: string | undefined): boolean =>
 	date.toLocaleTimeString("en-GB", { timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }) ===
 	"00:00"
 
+const tickFormatters = new Map<string, Intl.DateTimeFormat>()
+
+const tickFormatter = (
+	locale: string | undefined,
+	timeZone: string | undefined,
+	options: Intl.DateTimeFormatOptions,
+): Intl.DateTimeFormat => {
+	const key = `${locale ?? ""}|${timeZone ?? ""}|${options.month ?? ""}|${options.hour ?? ""}|${options.minute ?? ""}|${options.second ?? ""}`
+	const cached = tickFormatters.get(key)
+	if (cached !== undefined) return cached
+	const formatter = new Intl.DateTimeFormat(locale, { timeZone, ...options })
+	tickFormatters.set(key, formatter)
+	return formatter
+}
+
+/** A 12-hour clock reads "6:00 AM"; a 24-hour one keeps its leading zero ("06:00"). */
+const isTwelveHourClock = (locale: string | undefined): boolean =>
+	tickFormatter(locale, undefined, { hour: "numeric" }).resolvedOptions().hour12 === true
+
+/**
+ * A tick's clock, as short as the locale allows: a 12-hour clock drops the leading zero and, on
+ * the hour, the minutes ("6 AM", "6:30 AM"); a 24-hour clock keeps "06:00".
+ */
+const formatTickClock = (
+	date: Date,
+	options: {
+		readonly locale: string | undefined
+		readonly timeZone: string | undefined
+		readonly withDate: boolean
+		readonly withSeconds: boolean
+	},
+): string => {
+	const day: Intl.DateTimeFormatOptions = options.withDate ? { month: "short", day: "numeric" } : {}
+	const twelveHour = isTwelveHourClock(options.locale)
+	const full = tickFormatter(options.locale, options.timeZone, {
+		...day,
+		hour: twelveHour ? "numeric" : "2-digit",
+		minute: "2-digit",
+		second: options.withSeconds ? "2-digit" : undefined,
+	})
+	// Read off a Latin-digit formatter: the label's own parts print in the locale's digits.
+	const onTheHour =
+		twelveHour &&
+		!options.withSeconds &&
+		tickFormatter("en-US", options.timeZone, { minute: "numeric" }).format(date) === "0"
+	const formatter = onTheHour
+		? tickFormatter(options.locale, options.timeZone, { ...day, hour: "numeric" })
+		: full
+	// An h24 clock prints midnight as "24:00".
+	return Str.replace(/(^|\s)24:/, "$100:")(formatter.format(date))
+}
+
 /**
  * Format a bucket timestamp label that adapts based on the overall time range:
  * - >= 24h with daily buckets, or a tick on midnight: "Feb 14"
- * - >= 24h with sub-day buckets: "Feb 14, 02:00 PM"
- * - 30min - 24h: "02:00 PM"
- * - <= 30min: "02:00:30 PM"
+ * - >= 24h with sub-day buckets: "Feb 14, 2 PM"
+ * - 30min - 24h: "2 PM", "2:30 PM" ("14:00" on a 24-hour clock)
+ * - <= 30min: "2:00:30 PM"
  */
 export function formatBucketLabel(
 	value: unknown,
@@ -256,31 +308,10 @@ export function formatBucketLabel(
 		if ((context.bucketSeconds ?? 0) >= 24 * 60 * 60 || isZonedMidnight(date, timeZone)) {
 			return date.toLocaleDateString(locale, { timeZone, month: "short", day: "numeric" })
 		}
-		return Str.replace(
-			/ 24:/,
-			" 00:",
-		)(
-			date.toLocaleString(locale, {
-				timeZone,
-				month: "short",
-				day: "numeric",
-				hour: "2-digit",
-				minute: "2-digit",
-			}),
-		)
+		return formatTickClock(date, { locale, timeZone, withDate: true, withSeconds: false })
 	}
 
-	return Str.replace(
-		/^24:/,
-		"00:",
-	)(
-		date.toLocaleTimeString(locale, {
-			timeZone,
-			hour: "2-digit",
-			minute: "2-digit",
-			second: includeSeconds ? "2-digit" : undefined,
-		}),
-	)
+	return formatTickClock(date, { locale, timeZone, withDate: false, withSeconds: includeSeconds })
 }
 
 const bucketLabelMap: Record<number, string> = {
@@ -372,6 +403,23 @@ const UNIT_FORMATS = {
 	bytes: (num: number) => formatStorageBytes(num),
 } satisfies Record<(typeof WIDGET_UNITS)[number]["token"], (num: number) => string>
 
+// Spend per bucket is often a fraction of a cent, which two decimals print as "$0.00".
+const formatCurrencyAmount = (num: number, currency: string): string =>
+	num !== 0 && Math.abs(num) < 0.01
+		? num.toLocaleString("en-US", { style: "currency", currency, maximumSignificantDigits: 2 })
+		: formatCurrency(num, currency)
+
+/** The ISO code of a money unit: `"usd"` or `"currency:EUR"`; undefined for any other unit. */
+const currencyOfUnit = (unit: string | undefined): string | undefined => {
+	if (unit === "usd") return "USD"
+	const match = unit === undefined ? null : /^currency:([A-Z]{3})$/u.exec(unit)
+	return match?.[1]
+}
+
+/** A money unit for `formatValueByUnit` and chart ticks: `currencyUnit("EUR")` is `"currency:EUR"`. */
+export const currencyUnit = (currency: string): string | undefined =>
+	/^[A-Za-z]{3}$/u.test(currency) ? `currency:${Str.toUpperCase(currency)}` : undefined
+
 const isUnitToken = (unit: string): unit is keyof typeof UNIT_FORMATS =>
 	Rec.has<string, (num: number) => string>(UNIT_FORMATS, unit)
 
@@ -379,8 +427,14 @@ const isUnitToken = (unit: string): unit is keyof typeof UNIT_FORMATS =>
  * Format a numeric value according to a unit type. Used by chart Y-axis ticks, tooltips,
  * and stat widgets; an uncatalogued unit (a stored `"GB"`) renders as a plain number.
  */
-export const formatValueByUnit = (num: number, unit?: string): string =>
-	unit !== undefined && isUnitToken(unit) ? UNIT_FORMATS[unit](num) : formatNumber(num)
+export const formatValueByUnit = (num: number, unit?: string): string => {
+	const currency = currencyOfUnit(unit)
+	return currency !== undefined
+		? formatCurrencyAmount(num, currency)
+		: unit !== undefined && isUnitToken(unit)
+			? UNIT_FORMATS[unit](num)
+			: formatNumber(num)
+}
 
 const DURATION_TO_MS = new Map([
 	["duration_ms", 1],
@@ -490,6 +544,18 @@ export function axisTickFormatter(
 				: value === 0
 					? "0"
 					: `${((value * toMs) / axisUnit.ms).toFixed(decimals)}${axisUnit.suffix}`
+	}
+	const currency = currencyOfUnit(unit)
+	if (currency !== undefined) {
+		// Ticks a whole unit apart read "$10", not "$10.00"; finer steps show both cent digits.
+		const decimals = stepDecimals(step, 2) > 0 ? 2 : 0
+		const format = new Intl.NumberFormat("en-US", {
+			style: "currency",
+			currency,
+			minimumFractionDigits: decimals,
+			maximumFractionDigits: decimals,
+		})
+		return (value) => (!Number.isFinite(value) ? EMPTY_VALUE : value === 0 ? "0" : format.format(value))
 	}
 	if (unit === "percent" || unit === "percent_100") {
 		const scale = unit === "percent" ? 100 : 1

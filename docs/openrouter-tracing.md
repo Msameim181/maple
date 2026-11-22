@@ -16,7 +16,7 @@ References verified on August 4, 2026:
 | Path                                 | Client                              | Surfaces                                                   |
 | ------------------------------------ | ----------------------------------- | ---------------------------------------------------------- |
 | `apps/ai/src/platform/Llm.ts`        | Effect AI (`@effect/ai-openrouter`) | chat turns, investigation passes, and pull request reviews |
-| `apps/ai/src/mcp/__evals__/model.ts` | Effect AI (`@effect/ai-openrouter`) | evals in CI, **not** attributed or tagged                  |
+| `apps/ai/src/evals/model.ts`         | Effect AI (`@effect/ai-openrouter`) | evals in CI, **not** attributed or tagged                  |
 
 `apps/ai` can also run on Cloudflare Workers AI (`MAPLE_LLM_PROVIDER=workers-ai`). None of the
 attribution below applies on that path. The tag fields are OpenRouter's, and `resolveTriageModel`
@@ -83,8 +83,15 @@ https://<your-ingest-host>/v1/traces
 6. Use OpenRouter's Test Connection action, then send a Maple chat message.
 
 OpenRouter only emits Broadcast traces for traffic under the OpenRouter account or workspace where
-Broadcast is enabled. Maple has no BYOK path: every org's traffic runs on Maple's own
-`OPENROUTER_API_KEY`, so Broadcast is configured once, on Maple's OpenRouter account.
+Broadcast is enabled. Most orgs run on Maple's own `OPENROUTER_API_KEY`, so Broadcast is configured
+once, on Maple's OpenRouter account. An org admin can also connect the org's own OpenRouter key
+(`withOrgOpenRouterKey`); that org's traffic is traced only if the org enables Broadcast on its own
+account.
+
+Every request carries the provider preference `data_collection: "deny"` (`openRouterDataPolicy`
+in `apps/ai/src/platform/Llm.ts`), so OpenRouter skips endpoints that may train on prompts. A
+configured provider order keeps fallbacks on. Zero data retention (`zdr: true`) is not set: it
+narrows several models to one provider and bypasses a BYOK key's provider.
 
 ## Querying In Maple
 

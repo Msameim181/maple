@@ -11,6 +11,7 @@ import { codeTheme } from "./src/lib/code-theme.mjs"
 import mdx from "@astrojs/mdx"
 import { paraglideVitePlugin } from "@inlang/paraglide-js"
 import { foldkitIslands } from "./src/foldkit-island/integration.ts"
+import { buildSeo, sitemapEntry, sitemapIncludes } from "./src/lib/build-seo.mjs"
 import sitemap from "@astrojs/sitemap"
 import tailwindcss from "@tailwindcss/vite"
 import { siblingUrl } from "../../packages/infra/src/dev-urls.ts"
@@ -63,11 +64,17 @@ const telemetryEnv = {
 }
 
 // https://astro.build/config
+// maple.dev by default. The GitHub Pages build for a fork sets ASTRO_SITE / ASTRO_BASE
+// (e.g. https://user.github.io and /maple), see .github/workflows/selfhost-docs.yml.
+const SITE = process.env.ASTRO_SITE?.trim() || "https://maple.dev"
+const BASE = process.env.ASTRO_BASE?.trim() || "/"
+// What the sitemap and SEO checks treat as the site root: the site plus its sub-path, if any.
+const SITE_ROOT = BASE === "/" ? SITE : SITE + BASE.replace(/\/+$/, "")
+const DIST = new URL("./dist/", import.meta.url).pathname
+
 export default defineConfig({
-	// maple.dev by default. The GitHub Pages build for a fork sets ASTRO_SITE / ASTRO_BASE
-	// (e.g. https://user.github.io and /maple), see .github/workflows/selfhost-docs.yml.
-	site: process.env.ASTRO_SITE?.trim() || "https://maple.dev",
-	base: process.env.ASTRO_BASE?.trim() || "/",
+	site: SITE,
+	base: BASE,
 	trailingSlash: "ignore",
 	redirects: {
 		// The monthly release became individual entries.
@@ -137,13 +144,13 @@ export default defineConfig({
 					ko: "ko",
 				},
 			},
-			filter: (page) => !page.includes("/docs/404"),
-			// Stamp a build-time lastmod so the sitemap exposes a freshness signal.
-			serialize(item) {
-				item.lastmod = new Date().toISOString()
-				return item
-			},
+			// Only pages that are their own canonical: a locale URL that falls back to
+			// English, and every 404, points elsewhere or is not for the index.
+			filter: (page) => sitemapIncludes(DIST, SITE_ROOT, page),
+			serialize: (item) => sitemapEntry(DIST, SITE_ROOT, item),
 		}),
+		// After the sitemap: it also checks that the sitemap still lists the home page.
+		buildSeo({ site: SITE_ROOT }),
 	],
 	vite: {
 		plugins: [

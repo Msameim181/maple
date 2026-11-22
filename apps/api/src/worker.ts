@@ -21,6 +21,8 @@ import * as AlchemyTelemetry from "alchemy/Telemetry"
 import { Effect } from "effect"
 import { makeVcsSyncIsolateCaches } from "@maple/backend/services/integrations/vcs/vcs-sync-isolate-caches"
 import { ApiObservabilityLive } from "./http/api-observability"
+import { apiTelemetryOptions } from "./telemetry-options"
+import { resolveWorkerEnv } from "@maple/infra/secret-guard"
 import { apiConfiguredEnv } from "./resources/env"
 import { ApiBindingsLive, apiPorts, bindApiClients } from "./worker/bindings"
 import { registerQueueConsumers } from "./worker/consumers"
@@ -38,7 +40,7 @@ const props = Effect.gen(function* () {
 	// api keeps the hostname and OAuth, and forwards `/mcp` and chat to maple-ai.
 	const ai = yield* AiWorker
 	// Resolved up front so a misconfigured deploy fails before applying anything.
-	const configuredEnv = yield* apiConfiguredEnv(stage, region, domains)
+	const configuredEnv = yield* resolveWorkerEnv("api", apiConfiguredEnv(stage, region, domains))
 	return {
 		main: import.meta.url,
 		...mapleWorkerProps("api", stack),
@@ -93,7 +95,7 @@ export default class MapleApi extends Cloudflare.Worker<MapleApi>()(
 			IsolateAge.layer,
 			Cloudflare.Workers.CronEventSourceLive,
 			Cloudflare.Queues.EventSourceLive,
-			WorkerTelemetry({ serviceName: "maple-api" }),
+			WorkerTelemetry(apiTelemetryOptions),
 			// Read by the bridge's `HttpMiddleware.tracer`; cannot live in the app graph.
 			AlchemyTelemetry.layer(ApiObservabilityLive),
 		]),

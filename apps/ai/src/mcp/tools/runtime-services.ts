@@ -34,17 +34,20 @@ import { SlosService } from "@maple/backend/services/slos/SlosService"
 import { IngestRuleService } from "@maple/backend/services/org/IngestRuleService"
 import { StatusPagesService } from "@maple/backend/services/status-pages/StatusPagesService"
 import { StatusPageSnapshotBuilder } from "@maple/backend/services/status-pages/StatusPageSnapshotBuilder"
+import { StatusPageCustomDomainsService } from "@maple/backend/services/status-pages/StatusPageCustomDomainsService"
 import { VcsCommitService } from "@maple/backend/services/integrations/vcs/VcsCommitService"
 import { IntegrationInventoryService } from "@maple/backend/services/integrations/IntegrationInventoryService"
 import { SourcesService } from "@maple/backend/services/org/SourcesService"
 import { AgentFeedbackService } from "@maple/backend/services/feedback/AgentFeedbackService"
 import { QueryEngineService } from "@maple/backend/services/warehouse/QueryEngineService"
+import { PromqlQueryService } from "@maple/backend/services/promql/PromqlQueryService"
 import { SecurityAuditStore } from "@maple/backend/services/security-audit/SecurityAuditStore"
 import { DependencyScanReader } from "@maple/backend/services/dependency-scan/DependencyScanService"
 import { RuntimeReleaseCatalog } from "@maple/backend/services/security/RuntimeReleaseCatalog"
 import { RuntimeAdvisoryCatalog } from "@maple/backend/services/security/RuntimeAdvisoryCatalog"
 import { RepoSandboxService } from "@maple/backend/services/sandbox/RepoSandboxService"
 import { VcsSourceService } from "@maple/backend/services/integrations/vcs/VcsSourceService"
+import { VercelIntegrationService } from "@maple/backend/services/integrations/VercelIntegrationService"
 import { FetchHttpClient } from "effect/http"
 import { Layer } from "effect"
 import type { ExternalDataSourceService } from "@maple/backend/services/data-sources/ExternalDataSourceService"
@@ -81,6 +84,7 @@ export const McpRuntimeServicesLive = Layer.mergeAll(
 	InvestigationService.layer,
 	IssueFixVerificationService.layer,
 	QueryEngineService.layer,
+	PromqlQueryService.layer,
 	RailwayMetricsService.layer,
 	RecommendationIssueService.layer,
 	RepoSandboxService.layer,
@@ -91,6 +95,7 @@ export const McpRuntimeServicesLive = Layer.mergeAll(
 	SecurityAuditStore.layer,
 	SetupAuditService.layer,
 	SlosService.layer,
+	StatusPageCustomDomainsService.layer,
 	StatusPageSnapshotBuilder.layer,
 	StatusPagesService.layer,
 	UptimeMonitorsService.layer,
@@ -99,6 +104,7 @@ export const McpRuntimeServicesLive = Layer.mergeAll(
 	IngestRuleService.layer,
 	VcsCommitService.layer,
 	VcsSourceService.layer,
+	VercelIntegrationService.layer,
 	WarehouseQueryService.layer,
 ).pipe(
 	Layer.provide(

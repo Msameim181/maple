@@ -3,6 +3,7 @@ import { encodePublicId, PublicIdPrefixes, V2AwsIntegration } from "@maple/domai
 import { Option, Result, Schema, Array as Arr } from "effect"
 import { AsyncData } from "foldkit"
 import { click, Command, expect as expectView, given, role, scene, text, withViewInputs } from "foldkit/scene"
+import * as Field from "@maple/views/ui/field"
 import { describe, expect, test } from "vitest"
 import type { PageContext } from "../../contract"
 import { ScrollToTop } from "./command"
@@ -51,7 +52,17 @@ const connection = (overrides: Record<string, unknown> = {}) => ({
 
 const VERIFIED = { verified_at: "2026-10-23T08:00:00.000Z", last_checked_at: "2026-10-23T08:58:00.000Z" }
 
-const withConnections = (connections: ReadonlyArray<Record<string, unknown>>): Model => {
+const COST_MODULE = {
+	module: "cost",
+	title: "Cost",
+	summary: "Daily spend by service, read from Cost Explorer. AWS bills each request USD 0.01.",
+	available: true,
+}
+
+const withConnections = (
+	connections: ReadonlyArray<Record<string, unknown>>,
+	modules: ReadonlyArray<Record<string, unknown>> = [],
+): Model => {
 	const entered = init({ _tag: "SourcesNew", search: { integration: "aws" } }, context).model
 	return inner(
 		inner(entered, IntegrationMessage.CompletedReadClock({ nowMs: NOW })),
@@ -61,13 +72,29 @@ const withConnections = (connections: ReadonlyArray<Record<string, unknown>>): M
 				Schema.decodeUnknownSync(V2AwsIntegration)({
 					object: "aws_integration",
 					available: true,
-					modules: [],
+					modules,
 					connections,
 				}),
 			),
 		}),
 	)
 }
+
+const withAccountId = (model: Model, value: string): Model =>
+	inner(
+		model,
+		IntegrationMessage.GotAwsAccountIdMessage({ message: Field.Message.ChangedValue({ value }) }),
+	)
+
+/** What submitting the account form sends. */
+const submitted = (model: Model) =>
+	Arr.map(
+		pageUpdate(
+			model,
+			Message.GotIntegrationsMessage({ message: IntegrationMessage.SubmittedAwsAccount() }),
+		).commands ?? [],
+		({ name, args }) => ({ name, args }),
+	)
 
 const continued = (model: Model, times: number): Model =>
 	times === 0 ? model : continued(pageUpdate(model, Message.ClickedContinue()).model, times - 1)
@@ -227,7 +254,7 @@ describe("aws connect flow", () => {
 		scene(
 			{ update: pageUpdate, view },
 			given(streaming("2026-10-23T08:59:30.000Z")),
-			expectView(role("listitem", { name: "Live" })).toExist(),
+			expectView(role("listitem", { name: "Live (done)" })).toExist(),
 			expectView(text("Receiving metrics")).toExist(),
 		)
 		scene(
@@ -236,5 +263,153 @@ describe("aws connect flow", () => {
 			expectView(text("No metrics arriving")).toExist(),
 			expectView(role("listitem", { current: "step", name: "Go live: needs attention" })).toExist(),
 		)
+	})
+	describe("a connected account's switches", () => {
+		const AUDIT_MODULE = {
+			module: "audit",
+			title: "Audit log",
+			summary: "CloudTrail management events in the audit log.",
+			available: true,
+		}
+		const auditSwitch = role("switch", { name: "Audit log" })
+
+		test("the Connect step lists them, so turning one on there saves it", () => {
+			const model = withConnections(
+				[connection({ ...VERIFIED, granted_modules: [] })],
+				[COST_MODULE, AUDIT_MODULE],
+			)
+			scene(
+				{ update: pageUpdate, view },
+				given(model),
+				expectView(auditSwitch).not.toBeChecked(),
+				expectView(role("switch", { name: "Cost" })).not.toBeChecked(),
+			)
+			const id = idOf(model)
+			expect(id).not.toBeNull()
+			if (id === null) return
+			const toggled = pageUpdate(
+				model,
+				Message.GotIntegrationsMessage({
+					message: IntegrationMessage.ToggledAwsModule({ id, module: "audit" }),
+				}),
+			)
+			expect(names(toggled.commands)).toContain("UpdateAwsModules")
+		})
+
+		test("on but not granted, it asks for the stack update right there", () => {
+			const model = withConnections(
+				[connection({ ...VERIFIED, modules: ["audit"], granted_modules: [] })],
+				[COST_MODULE, AUDIT_MODULE],
+			)
+			scene(
+				{ update: pageUpdate, view },
+				given(model),
+				expectView(auditSwitch).toBeChecked(),
+				expectView(text("Needs a stack update")).toExist(),
+				expectView(role("button", { name: "Update the stack" })).toExist(),
+			)
+			// With the script open, the role can be checked right there once the stack is deployed.
+			const id = idOf(model)
+			expect(id).not.toBeNull()
+			if (id === null) return
+			const open = inner(model, IntegrationMessage.ClickedAwsSetup({ id }))
+			scene(
+				{ update: pageUpdate, view },
+				given(open),
+				expectView(role("button", { name: "Check now" })).toExist(),
+			)
+			const checked = pageUpdate(
+				open,
+				Message.GotIntegrationsMessage({ message: IntegrationMessage.ClickedAwsCheck({ id }) }),
+			)
+			expect(names(checked.commands)).toContain("CheckAwsConnection")
+		})
+	})
+
+	describe("the Cost choice", () => {
+		const costChoice = role("switch", { name: "Cost" })
+
+		test("it starts unticked, and an account connected without it asks for no module", () => {
+			const model = withAccountId(withConnections([], [COST_MODULE]), "123456789012")
+			scene(
+				{ update: pageUpdate, view },
+				given(model),
+				expectView(costChoice).not.toBeChecked(),
+				expectView(text(COST_MODULE.summary)).toExist(),
+				expectView(text("Cost policy")).not.toExist(),
+				// The metric stream is listed too: it is scoped on the next step, not switched here.
+				expectView(text("Infrastructure metrics")).toExist(),
+				expectView(text("Picked on the next step")).toExist(),
+			)
+			expect(submitted(model)).toEqual([
+				{ name: "CreateAwsConnection", args: { request: { account_id: "123456789012" } } },
+			])
+		})
+
+		test("ticked, the connection is created with the cost module and the stack lists its policy", () => {
+			const model = withAccountId(withConnections([], [COST_MODULE]), "123456789012")
+			const ticked = inner(model, IntegrationMessage.ToggledAwsNewModule({ module: "cost" }))
+			scene(
+				{ update: pageUpdate, view },
+				given(model),
+				click(costChoice),
+				expectView(costChoice).toBeChecked(),
+				expectView(text("Cost policy")).toExist(),
+				// Ticking again takes it back out.
+				click(costChoice),
+				expectView(costChoice).not.toBeChecked(),
+			)
+			expect(submitted(ticked)).toEqual([
+				{
+					name: "CreateAwsConnection",
+					args: { request: { account_id: "123456789012", modules: ["cost"] } },
+				},
+			])
+		})
+
+		test("an org offered Security scan can tick it, and the connection asks for it", () => {
+			const security = {
+				module: "security",
+				title: "Security scan",
+				summary: "GuardDuty, Security Hub, Inspector and Access Analyzer findings, and CloudTrail.",
+				available: true,
+			}
+			const model = withAccountId(withConnections([], [COST_MODULE, security]), "123456789012")
+			const securityChoice = role("switch", { name: "Security scan" })
+			scene(
+				{ update: pageUpdate, view },
+				given(model),
+				expectView(securityChoice).toExist(),
+				expectView(text("Security policy")).not.toExist(),
+				click(securityChoice),
+				expectView(securityChoice).toBeChecked(),
+				// The stack summary lists the policy the module adds.
+				expectView(text("Security policy")).toExist(),
+			)
+			const ticked = inner(model, IntegrationMessage.ToggledAwsNewModule({ module: "security" }))
+			expect(submitted(ticked)).toEqual([
+				{
+					name: "CreateAwsConnection",
+					args: { request: { account_id: "123456789012", modules: ["security"] } },
+				},
+			])
+		})
+
+		test("an org the module is not offered to gets no choice and sends nothing new", () => {
+			const unavailable = [{ ...COST_MODULE, available: false }]
+			const model = withAccountId(withConnections([], unavailable), "123456789012")
+			scene(
+				{ update: pageUpdate, view },
+				given(model),
+				expectView(role("button", { name: "Build the role stack" })).toBeEnabled(),
+				expectView(costChoice).not.toExist(),
+				expectView(text(COST_MODULE.summary)).not.toExist(),
+			)
+			// A tick left over from before the module was withdrawn is not sent either.
+			const stale = inner(model, IntegrationMessage.ToggledAwsNewModule({ module: "cost" }))
+			expect(submitted(stale)).toEqual([
+				{ name: "CreateAwsConnection", args: { request: { account_id: "123456789012" } } },
+			])
+		})
 	})
 })

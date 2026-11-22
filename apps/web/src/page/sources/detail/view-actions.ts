@@ -4,6 +4,8 @@ import { button } from "@maple/views/ui/button"
 import { type ConfirmDialogOptions, confirmDialog } from "@maple/views/ui/confirm-dialog"
 import { icon } from "@maple/views/ui/icon"
 import * as MenuView from "@maple/views/ui/menu-view"
+import { lockedControl } from "@maple/views/ui/locked-control"
+import { denialReason } from "../../kit/session-grants"
 import { deleteConsequences } from "../kit/integration"
 import { integrationPlatformOf } from "../kit/shared"
 import { Message } from "./message"
@@ -15,7 +17,7 @@ import { vstack } from "@maple/views/ui/stack"
 
 type H = HtmlBuilder<Message>
 
-const inlineIcon = (h: H, name: "MediaPauseIcon" | "MediaPlayIcon" | "ArrowPathIcon" | "TrashIcon") =>
+const inlineIcon = (h: H, name: "MediaPauseIcon" | "MediaPlayIcon" | "ArrowPathIcon") =>
 	icon(h, name, { attributes: [h.DataAttribute("icon", "inline-start")] })
 
 const isIntegration = (source: V2Source) => integrationPlatformOf(source) !== null
@@ -96,18 +98,6 @@ export const pauseControl = (h: H, model: Model, source: V2Source): Html =>
 			)
 		: pauseMenu(h, model, source)
 
-const deleteButton = (h: H) =>
-	button(
-		h,
-		{
-			variant: "ghost",
-			size: "sm",
-			className: "text-destructive",
-			attributes: [h.OnClick(Message.ClickedDelete())],
-		},
-		[inlineIcon(h, "TrashIcon"), "Delete"],
-	)
-
 /** A token source's delete: its senders are refused. */
 const tokenDeleteDialog = (h: H, model: Model, source: V2Source): Html =>
 	confirmDialog(h, {
@@ -156,14 +146,13 @@ const integrationDeleteDialog = (h: H, model: Model, source: V2Source): Html => 
 	)
 }
 
-/** Pause or Resume, Roll token and Delete: a token source's actions. */
+/** Pause or Resume and Roll token: a token source's actions. Delete is in Settings; its dialog lives here. */
 export const sourceActions = (h: H, model: Model, source: V2Source): ReadonlyArray<Html> => [
 	pauseControl(h, model, source),
 	button(h, { variant: "outline", size: "sm", attributes: [h.OnClick(Message.ClickedRollToken())] }, [
 		inlineIcon(h, "ArrowPathIcon"),
 		"Roll token",
 	]),
-	deleteButton(h),
 	confirmDialog(h, {
 		slotId: "source-roll-confirm",
 		model: model.rollDialog,
@@ -180,7 +169,25 @@ export const sourceActions = (h: H, model: Model, source: V2Source): ReadonlyArr
 	tokenDeleteDialog(h, model, source),
 ]
 
-/** Pause or Resume, the integration's own actions (`connection`), and Delete. */
+/** Pause or Resume (and Roll token on a token source) drawn locked: no menu, no dialogs mount. */
+export const lockedSourceActions = (h: H, source: V2Source, hasRollToken: boolean): ReadonlyArray<Html> => {
+	const locked = (children: ReadonlyArray<Html | string>) =>
+		lockedControl(
+			h,
+			denialReason("sources:manage"),
+			button(h, { variant: "outline", size: "sm", isDisabled: true }, children),
+		)
+	return [
+		locked(
+			source.status === "paused"
+				? [inlineIcon(h, "MediaPlayIcon"), "Resume"]
+				: [inlineIcon(h, "MediaPauseIcon"), "Pause"],
+		),
+		...(hasRollToken ? [locked([inlineIcon(h, "ArrowPathIcon"), "Roll token"])] : []),
+	]
+}
+
+/** Pause or Resume and the integration's own actions (`connection`). Delete is in Settings; its dialog lives here. */
 export const integrationActions = (
 	h: H,
 	model: Model,
@@ -189,7 +196,6 @@ export const integrationActions = (
 ): ReadonlyArray<Html> => [
 	pauseControl(h, model, source),
 	...(connection === null ? [] : [connection]),
-	deleteButton(h),
 	// Google Cloud's Delete opens the integration's removal dialog (rendered with `connection`) while its connector exists.
 	integrationDeleteDialog(h, model, source),
 ]

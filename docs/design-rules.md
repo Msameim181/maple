@@ -42,8 +42,13 @@ only shrink (`bun run ui:patterns:check` in CI). The workflow is in `apps/web/CL
 ## Type and spacing
 
 - Weights are `font-normal`, `font-medium` and `font-semibold` (`maple/font-weight-scale`).
-- Tracking is a token. An uppercase label is the `eyebrow` kit, or `tracking-caption` (0.08em) /
-  `tracking-overline` (0.12em); display type may take `tracking-tight`; nothing else is spaced.
+- The interface reads in Geist. Chrome (nav rows, buttons, inputs, selects, tabs, breadcrumbs) is
+  13px (`text-ui`). Numbers stay in Geist and line up with `tabular-nums` (`numeric` on
+  `typography`); `font-mono` (`mono`) is for machine text: log lines, ids, code, queries.
+- A group, column or stat label is the `eyebrow` kit: sentence case, no tracking. Uppercase is for a
+  machine tag (a badge `tag`, a log level, the `mono` eyebrow) and takes `tracking-caption` (0.08em)
+  or `tracking-overline` (0.12em).
+- Tracking is a token. Display type may take `tracking-tight`; nothing else is spaced.
   Tailwind's `tracking-wide`, `-wider`, `-widest` are banned (`maple/tracking-tokens`).
 - Spacing moves in half steps (2px). A quarter step (`gap-0.75`, `pl-3.75`) is an odd pixel; when a
   pixel offset is the point (centring a dot on a text line, meeting a rail), write it from a scale
@@ -74,6 +79,7 @@ Depth comes from surfaces and the hairline. The only shadows are tokens, colour 
 | `shadow-accent-start`                             | The current row's leading accent bar                                  |
 | `shadow-overflow-up`                              | A sticky footer over scrolled content                                 |
 | `shadow-rule-bottom`                              | A sticky table header's bottom rule                                   |
+| `shadow-backdrop-below`                           | The surface continued under a floating action bar                     |
 | `inset-shadow-highlight` / `inset-shadow-pressed` | A filled button at rest / pressed                                     |
 
 Corners come from the radius scale (`maple/no-arbitrary-radius`). A fill inset 1px inside a
@@ -84,7 +90,18 @@ bordered box takes its parent's radius minus 1px: `before:rounded-lg-inset` insi
 
 - Text greys are solid steps: `foreground`, `foreground-soft`, `muted-foreground`,
   `foreground-subtle`, `foreground-faint`. They read the same on a tinted row. Text never takes a
-  `/NN` opacity, grey or tone (`maple/no-faded-text`).
+  `/NN` opacity, grey or tone (`maple/no-faded-text`). `foreground-subtle` is the last step that
+  carries information (4.5:1 on the page, a card and a wash); `foreground-faint` is near 2:1, so it is
+  for separators and empty cells, never a value, a label or a placeholder.
+- A tone as text is its ink. `text-primary`, `text-severity-*`, `text-success`, `text-warning` and
+  `text-info` resolve to the tone's `--*-ink` (the `--text-color-*` block in tokens.css): a deeper
+  step of the hue in light, where the fill itself is near 3:1 as type, and the fill in dark. Fills,
+  borders and strokes keep the tone. Write the utility; never a fill token as `color` in a style
+  object.
+- Selected text is `primary-foreground` on `primary`, set once in tokens.css: an opaque pair, so it
+  reads the same over muted text or a tone. A chip keeps its own look when selected (a kit `badge`,
+  or a label on a solid fill: `text-on-fill`, `text-primary-foreground`): a band inside a fill
+  only fights it, so a thin underline in the chip's own ink marks the selected letters. No `selection:` utility at a call site.
 - Washes are translucent and read the same on any surface: `surface-faint`, `surface-sunken`,
   `surface-strong`.
 - A see-through surface is a token, never `bg-background/NN` or `bg-card/NN`
@@ -94,6 +111,9 @@ bordered box takes its parent's radius minus 1px: `before:rounded-lg-inset` insi
 - Layers come from the z scale, never `z-[…]` (`maple/no-arbitrary-z`): `z-1`..`z-10` inside a
   surface, `z-50` dialogs and sheets, `z-55` popovers and tooltips, `z-60` toasts and nested lists.
   A popup takes a popup radius (`maple/popup-radius`).
+- Every step flow (connect page, setup dialog, onboarding) shows its progress with `answerTrail`:
+  done steps as answer chips, the current one underlined in primary, sans, no numbers. Marking
+  `aria-current="step"` anywhere else is a second trail (`maple/one-step-trail`).
 - Neutral washes never take a `/NN`: `bg-muted/50` is `bg-surface-sunken` (`maple/surface-washes`).
 - Hover fills: a row, list item or chip hovers `bg-surface-sunken`, and a chip already on
   `surface-sunken` hovers `surface-strong`. A control (ghost button, toggle, tab, menu trigger)
@@ -123,8 +143,10 @@ instead. Only a reveal (`opacity-0` → `opacity-100`) sets opacity (`maple/no-d
 
 ## Waiting
 
-A skeleton stays blank for its first 300ms (`loading-delay`, on the kit `Skeleton`), so a fast
-load never flashes one. Every tooltip waits the one open delay, `Tooltip.OPEN_DELAY`
+A skeleton, bar or chart ghost, stays blank for `--loading-delay` (300ms), then fades in over 150ms,
+so a fast load never flashes one; every sweep runs on one clock (`syncSkeletonSweeps`). A navigation
+keeps the page left on screen while the next has nothing to show, for up to 300ms; the next page
+then skips the delay (`page/page-hold.ts`). Every tooltip waits the one open delay, `Tooltip.OPEN_DELAY`
 (`maple/single-tooltip-delay`).
 
 ## Copy

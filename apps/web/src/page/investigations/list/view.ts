@@ -1,4 +1,3 @@
-import * as Policy from "@maple/domain/policy"
 import type { V2Investigation } from "@maple/domain/http/v2"
 import { EMPTY_VALUE, formatNumber, pluralize } from "@maple/ui/lib/format"
 import { toEpochMs } from "@maple/ui/lib/time-format"
@@ -61,6 +60,8 @@ import { hstack, hstackClass, vstack } from "@maple/views/ui/stack"
 import { spaced } from "@maple/views/ui/spaced"
 import { Array as Arr, String as Str, Option } from "effect"
 import { textLink } from "@maple/views/ui/text-link"
+import { canRunInvestigations } from "../../kit/session-grants"
+import { gatedLinkButton } from "../../kit/gated-controls"
 
 type H = HtmlBuilder<Message>
 
@@ -244,7 +245,13 @@ const rowFinding = (h: H, investigation: V2Investigation): Html => {
 	)
 }
 
-const row = (h: H, investigation: V2Investigation, nowMs: number, timeZone: string): Html => {
+const row = (
+	h: H,
+	investigation: V2Investigation,
+	nowMs: number,
+	timeZone: string,
+	isFocused: boolean,
+): Html => {
 	const headline = investigationHeadline(investigation)
 	const scope = investigationScope(investigation)
 	return listRow(
@@ -252,6 +259,7 @@ const row = (h: H, investigation: V2Investigation, nowMs: number, timeZone: stri
 		{
 			as: "li",
 			divided: true,
+			isFocused,
 			className: "cursor-pointer gap-3.5 py-3.5",
 			leading: hstack(h, { align: "center", justify: "center", as: "span", className: "w-5" }, [
 				kindMarker(h, investigation.subject, investigation.seeded_by),
@@ -327,7 +335,7 @@ const tableSkeleton = (h: H): Html =>
 			),
 	})
 
-const hubEmpty = (h: H, view: HubView, isFiltered: boolean): Html => {
+const hubEmpty = (h: H, view: HubView, isFiltered: boolean, canRun: boolean): Html => {
 	if (isFiltered)
 		return filteredEmpty(h, {
 			noun: "investigations",
@@ -341,7 +349,7 @@ const hubEmpty = (h: H, view: HubView, isFiltered: boolean): Html => {
 			]),
 			emptyDescription(h, [
 				view === "active"
-					? "Start one above, or open an issue and choose Start investigation. When an alert rule fires, Maple opens one on its own."
+					? `${canRun ? "Start one above, or open an issue and choose Start investigation. " : ""}When an alert rule fires, Maple opens one on its own.`
 					: "Investigations you resolve, and any that fail, stay here for reference.",
 			]),
 		]),
@@ -484,7 +492,6 @@ const budgetNotice = (h: H, model: Model, timeZone: string): Html | null => {
 			? "Today's investigation limit is reached"
 			: "Today's model budget is spent"
 	// The limit lives on the AI settings tab, which needs llm_keys:manage to open.
-	const canEditSettings = Policy.has(model.grants, "llm_keys:manage")
 	return alert(h, { variant: "warn", className: "mb-4" }, [
 		alertTitle(
 			h,
@@ -508,28 +515,24 @@ const budgetNotice = (h: H, model: Model, timeZone: string): Html | null => {
 				],
 			),
 		]),
-		...(canEditSettings
-			? [
-					alertAction(h, [
-						linkButton(
-							h,
-							{
-								size: "sm",
-								variant: "ghost",
-								href: hrefOf(AppRoute.Settings({ search: { tab: "ai" } })),
-							},
-							["Raise the limit"],
-						),
-					]),
-				]
-			: []),
+		alertAction(h, [
+			gatedLinkButton(
+				h,
+				model,
+				"llm_keys:manage",
+				{ size: "sm", variant: "ghost", href: hrefOf(AppRoute.Settings({ search: { tab: "ai" } })) },
+				["Raise the limit"],
+			),
+		]),
 	])
 }
 
 export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, inputs, h) => {
 	const timeZone = inputs.context.timeZone
 	const all = allOf(model)
-	const isFirstRun = AsyncData.isSuccess(model.firstPage.data) && all.length === 0
+	// The hero is the investigate bar and what to ask it: only for who may start one.
+	const canRun = canRunInvestigations(model)
+	const isFirstRun = canRun && AsyncData.isSuccess(model.firstPage.data) && all.length === 0
 	if (isFirstRun) return dashboardPage(h, {}, [hubHero(h, model)])
 	const visible = visibleOf(model, all)
 	const isLoadingMore = isLoadingMoreOf(model)
@@ -555,14 +558,16 @@ export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, 
 		onRefreshing: () => loaded(),
 	})
 	function loaded(): Html {
-		if (visible.length === 0) return hubEmpty(h, viewOf(model.search), isFiltered)
+		if (visible.length === 0) return hubEmpty(h, viewOf(model.search), isFiltered, canRun)
 		return h.div(
 			[h.Class("contents")],
 			[
 				vstack(
 					h,
 					{ as: "ul", attributes: [h.OnMount(MountInvestigationRows())] },
-					Arr.map(visible, (investigation) => row(h, investigation, model.nowMs, timeZone)),
+					Arr.map(visible, (investigation, index) =>
+						row(h, investigation, model.nowMs, timeZone, model.focusedIndex === index),
+					),
 				),
 				...(hasMore
 					? [
@@ -599,7 +604,10 @@ export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, 
 		h,
 		{
 			title: "Investigations",
-			sticky: h.div([h.Class("contents")], [...(notice === null ? [] : [notice]), bar(h, model)]),
+			sticky: h.div(
+				[h.Class("contents")],
+				[...(notice === null ? [] : [notice]), ...(canRun ? [bar(h, model)] : [])],
+			),
 		},
 		[
 			isFailed

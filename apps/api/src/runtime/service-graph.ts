@@ -6,6 +6,25 @@ import { Layer } from "effect"
 import { EdgeCacheServiceLive } from "@maple/backend/platform/CacheBackendLive"
 
 import { Env } from "@maple/backend/platform/Env"
+import {
+	ApnsPrivateKey,
+	AutumnWebhookSecret,
+	ClerkWebhookSecret,
+	CloudflareOAuthClientSecret,
+	GithubAppClientSecret,
+	GithubAppPrivateKey,
+	GithubAppWebhookSecret,
+	LinearOAuthClientSecret,
+	PlanetScaleOAuthClientSecret,
+	PreviewSigninKey,
+	ProductEventsIngestKey,
+	ScraperInternalToken,
+	SearchConsoleClientSecret,
+	StatusDomainsApiToken,
+	StripeSecretKey,
+	SupabaseOAuthClientSecret,
+	SupportSlackBotToken,
+} from "@maple/infra/secrets"
 import { AlertsService } from "@maple/backend/services/alerts/AlertsService"
 import { AlertDestinationsService } from "@maple/backend/services/alerts/AlertDestinationsService"
 import { AlertReadModelsService } from "@maple/backend/services/alerts/AlertReadModelsService"
@@ -31,6 +50,7 @@ import { SearchConsoleImportService } from "@maple/backend/services/integrations
 import { McpConnectionsService } from "@maple/backend/services/auth/McpConnectionsService"
 import { McpOAuthService } from "@maple/backend/services/auth/McpOAuthService"
 import { PreviewSignInService } from "@maple/backend/services/auth/PreviewSignInService"
+import { SelfHostedLoginRateLimiter } from "@maple/backend/services/auth/SelfHostedLoginRateLimiter"
 
 import { DailySpendService } from "@maple/backend/services/billing/DailySpendService"
 import { BillingCustomerResolver } from "@maple/backend/services/billing/BillingCustomerResolver"
@@ -62,17 +82,33 @@ import { PlanetScaleConnectionService } from "@maple/backend/services/integratio
 import { PlanetScaleDiscoveryService } from "@maple/backend/services/integrations/PlanetScaleDiscoveryService"
 import { PlanetScaleService } from "@maple/backend/services/integrations/PlanetScaleService"
 import { PlanetScaleWebhookService } from "@maple/backend/services/integrations/PlanetScaleWebhookService"
+import { FleetConnectionService } from "@maple/backend/services/integrations/FleetConnectionService"
+import { DeviceSecurityService } from "@maple/backend/services/device-security/DeviceSecurityService"
 import { RailwayMetricsService } from "@maple/backend/services/integrations/RailwayMetricsService"
+import { VercelIntegrationService } from "@maple/backend/services/integrations/VercelIntegrationService"
 import { SupabaseConnectionService } from "@maple/backend/services/integrations/SupabaseConnectionService"
 import { SupabaseInsightsService } from "@maple/backend/services/integrations/SupabaseInsightsService"
 import { SupabaseLogsService } from "@maple/backend/services/integrations/SupabaseLogsService"
 import { SupabaseOAuthService } from "@maple/backend/services/auth/SupabaseOAuthService"
+import { AnthropicCostConnectionService } from "@maple/backend/services/cost/AnthropicCostConnectionService"
+import { FeatureRequestService } from "@maple/backend/services/feature-requests/FeatureRequestService"
+import { CloudflareCostConnectionService } from "@maple/backend/services/cost/CloudflareCostConnectionService"
+import { OpenAiCostConnectionService } from "@maple/backend/services/cost/OpenAiCostConnectionService"
+import { MorphCostConnectionService } from "@maple/backend/services/cost/MorphCostConnectionService"
+import { GithubCostSourceService } from "@maple/backend/services/cost/GithubCostSourceService"
+import { OpenRouterCostConnectionService } from "@maple/backend/services/cost/OpenRouterCostConnectionService"
+import { CostBudgetsService } from "@maple/backend/services/cost/CostBudgetsService"
+import { PlanetScaleCostSourceService } from "@maple/backend/services/cost/PlanetScaleCostSourceService"
+import { VercelCostSourceService } from "@maple/backend/services/cost/VercelCostSourceService"
+import { GcpCostSourceService } from "@maple/backend/services/cost/GcpCostSourceService"
 import { OrgOpenRouterKeyService } from "@maple/backend/services/org/OrgOpenRouterKeyService"
+import { EnterpriseSsoService } from "@maple/backend/services/org/enterprise-sso/EnterpriseSsoService"
 import { ServiceMapWorldService } from "@maple/backend/services/service-map/ServiceMapWorldService"
 import { ScrapeTargetsService } from "@maple/backend/services/integrations/ScrapeTargetsService"
 import { UptimeMonitorsService } from "@maple/backend/services/uptime/UptimeMonitorsService"
 import { SlosService } from "@maple/backend/services/slos/SlosService"
 import { StatusPagesService } from "@maple/backend/services/status-pages/StatusPagesService"
+import { StatusPageCustomDomainsService } from "@maple/backend/services/status-pages/StatusPageCustomDomainsService"
 import { StatusPagePublisher } from "@maple/backend/services/status-pages/StatusPagePublisher"
 import { StatusPageSnapshotBuilder } from "@maple/backend/services/status-pages/StatusPageSnapshotBuilder"
 import { ChatWorkspaceService } from "@maple/backend/services/integrations/ChatWorkspaceService"
@@ -92,11 +128,13 @@ import { SourcesService } from "@maple/backend/services/org/SourcesService"
 import { SourceRemovalService } from "@maple/backend/services/integrations/SourceRemovalService"
 import { SourceUsageService } from "@maple/backend/services/org/SourceUsageService"
 import { OrgMembersService } from "@maple/backend/services/org/OrgMembersService"
+import { OrganizationDeletionService } from "@maple/backend/services/org/OrganizationDeletionService"
 import { OrganizationService } from "@maple/backend/services/org/OrganizationService"
 import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/OrganizationFeatureFlagsService"
 import { LiveActivitiesService } from "@maple/backend/services/push/LiveActivitiesService"
 import { MobileDevicesService } from "@maple/backend/services/push/MobileDevicesService"
 import { AgentFeedbackService } from "@maple/backend/services/feedback/AgentFeedbackService"
+import { SavedViewsService } from "@maple/backend/services/saved-views/SavedViewsService"
 import { SetupAuditService } from "@maple/backend/services/org/SetupAuditService"
 import { SignalPresenceService } from "@maple/backend/services/org/SignalPresenceService"
 import { SessionReplayReadService } from "@maple/backend/services/session-replays/SessionReplayReadService"
@@ -106,14 +144,43 @@ import { AiSessionReadService } from "@maple/backend/services/ai-sessions/AiSess
 import { ProductEventsService } from "@maple/backend/services/product-events/ProductEventsService"
 
 import { AuditLogService } from "@maple/backend/services/audit/AuditLogService"
+import { AuditTrailService } from "@maple/backend/services/audit-trail/AuditTrailService"
+import { CloudSecurityReadService } from "@maple/backend/services/cloud-security/CloudSecurityReadService"
+import { SecurityAuditAccess } from "@maple/backend/services/security-audit/SecurityAuditAccess"
+import { CloudSecurityEventsService } from "@maple/backend/services/cloud-security/CloudSecurityEventsService"
+import { AwsEventsRateLimiter } from "@maple/backend/services/cloud-security/AwsEventsRateLimiter"
+import { AuditDetectionsService } from "@maple/backend/services/audit-trail/AuditDetectionsService"
+import { IntegrationInventoryService } from "@maple/backend/services/integrations/IntegrationInventoryService"
 import { WarehouseQueryService } from "@maple/backend/services/warehouse/WarehouseQueryService"
 import { QueryEngineService } from "@maple/backend/services/warehouse/QueryEngineService"
+import { PromqlQueryService } from "@maple/backend/services/promql/PromqlQueryService"
 import { TelemetryReadService } from "@maple/backend/services/warehouse/TelemetryReadService"
 import { OrgClickHouseSettingsService } from "@maple/backend/services/org/OrgClickHouseSettingsService"
 import { VcsSourceService } from "@maple/backend/services/integrations/vcs/VcsSourceService"
 import { CiAnalyticsService } from "@maple/backend/services/pr-review/CiAnalyticsService"
 import { CodeReviewTeamService } from "@maple/backend/services/pr-review/CodeReviewTeamService"
 import { PrReviewAnalyticsService } from "@maple/backend/services/pr-review/PrReviewAnalyticsService"
+
+/** The secrets the api's services and routes read, each bound to this Worker (`resources/env.ts`). */
+const ApiSecretsLive = Layer.mergeAll(
+	ApnsPrivateKey.layer,
+	AutumnWebhookSecret.layer,
+	ClerkWebhookSecret.layer,
+	CloudflareOAuthClientSecret.layer,
+	GithubAppClientSecret.layer,
+	GithubAppPrivateKey.layer,
+	GithubAppWebhookSecret.layer,
+	LinearOAuthClientSecret.layer,
+	PlanetScaleOAuthClientSecret.layer,
+	PreviewSigninKey.layer,
+	ProductEventsIngestKey.layer,
+	ScraperInternalToken.layer,
+	SearchConsoleClientSecret.layer,
+	StatusDomainsApiToken.layer,
+	StripeSecretKey.layer,
+	SupabaseOAuthClientSecret.layer,
+	SupportSlackBotToken.layer,
+)
 
 /**
  * Services the HTTP routes read, at group build or per request; each service owns its
@@ -135,6 +202,7 @@ export const HttpServicesLive = Layer.mergeAll(
 	McpOAuthService.layer,
 	McpConnectionsService.layer,
 	PreviewSignInService.layer,
+	SelfHostedLoginRateLimiter.layer,
 	CloudflareOAuthService.layer,
 	DashboardPersistenceService.layer,
 	SharedDashboardService.layer,
@@ -149,8 +217,10 @@ export const HttpServicesLive = Layer.mergeAll(
 	SourceUsageService.layer,
 	OrgClickHouseSettingsService.layer,
 	OrganizationService.layer,
+	OrganizationDeletionService.layer,
 	MobileDevicesService.layer,
 	AgentFeedbackService.layer,
+	SavedViewsService.layer,
 	LiveActivitiesService.layer,
 	PlanetScaleWebhookQueue.layer,
 	CancellationReviewQueue.layer,
@@ -158,7 +228,8 @@ export const HttpServicesLive = Layer.mergeAll(
 	UptimeMonitorsService.layer,
 	SlosService.layer,
 	StatusPagesService.layer,
-	// The `statusPages` rollout gate on the status page routes.
+	// Custom domains: Cloudflare for SaaS hostnames, unavailable where its zone is not configured.
+	StatusPageCustomDomainsService.layer,
 	OrganizationFeatureFlagsService.layer,
 	// Read-only: previews of unsaved pages.
 	StatusPageSnapshotBuilder.layer,
@@ -177,6 +248,9 @@ export const HttpServicesLive = Layer.mergeAll(
 	BillingOrgService.layer,
 	CloudflareAnalyticsService.layer,
 	RailwayMetricsService.layer,
+	FleetConnectionService.layer,
+	DeviceSecurityService.layer,
+	VercelIntegrationService.layer,
 	SupabaseOAuthService.layer,
 	SupabaseConnectionService.layer,
 	SupabaseLogsService.layer,
@@ -187,10 +261,30 @@ export const HttpServicesLive = Layer.mergeAll(
 	AwsConnectionService.layer,
 	AwsIngestService.layer,
 	OrgOpenRouterKeyService.layer,
+	EnterpriseSsoService.layer,
+	OpenRouterCostConnectionService.layer,
+	CloudflareCostConnectionService.layer,
+	AnthropicCostConnectionService.layer,
+	FeatureRequestService.layer,
+	OpenAiCostConnectionService.layer,
+	MorphCostConnectionService.layer,
+	GithubCostSourceService.layer,
+	PlanetScaleCostSourceService.layer,
+	VercelCostSourceService.layer,
+	GcpCostSourceService.layer,
+	CostBudgetsService.layer,
 	ServiceMapWorldService.layer,
 	AuditLogService.layer,
+	AuditTrailService.layer,
+	CloudSecurityReadService.layer,
+	SecurityAuditAccess.layer,
+	CloudSecurityEventsService.layer,
+	AwsEventsRateLimiter.layer,
+	AuditDetectionsService.layer,
+	IntegrationInventoryService.layer,
 	WarehouseQueryService.layer,
 	QueryEngineService.layer,
+	PromqlQueryService.layer,
 	RuntimeReleaseCatalog.layer,
 	RuntimeAdvisoryCatalog.layer,
 	DependencyScanService.layer,
@@ -237,4 +331,4 @@ export const HttpServicesLive = Layer.mergeAll(
 	VcsCommitService.layer,
 	VcsSourceService.layer,
 	ChatWorkspaceService.layer,
-).pipe(Layer.provideMerge(Layer.mergeAll(Env.layer, EdgeCacheServiceLive)))
+).pipe(Layer.provideMerge(Layer.mergeAll(Env.layer, ApiSecretsLive, EdgeCacheServiceLive)))

@@ -21,11 +21,29 @@ export interface IngestConfig {
 	 * follow it — the same source the session metadata row reads.
 	 */
 	readonly getIdentity?: (() => EventIdentity | undefined) | undefined
+	/**
+	 * Uncaught errors that are not the app's. One becomes no session event, so it
+	 * counts toward neither `error_count` nor the "has errors" filter.
+	 */
+	readonly isErrorNoise?: ErrorNoiseFilter | undefined
 	/** Record `<canvas>` content at this many frames per second. Off when unset or 0. */
 	readonly canvasFps?: number | undefined
 	/** Keep request and response bodies of these URLs on replay network events. */
 	readonly networkBodies?: NetworkBodyOptions | undefined
 }
+
+/**
+ * True for an uncaught error that is not the app's, such as the benign
+ * `ResizeObserver loop` notice. `error` is what was thrown, or the event's
+ * message when the browser gave no error; `filename` is `ErrorEvent.filename`.
+ * The SDK supplies it: its patterns live above this package.
+ * BOUNDARY: a thrown value is unparsed by definition.
+ */
+export type ErrorNoiseFilter = (
+	error: unknown,
+	source: "window.onerror" | "unhandledrejection",
+	filename?: string,
+) => boolean
 
 export interface NetworkBodyOptions {
 	/** Matched against the full request URL. Nothing is captured for other URLs. */
@@ -289,7 +307,8 @@ export function gzipStored(bytes: Uint8Array): Uint8Array {
 
 /**
  * How ingest answered. `"retry"` (429, 5xx) may succeed later; `"refused"`
- * (401, 402, 403) will not on this page, so the channel stops; `"rejected"`
+ * (401, 402, 403, and 404 from an endpoint without that route, such as an
+ * older Maple Local) will not on this page, so the channel stops; `"rejected"`
  * is any other answer, never resent; `"failed"` means no response came back,
  * so the rows may or may not have reached ingest.
  */
@@ -298,7 +317,7 @@ export type PostOutcome = "accepted" | "retry" | "refused" | "rejected" | "faile
 function outcomeOf(status: number): Exclude<PostOutcome, "failed"> {
 	if (status >= 200 && status < 300) return "accepted"
 	if (status === 429 || status >= 500) return "retry"
-	if (status === 401 || status === 402 || status === 403) return "refused"
+	if (status === 401 || status === 402 || status === 403 || status === 404) return "refused"
 	return "rejected"
 }
 

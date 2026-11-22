@@ -7,6 +7,7 @@ vi.hoisted(() => Object.assign(globalThis, { window: new EventTarget() }))
 import { Message } from "./message"
 import { ClerkPhase, type Model, Session } from "./model"
 import { initCustomer } from "./page/onboarding/plan-gate"
+import * as PageHold from "./page/page-hold"
 import * as Preload from "./page/preload"
 import * as SignIn from "./page/sign-in"
 import { SELF_HOSTED_AUTH_EVENT } from "./platform/auth-api"
@@ -73,6 +74,7 @@ const modelAt = (route: AppRoute, session: Session): Model => ({
 	signIn: SignIn.init(),
 	shell: Shell.init({ isMobile: false, theme: "light", pinnedNamespaces: {}, dashboardFavorites: [] }),
 	toasts: Toast.init("toasts"),
+	pageHold: PageHold.Model.None(),
 	toastActions: {},
 	toastRootActions: {},
 	tooltip: TooltipHost.init("tooltip"),

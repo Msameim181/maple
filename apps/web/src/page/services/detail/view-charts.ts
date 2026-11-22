@@ -2,10 +2,12 @@ import { mergeExactThroughput } from "@maple/web-data/warehouse/custom-charts"
 import { Option, Array as Arr } from "effect"
 import { AsyncData } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
-import { MountLinkedCursor } from "@maple/views/charts/linked-cursor"
+import { MountLinkedZoom } from "@maple/views/charts/linked-cursor"
 import { type GridState, metricsGridOf } from "../../kit/service-metrics/grid"
+import type { MarkerCard } from "../../kit/service-metrics/marker-card"
 import { commitMarkers } from "../../kit/service-metrics/markers"
 import type { DetailPoint } from "../../kit/service-metrics/points"
+import { deployChecksOf, isFlagged } from "./derive-deploys"
 import { Message } from "./message"
 import type { Model } from "./model"
 
@@ -21,7 +23,32 @@ export const mergedPoints = (model: Model): ReadonlyArray<DetailPoint> => {
 	return mergeExactThroughput(base, new Map(Arr.map(exact, (point) => [point.bucket, point.throughput])))
 }
 
-export const metricsGrid = (h: HtmlBuilder<Message>, model: Model, state: GridState): Html => {
+/** The page's marker hover card, over the commits the Overview resolved. */
+export const markerCardOf = (model: Model, timeZone: string): MarkerCard<Message> => ({
+	model: model.markerCard,
+	toParent: (message) => Message.GotMarkerCardMessage({ message }),
+	commits: model.commits,
+	clock: { nowMs: model.nowMs ?? 0, timeZone },
+})
+
+/** A flagged deploy's marker takes its verdict's tone; a commit flagged in two environments, the worse. */
+const markerToneOf = (model: Model) => {
+	const flagged = Arr.filter(deployChecksOf(model), (check) => isFlagged(check.verdict))
+	return (sha: string): "crit" | "warn" | undefined => {
+		const verdicts = Arr.map(
+			Arr.filter(flagged, (check) => check.sha === sha),
+			(check) => check.verdict,
+		)
+		return verdicts.includes("errors-up") ? "crit" : verdicts.length > 0 ? "warn" : undefined
+	}
+}
+
+export const metricsGrid = (
+	h: HtmlBuilder<Message>,
+	model: Model,
+	state: GridState,
+	timeZone: string,
+): Html => {
 	const points = mergedPoints(model)
 	const overview = AsyncData.getData(model.overview.data)
 	const markers = Option.match(overview, {
@@ -39,8 +66,10 @@ export const metricsGrid = (h: HtmlBuilder<Message>, model: Model, state: GridSt
 			charts: model.charts,
 			rows: Arr.map(points, (point) => ({ ...point })),
 			markers,
+			markerCard: markerCardOf(model, timeZone),
+			markerTone: markerToneOf(model),
 			toChartMessage: (chartId, message) => Message.GotChartMessage({ chartId, message }),
-			linkedCursorMount: MountLinkedCursor(),
+			linkedCursorMount: MountLinkedZoom({ timeZone }),
 		},
 		state,
 	)

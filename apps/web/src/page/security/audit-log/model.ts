@@ -1,0 +1,81 @@
+import { AuditTrailListResponse, AuditTrailSourcesResponse } from "@maple/domain/http"
+import * as Policy from "@maple/domain/policy"
+import { Schema } from "effect"
+import { defineMessageUnion } from "foldkit/message"
+import { KeyedSchema } from "@maple/views/data/keyed"
+import { LoadFailure } from "@maple/views/data/load-failure"
+import { SecurityAuditLogSearch } from "../../../route/search"
+import { laterPagesFields } from "../../kit/infinite-pages"
+import { SessionGrants } from "../../kit/session-grants"
+import * as Select from "@maple/views/ui/select"
+
+// `/security/audit-log`: audit events from every connected platform and Maple itself, newest
+// first. The filters live in the URL; only org admins (`audit_log:read`) read the list.
+
+export type Search = SecurityAuditLogSearch
+
+/** One page of events and the cursor of the next. */
+export const EventsPage = AuditTrailListResponse
+export type EventsPage = typeof EventsPage.Type
+
+/** Every platform that can feed the log, connected or not, and what each sent lately. */
+export const Sources = AuditTrailSourcesResponse
+export type Sources = typeof Sources.Type
+
+/** The pages after the first, for the current first-page key. */
+export const LaterPages = Schema.Struct({
+	key: Schema.NullOr(Schema.String),
+	...laterPagesFields(EventsPage),
+})
+export type LaterPages = typeof LaterPages.Type
+
+/** Base UI selects need a real value for "all platforms"; it never reaches the URL. */
+export const ALL_PROVIDERS = "__all__"
+
+/** The filters a select sets; the actor is typed and applied on Enter. */
+export const SelectFilter = Schema.Literals(["provider", "category", "outcome"])
+export type SelectFilter = typeof SelectFilter.Type
+
+export const Model = Schema.Struct({
+	search: SecurityAuditLogSearch,
+	nowMs: Schema.Finite,
+	grants: Schema.Array(Policy.PermissionName),
+	/** False until the session answers: the page says nothing about access before it knows. */
+	isGrantsRead: Schema.Boolean,
+	firstPage: KeyedSchema(EventsPage, LoadFailure),
+	sources: KeyedSchema(Sources, LoadFailure),
+	laterPages: LaterPages,
+	/** The events whose detail is open, by id. */
+	expanded: Schema.Array(Schema.String),
+	/** The actor field as typed; the URL holds what was applied. */
+	actorText: Schema.String,
+	/** The platform filter, a Select so each platform shows its mark; its value follows the URL. */
+	providerSelect: Select.Model,
+})
+export type Model = typeof Model.Type
+
+export { auditAccessOf as accessOf } from "../kit/audit-access"
+
+export const Message = defineMessageUnion({
+	ReadClock: { nowMs: Schema.Finite },
+	CompletedReadGrants: SessionGrants,
+	CompletedFetchFirstPage: { key: Schema.String, result: Schema.Result(EventsPage, LoadFailure) },
+	CompletedFetchSources: { key: Schema.String, result: Schema.Result(Sources, LoadFailure) },
+	CompletedFetchNextPage: {
+		key: Schema.String,
+		generation: Schema.Number,
+		/** The cursor the page was asked from: an answer for another one is not the next page. */
+		cursor: Schema.String,
+		result: Schema.Result(EventsPage, LoadFailure),
+	},
+	ClickedRetry: {},
+	ClickedLoadMore: {},
+	ChangedFilter: { filter: SelectFilter, value: Schema.String },
+	ChangedActorText: { value: Schema.String },
+	SubmittedActor: {},
+	ClearedActor: {},
+	ClickedClearFilters: {},
+	ToggledEvent: { id: Schema.String },
+	GotProviderSelectMessage: { message: Select.Message },
+})
+export type Message = typeof Message.Type

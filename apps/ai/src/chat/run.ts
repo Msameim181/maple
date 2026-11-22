@@ -34,7 +34,7 @@ import { agentSessionSpanAttributes, type ResolvedModel } from "../platform/Llm"
 import { withRunSessionAttributes } from "../platform/genai-spans"
 import { summarizeCause } from "@maple/backend/platform/describe-cause"
 import { type AgentDefinition, agentForSession, chatAgent } from "./agents"
-import { profileForTurn } from "./profiles"
+import { profileForTenant, profileForTurn } from "./profiles"
 import { MUTATING_TOOL_NAMES } from "./permissions"
 import {
 	makeTextSanitizer,
@@ -46,6 +46,7 @@ import {
 import { buildReviewFanout } from "./review/fanout"
 import { buildCodeMode, CODE_MODE_GUIDANCE, CODE_MODE_TOOLS } from "./code-mode"
 import { buildChatToolkit, type SessionRepositoryScope } from "./maple-toolkit"
+import { reportedCost } from "../platform/reported-cost"
 import { accumulateUsage, type RunUsage } from "./usage"
 import type { MakeCompletion } from "./completion"
 import type { TenantContext } from "@maple/domain/http"
@@ -164,7 +165,7 @@ export const runChatTurn = (input: ChatRunInput) =>
 
 const runChatTurnFrom = (input: ChatRunInput, startedAt: number) => {
 	const agent = input.agent ?? agentForSession(input.sessionId)
-	const profile = profileForTurn(agent, input.origin)
+	const profile = profileForTenant(profileForTurn(agent, input.origin), input.tenant)
 	const sessionAttributes = agentSessionSpanAttributes(input.model.tags)
 	const completion = input.completion?.({
 		turnId: input.messageId,
@@ -172,6 +173,7 @@ const runChatTurnFrom = (input: ChatRunInput, startedAt: number) => {
 		modelName: input.model.name,
 		partial: input.closeOut === true,
 		sessionAttributes,
+		content: input.model.content,
 	})
 	// A review's turn state is fed by the Maple handlers the review_files children share, so a
 	// group a child read counts as read, and `submit_review` checks the children's answers.
@@ -184,7 +186,8 @@ const runChatTurnFrom = (input: ChatRunInput, startedAt: number) => {
 		input.toolExecutor,
 		input.tenant,
 		profile.ruleset,
-		profile.surface,
+		profile.toolSurface,
+		input.model.content,
 		sessionAttributes,
 		review?.coverage.observe,
 		(toolCallId, ui, call) =>
@@ -206,7 +209,13 @@ const runChatTurnFrom = (input: ChatRunInput, startedAt: number) => {
 	)
 	const codeMode =
 		agent.codeMode === true && input.codeExecutor !== undefined
-			? buildCodeMode(codeTools, maple.layer, input.codeExecutor, input.codeOnly === true)
+			? buildCodeMode(
+					codeTools,
+					maple.layer,
+					input.codeExecutor,
+					input.model.content,
+					input.codeOnly === true,
+				)
 			: undefined
 	// What the model is offered directly; the handlers still serve every Maple tool to programs.
 	const direct =
@@ -332,6 +341,8 @@ const runChatTurnFrom = (input: ChatRunInput, startedAt: number) => {
 		// reports token usage as it accrues — the event stream carries none — and `submit_diagnosis`
 		// reads the running total mid-run, so a hook that merely observes is what fills it.
 		budget,
+		// Each call's cost as OpenRouter billed it, which is what the turn's AI credits charge.
+		estimateCostMicrousd: reportedCost,
 	}).pipe(
 		// An abort clears the claim; the run notices at the next event rather than only after the
 		// in-flight model call drains.

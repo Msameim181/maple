@@ -27,13 +27,14 @@ import type {
 	V2DashboardCreateParams,
 	V2DashboardMutation,
 	V2DashboardShare,
+	V2DashboardShareParams,
 	V2DashboardTemplate,
 	V2DashboardUpdateParams,
 	V2DashboardVersion,
 	V2DashboardVersionDetail,
 	V2DashboardWidgetDataOutcome,
 } from "@maple/domain/http/v2"
-import type { DashboardShare, DashboardShareMode, ShareWidgetDataOutcome } from "@maple/domain/http"
+import type { DashboardShare, ShareWidgetDataOutcome } from "@maple/domain/http"
 import { DashboardId } from "@maple/primitives"
 import { Clock, DateTime, Effect, Option, Ref, Result, Schema, Array as Arr } from "effect"
 import { Base64Url } from "effect/encoding"
@@ -49,8 +50,10 @@ import {
 	type StoredDashboard,
 } from "@maple/backend/services/dashboards/DashboardPersistenceService"
 import { SharedDashboardService } from "@maple/backend/services/dashboards/SharedDashboardService"
+import { timestampMs } from "@maple/backend/platform/time"
 import { DashboardWidgetDataService } from "@maple/backend/services/dashboards/DashboardWidgetDataService"
 import { convertPersesDashboardToPortable } from "@maple/backend/services/dashboards/perses-dashboard-import"
+import { convertGrafanaDashboardToPortable } from "@maple/backend/services/dashboards/grafana-dashboard-import"
 
 const canReadTelemetry = (scopes: ReadonlyArray<string> | undefined) =>
 	missingReadScopes(scopes, TELEMETRY_READ_FAMILIES).length === 0
@@ -110,6 +113,7 @@ const toV2DashboardSnapshot = (dashboard: DashboardDocument): V2DashboardVersion
 	sections: dashboard.sections ?? [],
 	variables: dashboard.variables ?? [],
 	refreshIntervalSeconds: dashboard.refreshIntervalSeconds ?? null,
+	...(dashboard.importReport === undefined ? undefined : { importReport: dashboard.importReport }),
 	createdAt: dashboard.createdAt,
 	updatedAt: dashboard.updatedAt,
 })
@@ -132,6 +136,7 @@ const toV2DashboardShare =
 		tokenSuffix: share.tokenSuffix,
 		createdAt: share.createdAt,
 		updatedAt: share.updatedAt,
+		...(share.expiresAt === undefined ? undefined : { expiresAt: share.expiresAt }),
 	})
 
 const toV2WidgetDataOutcome = (outcome: ShareWidgetDataOutcome): V2DashboardWidgetDataOutcome =>
@@ -242,6 +247,9 @@ const applyUpdate = (
 		payload.refreshIntervalSeconds === undefined
 			? current.refreshIntervalSeconds
 			: (payload.refreshIntervalSeconds ?? undefined)
+	// Kept across unrelated edits; only an explicit `null` (the board's Dismiss) removes it.
+	const importReport =
+		payload.importReport === undefined ? current.importReport : (payload.importReport ?? undefined)
 
 	return new DashboardDocument({
 		id: current.id,
@@ -254,13 +262,17 @@ const applyUpdate = (
 		...(sections !== undefined ? { sections } : undefined),
 		...(variables !== undefined ? { variables } : undefined),
 		...(refreshIntervalSeconds !== undefined ? { refreshIntervalSeconds } : undefined),
+		...(importReport !== undefined ? { importReport } : undefined),
 		createdAt: current.createdAt,
 		updatedAt,
 	})
 }
 
 /** Update-payload fields diffable through the wire shape; layout blobs get summarized. */
-const dashboardAuditDiff = auditDiff<keyof V2DashboardUpdateParams & keyof V2Dashboard>({
+// The import report is not audited: dismissing it is not a configuration change.
+const dashboardAuditDiff = auditDiff<
+	Exclude<keyof V2DashboardUpdateParams & keyof V2Dashboard, "importReport">
+>({
 	fields: [
 		"name",
 		"description",
@@ -308,6 +320,21 @@ export const HttpV2DashboardsLive = HttpApiBuilder.group(MapleApiV2, "dashboards
 		const persistence = yield* DashboardPersistenceService
 		const shares = yield* SharedDashboardService
 		const widgetData = yield* DashboardWidgetDataService
+
+		// An imported board is created like any other, with its source on the audit row.
+		const createImported = Effect.fn("HttpV2Dashboards.createImported")(function* (
+			portable: PortableDashboardDocument,
+			source: "perses_import" | "grafana_import",
+		) {
+			const tenant = yield* CurrentTenant.Context
+			yield* requireRawSqlScopes(tenant.scopes, [], portable.widgets)
+			const stored = yield* persistence.create(tenant.orgId, tenant.userId, portable)
+			yield* recordHttpAudit("dashboard.created", {
+				resourceId: stored.document.id,
+				metadata: { name: stored.document.name, source },
+			})
+			return toV2DashboardMutation(stored)
+		})
 
 		// Share management.
 		//
@@ -380,7 +407,7 @@ export const HttpV2DashboardsLive = HttpApiBuilder.group(MapleApiV2, "dashboards
 		 */
 		const upsertShareIn = (
 			context: Effect.Success<ReturnType<typeof openScope>>,
-			mode: DashboardShareMode,
+			params: V2DashboardShareParams,
 		) =>
 			Effect.gen(function* () {
 				yield* requireShareableScopes(context.tenant.scopes)
@@ -388,7 +415,12 @@ export const HttpV2DashboardsLive = HttpApiBuilder.group(MapleApiV2, "dashboards
 					context.tenant.orgId,
 					context.tenant.userId,
 					context.scope,
-					mode,
+					params.mode,
+					params.expiresAt === undefined
+						? undefined
+						: params.expiresAt === null
+							? null
+							: timestampMs(params.expiresAt),
 				)
 
 				yield* logShare("dashboard share upserted", context, {
@@ -399,6 +431,7 @@ export const HttpV2DashboardsLive = HttpApiBuilder.group(MapleApiV2, "dashboards
 					resourceId: created.id,
 					metadata: {
 						mode: created.mode,
+						...(created.expiresAt === undefined ? undefined : { expires_at: created.expiresAt }),
 						dashboard_id: encodePublicId(PublicIdPrefixes.dashboard, context.scope.dashboardId),
 						...(context.scope.widgetId === null
 							? undefined
@@ -613,27 +646,27 @@ export const HttpV2DashboardsLive = HttpApiBuilder.group(MapleApiV2, "dashboards
 					}),
 				)
 				.handle("importPerses", ({ payload }) =>
-					Effect.gen(function* () {
-						const converted = yield* convertPersesDashboardToPortable(payload.dashboard)
-						const tenant = yield* CurrentTenant.Context
-						yield* requireRawSqlScopes(tenant.scopes, [], converted.dashboard.widgets)
-						const stored = yield* persistence.create(
-							tenant.orgId,
-							tenant.userId,
-							converted.dashboard,
-						)
-						const dashboard = stored.document
-						yield* recordHttpAudit("dashboard.created", {
-							resourceId: dashboard.id,
-							metadata: { name: dashboard.name, source: "perses_import" },
-						})
-
-						return {
-							object: "dashboard_import" as const,
-							dashboard: toV2DashboardMutation(stored),
-							warnings: [...converted.warnings],
-						}
-					}),
+					Effect.flatMap(convertPersesDashboardToPortable(payload.dashboard), (converted) =>
+						createImported(converted.dashboard, "perses_import").pipe(
+							Effect.map((dashboard) => ({
+								object: "dashboard_import" as const,
+								dashboard,
+								warnings: [...converted.warnings],
+							})),
+						),
+					),
+				)
+				.handle("importGrafana", ({ payload }) =>
+					Effect.flatMap(convertGrafanaDashboardToPortable(payload.dashboard), (converted) =>
+						createImported(converted.dashboard, "grafana_import").pipe(
+							Effect.map((dashboard) => ({
+								object: "dashboard_import" as const,
+								dashboard,
+								warnings: [...converted.warnings],
+								stats: converted.stats,
+							})),
+						),
+					),
 				)
 				.handle("listVersions", ({ params, query }) =>
 					Effect.gen(function* () {
@@ -821,7 +854,7 @@ export const HttpV2DashboardsLive = HttpApiBuilder.group(MapleApiV2, "dashboards
 				.handle("retrieveShare", ({ params }) => retrieveShare(params.id, null))
 				.handle("upsertShare", ({ params, payload }) =>
 					openScope(params.id, null).pipe(
-						Effect.flatMap((context) => upsertShareIn(context, payload.mode)),
+						Effect.flatMap((context) => upsertShareIn(context, payload)),
 					),
 				)
 				.handle("rotateShare", ({ params }) => rotateShare(params.id, null))
@@ -841,7 +874,7 @@ export const HttpV2DashboardsLive = HttpApiBuilder.group(MapleApiV2, "dashboards
 							})
 						}
 
-						return yield* upsertShareIn(context, payload.mode)
+						return yield* upsertShareIn(context, payload)
 					}),
 				)
 				.handle("rotateWidgetShare", ({ params }) => rotateShare(params.id, params.widget_id))

@@ -2,7 +2,11 @@ import { existsSync } from "node:fs"
 import { resolve } from "node:path"
 import * as AWS from "@alchemy.run/aws"
 import * as Output from "alchemy/Output"
+import * as Config from "effect/Config"
+import * as ConfigProvider from "effect/ConfigProvider"
 import * as Effect from "effect/Effect"
+import * as Option from "effect/Option"
+import { FetchHttpClient } from "effect/http"
 import { ecsSecrets, pgUrlRequireSsl, resolveAwsRegion } from "@maple/infra/aws"
 import { cloudflareIpv4Ranges, issueRegionalCertificate, publishProxiedCname } from "@maple/infra/acm"
 import type { MapleDbLogin, MapleRegion, MapleStackContext, MapleStage } from "@maple/infra/cloudflare"
@@ -15,9 +19,22 @@ import {
 import { r2BucketCredentials } from "@maple/infra/r2-credentials"
 // Only the primitives: these values feed ECS `env:` and Secrets Manager, not Worker bindings.
 import { commitShaEnv, optionalPlain, requiredPlain } from "@maple/infra/env"
+import { resolveAs, resolveDerived } from "@maple/infra/secret-guard"
+import {
+	CH_PASSWORD_SLOT_KEYS_ENV,
+	clickHousePasswordSlotKeys,
+	warehouseTokenByName,
+} from "@maple/infra/secret-slot-keys"
+import { INGEST_APPEND_TOKEN } from "@maple/domain/tinybird/ingest-token"
 import { createIngestCollector } from "./alchemy/collector.ts"
+import {
+	ingestSecrets,
+	ingestSlotKeyMasters,
+	ingestWarehouseAdminToken,
+} from "./alchemy/secrets.ts"
 import { blockedIngestKeysEnv, blockIngestKeysAtEdge } from "./alchemy/edge-block.ts"
 import { gatewayTuningEnv } from "./alchemy/gateway-env.ts"
+import { walKeyPolicy } from "./alchemy/wal-key.ts"
 
 /** Compiled ahead of time by CI so the image build is a COPY. Absent on a dev machine. */
 const PREBUILT_BINARY = "apps/ingest/dist/maple-ingest"
@@ -62,13 +79,70 @@ const WAL_CONTAINER_DIR = "/var/lib/maple-ingest/wal"
 /** The host's instance-store NVMe (mounted by `ec2UserData`) or a root-volume directory. */
 const WAL_HOST_DIR = "/mnt/wal"
 
+/** Host directory holding the instance facts the gateway would otherwise ask the metadata service for. */
+const HOST_IDENTITY_HOST_DIR = "/etc/maple-ingest"
+/** Where the gateway reads them (`INGEST_HOST_IDENTITY_FILE`, `src/host_identity.rs`). */
+const HOST_IDENTITY_CONTAINER_DIR = "/etc/maple-ingest"
+
 /**
  * Boot script for a gateway host (ECS-optimized AL2023). An instance-store host mounts the
  * NVMe at WAL_HOST_DIR and only THEN joins the cluster, so a host whose disk did not come
  * up never gets a task. The S3 tier covers the disk being wiped on replace.
+ *
+ * Tasks share the host's network namespace, so the hop limit alone does not keep the gateway
+ * off the instance metadata service. A boot-time unit drops metadata traffic from every
+ * non-root uid (the ECS agent and SSM run as root) before the host can join the cluster.
  */
 const ec2UserData = (clusterName: string, disk: "instance-store" | "root-volume") => `#!/bin/bash
 set -euxo pipefail
+
+# Instance facts for the gateway's telemetry, read while root still reaches the metadata service.
+# Tracing off around the session token so it stays out of the boot log. Each call is capped
+# at 2s so a silent metadata service leaves the fields empty instead of stalling boot.
+set +x
+imds_token=$(curl -sf --connect-timeout 1 --max-time 2 -X PUT -H "X-aws-ec2-metadata-token-ttl-seconds: 60" http://169.254.169.254/latest/api/token) || imds_token=""
+imds() { curl -sf --connect-timeout 1 --max-time 2 -H "X-aws-ec2-metadata-token: $imds_token" "http://169.254.169.254/latest/meta-data/$1"; }
+mkdir -p ${HOST_IDENTITY_HOST_DIR}
+cat > ${HOST_IDENTITY_HOST_DIR}/host-identity <<IDENTITY
+host.id=$(imds instance-id)
+host.type=$(imds instance-type)
+host.image.id=$(imds ami-id)
+cloud.availability_zone=$(imds placement/availability-zone)
+IDENTITY
+unset imds_token
+set -x
+chmod 0644 ${HOST_IDENTITY_HOST_DIR}/host-identity
+
+cat > /usr/local/sbin/maple-imds-block <<'BLOCK'
+#!/bin/bash
+set -euo pipefail
+for cmd in iptables ip6tables; do
+	addr=169.254.169.254/32
+	[ "$cmd" = ip6tables ] && addr=fd00:ec2::254/128
+	"$cmd" -w -C OUTPUT -d "$addr" -m owner ! --uid-owner 0 -j DROP 2>/dev/null \\
+		|| "$cmd" -w -I OUTPUT 1 -d "$addr" -m owner ! --uid-owner 0 -j DROP
+done
+BLOCK
+chmod 0755 /usr/local/sbin/maple-imds-block
+# RequiredBy ecs.service: if the rule cannot be installed on a reboot, no task starts.
+cat > /etc/systemd/system/maple-imds-block.service <<'UNIT'
+[Unit]
+Description=Keep non-root processes off the instance metadata service
+DefaultDependencies=no
+After=local-fs.target network-pre.target
+Before=network.target docker.service ecs.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/maple-imds-block
+
+[Install]
+WantedBy=multi-user.target
+RequiredBy=ecs.service
+UNIT
+systemctl daemon-reload
+systemctl enable --now maple-imds-block.service
 
 mkdir -p ${WAL_HOST_DIR}
 ${
@@ -90,8 +164,8 @@ CONFIG
 export interface CreateMapleIngestOptions extends Pick<MapleStackContext, "stage" | "region" | "profile"> {
 	/** The public hostname (`domains.ingest`). Every stage that deploys a fleet has one. */
 	hostname: string
-	/** The declared database's gateway login; a stage without one reads `MAPLE_INGEST_PG_URL` instead. */
-	dbLogin?: MapleDbLogin
+	/** The declared database's gateway login. */
+	dbLogin: MapleDbLogin
 }
 
 /**
@@ -223,6 +297,10 @@ export const createMapleIngest = ({ stage, region, hostname, profile, dbLogin }:
 			securityGroupIds: [instanceSecurityGroup.groupId],
 			instanceProfileName: instanceProfile.instanceProfileName,
 			associatePublicIpAddress: true,
+			// IMDSv2 only: a forged request from inside the gateway (SSRF) cannot read the instance
+			// role, and hop limit 1 keeps it off any bridge-networked container. The host-networked
+			// gateway is kept off by the boot script's firewall unit (`ec2UserData`).
+			metadataOptions: { httpTokens: "required", httpPutResponseHopLimit: 1, httpEndpoint: "enabled" },
 			userData: ec2UserData(clusterName, WAL_STORAGE[instanceType].disk),
 			tags,
 		})
@@ -267,30 +345,47 @@ export const createMapleIngest = ({ stage, region, hostname, profile, dbLogin }:
 
 		const secret = ecsSecrets(name("ingest"), tags)
 
-		const tinybirdTokenValue = yield* requiredPlain("TINYBIRD_TOKEN")
-		const tinybirdToken = yield* secret("tinybird-token", tinybirdTokenValue)
+		const secrets = yield* resolveAs("ingest", ingestSecrets)
+		// Append-only on the datasources the gateway and collector write (`withIngestAppendToken`).
+		const tinybirdHost = yield* requiredPlain("TINYBIRD_HOST")
+		const tinybirdToken = yield* resolveDerived("ingest", ingestWarehouseAdminToken, (admin) =>
+			warehouseTokenByName(tinybirdHost, admin, INGEST_APPEND_TOKEN),
+		).pipe(
+			// @effect-diagnostics-next-line strictEffectProvide:off -- one plan-time lookup, its own client
+			Effect.provide(FetchHttpClient.layer),
+			// No such token means the warehouse project was not deployed first: fail the deploy as config.
+			Effect.catchTag("@maple/infra/ScopedTokenLookupError", (error) =>
+				Effect.fail(
+					new Config.ConfigError(
+						new ConfigProvider.SourceError({
+							message: `${error.tokenName}: ${error.message}. Deploy the warehouse project before ingest.`,
+						}),
+					),
+				),
+			),
+			Effect.flatMap((derived) => secret("tinybird-ingest-append-token", derived.value)),
+		)
 		// NOT `MAPLE_PG_URL`: that is the migration admin's URL. The gateway reads
 		// ingest keys through the pooler as its own role.
-		const pgUrl = dbLogin
-			? yield* secret("maple-pg-url", pgUrlRequireSsl(dbLogin.url))
-			: yield* requiredPlain("MAPLE_INGEST_PG_URL").pipe(
-					Effect.flatMap((url) => secret("maple-pg-url", url)),
-				)
-		const keyEncryptionKeyValue = yield* requiredPlain("MAPLE_INGEST_KEY_ENCRYPTION_KEY")
-		const keyEncryptionKey = yield* secret("ingest-key-encryption-key", keyEncryptionKeyValue)
-		// Only set while a key rotation is in flight (docs/secret-encryption.md).
-		const { MAPLE_INGEST_KEY_DECRYPTION_KEYS: decryptionKeysValue } = yield* optionalPlain(
-			"MAPLE_INGEST_KEY_DECRYPTION_KEYS",
+		const pgUrl = yield* secret("maple-pg-url", pgUrlRequireSsl(dbLogin.url))
+		// Only the subkeys for the one slot the gateway opens, derived here from the master keys.
+		const chPasswordSlotKeys = yield* resolveDerived(
+			"ingest",
+			ingestSlotKeyMasters,
+			clickHousePasswordSlotKeys,
+		).pipe(
+			// A malformed master key is bad config: fail the deploy as one.
+			Effect.catchTag("@maple/infra/SlotKeyDerivationError", (error) =>
+				Effect.fail(
+					new Config.ConfigError(new ConfigProvider.SourceError({ message: error.message })),
+				),
+			),
+			Effect.flatMap((derived) => secret("ingest-ch-password-slot-keys", derived.value)),
 		)
-		const keyDecryptionKeys = decryptionKeysValue
-			? yield* secret("ingest-key-decryption-keys", decryptionKeysValue)
+		const keyLookupHmacKey = yield* secret("ingest-key-lookup-hmac-key", secrets.keyLookupHmacKey)
+		const autumnSecret = Option.isSome(secrets.autumnSecretKey)
+			? yield* secret("autumn-secret-key", secrets.autumnSecretKey.value)
 			: undefined
-		const keyLookupHmacKeyValue = yield* requiredPlain("MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY")
-		const keyLookupHmacKey = yield* secret("ingest-key-lookup-hmac-key", keyLookupHmacKeyValue)
-
-		// Autumn absent means billing enforcement is dark.
-		const { AUTUMN_SECRET_KEY: autumnKey } = yield* optionalPlain("AUTUMN_SECRET_KEY")
-		const autumnSecret = autumnKey ? yield* secret("autumn-secret-key", autumnKey) : undefined
 
 		// The access key id is not secret, but it only exists once the token does and
 		// `env` takes plan-time strings only.
@@ -324,31 +419,9 @@ export const createMapleIngest = ({ stage, region, hostname, profile, dbLogin }:
 
 		// Durability tier for the WAL (`apps/ingest/src/wal_store.rs`): sealed,
 		// unexported segments, claimed by the next task if their owner dies.
-		// Named up front so the env var below is a plain string.
+		// Named up front so the env var and the IAM policy below are plain strings.
 		const walBucketName = name("ingest-wal")
-		const walSegments = yield* AWS.S3.Bucket("ingest-wal-segments", {
-			bucketName: walBucketName,
-			// Backstop for segments whose delete was lost.
-			lifecycleRules: [
-				{
-					ID: "expire-wal-segments",
-					Status: "Enabled",
-					Filter: { Prefix: "wal/" },
-					Expiration: { Days: 7 },
-					AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
-				},
-			],
-			publicAccessBlock: {
-				blockPublicAcls: true,
-				blockPublicPolicy: true,
-				ignorePublicAcls: true,
-				restrictPublicBuckets: true,
-			},
-			encryption: { sseAlgorithm: "AES256" },
-			forceDestroy: true,
-			tags,
-		})
-
+		const walBucketArn = `arn:aws:s3:::${walBucketName}`
 		// Its own logical id: alchemy keys resources by id alone, and a repeat id
 		// silently returns the first registration. Keep these policies without a
 		// `description`: changing one replaces the policy under the same name, and the
@@ -361,12 +434,12 @@ export const createMapleIngest = ({ stage, region, hostname, profile, dbLogin }:
 					{
 						Effect: "Allow",
 						Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-						Resource: [Output.map(walSegments.bucketArn, (arn) => `${arn}/wal/*`)],
+						Resource: [`${walBucketArn}/wal/*`],
 					},
 					{
 						Effect: "Allow",
 						Action: ["s3:ListBucket"],
-						Resource: [walSegments.bucketArn],
+						Resource: [walBucketArn],
 						Condition: { StringLike: { "s3:prefix": ["wal/*"] } },
 					},
 				],
@@ -415,11 +488,21 @@ export const createMapleIngest = ({ stage, region, hostname, profile, dbLogin }:
 			placementConstraints: [{ type: "distinctInstance" }],
 			cpu: taskSize.cpu,
 			memory: taskSize.memory,
-			volumes: [{ name: "wal", host: { sourcePath: WAL_HOST_DIR } }],
+			volumes: [
+				{ name: "wal", host: { sourcePath: WAL_HOST_DIR } },
+				{ name: "host-identity", host: { sourcePath: HOST_IDENTITY_HOST_DIR } },
+			],
 			container: {
 				// The shutdown drain (`INGEST_SHUTDOWN_DRAIN_SECS`, default 90) must fit inside this.
 				stopTimeout: 120,
-				mountPoints: [{ sourceVolume: "wal", containerPath: WAL_CONTAINER_DIR }],
+				mountPoints: [
+					{ sourceVolume: "wal", containerPath: WAL_CONTAINER_DIR },
+					{
+						sourceVolume: "host-identity",
+						containerPath: HOST_IDENTITY_CONTAINER_DIR,
+						readOnly: true,
+					},
+				],
 				// Replaces the mapping alchemy derives from `port`; host mode needs hostPort = containerPort.
 				portMappings: [INGEST_PORT, INGEST_GRPC_PORT].map((port) => ({
 					containerPort: port,
@@ -463,10 +546,7 @@ export const createMapleIngest = ({ stage, region, hostname, profile, dbLogin }:
 			secrets: {
 				TINYBIRD_TOKEN: tinybirdToken.secretArn,
 				MAPLE_PG_URL: pgUrl.secretArn,
-				MAPLE_INGEST_KEY_ENCRYPTION_KEY: keyEncryptionKey.secretArn,
-				...(keyDecryptionKeys
-					? { MAPLE_INGEST_KEY_DECRYPTION_KEYS: keyDecryptionKeys.secretArn }
-					: undefined),
+				[CH_PASSWORD_SLOT_KEYS_ENV]: chPasswordSlotKeys.secretArn,
 				MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY: keyLookupHmacKey.secretArn,
 				...(autumnSecret ? { AUTUMN_SECRET_KEY: autumnSecret.secretArn } : undefined),
 				...(replayR2Secret && replayR2AccessKeyId
@@ -485,11 +565,11 @@ export const createMapleIngest = ({ stage, region, hostname, profile, dbLogin }:
 				MAPLE_ENVIRONMENT: resolveDeploymentEnvironment(stage),
 				// Lets the unknown-key 401 name the other region's ingest URL.
 				...(stage.kind === "prd" && { MAPLE_REGION: region }),
-				TINYBIRD_HOST: yield* requiredPlain("TINYBIRD_HOST"),
+				TINYBIRD_HOST: tinybirdHost,
 				INGEST_KEY_STORE_BACKEND: "postgres",
 				// A replaced role changes the task definition, so the fleet rolls onto the
 				// new secret before alchemy deletes the old role.
-				...(dbLogin && { MAPLE_PG_ROLE_ID: dbLogin.id }),
+				MAPLE_PG_ROLE_ID: dbLogin.id,
 
 				// Trust `Cf-IPCountry` (fills `session_replays.Country`): the ALB admits only Cloudflare.
 				MAPLE_INGEST_TRUST_PROXY_GEO: "true",
@@ -499,6 +579,8 @@ export const createMapleIngest = ({ stage, region, hostname, profile, dbLogin }:
 				// The task role signs these requests; the S3 gateway endpoint keeps them private.
 				INGEST_WAL_S3_BUCKET: walBucketName,
 				INGEST_WAL_S3_REGION: resolveAwsRegion(region),
+				// Written by the boot script: the task itself cannot reach the metadata service.
+				INGEST_HOST_IDENTITY_FILE: `${HOST_IDENTITY_CONTAINER_DIR}/host-identity`,
 
 				...(replayBlobs
 					? {
@@ -522,12 +604,64 @@ export const createMapleIngest = ({ stage, region, hostname, profile, dbLogin }:
 				...(yield* blockedIngestKeysEnv),
 				// The org Maple's own telemetry is filed under. Required, no fallback.
 				MAPLE_INTERNAL_ORG_ID: yield* requiredPlain("MAPLE_INTERNAL_ORG_ID"),
+				// On wherever a stage is deployed whole and never rolled back to an older gateway; prd
+				// turns it on in its environment once `audit_trail_events` is there.
+				...(stage.kind !== "prd" && { INGEST_AUDIT_TRAIL_ENABLED: "true" }),
 				...(yield* gatewayTuningEnv),
 				// `INGEST_COMMIT_SHA` (prd) is the image's own revision, so a deploy that leaves
 				// `apps/ingest` alone does not change the task definition and roll the hosts.
 				...(yield* commitShaEnv("INGEST_COMMIT_SHA")),
 			} satisfies Record<string, string | Output.Output<string>>,
 
+			tags,
+		})
+
+		// The WAL's own key. Only the gateway's task role (and the deploy role, when the deploy
+		// names it) may use it; the account keeps administration so the key cannot be orphaned.
+		// Declared after the service because its policy names the task role.
+		const deployRoleArn = (yield* optionalPlain("MAPLE_AWS_DEPLOY_ROLE_ARN")).MAPLE_AWS_DEPLOY_ROLE_ARN
+		const walKey = yield* AWS.KMS.Key("ingest-wal-key", {
+			description: `Maple ingest WAL segments (${walBucketName})`,
+			enableKeyRotation: true,
+			policy: Output.map(service.taskRoleArn, (taskRoleArn = "") =>
+				walKeyPolicy({
+					region: resolveAwsRegion(region),
+					users: deployRoleArn ? [taskRoleArn, deployRoleArn] : [taskRoleArn],
+				}),
+			),
+			tags,
+		})
+		yield* AWS.KMS.Alias("ingest-wal-key-alias", {
+			aliasName: `alias/${walBucketName}`,
+			targetKeyId: walKey.keyId,
+		})
+
+		yield* AWS.S3.Bucket("ingest-wal-segments", {
+			bucketName: walBucketName,
+			// Backstop for segments whose delete was lost.
+			lifecycleRules: [
+				{
+					ID: "expire-wal-segments",
+					Status: "Enabled",
+					Filter: { Prefix: "wal/" },
+					Expiration: { Days: 7 },
+					AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 },
+				},
+			],
+			publicAccessBlock: {
+				blockPublicAcls: true,
+				blockPublicPolicy: true,
+				ignorePublicAcls: true,
+				restrictPublicBuckets: true,
+			},
+			// Objects written before the switch keep the encryption S3 recorded on each of them.
+			encryption: {
+				sseAlgorithm: "aws:kms",
+				kmsMasterKeyId: walKey.keyArn,
+				// One data key per bucket instead of a KMS call per object.
+				bucketKeyEnabled: true,
+			},
+			forceDestroy: true,
 			tags,
 		})
 

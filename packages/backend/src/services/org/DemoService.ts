@@ -3,9 +3,11 @@ import { Array as Arr, Context, Effect, Layer, Random } from "effect"
 import { Env } from "@maple/backend/platform/Env"
 import { WarehouseQueryService } from "@maple/backend/services/warehouse/WarehouseQueryService"
 import { generateDemoRows } from "./demo/fixtures"
+import { generateDemoProductRows } from "./demo/product"
 
 const DEMO_HOURS_DEFAULT = 6
 const DEMO_RATE_PER_HOUR = 250
+const DEMO_VISITORS_PER_HOUR = 40
 // Rows per warehouse append. Keeps each NDJSON POST body modest (~1.5k rows
 // total for the 6h default) without fanning out into many tiny requests.
 const INGEST_CHUNK = 500
@@ -43,7 +45,14 @@ export class DemoService extends Context.Service<DemoService, DemoServiceApi>()(
 				}
 				const safeHours = Math.max(1, Math.min(24, Math.floor(hours)))
 				const random = yield* Random.Random
-				const { traceRows, logRows, metricGaugeRows, metricSumRows } = generateDemoRows({
+				const {
+					traceRows,
+					logRows,
+					metricGaugeRows,
+					metricSumRows,
+					metricHistogramRows,
+					metricExponentialHistogramRows,
+				} = generateDemoRows({
 					orgId: tenant.orgId,
 					hours: safeHours,
 					ratePerHour: DEMO_RATE_PER_HOUR,
@@ -51,7 +60,15 @@ export class DemoService extends Context.Service<DemoService, DemoServiceApi>()(
 				})
 
 				const ingestAll = (
-					datasource: "traces" | "logs" | "metrics_gauge" | "metrics_sum",
+					datasource:
+						| "traces"
+						| "logs"
+						| "metrics_gauge"
+						| "metrics_sum"
+						| "metrics_histogram"
+						| "metrics_exponential_histogram"
+						| "session_replays"
+						| "product_events",
 					rows: ReadonlyArray<unknown>,
 				) =>
 					Effect.forEach(
@@ -77,13 +94,30 @@ export class DemoService extends Context.Service<DemoService, DemoServiceApi>()(
 				// Runtime, Metric Overview) have data to show.
 				yield* ingestAll("metrics_gauge", metricGaugeRows)
 				yield* ingestAll("metrics_sum", metricSumRows)
+				// Request durations as a histogram, so percentiles have something to read.
+				yield* ingestAll("metrics_histogram", metricHistogramRows)
+				// Query durations as an exponential histogram, the other bucket layout an SDK exports.
+				yield* ingestAll("metrics_exponential_histogram", metricExponentialHistogramRows)
+				// Browser sessions and their product events, so Web and Product analytics have data.
+				const { sessionRows, eventRows } = generateDemoProductRows({
+					orgId: tenant.orgId,
+					hours: safeHours,
+					visitorsPerHour: DEMO_VISITORS_PER_HOUR,
+					random: () => random.nextDoubleUnsafe(),
+				})
+				yield* ingestAll("session_replays", sessionRows)
+				yield* ingestAll("product_events", eventRows)
 
 				return new DemoSeedResponse({
 					seeded: true,
 					skippedReason: null,
 					spansSent: traceRows.length,
 					logsSent: logRows.length,
-					metricsSent: metricGaugeRows.length + metricSumRows.length,
+					metricsSent:
+						metricGaugeRows.length +
+						metricSumRows.length +
+						metricHistogramRows.length +
+						metricExponentialHistogramRows.length,
 				})
 			})
 

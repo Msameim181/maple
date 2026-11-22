@@ -62,6 +62,15 @@ docker compose up -d
 - Build while the old stack keeps running; downtime is roughly the `maple` restart. After an upgrade that changes the session system, every SSO user signs in once more.
 - Merging newer upstream Maple: `git fetch upstream && git merge upstream/main`, then the same build and `up -d`.
 
+### Upgrading to the 0.4.0 base
+
+Checked on a copy of a running stack with data: all new database migrations applied and no rows were lost. Before you upgrade:
+
+- **Root password.** The API refuses to start with `MAPLE_ROOT_PASSWORD` shorter than 16 characters or a known placeholder (`change-me`, `password`, `admin`, ...). Check yours: `grep -c '^MAPLE_ROOT_PASSWORD=.\{16,\}' .env` should print `1`. Generated passwords are 64 characters and pass.
+- **New secret.** Run `scripts/gen-secrets.sh`: it appends `MAPLE_SESSION_SIGNING_SECRET` (it replaces the older `MAPLE_SESSION_SECRET`, which you can delete from `.env`). Session tokens are signed from a new derived key, so **everyone signs in once more**.
+- **Rebuild the images.** The `maple` container now starts alchemy under Bun (the status Worker imports font files that Node cannot load), so a stale image fails to start with `Unknown file extension ".ttf"`. Rebuild with `docker compose build maple caddy scraper`.
+- **Disk.** A rebuild needs roughly 10 GB free for Docker (`docker system df`). If it fills, `docker builder prune -af` only removes build cache.
+
 ## Roll back
 
 1. `git checkout <previous commit>` and `docker compose build && docker compose up -d`.
@@ -74,8 +83,8 @@ docker compose up -d
 | Secret | Effect and procedure |
 |---|---|
 | `MAPLE_INGEST_KEY_ENCRYPTION_KEY`, `MAPLE_INGEST_KEY_LOOKUP_HMAC_KEY` | **Do not change.** Encrypted secrets and every ingest key stop working |
-| `MAPLE_ROOT_PASSWORD` | Edit `.env`, `docker compose up -d maple`. Root sessions end. If `MAPLE_SESSION_SECRET` is empty, the root password also signs session tokens, so **all** users are signed out |
-| `MAPLE_SESSION_SECRET` | Edit `.env`, `docker compose up -d maple`. All Maple sessions end; everyone signs in again |
+| `MAPLE_ROOT_PASSWORD` | Edit `.env`, `docker compose up -d maple`. Root sessions end. The session key is salted with the root password, so **all** users are signed out |
+| `MAPLE_SESSION_SIGNING_SECRET` | Edit `.env`, `docker compose up -d maple`. All Maple sessions end; everyone signs in again |
 | `SD_INTERNAL_TOKEN` | Must match in `maple` and `scraper`: `docker compose up -d maple scraper` |
 | `ELECTRIC_SECRET` | Must match in `electric` and `maple`: `docker compose up -d electric maple` |
 | `INTERNAL_SERVICE_TOKEN`, `SANDBOX_INTERNAL_SERVICE_TOKEN`, `MAPLE_SHARE_TOKEN_HMAC_KEY` | Edit `.env`, `docker compose up -d maple`. Existing share links stop working when the HMAC key changes |

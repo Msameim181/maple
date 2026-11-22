@@ -20,11 +20,12 @@ import { heading } from "@maple/views/ui/heading"
 import { icon } from "@maple/views/ui/icon"
 import { searchInput } from "@maple/views/ui/search-input"
 import { textLink } from "@maple/views/ui/text-link"
+import { answerTrail } from "@maple/views/ui/answer-trail"
 import { type PixelGlyphName, pixelGlyph } from "./option-card"
 import * as CopyButton from "@maple/views/ui/copy-button"
 import * as GuidedSetup from "../kit/guided-setup"
 import { presenceOf, type TelemetrySignalKind } from "@maple/views/data/signal-presence"
-import { ConnectMessage } from "./quick-start-connect"
+import { ConnectMessage, SETUP_LINK_COPY } from "./quick-start-connect"
 import { TEST_TRACE_SERVICE } from "../kit/own-services"
 import type { LiveFindings } from "./quick-start-live"
 import { regionStep } from "./quick-start-region-view"
@@ -80,66 +81,20 @@ type TrailItem = Readonly<{
 	to: StepId | null
 }>
 
-const trailAnswer = (h: H, item: TrailItem, answer: string): Html => {
-	const content = [icon(h, "CheckIcon", { size: 12, className: "text-severity-info" }), answer]
-	return item.to === null
-		? hstack(h, { gap: "1.5", as: "span", className: typographyClass({ tone: "muted" }) }, content)
-		: textLink(
-				h,
-				{
-					tone: "muted",
-					onClick: Message.ClickedBack({ to: item.to }),
-					className: "gap-1.5 underline-offset-4",
-					// Starts with the visible text, so voice control can say what it sees.
-					attributes: [
-						h.AriaLabel(
-							answer === item.label ? `Go to ${item.label}` : `${answer}, go to ${item.label}`,
-						),
-					],
-				},
-				content,
-			)
-}
-
 /** The quiet progress line: done steps show their answer and reopen it, the current one is underlined. */
 const trail = (h: H, items: ReadonlyArray<TrailItem>): Html =>
 	h.nav(
-		[h.AriaLabel("Onboarding progress"), h.Class("hidden items-center gap-2 text-xs md:flex")],
+		[h.AriaLabel("Onboarding progress"), h.Class("hidden md:flex")],
 		[
-			h.ol(
-				[h.Class(hstackClass({ gap: "2" }))],
-				Arr.map(items, (item, index) =>
-					hstack(
-						h,
-						{
-							gap: "2",
-							align: "center",
-							as: "li",
-							className: "whitespace-nowrap",
-							attributes: [...(item.isCurrent ? [h.AriaCurrent("step")] : [])],
-						},
-						[
-							...(index === 0
-								? []
-								: [h.span([h.AriaHidden(true), h.Class("text-input")], ["/"])]),
-							item.answer === null
-								? h.span(
-										[
-											h.Class(
-												cn(
-													item.isCurrent
-														? "text-foreground underline underline-offset-4"
-														: "text-muted-foreground",
-												),
-											),
-										],
-										[item.label],
-									)
-								: trailAnswer(h, item, item.answer),
-						],
-					),
-				),
-			),
+			answerTrail(h, {
+				label: "Onboarding steps",
+				steps: Arr.map(items, (item) => ({
+					label: item.label,
+					state: item.isCurrent ? "current" : item.answer === null ? "next" : "done",
+					answer: item.answer,
+					onClick: item.to === null ? null : Message.ClickedBack({ to: item.to }),
+				})),
+			}),
 		],
 	)
 
@@ -201,9 +156,11 @@ const shell = (h: H, options: ShellOptions, children: ReadonlyArray<Html>): Html
 						},
 						[
 							hstack(h, { gap: "2" }, [
-								typography(h, { tone: "primary", attributes: [h.AriaHidden(true)] }, [
-									icon(h, "MapleMark", { size: 20 }),
-								]),
+								icon(h, "MapleMark", {
+									size: 20,
+									className: "text-brand-maple",
+									attributes: [h.AriaHidden(true)],
+								}),
 								h.span(
 									[h.Class("font-display text-lg font-semibold tracking-tight")],
 									["maple"],
@@ -595,53 +552,80 @@ const TEST_TRACE_NOTE = {
 	Sent: `Sent as ${TEST_TRACE_SERVICE}. It takes a few minutes to show in Traces, and the next screen shows it arrive.`,
 } as const
 
+/** A bordered line of the connect step: a sentence, then its one action. */
+const noteRow = (h: H, children: ReadonlyArray<Html>): Html =>
+	hstack(
+		h,
+		{ gap: "3", justify: "between", wrap: true, className: "rounded-md border border-border px-4 py-3" },
+		children,
+	)
+
+/** Below `sm` only: wiring an app up takes the machine its code is on, so the page's link goes there. */
+const computerNote = (h: H, connect: Model["connect"]): Html =>
+	// Wrapped, so the column's side padding lands outside the row's border, not inside it.
+	h.div(
+		[h.Class("sm:hidden")],
+		[
+			noteRow(h, [
+				typography(h, { size: "xs", tone: "muted", as: "p", className: "min-w-48 flex-1" }, [
+					"Adding Maple to your app takes the computer your code is on. Copy the link and open it there.",
+				]),
+				CopyButton.copyButton(h, {
+					status: (connect.snippetCopies[SETUP_LINK_COPY] ?? CopyButton.init()).status,
+					label: "link to this setup",
+					idleLabel: "Copy link",
+					idleIcon: "LinkIcon",
+					variant: "outline",
+					size: "sm",
+					onClick: toConnect(ConnectMessage.ClickedCopySetupLink()),
+				}),
+			]),
+		],
+	)
+
 /** "Send test trace": proves the key and endpoint before any app is wired up. */
 const testTraceRow = (h: H, connect: Model["connect"]): Html => {
 	const apiKey = GuidedSetup.serverKey(keysOf(connect))
 	const { testTrace } = connect
-	return hstack(
-		h,
-		{ gap: "3", justify: "between", wrap: true, className: "rounded-md border border-border px-4 py-3" },
-		[
-			testTrace._tag === "Failed"
-				? typography(
-						h,
-						{
-							size: "xs",
-							tone: "error",
-							as: "p",
-							className: "min-w-48 flex-1",
-							attributes: [h.Role("alert")],
-						},
-						[testTrace.message],
-					)
-				: typography(
-						h,
-						{
-							size: "xs",
-							tone: "muted",
-							as: "p",
-							className: "min-w-48 flex-1",
-							attributes: [h.AriaLive("polite")],
-						},
-						[TEST_TRACE_NOTE[testTrace._tag]],
-					),
-			button(
-				h,
-				{
-					variant: "outline",
-					size: "sm",
-					isLoading: testTrace._tag === "Sending",
-					isDisabled: apiKey === null,
-					attributes:
-						apiKey === null
-							? []
-							: [h.OnClick(toConnect(ConnectMessage.ClickedSendTestTrace({ apiKey })))],
-				},
-				[testTrace._tag === "Sent" ? "Send another" : "Send test trace"],
-			),
-		],
-	)
+	return noteRow(h, [
+		testTrace._tag === "Failed"
+			? typography(
+					h,
+					{
+						size: "xs",
+						tone: "error",
+						as: "p",
+						className: "min-w-48 flex-1",
+						attributes: [h.Role("alert")],
+					},
+					[testTrace.message],
+				)
+			: typography(
+					h,
+					{
+						size: "xs",
+						tone: "muted",
+						as: "p",
+						className: "min-w-48 flex-1",
+						attributes: [h.AriaLive("polite")],
+					},
+					[TEST_TRACE_NOTE[testTrace._tag]],
+				),
+		button(
+			h,
+			{
+				variant: "outline",
+				size: "sm",
+				isLoading: testTrace._tag === "Sending",
+				isDisabled: apiKey === null,
+				attributes:
+					apiKey === null
+						? []
+						: [h.OnClick(toConnect(ConnectMessage.ClickedSendTestTrace({ apiKey })))],
+			},
+			[testTrace._tag === "Sent" ? "Send another" : "Send test trace"],
+		),
+	])
 }
 
 export const connectStep = (h: H, model: Model, state: QuickStartState): Html => {
@@ -659,6 +643,7 @@ export const connectStep = (h: H, model: Model, state: QuickStartState): Html =>
 					],
 				),
 			]),
+			computerNote(h, connect),
 			...(platforms.length === 0
 				? []
 				: [

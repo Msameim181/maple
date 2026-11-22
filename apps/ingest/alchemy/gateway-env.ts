@@ -24,17 +24,21 @@ export const gatewayTuningEnv: Config.Config<PlainEnv> = Config.all([
 	// switch rule application off in an emergency.
 	optionalPlain("INGEST_RULES_ENABLED"),
 	optionalPlain("INGEST_RULES_CACHE_TTL_SECS"),
+	// Provider audit events go to the audit trail instead of the logs. The gateway defaults to off:
+	// set "true" once `audit_trail_events` exists and every task runs a build that knows the switch.
+	optionalPlain("INGEST_AUDIT_TRAIL_ENABLED"),
 	optionalPlain("INGEST_MAX_REQUEST_BODY_BYTES"),
 	optionalPlain("INGEST_MAX_DECODED_BODY_BYTES"),
 	optionalPlain("INGEST_MAX_DECODE_HEAP_BYTES"),
+	optionalPlain("INGEST_MAX_ROW_EXPANSION"),
 	optionalPlain("INGEST_DECODE_MEMORY_BYTES"),
 	optionalPlain("INGEST_EXPORT_MAX_ATTEMPTS"),
 	optionalPlain("INGEST_REPLAY_MAX_SESSION_BYTES"),
 	optionalPlain("AUTUMN_API_URL"),
-	// Entitlement cache TTLs. The allow TTL is how soft a hard cap is.
-	optionalPlain("AUTUMN_ENTITLEMENT_ALLOW_TTL_SECS"),
+	// Entitlement cache TTLs. The allow TTL is how soft a hard cap is: 5 min, as paid plans allow overage.
+	optionalPlain("AUTUMN_ENTITLEMENT_ALLOW_TTL_SECS", "300"),
 	optionalPlain("AUTUMN_ENTITLEMENT_DENY_TTL_SECS"),
-	// 30s instead of the binary's 1s cuts Autumn track calls ~30x.
-	optionalPlain("AUTUMN_FLUSH_INTERVAL_SECS", "30"),
+	// Every instance tracks each active (org, feature) once per interval; billing reads hourly.
+	optionalPlain("AUTUMN_FLUSH_INTERVAL_SECS", "120"),
 	optionalPlain("INGEST_SHUTDOWN_DRAIN_SECS"),
 ]).pipe(Config.map((records) => Arr.reduce(records, EMPTY, (env, record) => ({ ...env, ...record }))))

@@ -15,7 +15,7 @@ import * as TimeRangePicker from "../../page/kit/time-range-picker"
 import { underlineTabClass, underlineTabStrip } from "../../page/kit/underline-tabs"
 import { listBody } from "../../page/mcp/view-list"
 import { formatClock } from "../../page/kit/timezone-zones"
-import { MCP_CHART_TOKENS, scopeText } from "../../page/mcp/view-kit"
+import { MCP_CHART_TOKENS, clientIcon, scopeText } from "../../page/mcp/view-kit"
 import { McpMetric, serverBody } from "../../page/mcp/view-server"
 import { serviceMcpTab } from "../mcp-service-tab"
 import { noServersState, quietWindow, serverError, serverLoading } from "../../page/mcp/view-states"
@@ -87,7 +87,8 @@ const serverTitle = (h: H, name: string, description: ReadonlyArray<Html | strin
 			pageTitle(h, { title: name, className: "leading-8" }, [
 				serviceDot(h, {
 					serviceName: name,
-					className: "relative -top-px mr-2.5 inline-block size-3 align-middle",
+					size: "lg",
+					className: "relative -top-px mr-2.5 inline-block align-middle",
 				}),
 				name,
 			]),
@@ -144,6 +145,7 @@ const toolbar = (h: H, model: Model, withSearch: boolean): Html => {
 		options: Arr.map(CALLERS, (client) => ({ name: client.name, count: client.calls })),
 		model: model.clientSelect,
 		toMessage: (message) => Message.GotSelectMessage({ facet: "client", message }),
+		optionIcon: (name) => clientIcon(h, name),
 	})
 	const kindSelect = facetSelect(h, {
 		label: "kind",
@@ -369,7 +371,8 @@ const pageView = (model: Model, h: H): Html => {
 					titleContent: pageTitle(h, { title: MCP_OVERVIEW.service }, [
 						serviceDot(h, {
 							serviceName: MCP_OVERVIEW.service,
-							className: "relative -top-px mr-2.5 inline-block size-3 align-middle",
+							size: "lg",
+							className: "relative -top-px mr-2.5 inline-block align-middle",
 						}),
 						MCP_OVERVIEW.service,
 					]),

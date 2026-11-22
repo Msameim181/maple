@@ -50,6 +50,8 @@ const unusedLinear: EffectTransportDeps["linear"] = {
 		Effect.fail(new AlertDeliveryError({ message: "unexpected Linear call", destinationType: "linear" })),
 	saveThread: () =>
 		Effect.fail(new AlertDeliveryError({ message: "unexpected Linear call", destinationType: "linear" })),
+	features: () =>
+		Effect.fail(new AlertDeliveryError({ message: "unexpected Linear call", destinationType: "linear" })),
 }
 
 const baseContext: TemplateRenderContext = {
@@ -225,6 +227,44 @@ describe("buildSummaryLine", () => {
 	})
 })
 
+describe("uptime certificate notifications", () => {
+	const certificateContext: TemplateRenderContext = {
+		...baseContext,
+		ruleName: "Checkout health",
+		signalType: "uptime",
+		comparator: "gte",
+		threshold: 0.5,
+		value: 0.5,
+		sampleCount: 1,
+		severity: "warning",
+		groupKey: "__tls_certificate__",
+		detail: "Certificate for checkout.example.com expires in 9 days (2026-11-24)",
+	}
+
+	it("headlines the certificate, never that the monitor is down", () => {
+		assert.deepStrictEqual(
+			Arr.map(["trigger", "renotify"] as const, (eventType) =>
+				formatAlertHeadline({ ...certificateContext, eventType }),
+			),
+			["Checkout health: certificate expires soon", "Checkout health: certificate still expiring"],
+		)
+		assert.strictEqual(
+			formatAlertHeadline({ ...certificateContext, eventType: "resolve", value: 0 }),
+			"Checkout health: certificate renewed",
+		)
+		// The monitor's own group still reads as an outage.
+		assert.strictEqual(
+			formatAlertHeadline({
+				...certificateContext,
+				groupKey: "__total__",
+				value: 1,
+				eventType: "trigger",
+			}),
+			"Checkout health is down",
+		)
+	})
+})
+
 describe("anomaly notifications", () => {
 	const anomalyContext: TemplateRenderContext = {
 		...baseContext,
@@ -286,6 +326,45 @@ describe("anomaly notifications", () => {
 			buildSummaryLine(resolved, (value) => value),
 			"The anomaly ended.",
 		)
+	})
+})
+
+describe("audit detection notifications", () => {
+	const auditContext: TemplateRenderContext = {
+		...baseContext,
+		ruleName: "Members added",
+		signalType: "audit",
+		signalDisplay: resolveSignalDisplay({ signalType: "audit" }),
+		comparator: "gte",
+		threshold: 3,
+		value: 4,
+		sampleCount: 4,
+		windowMinutes: 10,
+		detail: "4 matching audit events in the last 10 minutes",
+	}
+
+	it("says how many events matched and over which window", () => {
+		assert.deepStrictEqual(
+			[buildSummaryLine(auditContext, (value) => value), formatObservedSummary(auditContext)],
+			[
+				"4 matching audit events in the last 10 minutes",
+				"4 matching audit events in the last 10 minutes",
+			],
+		)
+	})
+
+	it("names the signal Audit log and reads the count as a whole number", () => {
+		const context = buildTemplateContext(auditContext, LINK, CHAT)
+		assert.strictEqual(context["signal.label"], "Audit log")
+		assert.strictEqual(context.observed, "4")
+		assert.strictEqual(context.threshold, "3")
+	})
+
+	// A test send observed nothing, so it describes the condition instead of a count.
+	it("a test notification describes the condition", () => {
+		const line = buildSummaryLine({ ...auditContext, eventType: "test" }, (value) => value)
+		assert.include(line, "Live alerts fire when Audit log is")
+		assert.notInclude(line, "matching audit events")
 	})
 })
 
@@ -384,6 +463,7 @@ describe("dispatchDelivery", () => {
 			let receiver: typeof globalThis | undefined
 			const fetchFn: typeof fetch = function (this: typeof globalThis | undefined) {
 				called = true
+				// oxlint-disable-next-line typescript/no-this-alias -- the receiver is what this test observes
 				receiver = this
 				return Promise.resolve(new Response("{}", { status: 202 }))
 			}

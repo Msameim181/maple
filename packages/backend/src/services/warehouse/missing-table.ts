@@ -51,10 +51,16 @@ export const isMissingAiCrawlerRequests = isMissingWarehouseTable(Datasources.ai
 /** `ci_runs` / `ci_jobs` ship in migration 0047; the CI reads have no raw fallback. */
 export const isMissingCiTables = isMissingWarehouseTable(Datasources.ciRuns, Datasources.ciJobs)
 
+/** `aws_metrics_hourly` ships in migration 0066; the AWS infra reads then take raw points only. */
+export const isMissingAwsMetricsHourly = isMissingWarehouseTable(Datasources.awsMetricsHourly)
+
 export const isMissingServiceOperationsRollup = isMissingWarehouseTable(
 	Datasources.serviceOperationsMinutely,
 	Datasources.serviceOperationsHourly,
 )
+
+/** `service_overview_minutely` ships with `requiredForIngest: false`; the anomaly detector's current window then reads hourly rows. */
+export const isMissingServiceOverviewMinutely = isMissingWarehouseTable(Datasources.serviceOverviewMinutely)
 
 /** `service_map_db_edges_minutely` ships in migration 0049; the map's DB edges then read raw traces. */
 export const isMissingServiceMapDbEdgesMinutely = isMissingWarehouseTable(
@@ -68,6 +74,9 @@ export const isMissingServiceEndpointDetails = isMissingWarehouseTable(
 
 /** `user_activity_hourly` (migration 0056) is missing; the users pages degrade. */
 export const isMissingUserActivityHourly = isMissingWarehouseTable(Datasources.userActivityHourly)
+
+/** `profiles` ships in migration 0067; a cluster without it has no profiles to show. */
+export const isMissingProfiles = isMissingWarehouseTable(Datasources.profiles)
 
 const MIGRATION_0048_COLUMNS =
 	/\b(?:HttpClassifiedSpanCount|HttpStatusCount|Http4xxCount|Http5xxCount|RequestBodyBytes|RequestBodyCount)\b/
@@ -85,6 +94,14 @@ export const isMissingUserActivityChannels = namesDriftedColumn(
 	/\b(?:ClassifiedRequestCount|WebRequestCount|MobileRequestCount)\b/,
 )
 
+/** `user_activity_hourly` predates its `UserName` / `UserEmail` states (migration 0065): schema drift
+ * naming one of them. The users pages then name users from replays and MCP spans only. */
+export const isMissingUserActivityIdentity = namesDriftedColumn(/\bUser(?:Name|Email)(?:At)?\b/)
+
 /** `error_events.UserId` (migration 0057) is missing: schema drift naming `UserId` only, so every
  * other drift still surfaces. User issues and affected users then answer unattributed. */
 export const isMissingErrorEventsUserId = namesDriftedColumn(/\bUserId\b/)
+
+/** `service_usage` predates its profile columns (migration 0068): schema drift naming one of them.
+ * The billing chart then reads no profile usage. */
+export const isMissingServiceUsageProfiles = namesDriftedColumn(/\bProfile(?:RowCount|SizeBytes)\b/)

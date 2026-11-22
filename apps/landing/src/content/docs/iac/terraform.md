@@ -1,13 +1,13 @@
 ---
 title: "Terraform"
-description: "Declare Maple dashboards, alert rules, notification destinations, uptime monitors, scrape targets and API keys in Terraform, next to the infrastructure they watch."
+description: "Declare Maple dashboards, alert rules, notification destinations, uptime monitors, status pages, scrape targets and API keys in Terraform, next to the infrastructure they watch."
 group: "Infrastructure as Code"
 order: 3
 icon: "terraform"
 navLabel: "Terraform"
 ---
 
-The Maple provider for [Terraform](https://developer.hashicorp.com/terraform) manages Maple configuration as code: dashboards, alert rules and their destinations, uptime monitors, scrape targets and API keys. It talks to the public [v2 API](/docs/reference/api), so anything you can do there with a key you can review in a plan first.
+The Maple provider for [Terraform](https://developer.hashicorp.com/terraform) manages Maple configuration as code: dashboards, alert rules and their destinations, uptime monitors, status pages, scrape targets and API keys. It talks to the public [v2 API](/docs/reference/api), so anything you can do there with a key you can review in a plan first. The same provider is available for [Pulumi](/docs/iac/pulumi).
 
 |                    |                                                                                                     |
 | ------------------ | --------------------------------------------------------------------------------------------------- |
@@ -115,7 +115,7 @@ The quickest way to get a dashboard's widget documents is to build it in Maple a
 
 ## Secrets and state
 
-Notification credentials (`integration_key`, `webhook_url`, `bot_token`, `signing_secret`) and a scrape target's `auth_credentials` are write-only in the API. Terraform keeps the value you set and sends it on every update, but it cannot see a credential someone changes in Maple.
+Notification credentials (`integration_key`, a webhook's `url` and `signing_secret`, `webhook_url`, `bot_token`) and a scrape target's `auth_credentials` are write-only in the API. Terraform keeps the value you set and sends it on every update, but it cannot see a credential someone changes in Maple.
 
 `maple_api_key` stores the new key's `secret` in state, since Maple only returns it once. The `maple_ingest_keys` data source reads your ingest keys into state too. Keep state in an encrypted backend.
 

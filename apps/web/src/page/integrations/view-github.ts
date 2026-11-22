@@ -1,24 +1,23 @@
 import type { GithubIntegrationStatus } from "@maple/domain/http"
 import { countLabel } from "@maple/ui/lib/format"
-import { AsyncData } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { heading } from "@maple/views/ui/heading"
 import { AppRoute, hrefOf } from "../../route"
 import { button, linkButton } from "@maple/views/ui/button"
-import { errorState } from "@maple/views/ui/error-state"
 import { icon } from "@maple/views/ui/icon"
 import { item, itemActions, itemContent, itemDescription, itemMedia } from "@maple/views/ui/item"
 import { panel } from "@maple/views/ui/panel"
 import { refreshButton } from "@maple/views/ui/refresh-button"
-import { settingRow } from "@maple/views/ui/setting-row"
 import { skeleton, skeletonBlock } from "@maple/views/ui/skeleton"
 import { statusDot } from "@maple/views/ui/status-dot"
-import { switchControl } from "@maple/views/ui/switch"
+import { INTEGRATION_FEATURES, type IntegrationFeatureSpec } from "@maple/domain/integration-features"
+import { type FeatureRow, featureList, featurePanel } from "../kit/feature-list"
 import { integrationIconPlate } from "../kit/integration-empty"
 import { integrationNotice } from "./kit/notice"
 import { Message } from "./message"
-import type { Model } from "./model"
-import { ciTracesShown, githubStatusOf } from "./update-github"
+import { integrationStatusCard } from "./view-integration-card"
+import { manageLock, type Model } from "./model"
+import { auditLogShown, ciTracesShown, githubStatusOf } from "./update-github"
 import { disconnectDialog } from "./view-disconnect"
 import { repositoriesPanels, repoDialogs } from "./view-github-repos"
 import { typography } from "@maple/views/ui/typography"
@@ -137,39 +136,53 @@ export const githubInstallationPicker = (h: H, model: Model): ReadonlyArray<Html
 	]
 }
 
-const ciTracesRow = (h: H, model: Model): Html => {
-	const isChecked = ciTracesShown(model)
-	return settingRow(h, {
-		ids: {
-			control: "github-ci-traces-input",
-			label: "github-ci-traces-label",
-			description: "github-ci-traces-description",
-		},
-		framed: true,
-		className: "bg-card px-4 py-3",
-		label: "CI traces and logs",
-		description: [
-			"Each finished GitHub Actions run becomes a trace under the",
-			" ",
-			typography(h, { tone: "foreground", mono: true }, ["github-actions"]),
-			" service, with a span per job and step. Each job's log lines become logs on the step that wrote them, up to 5 MB per job. Counts toward your usage.",
-		],
-		filled: isChecked,
-		control: switchControl(h, {
-			id: "github-ci-traces",
-			inputId: "github-ci-traces-input",
-			isChecked,
-			isFilled: isChecked,
-			labelledBy: "github-ci-traces-label",
-			describedBy: "github-ci-traces-description",
+/** CI traces and the audit log switch here; PR review is per repository, so its row counts them and links there. */
+/** GitHub's switches: a titled panel on the card, a plain list inside the flow's Choose data step. */
+export const githubFeatures = (
+	h: H,
+	model: Model,
+	status: GithubIntegrationStatus,
+	place: "card" | "flow" = "card",
+): Html => {
+	// Each position's id is pinned, so a reorder of the catalog fails to compile instead of
+	// binding a switch to another feature's toggle.
+	const [ciTraces, auditLog, prReview]: readonly [
+		IntegrationFeatureSpec<"ciTraces">,
+		IntegrationFeatureSpec<"auditLog">,
+		IntegrationFeatureSpec<"prReview">,
+	] = INTEGRATION_FEATURES.github
+	const active = Arr.filter(status.repositories, (repo) => repo.status === "active")
+	const reviewed = Arr.filter(active, (repo) => repo.prReviewEnabled).length
+	const rows: ReadonlyArray<FeatureRow<Message>> = [
+		{
+			spec: ciTraces,
+			isChecked: ciTracesShown(model),
+			isDisabled: model.githubCard.isSavingCiTraces,
 			onToggle: Message.ToggledCiTraces(),
-		}),
-	})
+		},
+		{
+			spec: auditLog,
+			isChecked: auditLogShown(model),
+			isDisabled: model.githubCard.isSavingAuditLog,
+			onToggle: Message.ToggledAuditLog(),
+		},
+		{
+			spec: prReview,
+			link: { href: hrefOf(AppRoute.CodeReviewSettings()), label: "Choose repositories" },
+			note: {
+				_tag: "Info",
+				text: `${reviewed} of ${countLabel(active.length, "repository", "repositories")}`,
+			},
+		},
+	]
+	const lockReason = manageLock(model)
+	return place === "card"
+		? featurePanel(h, { idPrefix: "github", title: "What Maple does", rows, error: null, lockReason })
+		: featureList(h, { idPrefix: "github", rows, lockReason })
 }
 
 const connectedView = (h: H, model: Model, status: GithubIntegrationStatus, timeZone: string): Html => {
 	const busy = model.connect.isStarting || model.disconnect.isPending
-	const active = Arr.filter(status.repositories, (repo) => repo.status === "active")
 	const login = status.accountLogin
 	return h.div(
 		[h.Class("space-y-4")],
@@ -246,49 +259,19 @@ const connectedView = (h: H, model: Model, status: GithubIntegrationStatus, time
 					"gap-1.5",
 				),
 			]),
-			ciTracesRow(h, model),
-			settingRow(h, {
-				ids: {
-					control: "github-pr-review-control",
-					label: "github-pr-review-label",
-					description: "github-pr-review-description",
-				},
-				framed: true,
-				className: "bg-card px-4 py-3",
-				label: "Pull request reviews",
-				description: [
-					String(Arr.filter(active, (repo) => repo.prReviewEnabled).length),
-					" of ",
-					String(active.length),
-					" ",
-					"repositories reviewed. Rules, models and analytics live on the Review & CI page.",
-				],
-				control: [
-					linkButton(
-						h,
-						{ size: "sm", variant: "outline", href: hrefOf(AppRoute.CodeReviewSettings()) },
-						["Open code review"],
-					),
-				],
-			}),
+			githubFeatures(h, model, status),
 			...repositoriesPanels(h, model, status, timeZone),
 		],
 	)
 }
 
 export const githubCard = (h: H, model: Model, timeZone: string): ReadonlyArray<Html> => {
-	const body = AsyncData.match(model.statuses.github.data, {
-		onIdle: () => loadingState(h),
-		onLoading: () => loadingState(h),
-		onFailure: (failure) =>
-			errorState(h, {
-				failure,
-				title: "Couldn't load the GitHub integration",
-				onRetry: Message.ClickedGithubRefresh(),
-			}),
-		onStale: ({ data }) => byState(h, model, data, timeZone),
-		onRefreshing: (data) => byState(h, model, data, timeZone),
-		onSuccess: (data) => byState(h, model, data, timeZone),
+	const body = integrationStatusCard(h, model.statuses.github, {
+		name: "github",
+		failureTitle: "Couldn't load the GitHub integration",
+		render: (data) => byState(h, model, data, timeZone),
+		loading: () => loadingState(h),
+		onRetry: Message.ClickedGithubRefresh(),
 	})
 	return [body, disconnectDialog(h, model, "github"), ...repoDialogs(h, model)]
 }

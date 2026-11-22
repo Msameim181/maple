@@ -13,7 +13,11 @@ import {
 	GROUP_BY_TOKENS,
 	resolveGroupBy,
 } from "./model"
-import { Array as Arr, String as Str } from "effect"
+import { Array as Arr, Exit, Schema, String as Str } from "effect"
+import {
+	QueryEngineExecuteRequest,
+	TRACES_NUMERIC_ATTRIBUTE_KEY_MAX_LENGTH,
+} from "@maple/domain/query-engine"
 
 // Minimal traces draft factory — only the fields the builder reads matter; the
 // rest satisfy the payload shape.
@@ -669,16 +673,88 @@ describe("aggregation enforcement follows AGGREGATIONS_BY_SOURCE", () => {
 		expect(result.error).toBeNull()
 	})
 
-	it("p95 on metrics is rejected and the error lists the valid set", () => {
+	it("a valueField key over the request limit fails in the builder; one at the limit decodes", () => {
+		const build = (length: number) =>
+			buildTimeseriesQuerySpec(
+				tracesDraft({ aggregation: "sum", valueField: `attr.${Str.repeat(length)("x")}` }),
+			)
+		expect(build(TRACES_NUMERIC_ATTRIBUTE_KEY_MAX_LENGTH + 1).error).toContain("limit")
+		const atLimit = build(TRACES_NUMERIC_ATTRIBUTE_KEY_MAX_LENGTH)
+		expect(atLimit.error).toBeNull()
+		const decoded = Schema.decodeUnknownExit(QueryEngineExecuteRequest)({
+			startTime: "2026-11-19 00:00:00",
+			endTime: "2026-11-19 01:00:00",
+			query: atLimit.query,
+		})
+		expect(Exit.isSuccess(decoded)).toBe(true)
+	})
+
+	it("a trace aggregation on metrics is rejected and the error lists the valid set", () => {
 		const result = buildTimeseriesQuerySpec({
 			...tracesDraft(),
 			dataSource: "metrics",
-			aggregation: "p95",
+			aggregation: "p95_duration",
 			metricName: "http.server.duration",
 			metricType: "gauge",
 		})
 		expect(result.error).toContain("Unsupported metrics aggregation")
 		expect(result.error).toContain("rate")
+	})
+
+	it("p95 on a histogram metric lowers to the percentile", () => {
+		const result = buildTimeseriesQuerySpec({
+			...tracesDraft(),
+			dataSource: "metrics",
+			aggregation: "p95",
+			metricName: "http.server.duration",
+			metricType: "histogram",
+		})
+		expect(result.error).toBeNull()
+		expect(result.query).toMatchObject({ source: "metrics", metric: "p95" })
+	})
+
+	it("a percentile on an exponential histogram builds a metrics percentile query", () => {
+		const result = buildTimeseriesQuerySpec({
+			...tracesDraft(),
+			dataSource: "metrics",
+			aggregation: "p95",
+			metricName: "db.client.operation.duration",
+			metricType: "exponential_histogram",
+		})
+		expect(result.error).toBeNull()
+		expect(result.query).toMatchObject({
+			source: "metrics",
+			metric: "p95",
+			filters: { metricType: "exponential_histogram" },
+		})
+	})
+
+	it("a percentile is built for the histogram type the where clause settles on", () => {
+		const draft = (metricType: "histogram" | "exponential_histogram", clauseType: string) =>
+			buildTimeseriesQuerySpec({
+				...tracesDraft(),
+				dataSource: "metrics",
+				aggregation: "p95",
+				metricName: "http.server.duration",
+				metricType,
+				whereClause: `metric.type = ${clauseType}`,
+			})
+		expect(draft("histogram", "exponential_histogram").query).toMatchObject({
+			metric: "p95",
+			filters: { metricType: "exponential_histogram" },
+		})
+		expect(draft("exponential_histogram", "histogram").query).toMatchObject({
+			metric: "p95",
+			filters: { metricType: "histogram" },
+		})
+	})
+
+	it("both kinds of histogram offer percentiles and neither offers latest", () => {
+		for (const metricType of ["histogram", "exponential_histogram"] as const) {
+			const offered = Arr.map(getMetricsAggregations(metricType), (o) => o.value)
+			expect(offered).toEqual(expect.arrayContaining(["avg", "p50", "p75", "p90", "p95", "p99"]))
+			expect(offered).not.toContain("latest")
+		}
 	})
 })
 

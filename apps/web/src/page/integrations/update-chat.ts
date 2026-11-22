@@ -1,89 +1,70 @@
+import type { V2ChatConnectorList } from "@maple/domain/http/v2"
 import type { ChatWorkspaceId } from "@maple/primitives"
-import { Option, Array as Arr } from "effect"
-import { AsyncData, Command as FoldkitCommand } from "foldkit"
 import type { LoadFailure } from "@maple/views/data/load-failure"
-import * as Dialog from "@maple/views/ui/dialog"
-import { type PageContext, PageOutMessage, type PageReturn } from "../contract"
-import { chatConnectorOf, chatManifestOf, integrationOfSearch } from "./catalog"
+import { Array as Arr, Option } from "effect"
+import { AsyncData } from "foldkit"
+import { chatConnectorOf, chatManifestOf } from "./catalog"
 import {
 	type ChatCardModel,
+	type ChatFeatureFlag,
+	ChatMessage,
+	SaveChatFeatures,
+	savedChatFeatures,
+	connectorStatusOf,
 	DisconnectChatWorkspace,
 	InstallChat,
 	LinkChatIdentity,
 	UnlinkChatIdentity,
 } from "./chat"
 import { disconnectSpec } from "./disconnect"
-import { Message } from "./message"
-import type { Model } from "./model"
-import { chain, requestStatus } from "./update-status"
+import { completedSwitches, initFeatureSwitches, settledSwitches, toggledSwitches } from "./feature-switches"
+import { HubRequest, type ProviderEnv, type ProviderReturn, type StatusAnswer } from "./provider"
 
-type Return = PageReturn<Model, Message>
+type Env = ProviderEnv<V2ChatConnectorList>
+type Return = ProviderReturn<ChatCardModel, ChatMessage>
 
-const withCard = (model: Model, card: Partial<ChatCardModel>): Model => ({
-	...model,
-	chatCard: { ...model.chatCard, ...card },
-})
+const connectorOfPage = (env: Env) => (env.integration === null ? null : chatConnectorOf(env.integration))
 
-const connectorOfPage = (model: Model) => {
-	const integration = integrationOfSearch(model.search.integration)
-	return integration === null ? null : chatConnectorOf(integration)
-}
-
-const platformOf = (model: Model) => {
-	const connector = connectorOfPage(model)
+const platformOf = (env: Env) => {
+	const connector = connectorOfPage(env)
 	return connector === null ? "" : (chatManifestOf(connector)?.name ?? "")
 }
 
-/** The connector's entry in the list (`status`), if it answered. */
-export const chatConnectorStatus = (model: Model) => {
-	const connector = connectorOfPage(model)
-	return Option.getOrNull(
-		Option.map(AsyncData.getData(model.statuses.chat.data), (response) =>
-			Option.getOrNull(Arr.findFirst(response.data, (entry) => entry.id === connector)),
-		),
-	)
-}
-
-const toast = (model: Model, type: "success" | "error", title: string, description = ""): Return => ({
-	model,
-	outMessage: PageOutMessage.RequestedToast({ type, title, description }),
-})
-
-/** A success title (optional), or the error title with the failure's message. */
-const outcome = (
-	model: Model,
-	context: PageContext,
+/** A success title (optional) and the connectors re-read, or the error title with the failure's message. */
+const outcomeRequests = (
 	failure: LoadFailure | null,
 	titles: Readonly<{ success?: string; error: string }>,
-): Return =>
+): ReadonlyArray<HubRequest> =>
 	failure === null
-		? chain(model, [
-				(next) =>
-					titles.success === undefined ? { model: next } : toast(next, "success", titles.success),
-				(next) => requestStatus(next, context, "chat", "Supersede"),
-			])
-		: toast(model, "error", titles.error, failure.message)
+		? [
+				...(titles.success === undefined ? [] : [HubRequest.toast("success", titles.success)]),
+				HubRequest.readStatus("Supersede"),
+			]
+		: [HubRequest.toast("error", titles.error, failure.message)]
 
-export const clickedInstall = (model: Model): Return => {
-	const connector = connectorOfPage(model)
-	if (connector === null || model.chatCard.busy !== null) return { model }
-	return { model: withCard(model, { busy: "install" }), commands: [InstallChat({ connector })] }
+const clickedInstall = (model: ChatCardModel, env: Env): Return => {
+	const connector = connectorOfPage(env)
+	if (connector === null || model.busy !== null) return { model }
+	return { model: { ...model, busy: "install" }, commands: [InstallChat({ connector })] }
 }
 
 /** Success keeps the card busy: the browser is already leaving for the platform. */
-export const completedInstall = (model: Model, context: PageContext, failure: LoadFailure | null): Return =>
+const completedInstall = (model: ChatCardModel, env: Env, failure: LoadFailure | null): Return =>
 	failure === null
-		? requestStatus(model, context, "chat", "Supersede")
-		: outcome(withCard(model, { busy: null }), context, failure, {
-				error: `Couldn't start the ${platformOf(model)} install`,
-			})
+		? { model, requests: [HubRequest.readStatus("Supersede")] }
+		: {
+				model: { ...model, busy: null },
+				requests: outcomeRequests(failure, {
+					error: `Couldn't start the ${platformOf(env)} install`,
+				}),
+			}
 
-export const clickedIdentity = (model: Model): Return => {
-	const connector = connectorOfPage(model)
-	const status = chatConnectorStatus(model)
-	if (connector === null || model.chatCard.identityBusy) return { model }
+const clickedIdentity = (model: ChatCardModel, env: Env): Return => {
+	const connector = connectorOfPage(env)
+	const status = connectorStatusOf(env.status, connector)
+	if (connector === null || model.identityBusy) return { model }
 	return {
-		model: withCard(model, { identityBusy: true }),
+		model: { ...model, identityBusy: true },
 		commands: [
 			status?.identity === undefined
 				? LinkChatIdentity({ connector })
@@ -92,51 +73,98 @@ export const clickedIdentity = (model: Model): Return => {
 	}
 }
 
-export const completedIdentity = (
-	model: Model,
-	context: PageContext,
+const completedIdentity = (
+	model: ChatCardModel,
 	kind: "link" | "unlink",
 	failure: LoadFailure | null,
 ): Return =>
-	kind === "link"
-		? failure === null
-			? requestStatus(model, context, "chat", "Supersede")
-			: outcome(withCard(model, { identityBusy: false }), context, failure, {
-					error: "Couldn't start the account link",
-				})
-		: outcome(withCard(model, { identityBusy: false }), context, failure, {
-				success: "Account unlinked",
-				error: "Couldn't unlink the account",
-			})
+	kind === "link" && failure === null
+		? { model, requests: [HubRequest.readStatus("Supersede")] }
+		: {
+				model: { ...model, identityBusy: false },
+				requests: outcomeRequests(
+					failure,
+					kind === "link"
+						? { error: "Couldn't start the account link" }
+						: { success: "Account unlinked", error: "Couldn't unlink the account" },
+				),
+			}
 
-const withDialog = (model: Model, step: ReturnType<typeof Dialog.update>): Return => ({
-	model: { ...model, disconnect: { ...model.disconnect, dialog: step.model } },
-	commands: FoldkitCommand.mapMessages(step.commands ?? [], (message) =>
-		Message.GotDisconnectDialogMessage({ message }),
-	),
+const clickedDisconnect = (model: ChatCardModel, workspaceId: ChatWorkspaceId): Return => ({
+	model: { ...model, confirmId: workspaceId },
+	requests: [HubRequest.openDisconnect()],
 })
 
-export const clickedDisconnect = (model: Model, workspaceId: ChatWorkspaceId): Return =>
-	withDialog(withCard(model, { confirmId: workspaceId }), Dialog.open(model.disconnect.dialog))
-
-/** The dialog stays open, pending, until the workspace is gone. */
-export const confirmedDisconnect = (model: Model): Return => {
-	const id = model.chatCard.confirmId
-	if (id === null || model.chatCard.busy !== null) return { model }
-	return { model: withCard(model, { busy: id }), commands: [DisconnectChatWorkspace({ id })] }
+/** The shared dialog's confirm: it stays open, pending, until the workspace is gone. */
+export const confirmedDisconnect = (model: ChatCardModel): Return => {
+	const id = model.confirmId
+	if (id === null || model.busy !== null) return { model }
+	return { model: { ...model, busy: id }, commands: [DisconnectChatWorkspace({ id })] }
 }
 
-export const completedDisconnect = (
-	model: Model,
-	context: PageContext,
-	failure: LoadFailure | null,
+const completedDisconnect = (model: ChatCardModel, env: Env, failure: LoadFailure | null): Return => {
+	const connector = connectorOfPage(env)
+	return {
+		model: { ...model, busy: null, confirmId: null },
+		requests: [
+			HubRequest.closeDisconnect(),
+			...outcomeRequests(failure, disconnectSpec("chat")),
+			...(failure === null && connector !== null ? [HubRequest.trackDisconnected(connector)] : []),
+		],
+	}
+}
+
+/** The workspace removal is in flight: the shared dialog ignores its own messages meanwhile. */
+export const isDisconnecting = (model: ChatCardModel): boolean =>
+	model.busy !== null && model.busy === model.confirmId
+
+/** A workspace's switch flips on screen at once and saves; a second toggle waits for the first save. */
+const toggledFeature = (
+	model: ChatCardModel,
+	env: Env,
+	workspaceId: ChatWorkspaceId,
+	flag: typeof ChatFeatureFlag.Type,
 ): Return => {
-	const closed = withDialog(
-		withCard(model, { busy: null, confirmId: null }),
-		Dialog.close(model.disconnect.dialog),
+	const workspace = Option.getOrNull(
+		Option.flatMap(AsyncData.getData(env.status.data), (response) =>
+			Arr.findFirst(
+				Arr.flatMap(response.data, (entry) => entry.workspaces),
+				(candidate) => candidate.id === workspaceId,
+			),
+		),
 	)
-	return chain(closed.model, [
-		() => closed,
-		(next) => outcome(next, context, failure, disconnectSpec("chat")),
-	])
+	if (workspace === null || model.features.isSaving) return { model }
+	// Another workspace's draft or error does not carry over to this one.
+	const state = model.featuresWorkspaceId === workspaceId ? model.features : initFeatureSwitches
+	const step = toggledSwitches(state, savedChatFeatures(workspace), (switches) => ({
+		...switches,
+		[flag]: !switches[flag],
+	}))
+	return {
+		model: { ...model, features: step.state, featuresWorkspaceId: workspaceId },
+		commands:
+			step.save === null ? [] : [SaveChatFeatures({ id: workspaceId, flag, enabled: step.save[flag] })],
+	}
 }
+
+/** Only the current answer settles the switches: a superseded read predates the save. */
+export const statusAnswered = (
+	model: ChatCardModel,
+	_env: Env,
+	answer: StatusAnswer<V2ChatConnectorList>,
+): Return => ({ model: answer.isCurrent ? { ...model, features: settledSwitches(model.features) } : model })
+
+export const update = (model: ChatCardModel, message: ChatMessage, env: Env): Return =>
+	ChatMessage.match<Return>(message, {
+		ClickedInstall: () => clickedInstall(model, env),
+		CompletedInstall: ({ failure }) => completedInstall(model, env, failure),
+		ClickedIdentity: () => clickedIdentity(model, env),
+		CompletedIdentity: ({ kind, failure }) => completedIdentity(model, kind, failure),
+		ClickedDisconnect: ({ workspaceId }) => clickedDisconnect(model, workspaceId),
+		CompletedDisconnect: ({ failure }) => completedDisconnect(model, env, failure),
+		ToggledFeature: ({ workspaceId, flag }) => toggledFeature(model, env, workspaceId, flag),
+		CompletedFeatures: ({ failure }) => ({
+			model: { ...model, features: completedSwitches(model.features, failure?.message ?? null) },
+			requests: [HubRequest.readStatus("Supersede")],
+		}),
+	})

@@ -3,12 +3,14 @@ import {
 	listRowBodyStyles,
 	listRowLeadingStyles,
 	listRowMetaStyles,
+	listRowMetaWrapStyles,
 	listRowTitleStyles,
 	listRowTrailingStyles,
 	listRowVariants,
 	rowSelectedClass,
 } from "./list-row.styles"
 import type { Attribute, Html, HtmlBuilder } from "foldkit/html"
+import { rowFocusAttributes } from "./row-focus"
 
 // Icon + title + meta + trailing row.
 
@@ -19,10 +21,14 @@ export interface ListRowOptions {
 	/** Hairline between rows (the last row drops it). */
 	readonly divided?: boolean
 	readonly selected?: boolean
+	/** The list page's keyboard-focused row. */
+	readonly isFocused?: boolean
 	readonly leading?: Child
 	readonly title: Child
 	/** Secondary line under the title. */
 	readonly meta?: Child
+	/** The secondary line wraps instead of being cut off with an ellipsis. */
+	readonly wrapMeta?: boolean
 	/** One child, or several (a fragment) laid out by the trailing slot. */
 	readonly trailing?: Child | ReadonlyArray<Child>
 	readonly className?: string
@@ -55,6 +61,7 @@ export const listRow = <M>(
 ): Html => {
 	const attributes = [
 		...(options.selected === true ? [h.AriaCurrent("true"), h.DataAttribute("selected", "")] : []),
+		...rowFocusAttributes(h, options.isFocused),
 		h.Attribute(
 			"class",
 			cn(
@@ -79,7 +86,10 @@ export const listRow = <M>(
 					: [
 							h.span(
 								[
-									h.Attribute("class", listRowMetaStyles),
+									h.Attribute(
+										"class",
+										options.wrapMeta === true ? listRowMetaWrapStyles : listRowMetaStyles,
+									),
 									h.DataAttribute("slot", "list-row-meta"),
 								],
 								[options.meta],

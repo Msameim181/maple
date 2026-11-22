@@ -1,23 +1,25 @@
 import type { V2PlanetScaleIntegration } from "@maple/domain/http/v2"
 import { derivePlanetScaleSetup } from "../setup-steps"
-import { AsyncData } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { heading } from "@maple/views/ui/heading"
 import { AppRoute, hrefOf } from "../../../../route/index"
 import { button, linkButton } from "@maple/views/ui/button"
 import { badge } from "@maple/views/ui/display"
-import { item, itemActions, itemContent, itemMedia, mediaCard } from "@maple/views/ui/item"
+import { item, itemActions, itemContent, itemMedia } from "@maple/views/ui/item"
 import { panel } from "@maple/views/ui/panel"
 import { skeletonBlock } from "@maple/views/ui/skeleton"
 import { integrationIconPlate } from "../../../kit/integration-empty"
 import { liveChecklist } from "../../../kit/connect-flow"
 import { integrationNotice } from "../../../integrations/kit/notice"
 import { Message } from "../../../integrations/message"
+import { PlanetscaleMessage } from "./planetscale"
 import type { Model } from "../../../integrations/model"
 import { isWatchExpired } from "./planetscale"
 import { disconnectDialog } from "../../../integrations/view-disconnect"
+import { connectedIntegrationCard, integrationStatusCard } from "../../../integrations/view-integration-card"
 import { inventoryCountsOf } from "./flow-planetscale"
-import { metricsHealth } from "./view-planetscale-parts"
+import { metricsHealth, toHub } from "./view-planetscale-parts"
+import { planetscaleFeaturePanel } from "./view-planetscale-features"
 import { pickerDialog } from "./view-planetscale-picker"
 import { typography } from "@maple/views/ui/typography"
 import { hstack, vstack } from "@maple/views/ui/stack"
@@ -133,7 +135,7 @@ const watchExpired = (h: H): Html =>
 			{
 				size: "sm",
 				variant: "outline",
-				attributes: [h.OnClick(Message.ClickedPlanetscaleCheckAgain())],
+				attributes: [h.OnClick(toHub(PlanetscaleMessage.ClickedCheckAgain()))],
 			},
 			["Check again"],
 		),
@@ -168,7 +170,9 @@ const connectedView = (h: H, model: Model, status: V2PlanetScaleIntegration, tim
 									size: "sm",
 									variant: "outline",
 									isDisabled: busy,
-									attributes: [h.OnClick(Message.ClickedChangeOrganization())],
+									attributes: [
+										h.OnClick(toHub(PlanetscaleMessage.ClickedChangeOrganization())),
+									],
 								},
 								["Edit data"],
 							),
@@ -196,19 +200,22 @@ const connectedView = (h: H, model: Model, status: V2PlanetScaleIntegration, tim
 						...(isWatchExpired(model.planetscaleCard, model.nowMs) ? [watchExpired(h)] : []),
 					]),
 		]),
-		...(webhooks === null ? [] : [webhookStatus(h, model, webhooks)]),
+		// With events off Maple has removed its webhooks, so their health says nothing.
+		...(webhooks === null || status.events_enabled === false ? [] : [webhookStatus(h, model, webhooks)]),
+		planetscaleFeaturePanel(h, model, status),
 		pickerDialog(h, model),
 	])
 }
 
 export const planetscaleCard = (h: H, model: Model, timeZone: string): Html =>
-	AsyncData.match(model.statuses.planetscale.data, {
-		onIdle: () => skeletonBlock(h, { height: "40" }),
-		onLoading: () => skeletonBlock(h, { height: "40" }),
-		onFailure: () => statusFailed(h),
-		onStale: () => statusFailed(h),
-		onRefreshing: (status) => byStatus(h, model, status, timeZone),
-		onSuccess: (status) => byStatus(h, model, status, timeZone),
+	integrationStatusCard(h, model.statuses.planetscale, {
+		name: "planetscale",
+		failureTitle: "Couldn't load the PlanetScale connection status",
+		render: (status) => byStatus(h, model, status, timeZone),
+		loading: () => skeletonBlock(h, { height: "40" }),
+		stale: "failure",
+		// No retry: its own card says to refresh, so the error state's title goes unused.
+		failure: () => statusFailed(h, model),
 	})
 
 const byStatus = (h: H, model: Model, status: V2PlanetScaleIntegration, timeZone: string): Html =>
@@ -233,12 +240,13 @@ const planetscaleReconnect = (h: H, text: string): Html =>
 	})
 
 /** A failed status read is not "not connected": no connect offer over a maybe-authorized org. */
-const statusFailed = (h: H): Html =>
-	mediaCard(h, integrationIconPlate(h, BRAND), [
-		itemContent(h, [
-			heading(h, { level: 3, variant: "section" }, ["PlanetScale"]),
-			typography(h, { size: "xs", tone: "muted", as: "p" }, [
-				"Couldn't load the PlanetScale connection status. Refresh the page to try again.",
-			]),
-		]),
-	])
+const statusFailed = (h: H, model: Model): Html =>
+	connectedIntegrationCard(h, model, {
+		integration: null,
+		brand: BRAND,
+		title: "PlanetScale",
+		badge: null,
+		summary: ["Couldn't load the PlanetScale connection status. Refresh the page to try again."],
+		actions: null,
+		contentGap: null,
+	})

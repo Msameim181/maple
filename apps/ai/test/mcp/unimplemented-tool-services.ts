@@ -27,6 +27,7 @@ import { IntegrationInventoryService } from "@maple/backend/services/integration
 import { SourcesService } from "@maple/backend/services/org/SourcesService"
 import { ExternalDataSourceService } from "@maple/backend/services/data-sources/ExternalDataSourceService"
 import { RailwayMetricsService } from "@maple/backend/services/integrations/RailwayMetricsService"
+import { VercelIntegrationService } from "@maple/backend/services/integrations/VercelIntegrationService"
 import { ScrapeTargetsService } from "@maple/backend/services/integrations/ScrapeTargetsService"
 import { SearchConsoleService } from "@maple/backend/services/integrations/SearchConsoleService"
 import { VcsCommitService } from "@maple/backend/services/integrations/vcs/VcsCommitService"
@@ -40,8 +41,10 @@ import { IngestRuleService } from "@maple/backend/services/org/IngestRuleService
 import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/OrganizationFeatureFlagsService"
 import { StatusPagesService } from "@maple/backend/services/status-pages/StatusPagesService"
 import { StatusPageSnapshotBuilder } from "@maple/backend/services/status-pages/StatusPageSnapshotBuilder"
+import { StatusPageCustomDomainsService } from "@maple/backend/services/status-pages/StatusPageCustomDomainsService"
 import { RepoSandboxService } from "@maple/backend/services/sandbox/RepoSandboxService"
 import { QueryEngineService } from "@maple/backend/services/warehouse/QueryEngineService"
+import { PromqlQueryService } from "@maple/backend/services/promql/PromqlQueryService"
 import { WarehouseQueryService } from "@maple/backend/services/warehouse/WarehouseQueryService"
 import { SecurityAuditStore } from "@maple/backend/services/security-audit/SecurityAuditStore"
 import { DependencyScanReader } from "@maple/backend/services/dependency-scan/DependencyScanService"
@@ -76,6 +79,7 @@ export const unimplementedMcpToolServices = Layer.mergeAll(
 	Layer.mock(SourcesService)({}),
 	Layer.mock(ExternalDataSourceService)({}),
 	Layer.mock(RailwayMetricsService)({}),
+	Layer.mock(VercelIntegrationService)({}),
 	Layer.mock(ScrapeTargetsService)({}),
 	Layer.mock(SearchConsoleService)({}),
 	Layer.mock(VcsCommitService)({}),
@@ -88,9 +92,11 @@ export const unimplementedMcpToolServices = Layer.mergeAll(
 	Layer.mock(IngestRuleService)({}),
 	Layer.mock(StatusPagesService)({}),
 	Layer.mock(StatusPageSnapshotBuilder)({}),
+	Layer.mock(StatusPageCustomDomainsService)({}),
 	Layer.mock(OrganizationFeatureFlagsService)({}),
 	Layer.mock(RepoSandboxService)({}),
 	Layer.mock(QueryEngineService)({}),
+	Layer.mock(PromqlQueryService)({}),
 	SecurityAuditStore.layer,
 	Layer.mock(DependencyScanReader)({}),
 	Layer.mock(RuntimeReleaseCatalog)({}),
@@ -100,4 +106,5 @@ export const unimplementedMcpToolServices = Layer.mergeAll(
 
 /** A tool service the runtime gains without a stand-in here fails to compile, not at test time. */
 type Uncovered = Exclude<McpToolRuntimeRequirements, Layer.Success<typeof unimplementedMcpToolServices>>
+/** @public Compile-time guard; nothing imports it. */
 export const coversEveryToolService: [Uncovered] extends [never] ? true : Uncovered = true

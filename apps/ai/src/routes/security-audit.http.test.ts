@@ -5,6 +5,7 @@ import {
 	ApiUnexpectedErrors,
 	CurrentTenant,
 	SecurityAuditApiGroup,
+	SecurityAuditReadsApiGroup,
 } from "@maple/domain/http"
 import {
 	DISABLED_ORGANIZATION_FEATURE_FLAGS,
@@ -34,6 +35,8 @@ import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/Org
 import { AiCredits, AiCreditsExhausted } from "@maple/backend/services/billing/AiCredits"
 import { SecurityAuditRepositorySize } from "@maple/backend/services/security-audit/SecurityAuditRepositorySize"
 import { SecurityAuditStore } from "@maple/backend/services/security-audit/SecurityAuditStore"
+import { SecurityAuditAccess } from "@maple/backend/services/security-audit/SecurityAuditAccess"
+import { HttpSecurityAuditReadsLive } from "@maple/backend/http/security-audit-reads"
 import { Clock, Context, Duration, Effect, Layer, Schema, Array as Arr, String as Str } from "effect"
 import { HttpRouter, HttpServerRequest } from "effect/http"
 import { HttpApi, HttpApiBuilder } from "effect/http-api"
@@ -41,6 +44,12 @@ import { HttpSecurityAuditLive } from "./security-audit.http"
 
 class SecurityAuditOnlyApi extends HttpApi.make("MapleAiApi")
 	.add(SecurityAuditApiGroup)
+	.middleware(ApiSchemaErrors)
+	.middleware(ApiUnexpectedErrors) {}
+
+/** The reads, which the api Worker serves on the same paths; one harness covers both Workers. */
+class SecurityAuditReadsOnlyApi extends HttpApi.make("MapleInternalApi")
+	.add(SecurityAuditReadsApiGroup)
 	.middleware(ApiSchemaErrors)
 	.middleware(ApiUnexpectedErrors) {}
 
@@ -131,8 +140,11 @@ const makeHarness = (
 		 VALUES ($1, $2, 'github', $3, '1001', 'acme', 'api', 'acme/api', 'main', 'https://github.com/acme/api', now(), now())`,
 		[crypto.randomUUID(), ORG_A, crypto.randomUUID()],
 	)
-	const routes = HttpApiBuilder.layer(SecurityAuditOnlyApi).pipe(
-		Layer.provide(HttpSecurityAuditLive),
+	const routes = Layer.mergeAll(
+		HttpApiBuilder.layer(SecurityAuditOnlyApi).pipe(Layer.provide(HttpSecurityAuditLive)),
+		HttpApiBuilder.layer(SecurityAuditReadsOnlyApi).pipe(Layer.provide(HttpSecurityAuditReadsLive)),
+	).pipe(
+		Layer.provide(SecurityAuditAccess.layerWithoutDependencies),
 		Layer.provide(ApiErrorBoundaryLive),
 		Layer.provide(WorkerPlatformLive),
 		Layer.provideMerge(AuthorizationStubLayer),
@@ -277,7 +289,7 @@ describe("/api/security-audit access", () => {
 		}
 	})
 
-	it("lets members list targets and runs, and keeps findings, reports and writes to admins", async () => {
+	it("refuses members every read and write with a 403", async () => {
 		const harness = makeHarness()
 		try {
 			const member = `${ORG_A}|org:member`
@@ -286,6 +298,7 @@ describe("/api/security-audit access", () => {
 			const memberCalls = await Promise.all([
 				harness.call("GET", "/targets", { as: member }),
 				harness.call("GET", "/runs", { as: member }),
+				harness.call("GET", "/settings", { as: member }),
 				harness.call("GET", `/runs/${run.body.id}`, { as: member }),
 				harness.call("GET", `/runs/${run.body.id}/events`, { as: member }),
 				harness.call("GET", `/targets/${target.body.id}/findings`, { as: member }),
@@ -296,8 +309,10 @@ describe("/api/security-audit access", () => {
 				}),
 			])
 
-			expect(Arr.map(memberCalls, (r) => r.status)).toEqual([200, 200, 403, 403, 403, 403, 403])
-			expect(memberCalls[5]?.body._tag).toBe(tag("SecurityAuditForbiddenError"))
+			expect(Arr.map(memberCalls, (r) => r.status)).toEqual([403, 403, 403, 403, 403, 403, 403, 403])
+			expect(Arr.map(memberCalls, (r) => r.body._tag)).toEqual(
+				Arr.map(memberCalls, () => tag("SecurityAuditForbiddenError")),
+			)
 			expect(Arr.map(harness.started, (p) => p.runId)).toEqual([run.body.id])
 		} finally {
 			await harness.dispose()
@@ -377,7 +392,7 @@ describe("/api/security-audit targets", () => {
 						{ ...TARGET, scopePaths: ["../secrets"] },
 						{ ...TARGET, scopePaths: ["/etc/passwd"] },
 						{ ...TARGET, discoveryModel: "acme/unlisted-model" },
-						// It refused verifier prompts in the eval, so it never verifies.
+						// Delisted: its cybersecurity filter refused audit prompts.
 						{ ...TARGET, validationModel: "openai/gpt-6.1-sol" },
 					],
 					(body) => harness.call("POST", "/targets", { body }).then((r) => r.status),
@@ -818,7 +833,7 @@ describe("/api/security-audit findings", () => {
 })
 
 describe("/api/security-audit run findings", () => {
-	it("lists what each run reported with rejected ones, and counts them for admins only", async () => {
+	it("lists what each run reported with rejected ones, and counts them per run", async () => {
 		const harness = makeHarness()
 		try {
 			const target = await harness.call("POST", "/targets", { body: TARGET })
@@ -878,11 +893,7 @@ describe("/api/security-audit run findings", () => {
 				[first.body.id]: { ...zeros, high: 1, medium: 1, unverified: 1, rejected: 1 },
 				[second.body.id]: { ...zeros, high: 1, rejected: 0 },
 			})
-			expect([
-				memberRuns.status,
-				memberRuns.body.runs.length,
-				"findingCounts" in memberRuns.body,
-			]).toEqual([200, 2, false])
+			expect(memberRuns.status).toBe(403)
 		} finally {
 			await harness.dispose()
 		}
@@ -1169,7 +1180,7 @@ describe("/api/security-audit settings", () => {
 	it("serves the defaults until an admin saves, and keeps them to the org that saved them", async () => {
 		const harness = makeHarness()
 		try {
-			const before = await harness.call("GET", "/settings", { as: `${ORG_A}|org:member` })
+			const before = await harness.call("GET", "/settings", { as: `${ORG_A}|org:engineer` })
 			const body = {
 				monthlySpendLimitUsd: 750,
 				discoveryModel: "anthropic/claude-haiku-5.5",

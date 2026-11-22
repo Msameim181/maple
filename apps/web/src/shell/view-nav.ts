@@ -1,5 +1,5 @@
 import { isClerkAuthEnabled } from "../platform/auth-mode"
-import { cn } from "@maple/ui/lib/utils"
+import * as Policy from "@maple/domain/policy"
 import { Option, Array as Arr, String as Str } from "effect"
 import type { InfraSurfaceLiteral } from "@maple/domain/http"
 import { AsyncData } from "foldkit"
@@ -16,11 +16,10 @@ import {
 	sidebarMenuItem,
 	sidebarMenuSub,
 	sidebarMenuSubButton,
-	sidebarMenuSubItem,
 } from "@maple/views/ui/sidebar"
 import type { PinnedDashboardRow } from "./dashboards-shape"
 import { Menu, Message } from "./message"
-import { type Model, type ShellClerk, shellProbe, shellSurfaces } from "./model"
+import { type Model, type ShellClerk, shellAudience, shellProbe, shellSurfaces } from "./model"
 import {
 	isNavItemActive,
 	matchSubItem,
@@ -39,16 +38,24 @@ import { typography } from "@maple/views/ui/typography"
 /**
  * Self-hosted turns every rollout on; a Clerk org reads its public
  * metadata, and fails closed (no flagged rows) until Clerk has an org.
+ * Security also needs a role with `security:manage`: members never see it.
  */
 export const shellNavGroups = (clerk: ShellClerk | null = null): ReadonlyArray<NavGroup> => {
+	const audience = shellAudience(clerk)
 	const flag = (name: keyof NavFlags) =>
 		!isClerkAuthEnabled ||
 		(clerk !== null && Option.exists(clerk.maybeOrganization, (organization) => organization.flags[name]))
-	return navGroups({
-		releases: flag("releases"),
-		securityAudit: flag("securityAudit"),
-		statusPages: flag("statusPages"),
-	})
+	const canReadSecurity =
+		!isClerkAuthEnabled ||
+		(clerk !== null && Option.exists(clerk.maybeRole, (role) => Policy.can([role], "security:manage")))
+	return navGroups(
+		{
+			cloudSecurity: flag("cloudSecurity") && canReadSecurity,
+			productAnalytics: flag("productAnalytics"),
+			securityAudit: flag("securityAudit") && canReadSecurity,
+		},
+		audience,
+	)
 }
 
 /** The last-hour probe's answer; `null` while it is first in flight or after it failed. */
@@ -83,8 +90,14 @@ const activeSubHrefOf = (subItems: ReadonlyArray<NavSubItem>, currentPath: strin
 			: best
 	})?.href
 
-const collapsedSectionRow = (h: HtmlBuilder<Message>, model: Model, item: NavItem, isActive: boolean): Html =>
-	sidebarMenuItem(h, undefined, [
+const collapsedSectionRow = (
+	h: HtmlBuilder<Message>,
+	model: Model,
+	item: NavItem,
+	isActive: boolean,
+	className: string | undefined,
+): Html =>
+	sidebarMenuItem(h, className, [
 		sidebarMenuButton(
 			h,
 			{
@@ -112,24 +125,19 @@ const subList = (
 	const activeSubHref = activeSubHrefOf(subItems, currentPath)
 	return sidebarMenuSub(
 		h,
-		"mx-0 ms-4 translate-x-0 gap-0 border-l-0 px-0 py-0",
-		Arr.map(subItems, (sub, index) => {
+		undefined,
+		Arr.map(subItems, (sub) => {
 			const count = subCountOf(model, sub)
-			return sidebarMenuSubItem(
-				h,
-				cn(
-					"border-l-2 ps-2.5",
-					sub.href === activeSubHref ? "border-sidebar-primary" : "border-sidebar-border",
-					// A 4px gap, not a rule, sets a group of rows apart.
-					sub.startsGroup === true && index > 0 && "mt-1",
-				),
-				[
+			const isActive = sub.href === activeSubHref
+			return {
+				isActive,
+				startsGroup: sub.startsGroup === true,
+				children: [
 					sidebarMenuSubButton(
 						h,
 						{
-							className:
-								"translate-x-0 data-[active=true]:text-sidebar-primary [&>svg]:text-current",
-							isActive: sub.href === activeSubHref,
+							className: "data-[active=true]:text-sidebar-primary [&>svg]:text-current",
+							isActive,
 							link: { href: sub.href, currentPath },
 						},
 						[
@@ -145,7 +153,9 @@ const subList = (
 						],
 					),
 					...(count === undefined
-						? []
+						? sub.badge === undefined
+							? []
+							: [navBadge(h, sub.badge, "top-1/2 -translate-y-1/2")]
 						: [
 								sidebarMenuBadge(
 									h,
@@ -160,7 +170,7 @@ const subList = (
 								),
 							]),
 				],
-			)
+			}
 		}),
 	)
 }
@@ -175,8 +185,11 @@ const navRow = (
 	item: NavItem,
 	currentPath: string,
 	tip: RailTip,
-	isGroupFolded = false,
+	isGroupFolded: boolean,
+	startsGroup: boolean,
 ): Html => {
+	// An 8px gap, not a rule, sets a row apart from the ones above it.
+	const className = startsGroup ? "mt-2" : undefined
 	const isActive = isNavItemActive(currentPath, item)
 	const isCollapsed = !model.isSidebarOpen && !model.isMobile
 	const allSubItems =
@@ -184,7 +197,7 @@ const navRow = (
 			? undefined
 			: partitionSubItems(item.subItems, surfacesOf(model), currentPath).shown
 	if (isCollapsed && allSubItems !== undefined && allSubItems.length > 0)
-		return collapsedSectionRow(h, model, item, isActive)
+		return collapsedSectionRow(h, model, item, isActive, className)
 	// A folded group keeps where you are: the section row and, under it, the current sub-item alone.
 	const subItems =
 		isGroupFolded && allSubItems !== undefined
@@ -194,7 +207,7 @@ const navRow = (
 	// The tint belongs to the sub-item that is the current page, when one is.
 	const hasActiveChild = isOpen && activeSubHrefOf(subItems, currentPath) !== undefined
 	const preview = isOpen || allSubItems === undefined ? undefined : navPreview(item, allSubItems)
-	return sidebarMenuItem(h, undefined, [
+	return sidebarMenuItem(h, className, [
 		sidebarMenuButton(
 			h,
 			{
@@ -371,8 +384,16 @@ export const navGroupSections = (
 							sidebarMenu(
 								h,
 								undefined,
-								Arr.map(rows, (item) =>
-									navRow(h, model, item, currentPath, tip, fold === "collapsed"),
+								Arr.map(rows, (item, index) =>
+									navRow(
+										h,
+										model,
+										item,
+										currentPath,
+										tip,
+										fold === "collapsed",
+										item.startsGroup === true && index > 0,
+									),
 								),
 							),
 						],

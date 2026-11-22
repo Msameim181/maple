@@ -10,7 +10,7 @@ The Discord integration adds the Maple bot to a Discord server and links that se
 
 ## Prerequisites
 
-- You are an admin of the Maple organization.
+- You are an admin or engineer in the Maple organization.
 - You have the **Manage Server** permission on the Discord server. Discord requires it to add an app.
 
 ## Add the bot to a server
@@ -59,7 +59,7 @@ When a request would change something, such as creating a dashboard or editing a
 
 Answers are posted in the channel, so everyone who can read the channel sees them. Add the bot only where the members should see your data.
 
-This differs from [Slack](/docs/integrations/slack), which has no account linking: anyone in a Slack channel with the bot can ask, and anyone who can see a card can approve it.
+This differs from [Slack](/docs/integrations/slack), which has no account linking: anyone in a Slack channel with the bot can ask about telemetry and alerts, and the only action there is acknowledging an alert.
 
 ## Discord as an alert destination
 
@@ -85,7 +85,7 @@ To unlink your own account, click **Unlink** under **Your Discord account**.
 ## Troubleshooting
 
 - **"This workspace isn't connected to a Maple organization yet."** The bot is in the server but the server is not linked. An admin runs **Add to Discord** from Maple.
-- **"Only organization admins can connect Discord."** Ask an organization admin to install it.
+- **"Only org admins and engineers can manage integrations."** Ask an admin or engineer in your organization to install it.
 - **"Link your Discord account to Maple to ask it questions."** Link your account in Maple, then mention the bot again.
 - **"Link your Discord account to Maple to approve this."** Link your account in Maple, then press **Run** again.
 - **"The Maple account this chat account is linked to is no longer in this organization."** Ask an admin to add you back, or link a different Maple account.

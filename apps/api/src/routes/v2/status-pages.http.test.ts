@@ -1,15 +1,23 @@
 import { afterEach, describe, expect, it } from "@effect/vitest"
-import { ConfigProvider, Context, Effect, Layer, ManagedRuntime, Schema, Array as Arr } from "effect"
+import {
+	ConfigProvider,
+	Context,
+	Effect,
+	Layer,
+	ManagedRuntime,
+	Schema,
+	Array as Arr,
+	String as Str,
+} from "effect"
 import { HttpRouter } from "effect/http"
 import { HttpApi, HttpApiBuilder } from "effect/http-api"
 import { OrgId, UserId } from "@maple/domain/http"
-import { MapleApiV2, UptimeMonitorPublicId } from "@maple/domain/http/v2"
+import { MapleApiV2, StatusPagePublicId, UptimeMonitorPublicId } from "@maple/domain/http/v2"
 import { UptimeMonitorId, type StatusPageId } from "@maple/primitives"
-import { utcDay } from "@maple/domain/status-page"
+import { StatusPageKeys, statusPageAddress, utcDay } from "@maple/domain/status-page"
 import { cleanupTestDbs, createTestDb, executeSql, type TestDb } from "@maple/backend/testing/test-pglite"
-import { DISABLED_ORGANIZATION_FEATURE_FLAGS } from "@maple/domain/organization-feature-flags"
-import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/OrganizationFeatureFlagsService"
 import { StatusPagePublisher } from "@maple/backend/services/status-pages/StatusPagePublisher"
+import { StatusPageStore } from "@maple/backend/services/status-pages/StatusPageStore"
 import { StatusPagePublishDbError } from "@maple/backend/services/status-pages/publish-errors"
 import { Env } from "@maple/backend/platform/Env"
 import { ApiAuthorizationV2Live } from "@maple/backend/services/auth/ApiAuthorizationV2Live"
@@ -25,6 +33,26 @@ import { ApiV2RateLimiterAllowAllLayer } from "./v2-test-support"
 import { HttpV2StatusPageIncidentsLive, HttpV2StatusPagesLive } from "./status-pages.http"
 import { StatusPagesService } from "@maple/backend/services/status-pages/StatusPagesService"
 import { StatusPageSnapshotBuilder } from "@maple/backend/services/status-pages/StatusPageSnapshotBuilder"
+import { CloudflareCustomHostnames } from "@maple/backend/services/status-pages/CloudflareCustomHostnames"
+import { StatusPageCustomDomainsService } from "@maple/backend/services/status-pages/StatusPageCustomDomainsService"
+import { DnsTxtResolver } from "@maple/backend/platform/DnsTxtResolver"
+
+/**
+ * Custom domains over the Cloudflare test double, with no ownership record published in DNS;
+ * `cnameTarget: null` is a deployment without them.
+ */
+const customDomainsLayer = (cnameTarget: string | null = "status-domains.maple.test") =>
+	Layer.effect(StatusPageCustomDomainsService, StatusPageCustomDomainsService.make).pipe(
+		Layer.provide(
+			Layer.effect(
+				CloudflareCustomHostnames,
+				CloudflareCustomHostnames.makeInMemory({ cnameTarget }).pipe(
+					Effect.map((double) => double.api),
+				),
+			),
+		),
+		Layer.provide(Layer.succeed(DnsTxtResolver, { lookupTxt: () => Effect.succeed([]) })),
+	)
 
 /** `/v2/status_pages` and `/v2/status_page_incidents` over an embedded PGlite with the real service. */
 
@@ -69,7 +97,8 @@ const fakePublisher = (published: Array<StatusPageId>, options: { readonly fail?
 
 const makeHarness = (
 	publisher?: Layer.Layer<StatusPagePublisher>,
-	featureFlags: Layer.Layer<OrganizationFeatureFlagsService> = OrganizationFeatureFlagsService.allEnabled,
+	customDomains: ReturnType<typeof customDomainsLayer> = customDomainsLayer(),
+	store?: Layer.Layer<StatusPageStore>,
 ) => {
 	const testDb = createTestDb(createdDbs)
 	const audit = makeMemoryAuditLog()
@@ -89,7 +118,7 @@ const makeHarness = (
 		Layer.provide(
 			Layer.mergeAll(HttpV2StatusPagesLive, HttpV2StatusPageIncidentsLive).pipe(
 				Layer.provide(
-					Layer.mergeAll(StatusPagesService.layer, StatusPageSnapshotBuilder.layer, featureFlags),
+					Layer.mergeAll(StatusPagesService.layer, StatusPageSnapshotBuilder.layer, customDomains),
 				),
 			),
 		),
@@ -99,6 +128,7 @@ const makeHarness = (
 		Layer.provideMerge(ApiV2RateLimiterAllowAllLayer),
 		Layer.provideMerge(servicesLive),
 		Layer.provideMerge(publisher ?? Layer.empty),
+		Layer.provideMerge(store ?? Layer.empty),
 	)
 	const { handler, dispose: disposeHandler } = HttpRouter.toWebHandler(routes, { disableLogger: true })
 	const runtime = ManagedRuntime.make(servicesLive)
@@ -147,17 +177,47 @@ const makeHarness = (
 const withHarness = (
 	body: (harness: ReturnType<typeof makeHarness>) => Promise<void>,
 	publisher?: Layer.Layer<StatusPagePublisher>,
-	featureFlags?: Layer.Layer<OrganizationFeatureFlagsService>,
+	customDomains?: ReturnType<typeof customDomainsLayer>,
+	store?: Layer.Layer<StatusPageStore>,
 ) =>
 	Effect.runPromise(
 		Effect.acquireUseRelease(
-			Effect.sync(() => makeHarness(publisher, featureFlags)),
+			Effect.sync(() => makeHarness(publisher, customDomains, store)),
 			(harness) => Effect.promise(() => body(harness)),
 			(harness) => Effect.promise(() => harness.dispose()),
 		),
 	)
 
 describe("v2 status pages", () => {
+	it("takes a deleted page's address and its pre-per-org slug route off the edge", async () => {
+		const memory = await Effect.runPromise(StatusPageStore.makeInMemory)
+		await withHarness(
+			async (harness) => {
+				const { secret: token } = await harness.bootstrapKey()
+				const created = await harness.request("POST", "/v2/status_pages", token, {
+					name: "Acme",
+					slug: "acme-edge",
+				})
+				const pageId = Schema.decodeSync(StatusPagePublicId)(created.body.id)
+				const address = statusPageAddress(ORG, "acme-edge")
+				await Effect.runPromise(
+					Effect.all([
+						memory.api.putRoutes(pageId, { address, hostnames: [] }),
+						memory.api.putRoutes(pageId, { address: "acme-edge", hostnames: [] }),
+					]),
+				)
+				const removed = await harness.request("DELETE", `/v2/status_pages/${created.body.id}`, token)
+				expect(removed.status).toBe(200)
+				const { kv } = await Effect.runPromise(memory.contents)
+				expect(kv.has(StatusPageKeys.slug(address))).toBe(false)
+				expect(kv.has(StatusPageKeys.slug("acme-edge"))).toBe(false)
+			},
+			undefined,
+			undefined,
+			Layer.succeed(StatusPageStore, memory.api),
+		)
+	})
+
 	it("creates, retrieves, updates and deletes a page", () =>
 		withHarness(async (harness) => {
 			const { secret: token } = await harness.bootstrapKey()
@@ -312,6 +372,45 @@ describe("v2 status pages", () => {
 			expect(revoked.body.break_glass_token_suffix).toBeNull()
 		}))
 
+	it("leaves the password and visibility to engineers and admins, never returns the password, and shows members the page", () =>
+		withHarness(async (harness) => {
+			const { secret: admin } = await harness.bootstrapKey()
+			const { secret: engineer } = await harness.bootstrapKey(ORG, {
+				...MEMBER,
+				roles: ["org:engineer"],
+			})
+			const { secret: member } = await harness.bootstrapKey(ORG, MEMBER)
+			const page = await harness.request("POST", "/v2/status_pages", admin, {
+				name: "Acme",
+				slug: "acme-locked",
+			})
+			const path = `/v2/status_pages/${page.body.id}`
+			const password = "correct horse battery"
+
+			expect((await harness.request("PUT", `${path}/password`, member, { password })).status).toBe(403)
+			expect((await harness.request("PATCH", path, member, { visibility: "internal" })).status).toBe(
+				403,
+			)
+			expect((await harness.request("GET", path, member)).body.visibility).toBe("public")
+
+			const short = await harness.request("PUT", `${path}/password`, engineer, { password: "short" })
+			expect(short.status).toBe(400)
+			const set = await harness.request("PUT", `${path}/password`, engineer, { password })
+			expect(set.body.has_password).toBe(true)
+			expect(JSON.stringify(set.body)).not.toContain(password)
+			const locked = await harness.request("PATCH", path, engineer, { visibility: "password" })
+			expect(locked.body.visibility).toBe("password")
+			const removing = await harness.request("DELETE", `${path}/password`, engineer)
+			expect(removing.status).toBe(400)
+
+			const view = await harness.request("GET", `${path}/view`, member)
+			expect(view.status).toBe(200)
+			expect(view.body.page.visibility).toBe("password")
+			expect(view.body).not.toHaveProperty("passwordHash")
+			expect(view.body).not.toHaveProperty("breakGlassTokenSha256")
+			expect(JSON.stringify(view.body)).not.toContain("pbkdf2")
+		}))
+
 	it("adds, reorders, updates and removes components", () =>
 		withHarness(async (harness) => {
 			const { secret: token } = await harness.bootstrapKey()
@@ -457,16 +556,16 @@ describe("v2 status pages", () => {
 				kind: "maintenance",
 				title: "Database upgrade",
 				body: "We are upgrading the primary database.",
-				scheduled_start: "2026-08-01T02:00:00.000Z",
-				scheduled_end: "2026-08-01T03:00:00.000Z",
+				scheduled_start: "2099-08-01T02:00:00.000Z",
+				scheduled_end: "2099-08-01T03:00:00.000Z",
 			})
 			expect(scheduled.body).toMatchObject({
 				kind: "maintenance",
 				status: "scheduled",
 				impact: "none",
-				scheduled_start: "2026-08-01T02:00:00.000Z",
-				scheduled_end: "2026-08-01T03:00:00.000Z",
-				started_at: "2026-08-01T02:00:00.000Z",
+				scheduled_start: "2099-08-01T02:00:00.000Z",
+				scheduled_end: "2099-08-01T03:00:00.000Z",
+				started_at: "2099-08-01T02:00:00.000Z",
 			})
 			const noWindow = await harness.request("POST", "/v2/status_page_incidents", token, {
 				page_id: page.body.id,
@@ -477,55 +576,47 @@ describe("v2 status pages", () => {
 			expect(noWindow.status).toBe(400)
 		}))
 
-	describe("statusPages rollout", () => {
-		const flagged = (statusPages: boolean) =>
-			OrganizationFeatureFlagsService.fixed({ ...DISABLED_ORGANIZATION_FEATURE_FLAGS, statusPages })
+	it("backdates an incident, records when it ended and caps an update at 20,000 characters", () =>
+		withHarness(async (harness) => {
+			const { secret: token } = await harness.bootstrapKey()
+			const page = await harness.request("POST", "/v2/status_pages", token, {
+				name: "Acme",
+				slug: "acme-times",
+			})
+			const minute = 60_000
+			const startedAt = new Date(Math.floor(Date.now() / minute) * minute - 50 * minute).toISOString()
+			const endedAt = new Date(Math.floor(Date.now() / minute) * minute - 5 * minute).toISOString()
+			const opened = await harness.request("POST", "/v2/status_page_incidents", token, {
+				page_id: page.body.id,
+				title: "Elevated API errors",
+				body: "We are looking into elevated error rates.",
+				started_at: startedAt,
+			})
+			expect(opened.body.started_at).toBe(startedAt)
 
-		it("refuses every page and incident route with 403 status_pages_disabled when the org is out", () =>
-			withHarness(
-				async (harness) => {
-					const { secret: token } = await harness.bootstrapKey()
-					const calls = [
-						harness.request("GET", "/v2/status_pages", token),
-						harness.request("POST", "/v2/status_pages", token, {
-							name: "Acme",
-							slug: "acme-off",
-						}),
-						harness.request("POST", "/v2/status_pages/preview", token, {
-							name: "Acme",
-							slug: "acme",
-							components: [{ name: "Docs" }],
-						}),
-						harness.request("GET", "/v2/status_page_incidents", token),
-					]
-					for (const response of await Promise.all(calls)) {
-						expect(response.status).toBe(403)
-						expect(response.body.error).toMatchObject({ code: "status_pages_disabled" })
-					}
-				},
-				undefined,
-				flagged(false),
-			))
+			const tooLong = await harness.request(
+				"POST",
+				`/v2/status_page_incidents/${opened.body.id}/updates`,
+				token,
+				{ status: "identified", body: Str.repeat(20_001)("x") },
+			)
+			expect(tooLong.status).toBe(400)
+			const resolved = await harness.request(
+				"POST",
+				`/v2/status_page_incidents/${opened.body.id}/updates`,
+				token,
+				{ status: "resolved", body: Str.repeat(20_000)("x"), resolved_at: endedAt },
+			)
+			expect(resolved.body).toMatchObject({ status: "resolved", resolved_at: endedAt })
 
-		it("serves the routes once the org is in", () =>
-			withHarness(
-				async (harness) => {
-					const { secret: token } = await harness.bootstrapKey()
-					const created = await harness.request("POST", "/v2/status_pages", token, {
-						name: "Acme",
-						slug: "acme-on",
-					})
-					expect(created.status).toBe(200)
-					const listed = await harness.request("GET", "/v2/status_pages", token)
-					expect(listed.body.data.map((page: { id: string }) => page.id)).toEqual([created.body.id])
-					expect((await harness.request("GET", "/v2/status_page_incidents", token)).status).toBe(
-						200,
-					)
-				},
-				undefined,
-				flagged(true),
-			))
-	})
+			const beforeStart = await harness.request(
+				"PATCH",
+				`/v2/status_page_incidents/${opened.body.id}`,
+				token,
+				{ resolved_at: new Date(Date.parse(startedAt) - minute).toISOString() },
+			)
+			expect(beforeStart.status).toBe(400)
+		}))
 
 	it("refuses page and component writes from members", () =>
 		withHarness(async (harness) => {
@@ -917,5 +1008,161 @@ describe("v2 status pages", () => {
 				expect(refused.status).toBe(400)
 				expect(refused.body.error.code).toBe("status_page_invalid")
 			}))
+	})
+	describe("custom domains", () => {
+		it("sets, reads, checks and removes a page's custom domain, audited", () =>
+			withHarness(async (harness) => {
+				const { secret: token } = await harness.bootstrapKey()
+				const created = await harness.request("POST", "/v2/status_pages", token, {
+					name: "Acme",
+					slug: "acme-domain",
+				})
+				const id: string = created.body.id
+				const none = await harness.request("GET", `/v2/status_pages/${id}/custom_domain`, token)
+				expect(none.body).toMatchObject({
+					object: "status_page_custom_domain",
+					page_id: id,
+					available: true,
+					cname_target: "status-domains.maple.test",
+					hostname: null,
+					status: null,
+					dns_records: [],
+				})
+
+				const set = await harness.request("PUT", `/v2/status_pages/${id}/custom_domain`, token, {
+					hostname: " Status.Acme.com ",
+				})
+				expect(set.status).toBe(200)
+				expect(set.body).toMatchObject({ hostname: "status.acme.com", status: "pending_dns" })
+				expect(set.body.dns_records[0]).toEqual({
+					type: "CNAME",
+					name: "status.acme.com",
+					value: "status-domains.maple.test",
+					purpose: "routing",
+				})
+				expect(set.body.dns_records[1]).toMatchObject({
+					type: "TXT",
+					name: "_maple-challenge.status.acme.com",
+					purpose: "ownership",
+				})
+				expect(set.body.dns_records[1].value).toMatch(/^maple-status-page=[0-9a-f]{32}$/)
+				const read = await harness.request("GET", `/v2/status_pages/${id}/custom_domain`, token)
+				expect(read.body).toEqual(set.body)
+
+				const checked = await harness.request(
+					"POST",
+					`/v2/status_pages/${id}/custom_domain/check`,
+					token,
+				)
+				expect(checked.status).toBe(200)
+				expect(checked.body.hostname).toBe("status.acme.com")
+
+				const removed = await harness.request("DELETE", `/v2/status_pages/${id}/custom_domain`, token)
+				expect(removed.body).toMatchObject({ hostname: null, status: null })
+				const again = await harness.request("DELETE", `/v2/status_pages/${id}/custom_domain`, token)
+				expect(again.status).toBe(404)
+				expect(again.body.error.code).toBe("status_page_custom_domain_not_found")
+
+				const [setEntry] = await harness.auditEntries("status_page.custom_domain_set")
+				expect(setEntry?.metadata).toMatchObject({
+					hostname: "status.acme.com",
+					previous_hostname: null,
+				})
+				const [removedEntry] = await harness.auditEntries("status_page.custom_domain_removed")
+				expect(removedEntry?.metadata).toMatchObject({ hostname: "status.acme.com" })
+			}))
+
+		it("answers 400 for a hostname that cannot be a custom domain, 409 for a taken one", () =>
+			withHarness(async (harness) => {
+				const { secret: token } = await harness.bootstrapKey()
+				const first = await harness.request("POST", "/v2/status_pages", token, {
+					name: "A",
+					slug: "acme-a",
+				})
+				const second = await harness.request("POST", "/v2/status_pages", token, {
+					name: "B",
+					slug: "acme-b",
+				})
+				for (const hostname of [
+					"acme.com",
+					"status.maple.dev",
+					"10.1.2.3",
+					"https://status.acme.com",
+				]) {
+					const refused = await harness.request(
+						"PUT",
+						`/v2/status_pages/${first.body.id}/custom_domain`,
+						token,
+						{ hostname },
+					)
+					expect(refused.status, hostname).toBe(400)
+					expect(refused.body.error.type).toBe("invalid_request_error")
+				}
+				await harness.request("PUT", `/v2/status_pages/${first.body.id}/custom_domain`, token, {
+					hostname: "status.acme.com",
+				})
+				const taken = await harness.request(
+					"PUT",
+					`/v2/status_pages/${second.body.id}/custom_domain`,
+					token,
+					{
+						hostname: "status.acme.com",
+					},
+				)
+				expect(taken.status).toBe(409)
+				expect(taken.body.error.code).toBe("status_page_custom_domain_taken")
+				// The first page never proved the hostname, so the answer names the record that claims it.
+				expect(taken.body.error.message).toContain("_maple-challenge.status.acme.com")
+			}))
+
+		it("lets members read the domain but not change it", () =>
+			withHarness(async (harness) => {
+				const { secret: token } = await harness.bootstrapKey()
+				const { secret: member } = await harness.bootstrapKey(ORG, MEMBER)
+				const created = await harness.request("POST", "/v2/status_pages", token, {
+					name: "A",
+					slug: "acme-m",
+				})
+				const read = await harness.request(
+					"GET",
+					`/v2/status_pages/${created.body.id}/custom_domain`,
+					member,
+				)
+				expect(read.status).toBe(200)
+				const refused = await harness.request(
+					"PUT",
+					`/v2/status_pages/${created.body.id}/custom_domain`,
+					member,
+					{ hostname: "status.acme.com" },
+				)
+				expect(refused.status).toBe(403)
+			}))
+
+		it("says custom domains are unavailable on a deployment without them", () =>
+			withHarness(
+				async (harness) => {
+					const { secret: token } = await harness.bootstrapKey()
+					const created = await harness.request("POST", "/v2/status_pages", token, {
+						name: "A",
+						slug: "acme-u",
+					})
+					const read = await harness.request(
+						"GET",
+						`/v2/status_pages/${created.body.id}/custom_domain`,
+						token,
+					)
+					expect(read.body).toMatchObject({ available: false, cname_target: null })
+					const refused = await harness.request(
+						"PUT",
+						`/v2/status_pages/${created.body.id}/custom_domain`,
+						token,
+						{ hostname: "status.acme.com" },
+					)
+					expect(refused.status).toBe(503)
+					expect(refused.body.error.code).toBe("status_page_custom_domains_unavailable")
+				},
+				undefined,
+				customDomainsLayer(null),
+			))
 	})
 })

@@ -20,11 +20,11 @@ export function registerListSourcesTool(server: McpToolRegistrar) {
 		description:
 			"Telemetry INGEST sources: everything that sends data to this Maple organization, worst health first: OpenTelemetry SDKs and collectors " +
 			"(each with its own token, or the default ingest keys), Kubernetes clusters, Docker hosts, Prometheus scrape " +
-			"targets and connected integrations (Cloudflare, Google Cloud, Railway, PlanetScale, GitHub CI). Each source " +
+			"targets and connected integrations (Cloudflare, Google Cloud, Railway, Vercel, PlanetScale, GitHub CI). Each source " +
 			"says whether data is arriving and when it last did. Telemetry carries its source in the `maple_source_id` " +
 			"resource attribute, so a source id filters traces, logs and metrics. Use it to find which sender stopped; " +
 			"ingest_freshness says whether any data arrives at all, list_integrations covers provider credentials and pollers. " +
-			"Not for databases or APIs the org connected to query in place: those are data sources, listed by list_data_sources.",
+			"Not for databases or APIs the org connected to query in place: those are data sources, which list_data_sources lists for an org that has them.",
 		parameters: Schema.Struct({
 			platform: P.optionalOneOf(SourcePlatform.literals, "Only sources of this platform"),
 		}),

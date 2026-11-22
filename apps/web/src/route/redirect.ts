@@ -10,6 +10,8 @@ import {
 	type AlertsTab,
 	type AnomaliesSearch,
 	ErrorsSearch,
+	type SettingsSearch,
+	SettingsTab,
 } from "./search"
 
 /** Where a route sends the browser instead of rendering, and whether it replaces history. */
@@ -84,12 +86,34 @@ export const alertsSectionRoute = (
 ): Extract<AppRoute, { readonly _tag: "Alerts" | "AlertsSection" }> =>
 	section === "inbox" ? AppRoute.Alerts({ search }) : AppRoute.AlertsSection({ section, search })
 
+/** Retired settings tabs and where each now lives. */
+const LEGACY_SETTINGS_TABS = new Map<string, AppRoute>([
+	["organization", AppRoute.Settings({ search: { tab: "general" } })],
+	["api-keys", AppRoute.Settings({ search: { tab: "keys" } })],
+	["developer", AppRoute.Settings({ search: { tab: "keys" } })],
+	["ai-provider", AppRoute.Settings({ search: { tab: "ai" } })],
+	["setup-audit", AppRoute.Settings({ search: { tab: "setup-health" } })],
+	["escalations", AppRoute.Settings({ search: { tab: "automation" } })],
+	["notifications", AppRoute.Account({ search: { tab: "email-preferences" } })],
+	["connectors", AppRoute.Integrations({ search: {} })],
+	["integrations", AppRoute.Integrations({ search: {} })],
+])
+
+const decodeSettingsTab = Schema.decodeUnknownOption(SettingsTab)
+
+/** An old `/settings?tab=` link: a live tab moves to its path, a retired one to its new home. */
+const legacySettingsRoute = (legacyTab: string, search: typeof SettingsSearch.Type): AppRoute =>
+	Option.match(decodeSettingsTab(legacyTab), {
+		onSome: (tab) => AppRoute.Settings({ search: { ...search, tab } }),
+		onNone: () => LEGACY_SETTINGS_TABS.get(legacyTab) ?? AppRoute.Settings({ search }),
+	})
+
 const DATA_INTEGRATION_IDS: ReadonlySet<string> = new Set(DATA_INTEGRATIONS)
 
 const redirect = (to: AppRoute, isReplace: boolean) =>
 	Option.some(Redirect.make({ url: hrefOf(to), isReplace }))
 
-/** Redirects of retired paths (connectors, developer, infra, errors/issues, alerts status pages, anomalies, security) and moved integrations. */
+/** Redirects of retired paths (connectors, developer, settings `?tab=`, infra, errors/issues, alerts status pages, anomalies, security) and moved integrations. */
 export const routeRedirect = (route: AppRoute): Option.Option<Redirect> =>
 	AppRoute.matchOrElse<Option.Option<Redirect>>(
 		route,
@@ -118,6 +142,10 @@ export const routeRedirect = (route: AppRoute): Option.Option<Redirect> =>
 					}),
 					true,
 				),
+			Settings: ({ search: { legacyTab, ...search } }) =>
+				legacyTab === undefined
+					? Option.none()
+					: redirect(legacySettingsRoute(legacyTab, search), true),
 			InfraDiscover: () => redirect(AppRoute.Infra({ search: {} }), true),
 			InfraLegacyHost: ({ hostName }) => redirect(AppRoute.InfraHost({ hostName, search: {} }), true),
 			AlertIncidentsIndex: () => redirect(AppRoute.Alerts({ search: {} }), true),
@@ -142,6 +170,45 @@ export const routeRedirect = (route: AppRoute): Option.Option<Redirect> =>
 					}),
 					true,
 				),
+			/** The Releases pages left for the service page, which judges each deploy where it ran. */
+			Releases: ({ search }) =>
+				redirect(
+					AppRoute.Services({
+						search: {
+							startTime: search.startTime,
+							endTime: search.endTime,
+							timePreset: search.timePreset,
+						},
+					}),
+					true,
+				),
+			/** A release named with its service opens that service's deploy drawer; without one, the services. */
+			Release: ({ commitSha, search }) =>
+				redirect(
+					search.service === undefined
+						? AppRoute.Services({
+								search: {
+									startTime: search.startTime,
+									endTime: search.endTime,
+									timePreset: search.timePreset,
+								},
+							})
+						: AppRoute.Service({
+								serviceName: search.service,
+								// The Releases pages read a week by default: a link with no window keeps that week,
+								// so the deploy is still in range when the drawer looks for it.
+								search: {
+									deploy: commitSha,
+									environments: search.environments,
+									startTime: search.startTime,
+									endTime: search.endTime,
+									timePreset:
+										search.timePreset ??
+										(search.startTime === undefined ? "7d" : undefined),
+								},
+							}),
+					true,
+				),
 			RecommendationsIndex: () => redirect(AppRoute.Settings({ search: { tab: "ingestion" } }), true),
 			InfraKubernetes: ({ search }) => redirect(AppRoute.InfraKubernetesPods({ search }), true),
 			ErrorIssues: (issues) => redirect(AppRoute.Errors({ search: errorsSearchOf(issues) }), true),
@@ -156,13 +223,41 @@ export const routeRedirect = (route: AppRoute): Option.Option<Redirect> =>
 		() => Option.none(),
 	)
 
-const isStatusPageRoute = AppRoute.isAnyOf(["StatusPages", "StatusPageNew", "StatusPage"])
+const isProductAnalyticsRoute = AppRoute.isAnyOf(["ProductAnalytics"])
 
-/** A route an org outside its rollout cannot open goes home (`/status-pages` without `statusPages`). */
+const isCloudSecurityRoute = AppRoute.isAnyOf(["SecurityCloud", "SecurityCloudFinding"])
+
+/**
+ * A route an org outside its rollout cannot open goes home (`/product-analytics` without
+ * `productAnalytics`, `/security/cloud` without `cloudSecurity`).
+ */
 export const flaggedRouteRedirect = (
 	route: AppRoute,
-	flags: Pick<OrganizationFeatureFlags, "statusPages">,
+	flags: Pick<OrganizationFeatureFlags, "productAnalytics" | "cloudSecurity">,
 ): Option.Option<Redirect> =>
-	!flags.statusPages && isStatusPageRoute(route)
+	(!flags.productAnalytics && isProductAnalyticsRoute(route)) ||
+	(!flags.cloudSecurity && isCloudSecurityRoute(route))
 		? redirect(AppRoute.Home({ search: {} }), true)
 		: Option.none()
+
+const isSecurityRoute = AppRoute.isAnyOf([
+	"Security",
+	"SecurityCode",
+	"SecurityCodeFindings",
+	"SecurityCodeRuns",
+	"SecurityExposure",
+	"SecurityRuntimes",
+	"SecurityDependencies",
+	"SecurityAuditLog",
+	"SecurityCloud",
+	"SecurityCloudFinding",
+	"SecurityDevices",
+	"SecurityDetections",
+	"SecurityDetectionNew",
+	"SecurityRun",
+	"SecurityFinding",
+])
+
+/** The Security Center is for org admins and engineers: anyone else opening it goes home. */
+export const securityRouteRedirect = (route: AppRoute, canReadSecurity: boolean): Option.Option<Redirect> =>
+	!canReadSecurity && isSecurityRoute(route) ? redirect(AppRoute.Home({ search: {} }), true) : Option.none()

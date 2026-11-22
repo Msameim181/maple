@@ -253,7 +253,7 @@ describe("security tabs", () => {
 		)
 	})
 
-	test("a member's findings are gated, the targets still show", () => {
+	test("a refused findings read is gated, the targets still show", () => {
 		const gated = Arr.reduce(
 			Rec.values(TARGET_IDS),
 			withTargets(),
@@ -274,7 +274,7 @@ describe("security tabs", () => {
 			{ update: pageUpdate, view },
 			given(gated),
 			expectView(text("acme/api-gateway")).toExist(),
-			expectView(text("Findings and reports are visible to org admins and engineers only")).toExist(),
+			expectView(text("Security is visible to org admins and engineers only")).toExist(),
 		)
 	})
 
@@ -485,12 +485,13 @@ describe("security tabs", () => {
 	test.each([
 		["member", MEMBER],
 		["engineer", Policy.grantsOf(["org:engineer"])],
-	])("a %s sees no Add target or Start run control", (_role, grants) => {
+	])("a %s sees Add target and Start run locked", (_role, grants) => {
 		const member = pageUpdate(loaded(), Message.CompletedReadGrants({ grants })).model
 		scene(
 			{ update: pageUpdate, view },
 			given(member),
-			expectView(role("button", { name: "Add target" })).not.toExist(),
+			expectView(role("button", { name: "Add target" })).toBeDisabled(),
+			expectView(role("group", { name: Policy.denialFor("security_audit:run").message })).toExist(),
 		)
 		const runsTab = routeChanged(
 			member,
@@ -500,7 +501,7 @@ describe("security tabs", () => {
 		scene(
 			{ update: pageUpdate, view },
 			given(runsTab),
-			expectView(role("button", { name: "Start run" })).not.toExist(),
+			expectView(role("button", { name: "Start run" })).toBeDisabled(),
 			expectView(role("link", { name: "Runs" })).toExist(),
 		)
 	})
@@ -559,15 +560,51 @@ describe("security tabs", () => {
 	test("a status picked within the search debounce keeps what was typed", () => {
 		const findings = routeChanged(loaded(), AppRoute.SecurityCodeFindings({ search: {} }), context).model
 		const typed = pageUpdate(findings, Message.ChangedSearchDraft({ value: "exports" })).model
-		const picked = pageUpdate(
-			typed,
-			Message.GotStatusSelectMessage({
-				message: Select.Message.SelectedItem({ index: 1, value: "fixed" }),
-			}),
-		)
+		const picked = pageUpdate(typed, Message.PickedStatus({ status: "fixed" }))
 		expect(picked.outMessage).toMatchObject({
 			url: hrefOf(AppRoute.SecurityCodeFindings({ search: { q: "exports", status: "fixed" } })),
 		})
+	})
+
+	test("closed findings are one tab away, and the tab keeps the other filters", () => {
+		const findings = routeChanged(
+			loaded(),
+			AppRoute.SecurityCodeFindings({ search: { target: TARGET_IDS.gateway } }),
+			context,
+		).model
+		scene(
+			{ update: pageUpdate, view },
+			given(findings),
+			expectView(role("link", { name: /^Fixed/ })).toHaveAttr(
+				"href",
+				hrefOf(
+					AppRoute.SecurityCodeFindings({
+						search: { target: TARGET_IDS.gateway, status: "fixed" },
+					}),
+				),
+			),
+			expectView(role("link", { name: /^Open/ })).toHaveAttr("aria-current", "page"),
+			// Counts leave disproved findings out, the gateway's included.
+			expectView(role("link", { name: /^Fixed/ })).toHaveText(/1$/),
+			expectView(role("link", { name: /^Accepted risk/ })).toHaveText(/0$/),
+		)
+		expect(pageUpdate(findings, Message.PickedStatus({ status: "open" })).outMessage).toMatchObject({
+			url: hrefOf(AppRoute.SecurityCodeFindings({ search: { target: TARGET_IDS.gateway } })),
+		})
+	})
+
+	test("the Overview counts resolved findings and links to them", () => {
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded()),
+			expectView(text("1 fixed · 1 dismissed")).toExist(),
+			// The run that no longer found the fixed finding says so in Recent runs.
+			expectView(text(/· 1 fixed$/)).toExist(),
+			expectView(role("link", { name: "View" })).toHaveAttr(
+				"href",
+				hrefOf(AppRoute.SecurityCodeFindings({ search: { status: "fixed" } })),
+			),
+		)
 	})
 
 	test("an empty status tab reads as filtered, with Clear filters, only when a filter besides the status is set", () => {
@@ -576,7 +613,7 @@ describe("security tabs", () => {
 		scene(
 			{ update: pageUpdate, view },
 			given(atStatus({ status: "accepted_risk" })),
-			expectView(text("No findings in this status")).toExist(),
+			expectView(text("No accepted risks")).toExist(),
 			expectView(role("button", { name: "Clear filters" })).toBeAbsent(),
 		)
 		scene(
@@ -844,13 +881,13 @@ describe("spend and models", () => {
 		])
 	})
 
-	test("a member gets no Spend & models control", () => {
+	test("a member sees Spend & models and Edit limit locked", () => {
 		const member = pageUpdate(withSettings(), Message.CompletedReadGrants({ grants: MEMBER })).model
 		scene(
 			{ update: pageUpdate, view },
 			given(member),
-			expectView(role("button", { name: "Spend & models" })).not.toExist(),
-			expectView(text("Edit limit")).not.toExist(),
+			expectView(role("button", { name: "Spend & models" })).toBeDisabled(),
+			expectView(role("button", { name: "Edit limit" })).toBeDisabled(),
 		)
 	})
 })

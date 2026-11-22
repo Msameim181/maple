@@ -23,6 +23,7 @@ import {
 import type { SignalDisplay } from "@maple/backend/services/alerts/alert-signal-display"
 import { LiveActivitiesService, type LiveActivity } from "./LiveActivitiesService"
 import { MobileDevicesService, type MobileDevice } from "./MobileDevicesService"
+import { UPTIME_CERTIFICATE_GROUP_KEY } from "@maple/domain/uptime"
 
 /**
  * Fans an alert event out to the phones registered in the organization.
@@ -291,6 +292,21 @@ export const renderIncidentPush = (
 	const rule = truncate(event.ruleName, 60)
 	const openFor = event.openForMs === null ? null : humanDuration(event.openForMs)
 
+	// A certificate nearing expiry: a heads-up, not a page.
+	if (event.signalType === "uptime" && event.groupKey === UPTIME_CERTIFICATE_GROUP_KEY) {
+		const body = uptimeSummaryLine(event)
+		return {
+			alert: {
+				title: `${event.eventType === "resolve" ? "Certificate renewed" : "Certificate expiring"} · ${rule}`,
+				subtitle: service ?? undefined,
+				body,
+			},
+			interruptionLevel: event.eventType === "resolve" ? "passive" : "active",
+			priority: 5,
+			...(event.eventType === "resolve" ? { sound: null } : undefined),
+		}
+	}
+
 	// A monitor has no value worth a sentence: the check's own error is the body.
 	if (event.signalType === "uptime") {
 		const body = uptimeSummaryLine(event)
@@ -330,6 +346,11 @@ export const renderIncidentPush = (
 		}
 	}
 
+	// A budget has no rolling window: its check's own sentence says what was spent, of how much.
+	const breachBody =
+		event.signalType === "cost_budget" && event.detail != null
+			? `${event.detail}.`
+			: `${label} ${observed} over ${formatWindow(event.windowMinutes)}.`
 	switch (event.eventType) {
 		case "resolve": {
 			const now = formatSignalMetric(event.value, event.signalDisplay)
@@ -339,7 +360,10 @@ export const renderIncidentPush = (
 				held === null
 					? event.signalType === "anomaly"
 						? `The anomaly ended${after}.`
-						: `${label} back to ${now}${after}.`
+						: // A budget's value is a bare percent: its check's sentence carries the money.
+							event.signalType === "cost_budget" && event.detail != null
+							? `${event.detail}${after}.`
+							: `${label} back to ${now}${after}.`
 					: `${describeHoldForPush(held.reason)} for ${humanDuration(held.heldForMs)} with no breach observed; resolved${after}.`
 			return {
 				alert: {
@@ -366,7 +390,7 @@ export const renderIncidentPush = (
 						),
 						" · ",
 					),
-					body: `${label} ${observed} over ${formatWindow(event.windowMinutes)}.`,
+					body: breachBody,
 				},
 				interruptionLevel: "active",
 				priority: 10,
@@ -379,7 +403,7 @@ export const renderIncidentPush = (
 				alert: {
 					title: `${severity} · ${rule}`,
 					subtitle: service ?? undefined,
-					body: `${label} ${observed} over ${formatWindow(event.windowMinutes)}.`,
+					body: breachBody,
 				},
 				interruptionLevel: event.severity === "critical" ? "time-sensitive" : "active",
 				priority: 10,

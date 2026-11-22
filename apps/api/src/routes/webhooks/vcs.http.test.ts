@@ -41,6 +41,7 @@ const makeHandler = () => {
 		commitFiles: unused,
 		fetchPullRequestContext: unused,
 		publishPullRequestReview: unused,
+		withdrawPullRequestApprovals: unused,
 		writePullRequestCheck: unused,
 		writePullRequestSummaryComment: unused,
 		searchCode: unused,
@@ -53,6 +54,8 @@ const makeHandler = () => {
 		fetchWorkflowJobAnnotations: unused,
 		streamWorkflowJobLog: unused,
 		canReadWorkflowLogs: unused,
+		fetchBillingUsage: unused,
+		installationSettingsUrl: () => "",
 	}
 	const web = HttpRouter.toWebHandler(
 		VcsWebhookRouter.pipe(

@@ -25,6 +25,8 @@ export interface ClickHouseProtocolBackendConfig {
 	readonly username: string
 	readonly password: string
 	readonly database: string
+	/** Extra request headers, e.g. a zero-trust proxy's service token in front of the server. */
+	readonly headers?: Readonly<Record<string, string>>
 }
 
 /** Resolved upstream connection config for a tenant's queries. */
@@ -140,6 +142,12 @@ export interface WarehouseBackendDialect {
 	 * so it keeps the live answer too.
 	 */
 	readonly managedSchema: boolean
+	/**
+	 * Run caller-written SQL with `readonly=1` and Maple's limits sent beside the statement, so
+	 * the server refuses writes and reader table functions. Not a boundary alone: see
+	 * `docs/self-hosted-clickhouse.md`. Tinybird scopes raw SQL with the per-org token instead.
+	 */
+	readonly readOnlyRawSql: boolean
 }
 
 /** Single source of truth for per-backend behavior. */
@@ -156,6 +164,7 @@ export const BackendDialect: Record<WarehouseBackendKind, WarehouseBackendDialec
 		unquote64BitIntegers: false,
 		pinSessionTimezoneUtc: false,
 		managedSchema: true,
+		readOnlyRawSql: false,
 	},
 	"tinybird-gateway": {
 		driver: "clickhouse-web",
@@ -168,6 +177,7 @@ export const BackendDialect: Record<WarehouseBackendKind, WarehouseBackendDialec
 		unquote64BitIntegers: true,
 		pinSessionTimezoneUtc: false,
 		managedSchema: true,
+		readOnlyRawSql: false,
 	},
 	clickhouse: {
 		driver: "clickhouse-web",
@@ -180,6 +190,7 @@ export const BackendDialect: Record<WarehouseBackendKind, WarehouseBackendDialec
 		unquote64BitIntegers: true,
 		pinSessionTimezoneUtc: true,
 		managedSchema: false,
+		readOnlyRawSql: true,
 	},
 	chdb: {
 		driver: "clickhouse-web",
@@ -192,5 +203,6 @@ export const BackendDialect: Record<WarehouseBackendKind, WarehouseBackendDialec
 		unquote64BitIntegers: true,
 		pinSessionTimezoneUtc: true,
 		managedSchema: false,
+		readOnlyRawSql: false,
 	},
 } satisfies Record<WarehouseBackendKind, WarehouseBackendDialect>

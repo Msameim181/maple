@@ -10,6 +10,7 @@ import {
 	Sources,
 	SupabaseConnections,
 	VcsInstallations,
+	VercelConnections,
 } from "@maple/db/tables"
 import { AWS_METRICS_OFF, AWS_NO_DELIVERY, awsStreamState } from "@maple/domain/aws"
 import { scrapeStaleAfterMs } from "./integration-inventory"
@@ -37,6 +38,7 @@ export const integrationSourceName = {
 	gcp: (connector: { readonly scopeId: string }) => `Google Cloud ${connector.scopeId}`,
 	railway: (connection: { readonly workspaceNames: string | null }) =>
 		connection.workspaceNames ?? "Railway",
+	vercel: (connection: { readonly teamName: string }) => connection.teamName,
 	planetscale: (organization: string | undefined) =>
 		organization === undefined ? "PlanetScale" : `PlanetScale ${organization}`,
 	cloudflare: (connection: { readonly externalAccountName: string | null }) =>
@@ -44,7 +46,7 @@ export const integrationSourceName = {
 	github: (installation: { readonly accountLogin: string }) => `GitHub ${installation.accountLogin}`,
 	aws: (connection: { readonly accountId: string }) => `AWS ${connection.accountId}`,
 	supabase: (organization: { readonly name: string }) => `Supabase ${organization.name}`,
-}
+} satisfies Record<PullSourcePlatform, (owner: never) => string>
 
 /** A new integration source. Create it in the transaction that writes the row pointing at it. */
 export const createIntegrationSource = Effect.fnUntraced(function* (
@@ -237,7 +239,8 @@ type AwsHealthRow = Pick<
 
 /**
  * What an AWS connection adds to its source's health: the stream is all it reads, so no stream is
- * off, and a refused delivery or a stream that never delivered fails. Silence is the row's own.
+ * off, and a refused delivery or a stream that never delivered fails. Its last delivery counts as
+ * data, so the source is not stale while `sources.last_used_at` lags the stream.
  */
 export const awsHealthOverrides = (connection: AwsHealthRow, now: number): SourceHealthOverrides => {
 	const state = awsStreamState(
@@ -259,9 +262,10 @@ export const awsHealthOverrides = (connection: AwsHealthRow, now: number): Sourc
 		case "undelivered":
 			return { failing: AWS_NO_DELIVERY }
 		case "waiting":
+			return {}
 		case "silent":
 		case "delivering":
-			return {}
+			return { deliveredAt: state.receivedAt }
 	}
 }
 
@@ -309,52 +313,65 @@ export const readHealthOverrides = Effect.fnUntraced(function* (db: MapleDb, org
  * scrape targets and AWS streams add to its health.
  */
 export const readSourceOwners = Effect.fnUntraced(function* (db: MapleDb, orgId: OrgId, now: number) {
-	const [targets, awsConnections, ...owners] = yield* Effect.all(
-		[
-			db.run(
+	// Keyed by every pull platform, so a new integration's rows cannot go unlinked from their source.
+	const owners = yield* Effect.all(
+		{
+			prometheus: db.run(
 				PG.from(ScrapeTargets)
 					.select("id", "sourceId", "enabled", "scrapeIntervalSeconds")
 					.where(($) => [$.orgId.eq(orgId), $.managedBy.isNull()]),
 			),
-			readAwsHealth(db, orgId),
-			db.run(
+			aws: readAwsHealth(db, orgId),
+			gcp: db.run(
 				PG.from(GcpConnectors)
 					.select("id", "sourceId")
 					.where(($) => [$.orgId.eq(orgId)]),
 			),
-			db.run(
+			railway: db.run(
 				PG.from(RailwayConnections)
 					.select("id", "sourceId")
 					.where(($) => [$.orgId.eq(orgId)]),
 			),
-			db.run(
+			vercel: db.run(
+				PG.from(VercelConnections)
+					.select("id", "sourceId")
+					.where(($) => [$.orgId.eq(orgId)]),
+			),
+			planetscale: db.run(
 				PG.from(PlanetscaleConnections)
 					.select("id", "sourceId")
 					.where(($) => [$.orgId.eq(orgId)]),
 			),
-			db.run(
+			supabase: db.run(
 				PG.from(SupabaseConnections)
 					.select("id", "sourceId")
 					.where(($) => [$.orgId.eq(orgId)]),
 			),
-			db.run(
+			// Only Cloudflare OAuth grants own a source; Supabase and PlanetScale link theirs on their own rows.
+			cloudflare: db.run(
 				PG.from(OAuthConnections)
 					.select("id", "sourceId")
 					.where(($) => [$.orgId.eq(orgId), $.sourceId.isNotNull()]),
 			),
-			db.run(
+			github: db.run(
 				PG.from(VcsInstallations)
 					.select("id", "sourceId")
 					.where(($) => [$.orgId.eq(orgId)]),
 			),
-		],
+		} satisfies Record<
+			PullSourcePlatform,
+			Effect.Effect<ReadonlyArray<{ readonly id: string; readonly sourceId: SourceId | null }>, unknown>
+		>,
 		{ concurrency: "unbounded" },
 	)
-	const linked = Arr.flatMap([...targets, ...awsConnections, ...owners.flat()], (owner) =>
+	const linked = Arr.flatMap(Rec.values(owners).flat(), (owner) =>
 		owner.sourceId === null ? [] : [[owner.sourceId, owner.id] as const],
 	)
 	return {
 		integrationIds: new Map(linked),
-		overrides: new Map([...overridesBySource(targets), ...awsOverridesBySource(awsConnections, now)]),
+		overrides: new Map([
+			...overridesBySource(owners.prometheus),
+			...awsOverridesBySource(owners.aws, now),
+		]),
 	}
 })

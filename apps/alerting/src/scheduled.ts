@@ -14,6 +14,19 @@ import { DigestService } from "@maple/backend/services/digest/DigestService"
 import { WebAnalyticsDigestService } from "@maple/backend/services/digest/WebAnalyticsDigestService"
 import { EdgeCacheServiceLive } from "@maple/backend/platform/CacheBackendLive"
 import { Env } from "@maple/backend/platform/Env"
+import {
+	ApnsPrivateKey,
+	CloudflareOAuthClientSecret,
+	GcpServiceAccountKey,
+	GithubAppClientSecret,
+	GithubAppPrivateKey,
+	GithubAppWebhookSecret,
+	LinearOAuthClientSecret,
+	PlanetScaleOAuthClientSecret,
+	SearchConsoleClientSecret,
+	StatusDomainsApiToken,
+	SupabaseOAuthClientSecret,
+} from "@maple/infra/secrets"
 import { ErrorsService } from "@maple/backend/services/errors/ErrorsService"
 import { EscalationService } from "@maple/backend/services/alerts/EscalationService"
 import { FixVerificationTickService } from "@maple/backend/services/errors/FixVerificationTickService"
@@ -26,11 +39,17 @@ import { PrReviewPostMergeService } from "@maple/backend/services/pr-review/PrRe
 import { RailwayMetricsService } from "@maple/backend/services/integrations/RailwayMetricsService"
 import { SearchConsoleImportService } from "@maple/backend/services/integrations/SearchConsoleImportService"
 import { AwsConnectionService } from "@maple/backend/services/integrations/AwsConnectionService"
+import { CostSyncService } from "@maple/backend/services/cost/CostSyncService"
+import { AwsSecurityFindingsService } from "@maple/backend/services/cloud-security/AwsSecurityFindingsService"
+import { FleetAuditService } from "@maple/backend/services/integrations/FleetAuditService"
+import { FleetFindingsService } from "@maple/backend/services/integrations/FleetFindingsService"
 import { SecretResealService } from "@maple/backend/services/secrets/SecretResealService"
 import { SupabaseConnectionService } from "@maple/backend/services/integrations/SupabaseConnectionService"
 import { SupabaseInsightsService } from "@maple/backend/services/integrations/SupabaseInsightsService"
 import { SupabaseLogsService } from "@maple/backend/services/integrations/SupabaseLogsService"
 import { ServiceMapRollupService } from "@maple/backend/services/service-map/ServiceMapRollupService"
+import { VercelIntegrationService } from "@maple/backend/services/integrations/VercelIntegrationService"
+import { StatusPageCustomDomainsService } from "@maple/backend/services/status-pages/StatusPageCustomDomainsService"
 import { StatusPagePublisher } from "@maple/backend/services/status-pages/StatusPagePublisher"
 import { StatusPageReconciler } from "@maple/backend/services/status-pages/StatusPageReconciler"
 import {
@@ -48,15 +67,36 @@ import { FetchHttpClient } from "effect/http"
 import { isLaneOf, scheduleFor, type TickLane } from "./schedule.ts"
 import type { AlertingWorkerEnv } from "./worker.ts"
 
-/** The status page publisher, only when its KV and R2 bindings exist on this Worker. */
+/**
+ * The status page publisher, only when its KV and R2 bindings exist on this Worker. Custom domains
+ * ride along: unavailable (a no-op poll) where the Cloudflare for SaaS zone is not configured.
+ */
 const statusPagesLayerIfBound = (bindings: Option.Option<StatusPageBindings>) =>
 	Option.match(bindings, {
 		onNone: () => Layer.empty,
 		onSome: ({ kv, bucket }) =>
-			Layer.mergeAll(StatusPagePublisher.layer, StatusPageReconciler.layer).pipe(
-				Layer.provide(StatusPageStore.fromBindings(kv, bucket)),
+			Layer.mergeAll(
+				Layer.mergeAll(StatusPagePublisher.layer, StatusPageReconciler.layer).pipe(
+					Layer.provide(StatusPageStore.fromBindings(kv, bucket)),
+				),
+				StatusPageCustomDomainsService.layer,
 			),
 	})
+
+/** The secrets the ticks' services read. Unbound here, a secret reads as absent (`resources/env.ts`). */
+const TickSecretsLive = Layer.mergeAll(
+	ApnsPrivateKey.layer,
+	CloudflareOAuthClientSecret.layer,
+	GcpServiceAccountKey.layer,
+	GithubAppClientSecret.layer,
+	GithubAppPrivateKey.layer,
+	GithubAppWebhookSecret.layer,
+	LinearOAuthClientSecret.layer,
+	PlanetScaleOAuthClientSecret.layer,
+	SearchConsoleClientSecret.layer,
+	StatusDomainsApiToken.layer,
+	SupabaseOAuthClientSecret.layer,
+)
 
 /**
  * The tick graph for one fire. Deliberately without a tracer or logger of its
@@ -81,8 +121,13 @@ export const layerTick = (
 		PlanetScaleService.layer,
 		PlanetScaleMetricsService.layer,
 		RailwayMetricsService.layer,
+		VercelIntegrationService.layer,
 		SearchConsoleImportService.layer,
 		AwsConnectionService.layer,
+		CostSyncService.layer,
+		AwsSecurityFindingsService.layer,
+		FleetAuditService.layer,
+		FleetFindingsService.layer,
 		SecretResealService.layer,
 		SupabaseConnectionService.layer,
 		SupabaseLogsService.layer,
@@ -99,7 +144,15 @@ export const layerTick = (
 		IncidentClassifier.layer,
 		statusPagesLayerIfBound(statusPages),
 	).pipe(
-		Layer.provide(Layer.mergeAll(Env.layer, DatabasePgLive, EdgeCacheServiceLive, FetchHttpClient.layer)),
+		Layer.provide(
+			Layer.mergeAll(
+				Env.layer,
+				TickSecretsLive,
+				DatabasePgLive,
+				EdgeCacheServiceLive,
+				FetchHttpClient.layer,
+			),
+		),
 		Layer.provideMerge(
 			Layer.mergeAll(
 				layerMapleDbConnection(env),
@@ -404,6 +457,78 @@ const railwayMetricsTick = makeTick(
 			: undefined,
 )
 
+const costSyncTick = makeTick(
+	CostSyncService.use((cost) => cost.pollAllSources),
+	"cost_sync",
+	(result) =>
+		result.due > 0
+			? {
+					due: result.due,
+					synced: result.synced,
+					skipped: result.skipped,
+					failures: result.failures,
+					rowsWritten: result.rowsWritten,
+					requests: result.requests,
+				}
+			: undefined,
+)
+
+const awsSecurityTick = makeTick(
+	AwsSecurityFindingsService.use((security) => security.pollAll),
+	"aws_security",
+	(result) =>
+		result.connections > 0
+			? {
+					connections: result.connections,
+					failedConnections: result.failedConnections,
+					reads: result.reads,
+					findings: result.findings,
+				}
+			: undefined,
+)
+
+const fleetTick = makeTick(
+	FleetAuditService.use((fleet) => fleet.pollAll),
+	"fleet",
+	(result) =>
+		result.connections > 0
+			? {
+					connections: result.connections,
+					failedConnections: result.failedConnections,
+					events: result.events,
+				}
+			: undefined,
+)
+
+const fleetFindingsTick = makeTick(
+	FleetFindingsService.use((fleet) => fleet.syncDue),
+	"fleet_findings",
+	(result) =>
+		result.connections > 0
+			? {
+					connections: result.connections,
+					failedConnections: result.failedConnections,
+					policies: result.policies,
+					vulnerabilities: result.vulnerabilities,
+				}
+			: undefined,
+)
+
+const vercelTick = makeTick(
+	VercelIntegrationService.use((vercel) => vercel.pollAllOrgs),
+	"vercel",
+	(result) =>
+		result.orgs > 0
+			? {
+					orgs: result.orgs,
+					deploymentsUpserted: result.deploymentsUpserted,
+					drainsRepaired: result.drainsRepaired,
+					skipped: result.skipped,
+					failures: result.failures,
+				}
+			: undefined,
+)
+
 const searchConsoleTick = makeTick(
 	SearchConsoleImportService.use((searchConsole) => searchConsole.pollAllSites),
 	"search_console",
@@ -479,13 +604,16 @@ const prReviewPostMergeTick = makeTick(
 )
 
 /**
- * Imports break-glass updates, repairs auto incidents, then sweeps: edge cleanups, lagging pages
- * and the heartbeat (written by the sweep only once it reached the database). Each step isolated.
+ * Imports break-glass updates, repairs auto incidents, starts and completes maintenance whose
+ * window began or ended, checks custom domains due a check, then
+ * sweeps: edge cleanups, lagging pages and the heartbeat (written by the sweep only once it
+ * reached the database). Each step isolated.
  */
 const statusPagesTick = Effect.gen(function* () {
 	const publisher = yield* Effect.serviceOption(StatusPagePublisher)
 	const reconciler = yield* Effect.serviceOption(StatusPageReconciler)
-	if (Option.isNone(publisher) || Option.isNone(reconciler)) {
+	const domains = yield* Effect.serviceOption(StatusPageCustomDomainsService)
+	if (Option.isNone(publisher) || Option.isNone(reconciler) || Option.isNone(domains)) {
 		return yield* Effect.logInfo("Status page storage is not bound; skipping status page publishing")
 	}
 	yield* makeTick(reconciler.value.reconcileAll, "status_page_reconcile", (result) =>
@@ -500,7 +628,23 @@ const statusPagesTick = Effect.gen(function* () {
 	yield* makeTick(reconciler.value.repairAutoIncidents, "status_page_repair", (repaired) =>
 		repaired > 0 ? { statusPageAutoIncidentsRepaired: repaired } : undefined,
 	)
+	// Before the sweep, so a window that just began or ended is on the page this same minute.
+	yield* makeTick(reconciler.value.advanceMaintenance, "status_page_maintenance", (advanced) =>
+		advanced > 0 ? { statusPageMaintenanceAdvanced: advanced } : undefined,
+	)
 	const nowMs = yield* Clock.currentTimeMillis
+	// Before the sweep, so a domain that just went live is routed in this same minute.
+	yield* makeTick(domains.value.poll(nowMs), "status_page_custom_domains", (result) =>
+		result.checked + result.errored + result.expired > 0
+			? {
+					statusPageCustomDomainsChecked: result.checked,
+					statusPageCustomDomainsActivated: result.activated,
+					statusPageCustomDomainsFailed: result.failed,
+					statusPageCustomDomainsErrored: result.errored,
+					statusPageCustomDomainsExpired: result.expired,
+				}
+			: undefined,
+	)
 	yield* makeTick(publisher.value.sweep(nowMs), "status_page_publish", (result) =>
 		result.due + result.cleaned + result.cleanupsFailed > 0
 			? {
@@ -521,10 +665,14 @@ const scheduledTicks = {
 	alertLongQuery: schedulerTick("long_query", "scheduler_long_query"),
 	anomaly: anomalyTick,
 	awsConnections: awsConnectionsTick,
+	awsSecurity: awsSecurityTick,
 	cloudflareAnalytics: cloudflareAnalyticsTick,
+	costSync: costSyncTick,
 	digest: digestTick,
 	error: errorTick,
 	escalation: escalationTick,
+	fleet: fleetTick,
+	fleetFindings: fleetFindingsTick,
 	fixVerification: fixVerificationTick,
 	gcpMetrics: gcpMetricsTick,
 	maintenanceWindows: maintenanceWindowsTick,
@@ -539,6 +687,7 @@ const scheduledTicks = {
 	supabaseDiscovery: supabaseDiscoveryTick,
 	supabaseLogs: supabaseLogsTick,
 	supabaseInsights: supabaseInsightsTick,
+	vercel: vercelTick,
 }
 
 export type ScheduledTickName = keyof typeof scheduledTicks
@@ -584,6 +733,11 @@ const LANE_TICKS = {
 	supabase_insights: ["supabaseInsights"],
 	maintenance_windows: ["maintenanceWindows"],
 	search_console: ["searchConsole"],
+	cost_sync: ["costSync"],
+	aws_security: ["awsSecurity"],
+	fleet: ["fleet"],
+	fleet_findings: ["fleetFindings"],
+	vercel: ["vercel"],
 } as const satisfies Record<TickLane, ReadonlyArray<ScheduledTickName>>
 
 /** The program a lane runs: its ticks one after another. */

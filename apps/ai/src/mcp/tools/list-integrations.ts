@@ -20,7 +20,7 @@ const iso = (ms: number | null) => (ms === null ? null : new Date(ms).toISOStrin
 type Output = typeof ListIntegrationsOutput.Type
 
 /** Providers whose data `list_infra` reads. */
-const PLATFORM_PROVIDERS: ReadonlySet<string> = new Set(["cloudflare", "railway", "planetscale"])
+const PLATFORM_PROVIDERS: ReadonlySet<string> = new Set(["cloudflare", "railway", "planetscale", "vercel"])
 
 /** Where each provider's data is read next, once the integration is known to deliver it. */
 const nextFor = (integration: Output["integrations"][number]): ReadonlyArray<NextCall> => {
@@ -63,6 +63,14 @@ const nextFor = (integration: Output["integrations"][number]): ReadonlyArray<Nex
 					"database CPU, memory, storage and replica lag",
 				),
 			]
+		case "vercel":
+			return [
+				doc.next(
+					"list_infra",
+					{ kind: "vercel_projects" },
+					"Vercel projects' requests, 5xx rate and error logs from the log drain",
+				),
+			]
 		case "search_console":
 			return [
 				doc.next("search_console_queries", {}, "search queries with clicks, CTR and position"),
@@ -72,6 +80,14 @@ const nextFor = (integration: Output["integrations"][number]): ReadonlyArray<Nex
 					"search landing pages with Maple sessions, bounce rate and conversions",
 				),
 			]
+		case "gcp":
+			return [doc.next("list_metrics", {}, "the Cloud Monitoring metrics the connector delivers")]
+		case "aws":
+			return [doc.next("list_metrics", {}, "the CloudWatch metrics the metric stream delivers")]
+		case "supabase":
+			return [doc.next("list_metrics", {}, "the project metrics the managed scrape delivers")]
+		// Fleet feeds the audit log and Security Center, which are admin pages with no tool.
+		case "fleet":
 		case "chat":
 			return []
 	}
@@ -82,11 +98,11 @@ export function registerListIntegrationsTool(server: McpToolRegistrar) {
 		name: TOOL,
 		title: "List Integrations",
 		description:
-			"Every third-party integration connected to this Maple organization (GitHub, Cloudflare, Railway, PlanetScale, Google Search Console, " +
+			"Every third-party integration connected to this Maple organization (GitHub, Cloudflare, Google Cloud, AWS, Railway, Fleet, Vercel, PlanetScale, Supabase, Google Search Console, " +
 			"Prometheus scrape targets, chat workspaces), what Maple data each one feeds, and whether it is working: " +
 			"revoked grants, failing or stale pollers, repositories that do not sync, scrape targets that error. Each " +
 			"provider lists its resources (repositories, zones, Workers, Logpush jobs, Hyperdrive configs, Railway " +
-			"environments, databases, scrape targets) worst first. Answers 'what is connected' and 'why is my Cloudflare / " +
+			"environments, Vercel drains, databases, Google Cloud scopes, AWS accounts, Supabase projects, scrape targets) worst first. Answers 'what is connected' and 'why is my Cloudflare / " +
 			"Railway / PlanetScale data missing'. Read from Maple's own state, so it never calls the providers. Which sender stopped sending: list_ingest_sources.",
 		parameters: Schema.Struct({
 			provider: P.optionalOneOf(
@@ -135,7 +151,7 @@ export function registerListIntegrationsTool(server: McpToolRegistrar) {
 						hints: [
 							filter === undefined
 								? "Connect data integrations in Sources, chat and alert connectors in Settings → Integrations. Each feeds:"
-								: filter === "chat"
+								: filter === "chat" || filter === "fleet"
 									? "Connect it in Settings → Integrations. Each feeds:"
 									: "Connect it in Sources. Each feeds:",
 							...Arr.map(available, (a) => `${a.provider}: ${Arr.join(a.feeds, "; ")}`),

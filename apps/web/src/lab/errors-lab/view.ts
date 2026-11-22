@@ -6,12 +6,14 @@ import type { Html, HtmlBuilder } from "foldkit/html"
 import { dashboardPage } from "../../page/kit/dashboard-page"
 import { listBody } from "../../page/errors/hub/view-list"
 import { toolbar } from "../../page/errors/hub/view-toolbar"
+import { filtersRail } from "../../page/errors/hub/view-filters"
 import type { Message as HubMessage } from "../../page/errors/hub/message"
 import type { Model as HubModel } from "../../page/errors/hub/model"
 import { eyebrow } from "@maple/views/ui/eyebrow"
 import { isMounted } from "@maple/views/ui/overlay/transition"
 import { labSignals } from "./hub-step"
-import { LAB_STATES, LAB_WIDTHS, type LabState, Message, type Model } from "./model"
+import { LAB_ROLES, LAB_STATES, LAB_WIDTHS, type LabState, Message, type Model } from "./model"
+import { canTriageIssues } from "../../page/errors/kit/grants"
 import { Array as Arr } from "effect"
 
 // The lab controls, stat strip and errors hub view over the fixture.
@@ -106,6 +108,7 @@ const hubView = Submodel.defineView<HubModel, HubMessage, HubInputs>((hub, input
 						isMounted(hub.rowMenu.isOpen, hub.rowMenu.animation)
 							? hub.rowMenu
 							: null,
+					canTriage: canTriageIssues(hub),
 				}),
 			}),
 		],
@@ -121,6 +124,9 @@ const toolbarView = Submodel.defineView<HubModel, HubMessage, HubInputs>((hub, i
 		status === "ready" ? [String(signals.length), " ", signals.length === 1 ? "issue" : "issues"] : null
 	return toolbar(h, hub, count, "pb-0")
 })
+
+/** The hub's filter rail, as the page shows it. */
+const railView = Submodel.defineView<HubModel, HubMessage>((hub, h) => filtersRail(h, hub))
 
 /** The lab's width cap, shared by the pinned toolbar and the hub column. */
 const widthCapped = (h: HtmlBuilder<Message>, width: number | null, child: Html): Html =>
@@ -147,11 +153,24 @@ export const view = Submodel.defineView<Model, Message>((model, h) =>
 						model.state,
 						(state) => Message.ClickedState({ state }),
 					),
+					toggleGroup(
+						h,
+						"Role",
+						Arr.map(LAB_ROLES, (value) => ({ value, label: value })),
+						model.role,
+						(role) => Message.ClickedRole({ role }),
+					),
 					toggleGroup(h, "Width", LAB_WIDTHS, model.width, (width) =>
 						Message.ClickedWidth({ width }),
 					),
 				],
 			),
+			filters: h.submodel({
+				slotId: "errors-lab-filters",
+				model: model.hub,
+				view: railView,
+				toParentMessage: (message) => Message.GotHubMessage({ message }),
+			}),
 			sticky: widthCapped(
 				h,
 				model.width,

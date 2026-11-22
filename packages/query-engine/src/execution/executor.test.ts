@@ -23,6 +23,7 @@ import { WarehouseResponseLimitError } from "./response-limits"
 import type {
 	ExecutionTenant,
 	ResolvedWarehouseConfig,
+	RouteScope,
 	SqlQueryOptions,
 	WarehouseExecutorDeps,
 	WarehouseSqlClient,
@@ -156,6 +157,50 @@ describe("makeWarehouseExecutor ingest routing", () => {
 	)
 })
 
+describe("makeWarehouseExecutor route scope", () => {
+	// A host may run a `tenant` read on credentials scoped to that org, so the mark must reach it
+	// for exactly the reads that passed the tenant-scope gate.
+	it.effect("marks only gated compiled reads as one tenant's", () =>
+		Effect.gen(function* () {
+			const scopes: Array<readonly [string, string | undefined]> = []
+			const executor = makeWarehouseExecutor({
+				...makeDeps([]),
+				resolveRoute: (_tenant, purpose, label, scope?: RouteScope) => {
+					scopes.push([label, scope?.kind])
+					return Effect.succeed({
+						source: "managed" as const,
+						config: tinybirdConfig,
+						clientCacheKey: purpose === "ingest" ? "write:managed" : "read:managed",
+					})
+				},
+			})
+			const crossOrg = rawCompiledQuery<Record<string, unknown>>({
+				sql: "SELECT OrgId FROM traces GROUP BY OrgId\nFORMAT JSON",
+				tenantScope: "cross-tenant",
+				reason: "test-fixture",
+				justification: "Synthetic SQL asserting executor behaviour, not a product query.",
+			})
+
+			yield* executor.compiledQuery(tenant, untaggedCompiled, { context: "scoped" })
+			yield* executor.compiledQuery(tenant, compiled, { context: "scopedIngestRead" })
+			yield* executor.crossOrgQuery(tenant, crossOrg, {
+				context: "crossOrg",
+				justification: "test",
+			})
+			yield* executor.rawSqlQuery(tenant, "SELECT 1 FROM traces WHERE OrgId = 'org_test'")
+			yield* executor.ingest(tenant, "traces", [{ OrgId: "org_test" }])
+
+			assert.deepStrictEqual(scopes, [
+				["scoped", "tenant"],
+				["scopedIngestRead", "tenant"],
+				["crossOrg", undefined],
+				["rawSqlQuery", undefined],
+				["ingest:traces", undefined],
+			])
+		}),
+	)
+})
+
 describe("makeWarehouseExecutor span instrumentation", () => {
 	it.effect("emits the canonical SQL attributes on the Client span", () =>
 		Effect.gen(function* () {
@@ -191,6 +236,28 @@ describe("makeWarehouseExecutor span instrumentation", () => {
 			assert.isFalse(span.attributes.has("error.type"))
 			assert.isNumber(span.attributes.get("db.duration_ms"))
 			assert.match(span.attributes.get("db.query.fingerprint") as string, /^[0-9a-f]{8}$/)
+		}),
+	)
+
+	it.effect("records the statement with its literals replaced, and the real statement's length", () =>
+		Effect.gen(function* () {
+			const { spans, tracer } = makeRecordingTracer()
+			const executor = makeWarehouseExecutor(makeDeps([]))
+			const sql =
+				"SELECT Body FROM logs WHERE OrgId = 'org_test' AND Body LIKE '%alice@example.com%' AND UserId = 4242"
+
+			yield* executor
+				.compiledQuery(tenant, scoped(sql), { profile: "list", context: "literals" })
+				.pipe(Effect.withTracer(tracer))
+
+			const span = Option.getOrThrow(
+				Arr.findFirst(spans, (candidate) => candidate.name === "WarehouseQueryService.executeSql"),
+			)
+			const text = String(span.attributes.get("db.query.text"))
+			assert.include(text, "WHERE OrgId = ? AND Body LIKE ? AND UserId = ?")
+			assert.notInclude(text, "alice@example.com")
+			assert.notInclude(text, "4242")
+			assert.isAbove(Number(span.attributes.get("db.query.length")), text.length)
 		}),
 	)
 
@@ -301,12 +368,20 @@ describe("makeWarehouseExecutor span instrumentation", () => {
 			const foreignResource = yield* executor
 				.ingest(tenant, "traces", [{ resource_attributes: { maple_org_id: "org_victim" } }])
 				.pipe(Effect.flip)
+			const foreignJsonKey = yield* executor
+				.ingest(tenant, "product_events", [{ org_id: "org_victim" }])
+				.pipe(Effect.flip)
 			yield* executor.ingest(tenant, "traces", [{ resource_attributes: { maple_org_id: "org_test" } }])
+			yield* executor.ingest(tenant, "product_events", [{ org_id: "org_test" }])
 
 			assert.strictEqual(error._tag, "@maple/http/errors/WarehouseScopeError")
 			assert.strictEqual(missing._tag, "@maple/http/errors/WarehouseScopeError")
 			assert.strictEqual(foreignResource._tag, "@maple/http/errors/WarehouseScopeError")
-			assert.deepStrictEqual(inserted, [[{ resource_attributes: { maple_org_id: "org_test" } }]])
+			assert.strictEqual(foreignJsonKey._tag, "@maple/http/errors/WarehouseScopeError")
+			assert.deepStrictEqual(inserted, [
+				[{ resource_attributes: { maple_org_id: "org_test" } }],
+				[{ org_id: "org_test" }],
+			])
 		}),
 	)
 
@@ -1301,6 +1376,67 @@ describe("makeWarehouseExecutor SQL normalization", () => {
 			)
 			yield* executor.compiledQuery(tenant, compiled, { context: "test" })
 			assert.isTrue(Str.endsWith("FORMAT JSON")(Str.trimEnd(Option.getOrThrow(Arr.head(sqls)))))
+		}),
+	)
+})
+
+describe("makeWarehouseExecutor read-only raw SQL", () => {
+	type SqlOptions = Parameters<WarehouseSqlClient["sql"]>[1]
+	const recording = (
+		config: ResolvedWarehouseConfig,
+		calls: Array<{ text: string; options: SqlOptions }>,
+	) =>
+		makeWarehouseExecutor({
+			...makeRecordingDeps({ config, clientCacheKey: "read:org_test" }, []),
+			createClient: () =>
+				Effect.succeed<WarehouseSqlClient>({
+					sql: (statement, options) =>
+						Effect.sync(() => {
+							calls.push({ text: statement.text, options })
+							return { data: [] }
+						}),
+					insert: () => Effect.void,
+				}),
+		})
+
+	it.effect("asks a customer ClickHouse for read-only mode and sends the limits beside the statement", () =>
+		Effect.gen(function* () {
+			const calls: Array<{ text: string; options: SqlOptions }> = []
+			yield* recording(clickhouseConfig, calls).rawSqlQuery(
+				tenant,
+				"SELECT 1 WHERE OrgId = 'org_test'",
+				{ profile: "rawInteractive" },
+			)
+			const call = Option.getOrThrow(Arr.head(calls))
+			assert.deepStrictEqual(call.options?.readOnly, {
+				settings: { max_execution_time: 10, max_memory_usage: 512_000_000, max_threads: 2 },
+			})
+			// Read-only mode refuses a SETTINGS clause, so the statement must not carry one.
+			assert.isFalse(/\bSETTINGS\b/i.test(call.text))
+		}),
+	)
+
+	it.effect("leaves a compiled read on the same server as it was", () =>
+		Effect.gen(function* () {
+			const calls: Array<{ text: string; options: SqlOptions }> = []
+			yield* recording(clickhouseConfig, calls).compiledQuery(tenant, compiled, { context: "test" })
+			const call = Option.getOrThrow(Arr.head(calls))
+			assert.isUndefined(call.options?.readOnly)
+			assert.isTrue(/\bSETTINGS\b/i.test(call.text))
+		}),
+	)
+
+	it.effect("keeps the limits in the statement where the token is the boundary", () =>
+		Effect.gen(function* () {
+			const calls: Array<{ text: string; options: SqlOptions }> = []
+			yield* recording(tinybirdGatewayConfig, calls).rawSqlQuery(
+				tenant,
+				"SELECT 1 WHERE OrgId = 'org_test'",
+				{ profile: "rawInteractive" },
+			)
+			const call = Option.getOrThrow(Arr.head(calls))
+			assert.isUndefined(call.options?.readOnly)
+			assert.isTrue(Str.includes("max_execution_time=10")(call.text))
 		}),
 	)
 })

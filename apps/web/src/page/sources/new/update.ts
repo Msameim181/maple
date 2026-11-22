@@ -51,14 +51,15 @@ type NewRoute = Extract<AppRoute, { readonly _tag: "SourcesNew" }>
 const navigate = (url: string): PageOutMessage =>
 	PageOutMessage.RequestedNavigation({ url, isReplace: false })
 
-/** Step 2's form, fresh for each platform pick. */
-const withForm = (model: Model, platform: PushSourcePlatform | null): Model => ({
+/** The push page's form, fresh for each platform pick; a created source keeps its own snippet tabs. */
+const withForm = (model: Model, platform: PushSourcePlatform | null, context: PageContext): Model => ({
 	...model,
 	platform,
 	name: platform === null ? "" : defaultSourceName(platform),
 	isAdvancedOpen: false,
-	rules: Rules.init(null),
+	rules: Rules.init(null, context.hasProfiling === true),
 	isSaving: false,
+	setup: model.created !== null || platform === null ? model.setup : Setup.init(platform),
 })
 
 /** The form's list read; `refresh` when it mounts again in the same visit (the cached list was dropped). */
@@ -111,10 +112,11 @@ export const init = (route: NewRoute, context: PageContext): Return => {
 		{
 			// Read only on the page under Clerk; self-hosted sessions hold every permission.
 			grants: isClerkAuthEnabled ? null : Policy.allPermissions,
+			search: "",
 			platform: null,
 			name: "",
 			isAdvancedOpen: false,
-			rules: Rules.init(null),
+			rules: Rules.init(null, context.hasProfiling === true),
 			isSaving: false,
 			list: Keyed.idle(),
 			created: null,
@@ -127,6 +129,7 @@ export const init = (route: NewRoute, context: PageContext): Return => {
 			stage: "connect",
 		},
 		platform,
+		context,
 	)
 	const lifted = liftIntegrations(model, embedded)
 	// An integration's step reads the list too: once connected it links to the source it made.
@@ -177,6 +180,7 @@ const enterRoute = (model: Model, route: NewRoute, context: PageContext): Return
 	const next = withForm(
 		{ ...entered.model, list: platform === null ? Keyed.idle() : entered.model.list },
 		platform,
+		context,
 	)
 	if (model.created !== null) return { ...entered, model: next }
 	// Back to the picker clears the form's list; an integration's step reads it again.
@@ -227,7 +231,14 @@ const readCreated = (
 const submit = (model: Model): Return => {
 	const outcome = Rules.rulesOutcome(model.rules)
 	const name = Str.trim(model.name)
-	if (model.platform === null || model.isSaving || name.length === 0 || !outcome.valid) return { model }
+	if (
+		model.platform === null ||
+		model.created !== null ||
+		model.isSaving ||
+		name.length === 0 ||
+		!outcome.valid
+	)
+		return { model }
 	const command: Cmd = CreateSource({
 		name,
 		platform: model.platform,
@@ -293,6 +304,7 @@ export const updateFlow = (model: Model, message: Message, context: PageContext)
 				? merge(step, readList(step.model, context, true))
 				: step
 		},
+		ChangedSearch: ({ value }) => ({ model: { ...model, search: value } }),
 		ChangedName: ({ value }) => ({ model: { ...model, name: value } }),
 		ToggledAdvanced: () => ({ model: { ...model, isAdvancedOpen: !model.isAdvancedOpen } }),
 		GotRulesMessage: ({ message: inner }) =>
@@ -331,10 +343,11 @@ export const updateFlow = (model: Model, message: Message, context: PageContext)
 				}),
 				onSuccess: ({ secret, ...source }) => {
 					const refreshed = readList({ ...model, isSaving: false }, context, true)
+					// The tabs the form showed stay as picked, unless the route moved on while it saved.
 					const created: Model = {
 						...refreshed.model,
 						created: { source, secret },
-						setup: Setup.init(source.platform),
+						setup: source.platform === model.platform ? model.setup : Setup.init(source.platform),
 					}
 					const read = readCreated(created, context, source, "Load")
 					return scrolledToTop({

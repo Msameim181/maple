@@ -13,6 +13,15 @@ import { organizationFeatureFlagsFrom } from "@maple/domain/organization-feature
 import { isClerkAuthEnabled } from "../../platform/auth-mode"
 import { trackProduct } from "../../data/analytics"
 import { readAllPages } from "../../platform/read-all-pages"
+import { RAILWAY } from "../infra-integrations/railway/integration/railway-provider"
+import { SUPABASE } from "../infra-integrations/supabase/integration/supabase-provider"
+import { SEARCH_CONSOLE_STATUS_READ } from "./search-console"
+import { LINEAR_STATUS_READ } from "./linear-provider"
+import { FLEET_STATUS_READ } from "./fleet/fleet"
+import { CHAT_STATUS_READ } from "./chat"
+import { VERCEL_STATUS_READ } from "../infra-integrations/vercel/integration/vercel"
+import { PLANETSCALE_STATUS_READ } from "../infra-integrations/planetscale/integration/planetscale"
+import { CLOUDFLARE_STATUS_READ } from "../infra-integrations/cloudflare/integration/cloudflare"
 
 const RefreshArgs = { key: Schema.String, refresh: Schema.Boolean }
 
@@ -47,23 +56,22 @@ const statusRead = <const Name extends string, A, E, R>(
 
 /** Every status read the page makes, by its slot in `Statuses`. */
 export const STATUS_READS = {
-	cloudflare: statusRead("LoadIntegrationsCloudflareStatus", Message.CompletedLoadCloudflare, (refresh) =>
-		Effect.flatMap(IntegrationStatuses, (statuses) => statuses.cloudflare({ refresh })),
+	cloudflare: statusRead(
+		CLOUDFLARE_STATUS_READ.name,
+		Message.CompletedLoadCloudflare,
+		CLOUDFLARE_STATUS_READ.read,
 	),
-	railway: statusRead("LoadIntegrationsRailwayStatus", Message.CompletedLoadRailway, (refresh) =>
-		Effect.flatMap(IntegrationStatuses, (statuses) => statuses.railway({ refresh })),
-	),
+	railway: statusRead(RAILWAY.statusRead.name, Message.CompletedLoadRailway, RAILWAY.statusRead.read),
+	vercel: statusRead(VERCEL_STATUS_READ.name, Message.CompletedLoadVercel, VERCEL_STATUS_READ.read),
 	planetscale: statusRead(
-		"LoadIntegrationsPlanetscaleStatus",
+		PLANETSCALE_STATUS_READ.name,
 		Message.CompletedLoadPlanetscale,
-		(refresh) => Effect.flatMap(IntegrationStatuses, (statuses) => statuses.planetscale({ refresh })),
+		PLANETSCALE_STATUS_READ.read,
 	),
 	gcp: statusRead("LoadIntegrationsGcpStatus", Message.CompletedLoadGcp, (refresh) =>
 		Effect.flatMap(IntegrationStatuses, (statuses) => statuses.gcp({ refresh })),
 	),
-	supabase: statusRead("LoadIntegrationsSupabaseStatus", Message.CompletedLoadSupabase, (refresh) =>
-		Effect.flatMap(IntegrationStatuses, (statuses) => statuses.supabase({ refresh })),
-	),
+	supabase: statusRead(SUPABASE.statusRead.name, Message.CompletedLoadSupabase, SUPABASE.statusRead.read),
 	aws: statusRead("LoadIntegrationsAwsStatus", Message.CompletedLoadAws, () =>
 		Effect.flatMap(MapleApiV2Client, (client) => client.awsIntegration.status()),
 	),
@@ -73,18 +81,17 @@ export const STATUS_READS = {
 		Message.CompletedLoadPlanetscaleDatabases,
 		() => Effect.flatMap(MapleApiV2Client, (client) => client.planetscaleIntegration.databases()),
 	),
-	linear: statusRead("LoadIntegrationsLinearStatus", Message.CompletedLoadLinear, () =>
-		Effect.flatMap(MapleInternalApiClient, (client) => client.integrations.linearStatus()),
-	),
-	searchConsole: statusRead("LoadIntegrationsSearchConsoleStatus", Message.CompletedLoadSearchConsole, () =>
-		Effect.flatMap(MapleInternalApiClient, (client) => client.integrations.searchConsoleStatus()),
+	linear: statusRead(LINEAR_STATUS_READ.name, Message.CompletedLoadLinear, LINEAR_STATUS_READ.read),
+	fleet: statusRead(FLEET_STATUS_READ.name, Message.CompletedLoadFleet, FLEET_STATUS_READ.read),
+	searchConsole: statusRead(
+		SEARCH_CONSOLE_STATUS_READ.name,
+		Message.CompletedLoadSearchConsole,
+		SEARCH_CONSOLE_STATUS_READ.read,
 	),
 	github: statusRead("LoadIntegrationsGithubStatus", Message.CompletedLoadGithub, () =>
 		Effect.flatMap(MapleInternalApiClient, (client) => client.integrations.githubStatus()),
 	),
-	chat: statusRead("LoadIntegrationsChatConnectors", Message.CompletedLoadChat, () =>
-		Effect.flatMap(MapleApiV2Client, (client) => client.chatIntegration.connectors()),
-	),
+	chat: statusRead(CHAT_STATUS_READ.name, Message.CompletedLoadChat, CHAT_STATUS_READ.read),
 	/** Every page of 100. */
 	scrapeTargets: statusRead("LoadIntegrationsScrapeTargets", Message.CompletedLoadScrapeTargets, () =>
 		Effect.flatMap(MapleApiV2Client, (client) =>
@@ -110,6 +117,16 @@ export const TrackConnected = Command.define("TrackIntegrationConnected", {
 	execute: ({ provider }) =>
 		trackProduct("integration_connected", { provider }).pipe(
 			Effect.as(Message.CompletedTrackConnected()),
+		),
+})
+
+/** A confirmed disconnect is the `integration_disconnected` product event. */
+export const TrackDisconnected = Command.define("TrackIntegrationDisconnected", {
+	args: { provider: Schema.String },
+	messages: [Message.CompletedTrackDisconnected],
+	execute: ({ provider }) =>
+		trackProduct("integration_disconnected", { provider }).pipe(
+			Effect.as(Message.CompletedTrackDisconnected()),
 		),
 })
 

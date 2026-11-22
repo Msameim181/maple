@@ -1,5 +1,6 @@
 import { McpSchema, McpServer as EffectMcpServer } from "effect/ai"
-import { Context, Effect, Layer, Array as Arr, String as Str } from "effect"
+import { Context, Duration, Effect, Layer, Option, Predicate, Array as Arr, String as Str } from "effect"
+import type { OrgId } from "@maple/domain/http"
 import { cachedRecoverable } from "@maple/infra/cached-recoverable"
 import {
 	McpToolExecutorLoader,
@@ -7,8 +8,16 @@ import {
 	McpToolsUnavailableError,
 } from "./executor-loader"
 import { CurrentMcpRequestTenant } from "./tenant"
-import { refusesReadOnlyCredential, type McpToolResult } from "./tools/types"
+import {
+	DATA_SOURCE_TOOLS,
+	refusesAnalyst,
+	refusesReadOnlyCredential,
+	type McpToolResult,
+} from "./tools/types"
+import { OrganizationFeatureFlagsService } from "@maple/backend/services/org/OrganizationFeatureFlagsService"
 import type { McpToolDescriptor } from "@maple/domain/mcp-tool-contract"
+import { enumSpelling } from "./tools/tool-name-aliases"
+import * as Policy from "@maple/domain/policy"
 
 /**
  * The text blocks are what a model reads; `structuredContent` is the typed output the tool's
@@ -25,6 +34,22 @@ const toCallToolResult = (result: McpToolResult): McpSchema.CallToolResult =>
 			? undefined
 			: { structuredContent: result.structuredContent }),
 	})
+
+/** How long a `tools/list` or an `initialize` waits for an org's rollout flags. */
+const FLAGS_WAIT = Duration.seconds(2)
+
+/** An org's rollout flags, when known within {@link FLAGS_WAIT}; a slow read is not waited on twice. */
+export const flagsInTime = (
+	featureFlags: Context.Service.Shape<typeof OrganizationFeatureFlagsService>,
+	orgId: OrgId,
+) => featureFlags.known(orgId, FLAGS_WAIT)
+
+/** The values a tool publishes for an `action` parameter: a family's actions, and so a bounded set. */
+const publishedActionsOf = (descriptor: McpToolDescriptor): ReadonlyArray<unknown> => {
+	const properties = descriptor.inputSchema.properties
+	const action = Predicate.isObject(properties) ? properties.action : undefined
+	return Predicate.isObject(action) && Arr.isArray(action.enum) ? action.enum : []
+}
 
 /** Long enough to tell failures apart in the MCP hub's error groups, short enough for a span. */
 const MAX_ERROR_MESSAGE_CHARS = 300
@@ -69,15 +94,36 @@ const annotateToolFailure = (result: McpToolResult) =>
 		: Effect.void
 
 /**
- * Hides a tool from a read-only credential's `tools/list`, and answers a call to it as unknown:
- * the registry would refuse every such call anyway, and a listed tool invites it.
+ * Hides a tool from the `tools/list` of a caller the registry would refuse, and answers a call to
+ * it as unknown: a listed tool invites the call.
  */
-const HiddenFromReadOnlyCredentials = EffectMcpServer.visibility(() =>
-	Effect.gen(function* () {
-		const tenant = yield* CurrentMcpRequestTenant
-		return tenant?.readOnly !== true
-	}),
+const hiddenFrom = (isRefused: (tenant: { readOnly?: true; roles: ReadonlyArray<string> }) => boolean) =>
+	EffectMcpServer.visibility(() =>
+		Effect.gen(function* () {
+			const tenant = yield* CurrentMcpRequestTenant
+			return tenant === undefined || !isRefused(tenant)
+		}),
+	)
+
+/**
+ * Hides the data source tools from an org outside the `dataSources` rollout: it has none to list.
+ * Flags that cannot be read in time hide nothing: the tools still refuse an org without the rollout.
+ */
+const HiddenWithoutDataSources = EffectMcpServer.visibility(
+	Effect.map(
+		OrganizationFeatureFlagsService,
+		(featureFlags) => () =>
+			Effect.gen(function* () {
+				const tenant = yield* CurrentMcpRequestTenant
+				if (tenant === undefined) return false
+				const flags = yield* flagsInTime(featureFlags, tenant.orgId)
+				return Option.isNone(flags) || flags.value.dataSources
+			}),
+	),
 )
+
+const HiddenFromReadOnlyKeys = hiddenFrom((tenant) => tenant.readOnly === true)
+const HiddenFromAnalysts = hiddenFrom((tenant) => tenant.readOnly === true || Policy.isAnalyst(tenant.roles))
 
 const toBoundaryErrorResult = (error: { readonly _tag: string; readonly message: string }) =>
 	toCallToolResult({
@@ -104,12 +150,19 @@ export class McpToolRegistration extends Context.Service<
 	make: Effect.gen(function* () {
 		const server = yield* EffectMcpServer.McpServer
 		const loader = yield* McpToolExecutorLoader
-		const readOnlyGate = yield* Layer.build(HiddenFromReadOnlyCredentials.layer)
-		const addTool = (descriptor: McpToolDescriptor) =>
-			server.addTool({
-				...(refusesReadOnlyCredential(descriptor.name, descriptor.annotations?.readOnlyHint === true)
-					? { services: readOnlyGate }
-					: undefined),
+		const keyGate = yield* Layer.build(HiddenFromReadOnlyKeys.layer)
+		const analystGate = yield* Layer.build(HiddenFromAnalysts.layer)
+		const dataSourcesGate = yield* Layer.build(HiddenWithoutDataSources.layer)
+		// A dashboard tool is hidden from read-only keys alone; every other change from analysts too.
+		const gateFor = (name: string, readOnly: boolean) => {
+			if (DATA_SOURCE_TOOLS.has(name)) return { services: dataSourcesGate }
+			if (refusesAnalyst(name, readOnly)) return { services: analystGate }
+			return refusesReadOnlyCredential(name, readOnly) ? { services: keyGate } : undefined
+		}
+		const addTool = (descriptor: McpToolDescriptor) => {
+			const actions = publishedActionsOf(descriptor)
+			return server.addTool({
+				...gateFor(descriptor.name, descriptor.annotations?.readOnlyHint === true),
 				tool: new McpSchema.Tool({
 					name: descriptor.name,
 					title: descriptor.title,
@@ -137,6 +190,12 @@ export class McpToolRegistration extends Context.Service<
 						if (tenant.mcpClientName !== undefined) {
 							yield* Effect.annotateCurrentSpan("maple.mcp.client.name", tenant.mcpClientName)
 						}
+						// The hub groups on this span: a family's name alone merges its actions.
+						const asked = Predicate.isObject(payload) ? payload.action : undefined
+						const action = typeof asked === "string" ? enumSpelling(asked) : undefined
+						if (action !== undefined && actions.includes(action)) {
+							yield* Effect.annotateCurrentSpan("maple.mcp.tool.action", action)
+						}
 						// Already built by the transport before the call; this reads the cached executor.
 						const executor = yield* loader.load
 						return yield* executor
@@ -158,6 +217,7 @@ export class McpToolRegistration extends Context.Service<
 						),
 					),
 			})
+		}
 		const register = Effect.tryPromise({
 			try: () => import("./tool-descriptors.generated"),
 			catch: (cause) =>
@@ -174,5 +234,6 @@ export class McpToolRegistration extends Context.Service<
 		}
 	}),
 }) {
+	/** Needs the org's rollout flags from the transport that builds it, which reads them too. */
 	static readonly layer = Layer.effect(this, this.make)
 }

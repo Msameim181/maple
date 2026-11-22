@@ -21,15 +21,19 @@ export const SelectField = Schema.Literals([
 	"feedbackScope",
 	"reviewDrafts",
 	"reviewExternalContributors",
+	"mapleToolAccess",
 	"blockOnContractBreaks",
 	"postMergeCheck",
+	"autoApprove",
 ])
 export type SelectField = typeof SelectField.Type
 export const SwitchField = Schema.Literals([
 	"reviewDrafts",
 	"reviewExternalContributors",
+	"mapleToolAccess",
 	"blockOnContractBreaks",
 	"postMergeCheck",
+	"autoApprove",
 ])
 export type SwitchField = typeof SwitchField.Type
 

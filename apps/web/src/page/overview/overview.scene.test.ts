@@ -1,9 +1,20 @@
 import { OrgId } from "@maple/domain"
 import { Option, Result, Schema, Array as Arr } from "effect"
 import { AsyncData } from "foldkit"
-import { expect as expectView, given, label, Mount, role, scene, text, withViewInputs } from "foldkit/scene"
+import {
+	all,
+	expect as expectView,
+	expectAll,
+	given,
+	label,
+	Mount,
+	role,
+	scene,
+	text,
+	withViewInputs,
+} from "foldkit/scene"
 import { describe, expect, test } from "vitest"
-import { LinkedCursorMessage, MountLinkedCursor } from "@maple/views/charts/linked-cursor"
+import { LinkedCursorMessage, MountLinkedZoom } from "@maple/views/charts/linked-cursor"
 import { ResolveThemeColors, ThemeMessage } from "@maple/views/charts/theme-colors"
 import { toLoadFailure } from "@maple/views/data/load-failure"
 import { PageOutMessage, type PageContext } from "../contract"
@@ -46,19 +57,42 @@ const withFacets = (model: Model, environments: ReadonlyArray<string>) =>
 		}),
 	)
 
+const CHECKOUT_RULE = "0199a001-0000-7000-8000-000000000001"
+const EVALUATE_RULE = "0199a001-0000-7000-8000-000000000002"
+const LATENCY_RULE = "0199a001-0000-7000-8000-000000000003"
+
+const RULE_NAMES = {
+	[CHECKOUT_RULE]: "Checkout errors",
+	[EVALUATE_RULE]: "Rule cannot evaluate",
+	[LATENCY_RULE]: "API latency",
+} as const
+
+/** An open incident of `ruleId`, named after it, for one group. */
+const openIncident = (
+	ruleId: keyof typeof RULE_NAMES,
+	fields: Partial<HealthIncident> = {},
+): HealthIncident => ({
+	ruleId,
+	ruleName: RULE_NAMES[ruleId],
+	status: "open",
+	groupKey: null,
+	severity: "critical",
+	signalType: "error_rate",
+	...fields,
+})
+
 /** Everything the health sections block on has loaded, with `rows` in the snapshot. */
 const loaded = (
 	rows: ReadonlyArray<HealthSnapshot>,
-	incidents: ReadonlyArray<HealthIncident> = [
-		{ status: "open", groupKey: null, severity: "critical", signalType: "error_rate" },
-	],
+	incidents: ReadonlyArray<HealthIncident> = [openIncident(CHECKOUT_RULE)],
+	enabledRuleIds: ReadonlyArray<string> = [CHECKOUT_RULE, EVALUATE_RULE, LATENCY_RULE],
 ): Model => {
 	const facets = withFacets(entered().model, ["production"]).model
 	const steps: ReadonlyArray<Message> = [
 		Message.CompletedFetchSnapshot({ key: facets.snapshot.key ?? "", result: Result.succeed(rows) }),
 		Message.CompletedFetchAnomalies({ key: facets.anomalies.key ?? "", result: Result.succeed([]) }),
 		Message.UpdatedIncidents({ orgId, incidents }),
-		Message.UpdatedRules({ orgId, enabled: [true, false] }),
+		Message.UpdatedRules({ orgId, enabledRuleIds }),
 	]
 	return Arr.reduce(steps, facets, (model, message) => pageUpdate(model, message).model)
 }
@@ -79,7 +113,7 @@ const withPresence = (model: Model, traces: Presence, logs: Presence = traces): 
 
 const themeResolved = () =>
 	Mount.resolve(ResolveThemeColors, ThemeMessage.ResolvedThemeColors({ colors: {} }))
-const cursorMounted = () => Mount.resolve(MountLinkedCursor, LinkedCursorMessage.CompletedMountLinkedCursor())
+const cursorMounted = () => Mount.resolve(MountLinkedZoom, LinkedCursorMessage.CompletedMountLinkedCursor())
 
 describe("overview", () => {
 	test("entry reads the clock and hint; downstream queries wait for facets", () => {
@@ -242,9 +276,59 @@ describe("overview", () => {
 			given(failed),
 			Mount.resolveAll(
 				[ResolveThemeColors, ThemeMessage.ResolvedThemeColors({ colors: {} })],
-				[MountLinkedCursor, LinkedCursorMessage.CompletedMountLinkedCursor()],
+				[MountLinkedZoom, LinkedCursorMessage.CompletedMountLinkedCursor()],
 			),
-			expectView(text("Firing now:")).toBeAbsent(),
+			expectView(text("Firing now")).toBeAbsent(),
+		)
+	})
+
+	test("health computed without alert status says so, and says nothing once alerts are known", () => {
+		const facets = withFacets(entered().model, ["production"]).model
+		const steps: ReadonlyArray<Message> = [
+			Message.CompletedFetchSnapshot({
+				key: facets.snapshot.key ?? "",
+				result: Result.succeed([snapshotRow("checkout")]),
+			}),
+			Message.CompletedFetchAnomalies({ key: facets.anomalies.key ?? "", result: Result.succeed([]) }),
+			Message.FailedLoadIncidents({ orgId }),
+		]
+		const mounts = Mount.resolveAll(
+			[ResolveThemeColors, ThemeMessage.ResolvedThemeColors({ colors: {} })],
+			[MountLinkedZoom, LinkedCursorMessage.CompletedMountLinkedCursor()],
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(Arr.reduce(steps, facets, (model, message) => pageUpdate(model, message).model)),
+			mounts,
+			expectView(text("Couldn't load alert status")).toExist(),
+			// The notice, and the services list's caption further down.
+			expectAll(all.text("Service health leaves out firing alerts.")).toHaveCount(2),
+			expectView(text("Status reflects active alerts and baseline anomalies.")).toBeAbsent(),
+		)
+		const withoutAnomalies: ReadonlyArray<Message> = [
+			Message.CompletedFetchSnapshot({
+				key: facets.snapshot.key ?? "",
+				result: Result.succeed([snapshotRow("checkout")]),
+			}),
+			Message.CompletedFetchAnomalies({
+				key: facets.anomalies.key ?? "",
+				result: Result.fail(toLoadFailure("boom")),
+			}),
+			Message.UpdatedIncidents({ orgId, incidents: [] }),
+		]
+		scene(
+			{ update: pageUpdate, view },
+			given(Arr.reduce(withoutAnomalies, facets, (model, message) => pageUpdate(model, message).model)),
+			mounts,
+			expectView(text("Couldn't load anomalies")).toExist(),
+			expectView(text("Couldn't load alert status")).toBeAbsent(),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded([snapshotRow("checkout")])),
+			mounts,
+			expectView(text("Couldn't load alert status")).toBeAbsent(),
+			expectView(text("Status reflects active alerts and baseline anomalies.")).toExist(),
 		)
 	})
 
@@ -268,50 +352,115 @@ describe("overview", () => {
 		expect(all.outMessage).toEqual(PageOutMessage.RequestedNavigation({ url: "/", isReplace: false }))
 	})
 
-	test("the banner counts the firing incident and the rail counts services by health", () => {
+	test("the banner names the firing rule and the rail counts services by health", () => {
 		scene(
 			{ update: pageUpdate, view },
 			given(loaded([snapshotRow("checkout"), snapshotRow("cart")])),
 			themeResolved(),
 			cursorMounted(),
-			expectView(text("Firing now:")).toExist(),
-			expectView(text("1 incident · 1 critical")).toExist(),
+			expectView(text("Firing now")).toExist(),
+			expectView(role("link", { name: "Checkout errors" })).toHaveAttr(
+				"href",
+				`/alerts/rules/${CHECKOUT_RULE}`,
+			),
+			expectView(text("critical")).toExist(),
+			expectView(role("link", { name: "1 of 3 enabled rules firing →" })).toHaveAttr("href", "/alerts"),
 			expectView(role("link", { name: "View healthy services" })).toExist(),
 			expectView(role("link", { name: /checkout/ })).toExist(),
 		)
 	})
 
 	test("an open anomaly-rule incident is an open anomaly, not a firing incident", () => {
-		const anomaly: HealthIncident = {
-			status: "open",
-			groupKey: null,
-			severity: "critical",
-			signalType: "anomaly",
-		}
+		const anomaly = openIncident(LATENCY_RULE, { signalType: "anomaly" })
 		scene(
 			{ update: pageUpdate, view },
 			given(loaded([snapshotRow("checkout")], [anomaly])),
 			themeResolved(),
 			cursorMounted(),
 			expectView(role("link", { name: /1 open anomaly/ })).toHaveAttr("href", "/alerts?signal=anomaly"),
-			expectView(text("Firing now:")).not.toExist(),
+			expectView(text("Firing now")).not.toExist(),
 		)
 		scene(
 			{ update: pageUpdate, view },
 			given(
 				loaded(
 					[snapshotRow("checkout")],
-					[
-						anomaly,
-						{ status: "open", groupKey: null, severity: "warning", signalType: "error_rate" },
-					],
+					[anomaly, openIncident(CHECKOUT_RULE, { severity: "warning" })],
 				),
 			),
 			themeResolved(),
 			cursorMounted(),
-			expectView(text("Firing now:")).toExist(),
-			expectView(text("1 incident · 1 warning")).toExist(),
+			expectView(role("link", { name: "Checkout errors" })).toExist(),
+			expectView(text("warning")).toExist(),
 			expectView(role("link", { name: /1 open anomaly/ })).toHaveAttr("href", "/alerts?signal=anomaly"),
+		)
+	})
+
+	test("one rule firing for several groups is one rule with its group count, not an incident per group", () => {
+		const groups = Arr.map(["us", "eu", "ap"], (groupKey) =>
+			openIncident(EVALUATE_RULE, { groupKey, severity: "warning", signalType: "raw_query" }),
+		)
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded([snapshotRow("checkout")], groups)),
+			themeResolved(),
+			cursorMounted(),
+			expectView(role("link", { name: "Rule cannot evaluate" })).toHaveAttr(
+				"href",
+				`/alerts/rules/${EVALUATE_RULE}`,
+			),
+			expectView(text("warning")).toExist(),
+			expectView(text(" · 3 groups")).toExist(),
+			expectView(role("link", { name: "1 of 3 enabled rules firing →" })).toExist(),
+		)
+	})
+
+	test("several rules firing name a critical rule first, link the rest, and count only enabled rules", () => {
+		// The critical rule has the fewest groups and the last name, so only severity puts it first.
+		const incidents = [
+			openIncident(EVALUATE_RULE, { groupKey: "us", severity: "warning" }),
+			openIncident(EVALUATE_RULE, { groupKey: "eu", severity: "warning" }),
+			openIncident(EVALUATE_RULE, { groupKey: "ap", severity: "warning" }),
+			openIncident(LATENCY_RULE, { groupKey: "us", severity: "warning" }),
+			openIncident(LATENCY_RULE, { groupKey: "eu", severity: "warning" }),
+			openIncident(CHECKOUT_RULE, { severity: "critical" }),
+		]
+		scene(
+			{ update: pageUpdate, view },
+			// The latency rule was disabled; its incidents have not synced resolved yet.
+			given(
+				loaded([snapshotRow("checkout")], incidents, [
+					CHECKOUT_RULE,
+					EVALUATE_RULE,
+					"rule-4",
+					"rule-5",
+					"rule-6",
+				]),
+			),
+			themeResolved(),
+			cursorMounted(),
+			expectView(role("link", { name: "Checkout errors" })).toExist(),
+			expectView(role("link", { name: "Rule cannot evaluate" })).toExist(),
+			expectView(role("link", { name: "API latency" })).not.toExist(),
+			expectView(role("link", { name: "+1 more" })).toHaveAttr("href", "/alerts"),
+			expectView(role("link", { name: "2 of 5 enabled rules firing →" })).toHaveAttr("href", "/alerts"),
+		)
+	})
+
+	test("a rule with a critical group reads critical, and a strip with no enabled rule firing links to alerts", () => {
+		const incidents = [
+			openIncident(CHECKOUT_RULE, { groupKey: "us", severity: "warning" }),
+			openIncident(CHECKOUT_RULE, { groupKey: "eu", severity: "critical" }),
+		]
+		scene(
+			{ update: pageUpdate, view },
+			given(loaded([snapshotRow("checkout")], incidents, [EVALUATE_RULE])),
+			themeResolved(),
+			cursorMounted(),
+			expectView(text("critical")).toExist(),
+			expectView(text("warning")).not.toExist(),
+			expectView(text(" · 2 groups")).toExist(),
+			expectView(role("link", { name: "View alerts →" })).toExist(),
 		)
 	})
 
@@ -441,5 +590,23 @@ describe("overview", () => {
 			Message.CompletedReloadSpin({ version: reloaded.model.refreshVersion }),
 		)
 		expect(settled.model.isReloading).toBe(false)
+	})
+})
+
+describe("chart zoom", () => {
+	test("a drag across an Overview chart opens that span as the window", () => {
+		const zoomed = pageUpdate(
+			loaded([snapshotRow("checkout")]),
+			Message.SelectedChartRange({
+				startMs: Date.parse("2026-10-01T09:00:00Z"),
+				endMs: Date.parse("2026-10-01T09:45:00Z"),
+			}),
+		)
+		expect(zoomed.outMessage).toEqual(
+			PageOutMessage.RequestedNavigation({
+				url: "/?startTime=2026-10-01+09%3A00%3A00&endTime=2026-10-01+09%3A45%3A00",
+				isReplace: false,
+			}),
+		)
 	})
 })

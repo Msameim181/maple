@@ -4,37 +4,23 @@ import type { Html, HtmlBuilder } from "foldkit/html"
 import type { PageViewInputs } from "../contract"
 import { dashboardPage } from "../kit/dashboard-page"
 import { button } from "@maple/views/ui/button"
-import {
-	type CatalogEntry,
-	catalogEntry,
-	chatConnectorOf,
-	entryOfSearch,
-	type IntegrationId,
-} from "./catalog"
+import { type CatalogEntry, catalogEntry, entryOfSearch, type IntegrationId } from "./catalog"
 import { ConnectProvider } from "./connect"
 import { Message } from "./message"
-import { canManage, type Model } from "./model"
+import type { Model } from "./model"
+import { gatedControl } from "../kit/session-grants"
 import { navShell } from "../kit/nav-shell"
 import { isClerkAuthEnabled } from "../../platform/auth-mode"
 import { visibleSections } from "../settings/nav"
 import { settingsNavVisibility } from "./derive"
 import { entryGlyph } from "./view-entry"
-import { chatCard } from "./view-chat-card"
-import {
-	cloudflareCard,
-	cloudflareHeaderActions,
-} from "../infra-integrations/cloudflare/integration/view-cloudflare"
 import { gcpCard, gcpHeaderStatus } from "../infra-integrations/gcp/integration/view-gcp"
 import { githubCard } from "./view-github"
-import { linearCard } from "./view-linear"
-import { searchConsoleCard } from "./view-search-console"
-import { planetscaleCard } from "../infra-integrations/planetscale/integration/view-planetscale"
-import { railwayCard } from "../infra-integrations/railway/integration/view-railway"
 import { awsCard } from "../infra-integrations/aws/integration/view-aws"
-import { supabaseCard } from "../infra-integrations/supabase/integration/view-supabase"
 import { scrapeIntro, scrapeTargetsSection } from "./view-prometheus"
 import { integrationHeader } from "./view-header"
 import { hubTitle, integrationCatalog, integrationsSummary } from "./view-hub"
+import { providerModuleOf } from "./provider-modules"
 
 type H = HtmlBuilder<Message>
 
@@ -44,18 +30,21 @@ const selectIntegration = (id: IntegrationId) => Message.ClickedIntegration({ in
 export const connectButton = (h: H, model: Model, integration: IntegrationId): Html | undefined => {
 	if (!Schema.is(ConnectProvider)(integration)) return undefined
 	const entry = catalogEntry(integration)
-	return button(
-		h,
-		{
-			size: "sm",
-			isLoading: model.connect.isStarting,
-			// Linear's and Google's starts are admin-only on the server.
-			isDisabled:
-				(integration === "linear" || integration === "google-search-console") && !canManage(model),
-			attributes: [h.OnClick(Message.ClickedConnect())],
-		},
-		[entryGlyph(h, entry, undefined), "Connect ", entry.name],
-	)
+	const control = (isDisabled: boolean): Html =>
+		button(
+			h,
+			{
+				size: "sm",
+				isLoading: model.connect.isStarting,
+				isDisabled,
+				attributes: [h.OnClick(Message.ClickedConnect())],
+			},
+			[entryGlyph(h, entry, undefined), "Connect ", entry.name],
+		)
+	// Linear's and Google's starts are gated on the server.
+	return integration === "linear" || integration === "google-search-console"
+		? gatedControl(h, model, "integrations:manage", control)
+		: control(false)
 }
 
 /** The integration's own card under the header. */
@@ -66,23 +55,11 @@ export const cardView = (
 	timeZone: string,
 	focusId: string | null = null,
 ): ReadonlyArray<Html> => {
-	const connector = chatConnectorOf(integration)
-	if (connector !== null) return [chatCard(h, model, connector, timeZone)]
+	const provider = providerModuleOf(integration)
+	if (provider !== undefined) return provider.card(h, model, timeZone, focusId)
 	switch (integration) {
-		case "linear":
-			return [linearCard(h, model)]
 		case "github":
 			return githubCard(h, model, timeZone)
-		case "google-search-console":
-			return [searchConsoleCard(h, model)]
-		case "cloudflare":
-			return [cloudflareCard(h, model, timeZone)]
-		case "railway":
-			return [railwayCard(h, model, timeZone)]
-		case "supabase":
-			return [supabaseCard(h, model, timeZone)]
-		case "planetscale":
-			return [planetscaleCard(h, model, timeZone)]
 		case "gcp":
 			return [gcpCard(h, model, timeZone, focusId)]
 		case "aws":
@@ -102,6 +79,7 @@ export const cardView = (
 
 const detailView = (h: H, model: Model, entry: CatalogEntry, timeZone: string): Html => {
 	const integration = entry.id
+	const provider = providerModuleOf(integration)
 	return dashboardPage(
 		h,
 		{
@@ -113,8 +91,11 @@ const detailView = (h: H, model: Model, entry: CatalogEntry, timeZone: string): 
 				entry,
 				{
 					connect: connectButton(h, model, integration),
-					actions: integration === "cloudflare" ? cloudflareHeaderActions(h, model) : undefined,
-					statusLine: integration === "gcp" ? gcpHeaderStatus(h, model) : undefined,
+					actions: provider?.headerActions?.(h, model) ?? undefined,
+					statusLine:
+						integration === "gcp"
+							? gcpHeaderStatus(h, model)
+							: (provider?.headerStatus?.(h, model, timeZone) ?? undefined),
 				},
 				timeZone,
 			),

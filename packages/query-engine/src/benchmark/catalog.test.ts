@@ -25,6 +25,7 @@ import * as activityQueries from "../ch/queries/activity"
 import * as alertCheckQueries from "../ch/queries/alert-checks"
 import * as ciRunsQueries from "../ch/queries/ci-runs"
 import * as auditLogQueries from "../ch/queries/audit-log"
+import * as auditTrailQueries from "../ch/queries/audit-trail"
 import * as cancellationEvidenceQueries from "../ch/queries/cancellation-evidence"
 import * as anomalyQueries from "../ch/queries/anomaly"
 import * as attributeKeyQueries from "../ch/queries/attribute-keys"
@@ -50,12 +51,14 @@ import * as prReviewQueries from "../ch/queries/pr-review"
 import * as serviceQueries from "../ch/queries/services"
 import * as sloQueries from "../ch/queries/slos"
 import * as releaseQueries from "../ch/queries/releases"
+import * as costQueries from "../ch/queries/cost"
 import * as searchConsoleQueries from "../ch/queries/search-console"
 import * as sessionEventQueries from "../ch/queries/session-events"
 import * as sessionReplayQueries from "../ch/queries/session-replays"
 import * as webAnalyticsQueries from "../ch/queries/web-analytics"
 import * as webAnalyticsAiQueries from "../ch/queries/web-analytics-ai"
 import * as securityTelemetryQueries from "../ch/queries/security-telemetry"
+import * as cloudResourceQueries from "../ch/queries/cloud-resources"
 import * as userActivityQueries from "../ch/queries/user-activity"
 import * as productEventQueries from "../ch/queries/product-events"
 import * as productEventPathQueries from "../ch/queries/product-events-paths"
@@ -278,6 +281,7 @@ const QUERY_MODULES: Record<string, Record<string, unknown>> = {
 	activity: activityQueries,
 	"alert-checks": alertCheckQueries,
 	"audit-log": auditLogQueries,
+	"audit-trail": auditTrailQueries,
 	"cancellation-evidence": cancellationEvidenceQueries,
 	"ci-runs": ciRunsQueries,
 	anomaly: anomalyQueries,
@@ -303,6 +307,7 @@ const QUERY_MODULES: Record<string, Record<string, unknown>> = {
 	"source-usage": sourceUsageQueries,
 	"aws-ingest": awsIngestQueries,
 	releases: releaseQueries,
+	cost: costQueries,
 	"search-console": searchConsoleQueries,
 	"session-events": sessionEventQueries,
 	"session-replays": sessionReplayQueries,
@@ -310,6 +315,7 @@ const QUERY_MODULES: Record<string, Record<string, unknown>> = {
 	"web-analytics": webAnalyticsQueries,
 	"web-analytics-ai": webAnalyticsAiQueries,
 	"security-telemetry": securityTelemetryQueries,
+	"cloud-resources": cloudResourceQueries,
 	"user-activity": userActivityQueries,
 	"product-events": productEventQueries,
 	"product-events-paths": productEventPathQueries,

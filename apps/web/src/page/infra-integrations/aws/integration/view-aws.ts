@@ -1,4 +1,5 @@
 import { AWS_METRICS_OFF } from "@maple/domain/aws"
+import type { IntegrationFeatureSignal, IntegrationFeatureSpec } from "@maple/domain/integration-features"
 import type { V2AwsConnection, V2AwsIngest, V2AwsIntegration } from "@maple/domain/http/v2"
 import { countLabel, formatNumber } from "@maple/ui/lib/format"
 import { cn } from "@maple/ui/lib/utils"
@@ -6,24 +7,35 @@ import { Option, Array as Arr, String as Str } from "effect"
 import { AsyncData } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { heading } from "@maple/views/ui/heading"
+import { textLink } from "@maple/views/ui/text-link"
 import { AppRoute, hrefOf } from "../../../../route/index"
 import { button, linkButton } from "@maple/views/ui/button"
 import { badge } from "@maple/views/ui/display"
 import { errorState } from "@maple/views/ui/error-state"
 import { icon } from "@maple/views/ui/icon"
 import type { IconName } from "@maple/views/ui/icons.generated"
-import { itemContent, mediaCard } from "@maple/views/ui/item"
 import { skeletonBlock } from "@maple/views/ui/skeleton"
 import { table, tableBody, tableCell, tableHead, tableHeader, tableRow } from "@maple/views/ui/table"
 import { relativeTime } from "../../../kit/relative-time"
-import { integrationIconPlate } from "../../../kit/integration-empty"
 import {
+	type FeatureControlRow,
+	type FeatureRow,
+	type FeatureSwitchRow,
+	featureList,
+} from "../../../kit/feature-list"
+import {
+	type AwsModuleInfo,
 	isMetricsPanelOpen,
 	isSavingMetricsOf,
 	isSelectionSaved,
 	metricsErrorOf,
 	metricStreamOf,
+	moduleErrorOf,
+	moduleStateOf,
+	offeredModule,
 	selectionOf,
+	AWS_OPT_IN_MODULES,
+	type AwsOptInModule,
 } from "./aws"
 import {
 	AWS_CONDITION_LABEL,
@@ -32,10 +44,11 @@ import {
 	awsStreamOf,
 } from "../../../integrations/derive"
 import { Message } from "../../../integrations/message"
-import type { Model } from "../../../integrations/model"
+import { manageLock, type Model } from "../../../integrations/model"
 import { dataPicker } from "./view-aws-choose"
 import { CLOUDSHELL_URL, fileBlock, methodSelect, SMALL, setupBody } from "./view-aws-setup"
 import { disconnectConfirm } from "../../../integrations/view-disconnect"
+import { connectedIntegrationCard, integrationStatusCard } from "../../../integrations/view-integration-card"
 import { externalLink } from "../../gcp/integration/view-gcp-configure-parts"
 import { typography, typographyClass } from "@maple/views/ui/typography"
 import { hstack, vstack } from "@maple/views/ui/stack"
@@ -46,6 +59,44 @@ type H = HtmlBuilder<Message>
 const BRAND = providerBrand("aws")
 
 export const AWS_FLOW_HREF = hrefOf(AppRoute.SourcesNew({ search: { integration: "aws" } }))
+
+const COST_HREF = hrefOf(AppRoute.Cost({ search: {} }))
+
+interface ModuleCopy {
+	readonly signal: IntegrationFeatureSignal
+	/** The role allows it, the stack is not deployed yet. */
+	readonly waiting: string
+	/** Asked for on a deployed role that does not grant it yet. */
+	readonly needsUpdate: string
+	readonly open: Readonly<{ href: string; label: string }>
+}
+
+/** How each opt-in module reads on a connection card; a module with no copy here is a type error. */
+const MODULE_COPY = {
+	cost: {
+		signal: "metrics",
+		waiting: "Maple starts reading this account's cost once the stack is deployed.",
+		needsUpdate:
+			"The role does not allow cost reads yet. Update the stack to add read-only billing access.",
+		open: { href: COST_HREF, label: "Open Cost" },
+	},
+	audit: {
+		signal: "events",
+		waiting: "Maple starts reading CloudTrail once the stack is deployed.",
+		needsUpdate: "The role does not allow CloudTrail reads yet. Update the stack to add them.",
+		open: {
+			href: hrefOf(AppRoute.SecurityAuditLog({ search: { provider: "aws" } })),
+			label: "Open audit log",
+		},
+	},
+	security: {
+		signal: "events",
+		waiting: "Maple starts reading this account's security findings once the stack is deployed.",
+		needsUpdate:
+			"The role does not allow security reads yet. Update the stack to add read-only security access.",
+		open: { href: hrefOf(AppRoute.SecurityCloud({ search: {} })), label: "Open cloud findings" },
+	},
+} as const satisfies Record<AwsOptInModule, ModuleCopy>
 
 const CONDITION_VARIANT = {
 	setup: "muted",
@@ -133,18 +184,17 @@ const STEP_LABEL = {
 	todo: "Not yet",
 } satisfies Record<StepState, string>
 
-const stepGlyph = (h: H, state: StepState, index: number): Html =>
+const stepGlyph = (h: H, state: StepState): Html =>
 	state === "todo"
-		? hstack(
-				h,
-				{
-					align: "center",
-					justify: "center",
-					as: "span",
-					className:
-						"size-4 shrink-0 rounded-full border text-3xs tabular-nums text-muted-foreground",
-				},
-				[String(index + 1)],
+		? // Not reached yet: an empty ring where the others carry a mark.
+			h.span(
+				[
+					h.Class(
+						"m-px block size-3.5 shrink-0 rounded-full border border-dashed border-muted-foreground",
+					),
+					h.AriaHidden(true),
+				],
+				[],
 			)
 		: icon(h, STEP_GLYPH[state].icon, {
 				size: 16,
@@ -154,7 +204,7 @@ const stepGlyph = (h: H, state: StepState, index: number): Html =>
 const stepList = (h: H, steps: ReadonlyArray<Step>): Html =>
 	h.ol(
 		[h.Class("flex w-full flex-col gap-2.5"), h.AriaLabel("Connection status")],
-		Arr.map(steps, (step, index) =>
+		Arr.map(steps, (step) =>
 			hstack(
 				h,
 				{
@@ -164,7 +214,7 @@ const stepList = (h: H, steps: ReadonlyArray<Step>): Html =>
 					attributes: [h.DataAttribute("step-state", step.state)],
 				},
 				[
-					h.span([h.Class("mt-0.5")], [stepGlyph(h, step.state, index)]),
+					h.span([h.Class("mt-0.5")], [stepGlyph(h, step.state)]),
 					vstack(h, { gap: "1", shrink: true, grow: true }, [
 						h.p(
 							[
@@ -262,79 +312,59 @@ const streamStep = (connection: V2AwsConnection): Step => {
 	}
 }
 
-const deliverySteps = (
-	h: H,
-	model: Model,
-	connection: V2AwsConnection,
-	timeZone: string,
-): ReadonlyArray<Step> => {
+/** Where the stream's deliveries stand: the first one until it arrived, the latest one after. */
+const deliveryStep = (h: H, model: Model, connection: V2AwsConnection, timeZone: string): Step => {
 	const at = (value: number, prefix: string) =>
 		relativeTime(h, { value, nowMs: model.nowMs, timeZone, prefix })
 	const first = "First delivery"
 	const latest = "Latest delivery"
-	const notYet: Step = { title: latest, state: "todo", detail: [] }
 	const stream = awsStreamOf(connection, model.nowMs)
 	switch (stream._tag) {
 		case "off":
-			return [{ title: first, state: "todo", detail: [] }, notYet]
+			return { title: first, state: "todo", detail: [] }
 		case "waiting":
-			return [
-				connection.verified_at === null
-					? {
-							title: first,
-							state: "todo",
-							detail: ["Arrives a few minutes after the stack is deployed."],
-						}
-					: {
-							title: first,
-							state: "current",
-							detail: [
-								"Waiting. Metrics arrive a few minutes after the setup script deploys the stream. Run it again if you have not since turning the stream on.",
-							],
-						},
-				notYet,
-			]
+			return connection.verified_at === null
+				? {
+						title: first,
+						state: "todo",
+						detail: ["Arrives a few minutes after the stack is deployed."],
+					}
+				: {
+						title: first,
+						state: "current",
+						detail: [
+							"Waiting. Metrics arrive a few minutes after the setup script deploys the stream. Run it again if you have not since turning the stream on.",
+						],
+					}
 		case "undelivered":
-			return [
-				{
-					title: first,
-					state: "crit",
-					detail: [
-						"Nothing has arrived since the stream was set up ",
-						at(stream.since, ""),
-						". Run the setup script again: it deploys the stream in each region.",
-					],
-				},
-				notYet,
-			]
+			return {
+				title: first,
+				state: "crit",
+				detail: [
+					"Nothing has arrived since the stream was set up ",
+					at(stream.since, ""),
+					". Run the setup script again: it deploys the stream in each region.",
+				],
+			}
 		case "refused":
 			return stream.receivedAt === null
-				? [{ title: first, state: "crit", detail: [stream.error] }, notYet]
-				: [
-						{ title: first, state: "done", detail: [] },
-						{
-							title: latest,
-							state: "crit",
-							detail: [stream.error, " · ", at(stream.receivedAt, "last accepted")],
-						},
-					]
+				? { title: first, state: "crit", detail: [stream.error] }
+				: {
+						title: latest,
+						state: "crit",
+						detail: [stream.error, " · ", at(stream.receivedAt, "last accepted")],
+					}
 		case "silent":
-			return [
-				{ title: first, state: "done", detail: [] },
-				{
-					title: latest,
-					state: "warn",
-					detail: [
-						at(stream.receivedAt, ""),
-						". CloudWatch stopped sending: check that each region's stack still exists, or run the setup script again.",
-					],
-				},
-			]
+			return {
+				title: latest,
+				state: "warn",
+				detail: [
+					at(stream.receivedAt, ""),
+					". CloudWatch stopped sending: check that each region's stack still exists, or run the setup script again.",
+				],
+			}
 		case "delivering":
-			return [
-				{ title: first, state: "done", detail: [] },
-				{ title: latest, state: "done", detail: [at(stream.receivedAt, "")] },
-			]
+			return { title: latest, state: "done", detail: [at(stream.receivedAt, "")] }
 	}
 }
 
@@ -492,85 +522,265 @@ export const ingestPanel = (
 	]
 }
 
-const connectionRow = (h: H, model: Model, connection: V2AwsConnection, timeZone: string): Html => {
+type ActionVariant = "default" | "outline" | "destructive-outline"
+
+/** A connection's action; one that opens a panel reads pressed while the panel is open. */
+const actionButton = (
+	h: H,
+	label: string,
+	message: Message,
+	extra: Readonly<{ isLoading?: boolean; isExpanded?: boolean; variant?: ActionVariant }> = {},
+): Html =>
+	button(
+		h,
+		{
+			size: "sm",
+			variant: extra.isExpanded === true ? "secondary" : (extra.variant ?? "outline"),
+			isLoading: extra.isLoading,
+			attributes: [
+				h.OnClick(message),
+				...(extra.isExpanded === undefined ? [] : [h.AriaExpanded(extra.isExpanded)]),
+			],
+		},
+		[label],
+	)
+
+/** Opens the connection's setup (the stack's script), or closes it when it is the open one. */
+const setupToggle = (
+	h: H,
+	model: Model,
+	connection: V2AwsConnection,
+	label: string,
+	variant: ActionVariant = "outline",
+): Html => {
+	const isOpen = model.awsCard.setupId === connection.id
+	return actionButton(
+		h,
+		label,
+		isOpen ? Message.ClickedAwsSetupClose() : Message.ClickedAwsSetup({ id: connection.id }),
+		{ isExpanded: isOpen, variant },
+	)
+}
+
+/** What the metric stream sends: the account's main data, picked by region and service, not a policy. */
+export const METRICS_SPEC: IntegrationFeatureSpec = {
+	id: "metrics",
+	title: "Infrastructure metrics",
+	summary:
+		"CloudWatch metrics of the services you pick (ECS, EC2, RDS, Lambda, load balancers and more), streamed from each region you pick to the Infrastructure pages.",
+	signal: "metrics",
+	defaultEnabled: true,
+	countsTowardIngest: true,
+	apply: "setupUpdate",
+}
+
+/** The metric stream's scope in a few words, or Off. */
+const streamScope = (connection: V2AwsConnection): string => {
+	const stream = connection.metric_stream
+	return stream === null
+		? "Off"
+		: `${countLabel(stream.regions.length, "region")} · ${countLabel(stream.namespaces.length, "service")}`
+}
+
+/** The metric stream as the first row: its scope, and on the card the Edit data panel it opens. */
+const metricsFeature = (
+	h: H,
+	model: Model,
+	connection: V2AwsConnection,
+	place: "card" | "flow",
+): FeatureControlRow => {
+	if (place === "flow")
+		return { spec: METRICS_SPEC, note: { _tag: "Info", text: "Picked on the next step" }, control: [] }
+	const isEditing = isMetricsPanelOpen(model.awsCard.metrics, connection.id)
+	return {
+		spec: METRICS_SPEC,
+		note: { _tag: "Info", text: streamScope(connection) },
+		control:
+			connection.verified_at === null
+				? []
+				: [
+						actionButton(
+							h,
+							"Edit data",
+							isEditing
+								? Message.ClickedAwsMetricsCancel()
+								: Message.ClickedAwsMetrics({ id: connection.id }),
+							{ isExpanded: isEditing },
+						),
+					],
+		children: isEditing ? [h.div([h.Class("mt-3")], [editDataPanel(h, model, connection)])] : [],
+	}
+}
+
+/** A module as the feature list names it. Every module is a policy on the role: it takes a stack update. */
+export const moduleSpec = (module: AwsOptInModule, info: AwsModuleInfo): IntegrationFeatureSpec => ({
+	id: module,
+	title: info.title,
+	summary: info.summary,
+	signal: MODULE_COPY[module].signal,
+	defaultEnabled: false,
+	countsTowardIngest: false,
+	apply: "setupUpdate",
+})
+
+/** One module as a switch row: its state as a note, and the next step under it. */
+const moduleFeature = (
+	h: H,
+	model: Model,
+	connection: V2AwsConnection,
+	module: AwsOptInModule,
+	info: AwsModuleInfo,
+): FeatureSwitchRow<Message> => {
+	const copy = MODULE_COPY[module]
+	const state = moduleStateOf(connection, module)
+	const spec = moduleSpec(module, info)
+	const next = (text: string, action: Html | null): ReadonlyArray<Html> => [
+		hstack(h, { gap: "3", align: "center", justify: "between", wrap: true, className: "mt-2" }, [
+			typography(h, { size: "xs", tone: "muted", as: "p" }, [text]),
+			...(action === null ? [] : [action]),
+		]),
+	]
+	const base = {
+		spec,
+		isChecked: state !== "off",
+		isDisabled: model.awsCard.moduleSave._tag === "Saving",
+		onToggle: Message.ToggledAwsModule({ id: connection.id, module }),
+	}
+	switch (state) {
+		case "off":
+			return base
+		case "ungranted":
+			// Before the first deploy the role step already asks for the stack.
+			return connection.verified_at === null
+				? {
+						...base,
+						note: { _tag: "Pending", text: "Waiting for the stack" },
+						children: next(copy.waiting, null),
+					}
+				: {
+						...base,
+						note: { _tag: "Pending", text: "Needs a stack update" },
+						children: next(
+							copy.needsUpdate,
+							setupToggle(h, model, connection, "Update the stack"),
+						),
+					}
+		case "granted":
+			return {
+				...base,
+				children: [
+					typography(h, { size: "xs", tone: "muted", as: "p", className: "mt-1.5" }, [
+						textLink(h, { href: copy.open.href }, [copy.open.label]),
+					]),
+				],
+			}
+	}
+}
+
+/**
+ * Every module the org is offered, as one switch list, the same on the card and in the connect flow;
+ * the error of a change that did not save under it, and the stack update when one is open.
+ */
+export const moduleList = (
+	h: H,
+	model: Model,
+	status: V2AwsIntegration | null,
+	connection: V2AwsConnection,
+	place: "card" | "flow" = "card",
+): ReadonlyArray<Html> => {
+	const rows: ReadonlyArray<FeatureRow<Message>> = [
+		metricsFeature(h, model, connection, place),
+		...Arr.flatMap(AWS_OPT_IN_MODULES, (module) =>
+			Option.match(offeredModule(status, module), {
+				onNone: () => [],
+				onSome: (info) => [moduleFeature(h, model, connection, module, info)],
+			}),
+		),
+	]
+	const error = Arr.findFirst(
+		AWS_OPT_IN_MODULES,
+		(module) => moduleErrorOf(model.awsCard.moduleSave, connection.id, module) !== null,
+	).pipe(
+		Option.flatMap((module) =>
+			Option.fromNullOr(moduleErrorOf(model.awsCard.moduleSave, connection.id, module)),
+		),
+	)
+	return [
+		vstack(h, { gap: "2" }, [
+			...(place === "card"
+				? [heading(h, { level: 4, variant: "subsection" }, ["What Maple collects"])]
+				: []),
+			featureList(h, { idPrefix: `aws-${connection.id}`, rows, lockReason: manageLock(model) }),
+			...Option.match(error, {
+				onNone: () => [],
+				onSome: (text) => [
+					typography(
+						h,
+						{ size: "xs", tone: "destructive", as: "p", attributes: [h.Role("alert")] },
+						[text],
+					),
+				],
+			}),
+		]),
+	]
+}
+
+const connectionRow = (
+	h: H,
+	model: Model,
+	status: V2AwsIntegration,
+	connection: V2AwsConnection,
+	timeZone: string,
+): Html => {
 	const condition = awsConditionOf(connection, model.nowMs)
 	const isChecking = Arr.some(model.awsCard.checking, (entry) => entry.id === connection.id)
 	const isOpen = model.awsCard.setupId === connection.id
-	const isEditing = isMetricsPanelOpen(model.awsCard.metrics, connection.id)
 	const action = (
 		label: string,
 		message: Message,
-		extra: Readonly<{ isLoading?: boolean; isExpanded?: boolean }> = {},
-	) =>
-		button(
-			h,
-			{
-				size: "sm",
-				variant: extra.isExpanded === true ? "secondary" : "outline",
-				isLoading: extra.isLoading,
-				attributes: [
-					h.OnClick(message),
-					...(extra.isExpanded === undefined ? [] : [h.AriaExpanded(extra.isExpanded)]),
-				],
-			},
-			[label],
-		)
-	return mediaCard(h, integrationIconPlate(h, BRAND), [
-		itemContent(
-			h,
-			[
-				hstack(h, { gap: "2", wrap: true }, [
-					heading(
-						h,
-						{
-							level: 3,
-							variant: "section",
-							className: typographyClass({ mono: true, numeric: true }),
-						},
-						[connection.account_id],
-					),
-					badge(h, { variant: CONDITION_VARIANT[condition] }, [AWS_CONDITION_LABEL[condition]]),
-				]),
-				stepList(h, [
-					roleStep(h, model, connection, timeZone),
-					streamStep(connection),
-					...deliverySteps(h, model, connection, timeZone),
-				]),
-				...ingestPanel(h, model, connection, timeZone),
-				hstack(h, { gap: "2", align: "stretch", wrap: true, className: "pt-1" }, [
-					// Reconnect deploys the stack again: it finishes a setup and updates an old one.
-					action(
-						"Reconnect",
-						isOpen
-							? Message.ClickedAwsSetupClose()
-							: Message.ClickedAwsSetup({ id: connection.id }),
-						{ isExpanded: isOpen },
-					),
-					...(connection.verified_at === null
-						? []
-						: [
-								action(
-									"Edit data",
-									isEditing
-										? Message.ClickedAwsMetricsCancel()
-										: Message.ClickedAwsMetrics({ id: connection.id }),
-									{ isExpanded: isEditing },
-								),
-							]),
-					action("Sync now", Message.ClickedAwsCheck({ id: connection.id }), {
-						isLoading: isChecking,
+		extra: Readonly<{ isLoading?: boolean; isExpanded?: boolean; variant?: ActionVariant }> = {},
+	) => actionButton(h, label, message, extra)
+	return connectedIntegrationCard(h, model, {
+		integration: null,
+		brand: BRAND,
+		title: connection.account_id,
+		titleClassName: typographyClass({ mono: true, numeric: true }),
+		badge: badge(h, { variant: CONDITION_VARIANT[condition] }, [AWS_CONDITION_LABEL[condition]]),
+		summary: null,
+		body: [
+			stepList(h, [
+				roleStep(h, model, connection, timeZone),
+				streamStep(connection),
+				deliveryStep(h, model, connection, timeZone),
+			]),
+			...ingestPanel(h, model, connection, timeZone),
+			...moduleList(h, model, status, connection),
+		],
+		actions: hstack(h, { gap: "2", align: "stretch", wrap: true, className: "pt-1" }, [
+			// The stack's script: it finishes a setup, which is the one thing to do then, and
+			// updates an old one.
+			connection.verified_at === null
+				? setupToggle(h, model, connection, "Finish setup", "default")
+				: setupToggle(h, model, connection, "Reconnect"),
+			action("Sync now", Message.ClickedAwsCheck({ id: connection.id }), {
+				isLoading: isChecking,
+			}),
+			// Apart from the routine actions: it ends the connection.
+			h.span(
+				[h.Class("ml-auto")],
+				[
+					action("Disconnect", Message.ClickedAwsDisconnect({ id: connection.id }), {
+						variant: "destructive-outline",
 					}),
-					action("Disconnect", Message.ClickedAwsDisconnect({ id: connection.id })),
-				]),
-				...(isEditing ? [editDataPanel(h, model, connection)] : []),
-				...(isOpen ? [setupPanel(h, model, connection)] : []),
-			],
-			"gap-3",
-		),
-	])
+				],
+			),
+		]),
+		afterActions: isOpen ? [setupPanel(h, model, connection)] : [],
+		contentGap: "gap-3",
+	})
 }
 
-const setupPanel = (h: H, model: Model, connection: V2AwsConnection): Html => {
+export const setupPanel = (h: H, model: Model, connection: V2AwsConnection): Html => {
 	const waiting = connection.verified_at === null
 	return vstack(h, { gap: "3", className: "mt-2 w-full rounded-md border bg-surface-faint p-3" }, [
 		hstack(h, { gap: "2", wrap: true }, [
@@ -669,7 +879,7 @@ const connectedView = (
 	)
 	return vstack(h, { gap: "3" }, [
 		...removedPanel(h, model, focusId),
-		...Arr.map(shown, (connection) => connectionRow(h, model, connection, timeZone)),
+		...Arr.map(shown, (connection) => connectionRow(h, model, status, connection, timeZone)),
 		...(focusId !== null || !status.available
 			? []
 			: [
@@ -715,16 +925,8 @@ const byStatus = (
 		: vstack(h, { gap: "3" }, [...removedPanel(h, model, focusId), reconnectLink(h)])
 
 export const awsCard = (h: H, model: Model, timeZone: string, focusId: string | null): Html =>
-	AsyncData.match(model.statuses.aws.data, {
-		onIdle: () => skeletonBlock(h, { height: "32" }),
-		onLoading: () => skeletonBlock(h, { height: "32" }),
-		onFailure: (failure) =>
-			errorState(h, {
-				failure,
-				title: "Couldn't load the AWS integration",
-				onRetry: Message.ClickedRetryStatus({ name: "aws" }),
-			}),
-		onStale: ({ data }) => byStatus(h, model, data, timeZone, focusId),
-		onRefreshing: (data) => byStatus(h, model, data, timeZone, focusId),
-		onSuccess: (data) => byStatus(h, model, data, timeZone, focusId),
+	integrationStatusCard(h, model.statuses.aws, {
+		name: "aws",
+		failureTitle: "Couldn't load the AWS integration",
+		render: (data) => byStatus(h, model, data, timeZone, focusId),
 	})

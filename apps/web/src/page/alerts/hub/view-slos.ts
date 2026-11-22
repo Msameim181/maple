@@ -1,9 +1,7 @@
 import { pluralize } from "@maple/ui/lib/format"
-import type { AlertIncidentRow } from "@maple/web-data/collections/alerts"
 import { Option, Array as Arr } from "effect"
 import { AsyncData } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
-import { linkButton } from "@maple/views/ui/button"
 import { empty, emptyDescription, emptyHeader, emptyMedia, emptyTitle } from "@maple/views/ui/empty"
 import { errorState } from "@maple/views/ui/error-state"
 import { icon } from "@maple/views/ui/icon"
@@ -26,14 +24,12 @@ import { newSloHref, sloHref } from "../shared/slo-commands"
 import {
 	burnTone,
 	fastestBurn,
-	firingTier,
 	formatBurn,
 	formatSli,
 	formatTarget,
 	formatWindow,
-	holdingTier,
 	isBudgetSpent,
-	openIncident,
+	isBurning,
 	scopeLine,
 	sliLabel,
 	sliTone,
@@ -41,11 +37,11 @@ import {
 import { alertingState, budgetBar, toneText } from "../shared/slo-view"
 import { Message } from "./message"
 import { type Model, type SloListRow } from "./model"
-import { canManageAlerts } from "../../kit/session-grants"
+import { gatedLinkButton } from "../../kit/gated-controls"
 
 type H = HtmlBuilder<Message>
 
-const slosEmptyState = (h: H, serviceName: string | undefined, canEdit: boolean): Html =>
+const slosEmptyState = (h: H, model: Model, serviceName: string | undefined): Html =>
 	empty(
 		h,
 		[
@@ -56,25 +52,18 @@ const slosEmptyState = (h: H, serviceName: string | undefined, canEdit: boolean)
 					"An SLO sets the share of a service's requests that must succeed or stay fast, and alerts when the error budget burns too fast.",
 				]),
 			]),
-			...(canEdit
-				? [
-						emptyActions(h, [
-							linkButton(h, { size: "sm", href: newSloHref({ serviceName }) }, [
-								icon(h, "PlusIcon"),
-								"New SLO",
-							]),
-						]),
-					]
-				: []),
+			emptyActions(h, [
+				gatedLinkButton(
+					h,
+					model,
+					"alerts:manage",
+					{ size: "sm", href: newSloHref({ serviceName }) },
+					[icon(h, "PlusIcon"), "New SLO"],
+				),
+			]),
 		],
 		"py-12",
 	)
-
-/** Burning: a tier fires, or a tier holds (no events) while the SLO's incident stays open. */
-const isBurning = (row: SloListRow, incidents: ReadonlyArray<AlertIncidentRow>): boolean =>
-	row.status !== null &&
-	(Option.isSome(firingTier(row.status)) ||
-		(Option.isSome(holdingTier(row.status)) && Option.isSome(openIncident(row.slo, incidents))))
 
 const readout = (h: H, model: Model, rows: ReadonlyArray<SloListRow>): ReadonlyArray<Html> => {
 	// Every SLO's status arrives in one read; none at all means that read failed, not that nothing burns.
@@ -212,7 +201,7 @@ export const slosTab = (h: H, model: Model): Html => {
 		onNone: () => vstack(h, { gap: "4" }, [skeleton(h, "h-9 w-2/3"), skeleton(h, "h-64 w-full")]),
 		onSome: (rows) =>
 			rows.length === 0
-				? slosEmptyState(h, model.search.serviceName, canManageAlerts(model))
+				? slosEmptyState(h, model, model.search.serviceName)
 				: vstack(h, { gap: "4" }, [
 						listToolbar(h, { className: "pb-0", trailing: readout(h, model, rows) }),
 						slosTable(h, model, rows),

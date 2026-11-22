@@ -15,6 +15,8 @@ type EncodedIncident = Encoded["incidents"][number]
 type EncodedDay = EncodedComponent["days"][number]
 
 export const FIXTURE_PAGE_ID = "0b4c9b8e-6f2a-4d1e-9a5b-2f6c8d7e1a01"
+/** The fixture page's org key: its shared-host address is `/s/a1b2c3d4e5f6/acme`. */
+export const FIXTURE_ORG_KEY = "a1b2c3d4e5f6"
 export const FIXTURE_NOW = Date.UTC(2026, 9, 28, 12, 0, 0)
 
 const COMPONENT_IDS = [
@@ -27,12 +29,15 @@ const COMPONENT_IDS = [
 export const fixtureComponentId = (index: number): string =>
 	COMPONENT_IDS[index] ?? "1c4c9b8e-6f2a-4d1e-9a5b-2f6c8d7e1aff"
 
+/** Checks alone never make a maintenance day. */
+type CheckedDayState = Exclude<StatusPageDayState, "maintenance">
+
 const DAY_COUNTS = {
 	none: { checks: 0, failures: 0, downChecks: 0 },
-	ok: { checks: 1440, failures: 0, downChecks: 0 },
-	degraded: { checks: 1440, failures: 3, downChecks: 0 },
+	ok: { checks: 1440, failures: 2, downChecks: 0 },
+	degraded: { checks: 1440, failures: 72, downChecks: 0 },
 	down: { checks: 1440, failures: 30, downChecks: 30 },
-} as const satisfies Record<StatusPageDayState, Omit<EncodedDay, "day">>
+} as const satisfies Record<CheckedDayState, Omit<EncodedDay, "day">>
 
 /**
  * `count` days ending on `nowMs` (90 unless given), all `ok` except the given overrides
@@ -40,7 +45,7 @@ const DAY_COUNTS = {
  */
 export const makeDays = (
 	nowMs: number = FIXTURE_NOW,
-	overrides: Readonly<Record<number, StatusPageDayState>> = {},
+	overrides: Readonly<Record<number, CheckedDayState>> = {},
 	count: number = STATUS_PAGE_WINDOW_DAYS,
 ): ReadonlyArray<EncodedDay> =>
 	Arr.map(lastDays(nowMs, count), (day, index) => ({
@@ -87,6 +92,7 @@ export const makeSnapshot = (fields: Partial<Encoded> = {}): StatusPageSnapshot 
 		page: {
 			name: "Acme",
 			slug: "acme",
+			orgKey: FIXTURE_ORG_KEY,
 			description: "Status of Acme services",
 			websiteUrl: "https://acme.example",
 			logoUrl: null,
@@ -94,6 +100,7 @@ export const makeSnapshot = (fields: Partial<Encoded> = {}): StatusPageSnapshot 
 			showPoweredBy: true,
 			privacyUrl: null,
 			termsUrl: null,
+			customDomain: null,
 		},
 		breakGlassTokenSha256: null,
 		components: [

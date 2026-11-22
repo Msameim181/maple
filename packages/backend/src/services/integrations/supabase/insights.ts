@@ -10,10 +10,11 @@ import {
 	type SupabaseAdvisorLint,
 	type SupabaseTopQuery,
 } from "@maple/domain/http"
+import * as Supabase from "@distilled.cloud/supabase"
 import type { SupabaseProjectRef } from "@maple/primitives"
 import { Effect, Option, Schema, Array as Arr } from "effect"
-import { HttpClient, HttpClientRequest } from "effect/http"
-import { send, SupabaseApiError } from "./api"
+import type { HttpClient } from "effect/http"
+import { supabaseCallSpan, supabaseSdk } from "./api"
 
 export const TOP_QUERIES_LIMIT = 10
 const QUERY_TEXT_CHARS = 2000
@@ -63,9 +64,7 @@ const LintWire = Schema.Struct({
 	cache_key: OptionalText,
 })
 const decodeLint = Schema.decodeUnknownOption(LintWire)
-const decodeAdvisorsBody = Schema.decodeUnknownOption(
-	Schema.fromJsonString(Schema.Struct({ lints: Schema.Array(Schema.Unknown) })),
-)
+const AdvisorsBody = Schema.Struct({ lints: Schema.Array(Schema.Unknown) })
 
 /** Numbers may come back as JSON numbers or, for bigint columns, as strings. */
 const Numeric = Schema.Union([Schema.Finite, Schema.FiniteFromString])
@@ -78,7 +77,6 @@ const StatementWire = Schema.Struct({
 	rows: Numeric,
 })
 const decodeStatement = Schema.decodeUnknownOption(StatementWire)
-const decodeRowsBody = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Array(Schema.Unknown)))
 
 /** A lint that does not decode is dropped; an advisor keeps the rest. */
 export const decodeLints = (kind: SupabaseAdvisorKind, raw: ReadonlyArray<unknown>) =>
@@ -121,10 +119,7 @@ export const decodeStatements = (raw: ReadonlyArray<unknown>) =>
 		}),
 	)
 
-const unexpectedBody = (what: string) =>
-	new SupabaseApiError({ message: `Supabase returned an unexpected body while ${what}`, kind: "upstream" })
-
-export const getAdvisors = Effect.fn("SupabaseApi.getAdvisors")(function* (
+export const getAdvisors = Effect.fnUntraced(function* (
 	httpClient: HttpClient.HttpClient,
 	apiBaseUrl: string,
 	accessToken: string,
@@ -135,44 +130,34 @@ export const getAdvisors = Effect.fn("SupabaseApi.getAdvisors")(function* (
 		"maple.supabase.project_ref": projectRef,
 		"maple.supabase.advisor": kind,
 	})
-	const what = `reading the ${kind} advisors`
-	const text = yield* send(
-		httpClient,
-		HttpClientRequest.get(`${apiBaseUrl}/v1/projects/${projectRef}/advisors/${kind}`).pipe(
-			HttpClientRequest.bearerToken(accessToken),
-			HttpClientRequest.acceptJson,
-		),
-		what,
+	const body = yield* supabaseSdk(httpClient, apiBaseUrl, accessToken).call(
+		AdvisorsBody,
+		kind === "performance"
+			? Supabase.v1GetPerformanceAdvisors({ ref: projectRef })
+			: Supabase.v1GetSecurityAdvisors({ ref: projectRef }),
+		{ operation: `reading the ${kind} advisors` },
 	)
-	const body = decodeAdvisorsBody(text)
-	if (Option.isNone(body)) return yield* unexpectedBody(what)
-	const lints = decodeLints(kind, body.value.lints)
+	const lints = decodeLints(kind, body.lints)
 	yield* Effect.annotateCurrentSpan({
 		"maple.supabase.lints": lints.length,
-		"maple.supabase.lints_skipped": body.value.lints.length - lints.length,
+		"maple.supabase.lints_skipped": body.lints.length - lints.length,
 	})
 	return lints
-})
+}, supabaseCallSpan("SupabaseApi.getAdvisors"))
 
 /** The top statements by total execution time. A refused query (e.g. no privilege) fails with its message. */
-export const getTopQueries = Effect.fn("SupabaseApi.getTopQueries")(function* (
+export const getTopQueries = Effect.fnUntraced(function* (
 	httpClient: HttpClient.HttpClient,
 	apiBaseUrl: string,
 	accessToken: string,
 	projectRef: SupabaseProjectRef,
 ) {
 	yield* Effect.annotateCurrentSpan({ "maple.supabase.project_ref": projectRef })
-	const what = "reading pg_stat_statements"
-	const text = yield* send(
-		httpClient,
-		HttpClientRequest.post(`${apiBaseUrl}/v1/projects/${projectRef}/database/query/read-only`).pipe(
-			HttpClientRequest.bearerToken(accessToken),
-			HttpClientRequest.acceptJson,
-			HttpClientRequest.bodyJsonUnsafe({ query: TOP_QUERIES_SQL }),
-		),
-		what,
+	// A read-only query, so a passing failure is retried like a GET.
+	const rows = yield* supabaseSdk(httpClient, apiBaseUrl, accessToken).call(
+		Schema.Array(Schema.Unknown),
+		Supabase.v1ReadOnlyQuery({ ref: projectRef, query: TOP_QUERIES_SQL }),
+		{ method: "POST", operation: "reading pg_stat_statements", retry: true },
 	)
-	const rows = decodeRowsBody(text)
-	if (Option.isNone(rows)) return yield* unexpectedBody(what)
-	return decodeStatements(rows.value)
-})
+	return decodeStatements(rows)
+}, supabaseCallSpan("SupabaseApi.getTopQueries"))

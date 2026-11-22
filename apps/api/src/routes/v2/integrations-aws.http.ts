@@ -105,7 +105,16 @@ export const HttpV2AwsIntegrationsLive = HttpApiBuilder.group(MapleApiV2, "awsIn
 					yield* Policy.check(tenant.roles, "integrations:manage", (denial) =>
 						V2InsufficientPermissions.make(denial.message),
 					)
+					// A rendered setup can hold keys that write to ingest, so `requiredScopeForRoute`
+					// asks a scoped key for write on this GET.
 					const setup = yield* aws.setup(tenant.orgId, params.id)
+					// One entry per key handed out; the keys themselves stay out of the entries.
+					if (setup.containsStreamKey) {
+						yield* recordHttpAudit("aws_connection.stream_key_read", { resourceId: params.id })
+					}
+					if (setup.containsEventsKey) {
+						yield* recordHttpAudit("aws_connection.events_key_read", { resourceId: params.id })
+					}
 					return {
 						object: "aws_connection.setup" as const,
 						stack_name: setup.stackName,
@@ -117,6 +126,19 @@ export const HttpV2AwsIntegrationsLive = HttpApiBuilder.group(MapleApiV2, "awsIn
 						metrics_stack_name: setup.metricsStackName,
 						metrics_cloudformation_template: setup.metricsCloudformationTemplate,
 					}
+				}),
+			)
+			.handle("rotateEventsKey", ({ params }) =>
+				Effect.gen(function* () {
+					const tenant = yield* CurrentTenant.Context
+					yield* Policy.check(tenant.roles, "integrations:manage", (denial) =>
+						V2InsufficientPermissions.make(denial.message),
+					)
+					const connection = yield* aws.rotateEventsKey(tenant.orgId, params.id)
+					yield* recordHttpAudit("aws_connection.events_key_rotated", {
+						resourceId: connection.id,
+					})
+					return toV2Connection(connection)
 				}),
 			)
 			.handle("checkConnection", ({ params }) =>

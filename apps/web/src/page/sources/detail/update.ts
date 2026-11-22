@@ -14,7 +14,7 @@ import * as Dialog from "@maple/views/ui/dialog"
 import * as Menu from "@maple/views/ui/menu"
 import { type PageContext, PageOutMessage, type PageReturn } from "../../contract"
 import { copyToast } from "../../kit/clipboard"
-import { sourcesListKey, sourceUsageKey } from "../kit/data"
+import { RESUME_COPY, sourcesListKey, sourceUsageKey } from "../kit/data"
 import * as Rules from "../kit/rules"
 import * as Setup from "../kit/setup"
 import { hasOwnRemoval } from "../kit/integration"
@@ -90,11 +90,11 @@ const loadUsage = (model: Model, context: PageContext): Return => {
 	})
 }
 
-const settingsOf = (source: V2Source): SettingsForm => ({
+const settingsOf = (source: V2Source, context: PageContext): SettingsForm => ({
 	builtFrom: source.updated_at,
 	name: source.name,
 	description: source.description ?? "",
-	rules: Rules.init(source),
+	rules: Rules.init(source, context.hasProfiling === true),
 	isSaving: false,
 })
 
@@ -120,13 +120,13 @@ const openTab = (model: Model, source: V2Source): SourceTab => {
 }
 
 /** The open tab's state, built as its component mounts; Settings rebuilds when `updated_at` moves. */
-const withTabState = (model: Model): Model =>
+const withTabState = (model: Model, context: PageContext): Model =>
 	Option.match(sourceOf(model), {
 		onNone: () => model,
-		onSome: (source) => withSourceTab({ ...model, tab: openTab(model, source) }, source),
+		onSome: (source) => withSourceTab({ ...model, tab: openTab(model, source) }, source, context),
 	})
 
-const withSourceTab = (model: Model, source: V2Source): Model => ({
+const withSourceTab = (model: Model, source: V2Source, context: PageContext): Model => ({
 	...model,
 	setup: model.tab !== "setup" ? null : (model.setup ?? Setup.init(source.platform)),
 	settings:
@@ -134,7 +134,7 @@ const withSourceTab = (model: Model, source: V2Source): Model => ({
 			? null
 			: model.settings !== null && model.settings.builtFrom === source.updated_at
 				? model.settings
-				: settingsOf(source),
+				: settingsOf(source, context),
 })
 
 const andThen = (first: Return, next: (model: Model) => Return): Return => {
@@ -233,7 +233,10 @@ export const init = (route: SourceRoute, context: PageContext): Return => {
 export const routeChanged = (model: Model, route: SourceRoute, context: PageContext): Return =>
 	andThen(
 		loadUsage(
-			withTabState({ ...model, tab: route.search.tab ?? "overview", setup: null, settings: null }),
+			withTabState(
+				{ ...model, tab: route.search.tab ?? "overview", setup: null, settings: null },
+				context,
+			),
 			context,
 		),
 		(next) => syncTarget(next, context),
@@ -244,7 +247,7 @@ const toast = (type: "success" | "error", title: string, description = "") =>
 
 const failureToast = (title: string, failure: LoadFailure) => toast("error", title, failure.message)
 
-const SOURCES_HREF = hrefOf(AppRoute.Sources())
+const SOURCES_HREF = hrefOf(AppRoute.Sources({ search: {} }))
 
 const liftMenu = (model: Model, step: ReturnType<typeof Menu.update>): Return => {
 	const lifted: Return = {
@@ -451,10 +454,13 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 	Message.match<Return>(message, {
 		ReadClock: ({ nowMs }) => ({ model: { ...model, nowMs } }),
 		// A member sent to Settings lands on the overview, which reads its usage then.
-		CompletedReadGrants: ({ grants }) => loadUsage(withTabState({ ...model, grants }), context),
+		CompletedReadGrants: ({ grants }) => loadUsage(withTabState({ ...model, grants }, context), context),
 		CompletedFetchList: ({ key, result }) =>
 			andThen(
-				loadUsage(withTabState({ ...model, list: Keyed.accept(model.list, key, result) }), context),
+				loadUsage(
+					withTabState({ ...model, list: Keyed.accept(model.list, key, result) }, context),
+					context,
+				),
 				(next) => ensureConnection(next, context),
 			),
 		GotConnectionMessage: ({ message: child }) =>
@@ -520,11 +526,7 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 				success: "Source paused. Takes effect within a minute.",
 				error: "Couldn't pause source",
 			}),
-		CompletedResume: ({ result }) =>
-			settled(model, context, result, {
-				success: "Source resumed. Takes effect within a minute.",
-				error: "Couldn't resume source",
-			}),
+		CompletedResume: ({ result }) => settled(model, context, result, RESUME_COPY),
 		CompletedRoll: ({ result }) => {
 			const closed = liftDialog({ ...model, busy: null }, "rollDialog", Dialog.close(model.rollDialog))
 			return Result.match(result, {
@@ -600,7 +602,7 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 				? { model }
 				: Option.match(sourceOf(model), {
 						onNone: () => ({ model }),
-						onSome: (source) => ({ model: { ...model, settings: settingsOf(source) } }),
+						onSome: (source) => ({ model: { ...model, settings: settingsOf(source, context) } }),
 					}),
 		CompletedSave: ({ result }) =>
 			settled(
@@ -608,7 +610,7 @@ export const update = (model: Model, message: Message, context: PageContext): Re
 				Result.match(result, {
 					onFailure: () => withSettings(model, (form) => ({ ...form, isSaving: false })),
 					onSuccess: (saved) =>
-						model.settings === null ? model : { ...model, settings: settingsOf(saved) },
+						model.settings === null ? model : { ...model, settings: settingsOf(saved, context) },
 				}),
 				context,
 				result,

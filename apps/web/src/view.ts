@@ -5,9 +5,16 @@ import { createKeyedLazy, type Document, type Html, type HtmlBuilder } from "fol
 import { bootSplash } from "./layout/boot-splash"
 import { Message } from "./message"
 import { type Model, Session } from "./model"
+import * as PageHold from "./page/page-hold"
 import { onboardingInputsOf, pageContextOf, planGateOf, shellClerkOf } from "./update"
 import * as OnboardingView from "./page/onboarding/view"
-import { breadcrumbsOf, notFoundContent, placeholderContent, rendersShell } from "./page/chrome"
+import {
+	breadcrumbsOf,
+	documentTitleOf,
+	notFoundContent,
+	placeholderContent,
+	rendersShell,
+} from "./page/chrome"
 import type { PageContext, ShellInfraSurfaces } from "./page/contract"
 import {
 	isBarePageRoute,
@@ -71,6 +78,10 @@ const renderPage = (
 	isPresenceFailed: boolean | undefined,
 	integrations: ShellInfraSurfaces["integrations"] | undefined,
 	remembered: ShellInfraSurfaces["remembered"],
+	audience: PageContext["audience"],
+	hasProductAnalytics: PageContext["hasProductAnalytics"],
+	hasProfiling: PageContext["hasProfiling"],
+	hasCloudSecurity: PageContext["hasCloudSecurity"],
 	isMobile: boolean,
 	isBelowSm: boolean,
 	isBelowLg: boolean,
@@ -86,6 +97,10 @@ const renderPage = (
 				...(presence === undefined || isPresenceFailed === undefined || integrations === undefined
 					? undefined
 					: { infra: { presence, isPresenceFailed, integrations, remembered } }),
+				...(audience === undefined ? undefined : { audience }),
+				...(hasProductAnalytics === undefined ? undefined : { hasProductAnalytics }),
+				...(hasProfiling === undefined ? undefined : { hasProfiling }),
+				...(hasCloudSecurity === undefined ? undefined : { hasCloudSecurity }),
 			},
 			isMobile,
 			isBelowSm,
@@ -94,28 +109,46 @@ const renderPage = (
 		toPageMessage,
 	)
 
+/** The page on screen: the one a navigation left while the entered one loads, else the open page. */
+const shownPage = (model: Model) => PageHold.shownSlot(model.pageHold, model.page)
+
 /**
  * The routed page, rebuilt only when its slot or an input it reads changes: a hovered link, a
  * toast or a shell menu re-renders the root, not the page. The context is rebuilt on every call,
  * so it is passed by field.
  */
 const lazyPageView = (model: Model, h: HtmlBuilder<Message>, position: PagePosition): Option.Option<Html> =>
-	Option.flatMap(Option.fromNullishOr(model.page), (page) =>
-		Option.map(pageContextOf(model), ({ orgId, pinnedNamespace, timeZone, infra }) =>
-			lazyPage(position, renderPage, [
-				h,
-				page,
+	Option.flatMap(Option.fromNullishOr(shownPage(model)), (page) =>
+		Option.map(
+			pageContextOf(model),
+			({
 				orgId,
 				pinnedNamespace,
 				timeZone,
-				infra?.presence,
-				infra?.isPresenceFailed,
-				infra?.integrations,
-				infra?.remembered,
-				model.shell.isMobile,
-				model.shell.isBelowSm,
-				model.shell.isFilterCollapsed,
-			]),
+				infra,
+				audience,
+				hasProductAnalytics,
+				hasProfiling,
+				hasCloudSecurity,
+			}) =>
+				lazyPage(position, renderPage, [
+					h,
+					page,
+					orgId,
+					pinnedNamespace,
+					timeZone,
+					infra?.presence,
+					infra?.isPresenceFailed,
+					infra?.integrations,
+					infra?.remembered,
+					audience,
+					hasProductAnalytics,
+					hasProfiling,
+					hasCloudSecurity,
+					model.shell.isMobile,
+					model.shell.isBelowSm,
+					model.shell.isFilterCollapsed,
+				]),
 		),
 	)
 
@@ -125,7 +158,7 @@ const pageView = (model: Model, h: HtmlBuilder<Message>, position: PagePosition)
 		model.route._tag === "NotFound" ? notFoundContent(h) : placeholderContent(h),
 	)
 
-/** The routed page's own top-bar actions, if it has any. */
+/** The routed page's own top-bar actions, if it has any: the open page's, live even while held. */
 const topbarActionsView = (model: Model, h: HtmlBuilder<Message>): Html => {
 	const maybeContext = pageContextOf(model)
 	return model.page !== null && Option.isSome(maybeContext)
@@ -145,7 +178,8 @@ const topbarActionsView = (model: Model, h: HtmlBuilder<Message>): Html => {
 
 /** The open page's source, once it names one. */
 const sourceLinkOf = (model: Model): SourceLink | null => {
-	const ref = model.page === null ? null : pageSource(model.page)
+	const page = shownPage(model)
+	const ref = page === null ? null : pageSource(page)
 	return ref === null
 		? null
 		: resolveSourceLink(ref, Option.getOrNull(AsyncData.getData(model.shell.sources)))
@@ -155,6 +189,7 @@ const sourceLinkOf = (model: Model): SourceLink | null => {
 const shellRoute = (model: Model, h: HtmlBuilder<Message>): ReadonlyArray<Html> => {
 	const currentPath = Str.split("?")(hrefOf(model.route))[0] ?? "/"
 	const clerk = shellClerkOf(model)
+	const shown = shownPage(model)
 	return [
 		h.submodel({
 			slotId: "shell-frame",
@@ -164,7 +199,8 @@ const shellRoute = (model: Model, h: HtmlBuilder<Message>): ReadonlyArray<Html> 
 			viewInputs: {
 				currentPath,
 				clerk,
-				breadcrumbs: model.page === null ? breadcrumbsOf(model.route) : pageBreadcrumbs(model.page),
+				breadcrumbs: shown === null ? breadcrumbsOf(model.route) : pageBreadcrumbs(shown),
+				pageHold: PageHold.holdAttribute(model.pageHold),
 				page: () => pageView(model, h, "shell"),
 				topbarActions: () => topbarActionsView(model, h),
 				sourceLink: sourceLinkOf(model),
@@ -279,8 +315,20 @@ const body = (model: Model, h: HtmlBuilder<Message>): Html =>
 		],
 	)
 
+/** The tab names the open page; a route with no page up yet (or none at all) is just "Maple". */
+export const titleOf = (model: Model): string =>
+	documentTitleOf(
+		model.page !== null
+			? pageBreadcrumbs(model.page)
+			: AppRoute.matchOrElse<ReadonlyArray<Shell.BreadcrumbEntry>>(
+					model.route,
+					{ NotFound: () => breadcrumbsOf(model.route) },
+					() => [],
+				),
+	)
+
 // NOTE: Foldkit's first render replaces the container, so the view root is `div#app` itself.
 export const view = (model: Model, h: HtmlBuilder<Message>): Document => ({
-	title: "Maple",
+	title: titleOf(model),
 	body: body(model, h),
 })

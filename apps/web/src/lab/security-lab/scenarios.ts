@@ -5,12 +5,15 @@ import {
 	type DependencyFindingsResponse,
 	type DependencyScanRepositoriesResponse,
 	SecurityAuditDisabledError,
+	AuditDetectionInvalidError,
+	AuditTrailPersistenceError,
+	CloudSecurityPersistenceError,
 	SecurityAuditForbiddenError,
 	SecurityAuditTargetExistsError,
 } from "@maple/domain/http"
 import { SecurityAuditRunId, SecurityAuditTargetId } from "@maple/domain/security-audit"
 import { Result, Schema, Array as Arr, Record as Rec, String as Str } from "effect"
-import type { Command } from "foldkit"
+import { AsyncData, type Command } from "foldkit"
 import { toLoadFailure } from "@maple/views/data/load-failure"
 import type { PageContext } from "../../page/contract"
 import * as AddTarget from "../../page/security/kit/add-target"
@@ -22,12 +25,21 @@ import * as RunPage from "../../page/security/run/model"
 import * as RunUpdate from "../../page/security/run/update"
 import * as TabsPage from "../../page/security/tabs/model"
 import * as TabsUpdate from "../../page/security/tabs/update"
+import * as AuditLogPage from "../../page/security/audit-log/model"
+import * as AuditLogUpdate from "../../page/security/audit-log/update"
+import * as DetectionFormPage from "../../page/security/detection-form/model"
+import * as DetectionFormUpdate from "../../page/security/detection-form/update"
+import * as DetectionsPage from "../../page/security/detections/model"
+import * as DetectionsUpdate from "../../page/security/detections/update"
+import * as CloudPage from "../../page/security/cloud/model"
+import * as CloudUpdate from "../../page/security/cloud/update"
 import * as TelemetryPage from "../../page/security/telemetry/model"
 import * as TelemetryUpdate from "../../page/security/telemetry/update"
 import type { Resources } from "../../platform/resources"
 import { AppRoute } from "../../route"
-import type { SecurityDependenciesSearch } from "../../route/search"
+import type { SecurityDependenciesSearch, SecurityDetectionNewSearch } from "../../route/search"
 import * as Field from "@maple/views/ui/field"
+import * as Menu from "@maple/views/ui/menu"
 import * as Select from "@maple/views/ui/select"
 import * as ToggleGroup from "@maple/views/ui/toggle-group"
 import {
@@ -59,6 +71,24 @@ import {
 	repositoriesOf,
 } from "../security-dependencies-fixture"
 import { emptyExposureOf, exposureOf, runtimesOf } from "../security-telemetry-fixture"
+import {
+	allClearOverview,
+	CLOUD_DETAIL_SEARCH,
+	cloudFindingDetailOf,
+	cloudFindingsOf,
+	failingOverview,
+	moduleOverview,
+	noCloudFindings,
+	noConnectionOverview,
+	populatedOverview,
+} from "../security-cloud-fixture"
+import { auditEventsOf, auditSourcesOf, noAuditEvents, noAuditSources } from "../security-audit-log-fixture"
+import {
+	detectionDestinationsOf,
+	detectionsOf,
+	noDetections,
+	ON_CALL_ID,
+} from "../security-detections-fixture"
 
 // Every Security Center state the lab renders, built by sending each page the fixture answers its
 // own requests would get. API Commands are dropped; dialog and select Commands still run.
@@ -72,6 +102,7 @@ export const SCENARIOS = [
 	"add-target-exists",
 	"spend-and-models",
 	"findings",
+	"findings-fixed",
 	"findings-member",
 	"runs",
 	"run-live",
@@ -86,6 +117,21 @@ export const SCENARIOS = [
 	"finding-lead",
 	"exposure",
 	"exposure-empty",
+	"audit-log",
+	"audit-log-detail",
+	"audit-log-empty",
+	"audit-log-filtered-empty",
+	"audit-log-member",
+	"audit-log-error",
+	"audit-log-filtered",
+	"detections",
+	"detections-empty",
+	"detections-member",
+	"detections-error",
+	"detection-new",
+	"detection-new-template",
+	"detection-edit",
+	"detection-error",
 	"runtimes",
 	"dependencies",
 	"dependencies-finding",
@@ -102,6 +148,14 @@ export const SCENARIOS = [
 	"dependencies-no-github",
 	"dependencies-error",
 	"dependencies-loading",
+	"cloud",
+	"cloud-no-connection",
+	"cloud-not-requested",
+	"cloud-awaiting-grant",
+	"cloud-all-clear",
+	"cloud-failing",
+	"cloud-detail",
+	"cloud-error",
 ] as const
 export const Scenario = Schema.Literals(SCENARIOS)
 export type Scenario = typeof Scenario.Type
@@ -110,6 +164,7 @@ export const context: PageContext = {
 	orgId: Schema.decodeSync(OrgId)("org_lab"),
 	pinnedNamespace: null,
 	timeZone: "UTC",
+	hasCloudSecurity: true,
 }
 
 type Step<M, Msg> = Readonly<{ model: M; commands: ReadonlyArray<Command.Command<Msg, never, Resources>> }>
@@ -328,6 +383,95 @@ const finding = (
 	)
 }
 
+type AuditLogStep = Step<AuditLogPage.Model, AuditLogPage.Message>
+const A = AuditLogPage.Message
+
+/** The audit log entered under `search`, as an admin or a member, then sent `answers`. */
+const auditLog = (
+	nowMs: number,
+	options: Readonly<{
+		search?: AuditLogPage.Search
+		isMember?: boolean
+		answers?: ReadonlyArray<(model: AuditLogPage.Model) => AuditLogPage.Message>
+	}> = {},
+): AuditLogStep => {
+	const entered = AuditLogUpdate.init(AppRoute.SecurityAuditLog({ search: options.search ?? {} }), context)
+	return fold<AuditLogPage.Model, AuditLogPage.Message>(
+		{ model: entered.model, commands: entered.commands ?? [] },
+		(model, message) => AuditLogUpdate.update(model, message, context),
+		[
+			() => A.ReadClock({ nowMs }),
+			() =>
+				A.CompletedReadGrants({
+					orgId: context.orgId,
+					grants:
+						options.isMember === true ? Policy.grantsOf(["org:engineer"]) : Policy.allPermissions,
+				}),
+			...(options.answers ?? []),
+		],
+	)
+}
+
+const auditLogPage = (page: AuditLogPage.EventsPage) => (model: AuditLogPage.Model) =>
+	A.CompletedFetchFirstPage({ key: model.firstPage.key ?? "", result: Result.succeed(page) })
+
+const auditLogSources = (sources: AuditLogPage.Sources) => (model: AuditLogPage.Model) =>
+	A.CompletedFetchSources({ key: model.sources.key ?? "", result: Result.succeed(sources) })
+
+type DetectionsStep = Step<DetectionsPage.Model, DetectionsPage.Message>
+const DT = DetectionsPage.Message
+
+const grantsOf = (isMember: boolean) => (isMember ? Policy.grantsOf(["org:engineer"]) : Policy.allPermissions)
+
+/** The Detections page entered as an admin or a member, then sent `answers`. */
+const detections = (
+	options: Readonly<{
+		isMember?: boolean
+		answers?: ReadonlyArray<(model: DetectionsPage.Model) => DetectionsPage.Message>
+	}> = {},
+): DetectionsStep => {
+	const entered = DetectionsUpdate.enter(context, true)
+	return fold<DetectionsPage.Model, DetectionsPage.Message>(
+		{ model: entered.model, commands: entered.commands ?? [] },
+		(model, message) => DetectionsUpdate.update(model, message, context),
+		[
+			() =>
+				DT.CompletedReadGrants({ orgId: context.orgId, grants: grantsOf(options.isMember === true) }),
+			...(options.answers ?? []),
+		],
+	)
+}
+
+const detectionsList =
+	(list: typeof noDetections) =>
+	(model: DetectionsPage.Model): DetectionsPage.Message =>
+		DT.CompletedFetchDetections({ key: model.list.key ?? "", result: Result.succeed(list) })
+
+type DetectionFormStep = Step<DetectionFormPage.Model, DetectionFormPage.Message>
+const DF = DetectionFormPage.Message
+
+/** The detection editor entered under `search` as an admin, its destinations synced, then sent `answers`. */
+const detectionForm = (
+	nowMs: number,
+	search: SecurityDetectionNewSearch,
+	answers: ReadonlyArray<(model: DetectionFormPage.Model) => DetectionFormPage.Message> = [],
+): DetectionFormStep => {
+	const entered = DetectionFormUpdate.enter(AppRoute.SecurityDetectionNew({ search }), context, true)
+	return fold<DetectionFormPage.Model, DetectionFormPage.Message>(
+		{ model: entered.model, commands: entered.commands ?? [] },
+		(model, message) => DetectionFormUpdate.update(model, message, context),
+		[
+			() => DF.CompletedReadGrants({ orgId: context.orgId, grants: Policy.allPermissions }),
+			() =>
+				DF.UpdatedDestinations({
+					orgId: context.orgId,
+					rows: [...detectionDestinationsOf(context.orgId, nowMs)],
+				}),
+			...answers,
+		],
+	)
+}
+
 type TelemetryStep = Step<TelemetryPage.Model, TelemetryPage.Message>
 const T = TelemetryPage.Message
 
@@ -398,17 +542,88 @@ const dependencies = (
 	)
 }
 
+type CloudStep = Step<CloudPage.Model, CloudPage.Message>
+const C = CloudPage.Message
+
+/** The Cloud tab entered on `route`, its clock read, then sent `answers`. */
+const cloud = (
+	route: Parameters<typeof CloudUpdate.init>[0],
+	nowMs: number,
+	answers: ReadonlyArray<(model: CloudPage.Model) => CloudPage.Message>,
+): CloudStep => {
+	const entered = CloudUpdate.init(route, context)
+	return fold<CloudPage.Model, CloudPage.Message>(
+		{ model: entered.model, commands: entered.commands ?? [] },
+		(model, message) => CloudUpdate.update(model, message, context),
+		[() => C.ReadClock({ nowMs }), ...answers],
+	)
+}
+
+const cloudOverview = (overview: CloudPage.Overview) => (model: CloudPage.Model) =>
+	C.CompletedFetchOverview({ key: model.overview.key ?? "", result: Result.succeed(overview) })
+
+const cloudPage = (page: CloudPage.FindingsPage) => (model: CloudPage.Model) =>
+	C.CompletedFetchFirstPage({ key: model.firstPage.key ?? "", result: Result.succeed(page) })
+
+const cloudList = (nowMs: number, overview: CloudPage.Overview, page: CloudPage.FindingsPage | "failed") =>
+	cloud(AppRoute.SecurityCloud({ search: {} }), nowMs, [
+		cloudOverview(overview),
+		page === "failed"
+			? (model) =>
+					C.CompletedFetchFirstPage({
+						key: model.firstPage.key ?? "",
+						result: Result.fail(
+							toLoadFailure(
+								new CloudSecurityPersistenceError({
+									message: "Cloud findings are unavailable",
+								}),
+							),
+						),
+					})
+			: cloudPage(page),
+	])
+
 export type Built =
 	| Readonly<{ _tag: "Tabs"; step: TabsStep }>
 	| Readonly<{ _tag: "Run"; step: RunStep }>
 	| Readonly<{ _tag: "Finding"; step: FindingStep }>
 	| Readonly<{ _tag: "Telemetry"; step: TelemetryStep }>
+	| Readonly<{ _tag: "AuditLog"; step: AuditLogStep }>
+	| Readonly<{ _tag: "Detections"; step: DetectionsStep }>
+	| Readonly<{ _tag: "DetectionForm"; step: DetectionFormStep }>
 	| Readonly<{ _tag: "Dependencies"; step: DependenciesStep }>
+	| Readonly<{ _tag: "Cloud"; step: CloudStep }>
 
 const overviewRoute = AppRoute.SecurityCode()
 
 export const build = (scenario: Scenario, nowMs: number): Built => {
 	switch (scenario) {
+		case "cloud":
+			return { _tag: "Cloud", step: cloudList(nowMs, populatedOverview(nowMs), cloudFindingsOf(nowMs)) }
+		case "cloud-no-connection":
+			return { _tag: "Cloud", step: cloudList(nowMs, noConnectionOverview, noCloudFindings) }
+		case "cloud-not-requested":
+			return { _tag: "Cloud", step: cloudList(nowMs, moduleOverview("not_requested"), noCloudFindings) }
+		case "cloud-awaiting-grant":
+			return { _tag: "Cloud", step: cloudList(nowMs, moduleOverview("requested"), noCloudFindings) }
+		case "cloud-all-clear":
+			return { _tag: "Cloud", step: cloudList(nowMs, allClearOverview(nowMs), noCloudFindings) }
+		case "cloud-failing":
+			return { _tag: "Cloud", step: cloudList(nowMs, failingOverview(nowMs), noCloudFindings) }
+		case "cloud-error":
+			return { _tag: "Cloud", step: cloudList(nowMs, populatedOverview(nowMs), "failed") }
+		case "cloud-detail":
+			return {
+				_tag: "Cloud",
+				step: cloud(AppRoute.SecurityCloudFinding({ search: CLOUD_DETAIL_SEARCH }), nowMs, [
+					cloudOverview(populatedOverview(nowMs)),
+					(model) =>
+						C.CompletedFetchFinding({
+							key: model.detail.key ?? "",
+							result: Result.succeed(cloudFindingDetailOf(nowMs)),
+						}),
+				]),
+			}
 		case "overview":
 			return { _tag: "Tabs", step: tabs(overviewRoute, nowMs) }
 		case "empty":
@@ -487,6 +702,11 @@ export const build = (scenario: Scenario, nowMs: number): Built => {
 			}
 		case "findings":
 			return { _tag: "Tabs", step: tabs(AppRoute.SecurityCodeFindings({ search: {} }), nowMs) }
+		case "findings-fixed":
+			return {
+				_tag: "Tabs",
+				step: tabs(AppRoute.SecurityCodeFindings({ search: { status: "fixed" } }), nowMs),
+			}
 		case "findings-member":
 			return {
 				_tag: "Tabs",
@@ -518,6 +738,152 @@ export const build = (scenario: Scenario, nowMs: number): Built => {
 			return { _tag: "Telemetry", step: exposure(nowMs, exposureOf(nowMs)) }
 		case "exposure-empty":
 			return { _tag: "Telemetry", step: exposure(nowMs, emptyExposureOf()) }
+		case "audit-log":
+			return {
+				_tag: "AuditLog",
+				step: auditLog(nowMs, {
+					answers: [auditLogPage(auditEventsOf(nowMs)), auditLogSources(auditSourcesOf(nowMs))],
+				}),
+			}
+		case "audit-log-detail":
+			return {
+				_tag: "AuditLog",
+				step: auditLog(nowMs, {
+					answers: [
+						auditLogPage(auditEventsOf(nowMs, false)),
+						(model) =>
+							A.ToggledEvent({
+								id: AsyncData.matchData(model.firstPage.data, {
+									onEmpty: () => "",
+									onFailure: () => "",
+									onData: (page) => page.events[0]?.id ?? "",
+								}),
+							}),
+					],
+				}),
+			}
+		case "audit-log-empty":
+			return {
+				_tag: "AuditLog",
+				step: auditLog(nowMs, {
+					answers: [auditLogPage(noAuditEvents), auditLogSources(noAuditSources)],
+				}),
+			}
+		case "audit-log-filtered-empty":
+			return {
+				_tag: "AuditLog",
+				step: auditLog(nowMs, {
+					search: { category: "billing", outcome: "denied" },
+					answers: [auditLogPage(noAuditEvents)],
+				}),
+			}
+		case "audit-log-member":
+			return { _tag: "AuditLog", step: auditLog(nowMs, { isMember: true }) }
+		case "audit-log-error":
+			return {
+				_tag: "AuditLog",
+				step: auditLog(nowMs, {
+					answers: [
+						(model) =>
+							A.CompletedFetchFirstPage({
+								key: model.firstPage.key ?? "",
+								result: Result.fail(
+									toLoadFailure(
+										new AuditTrailPersistenceError({
+											message: "The audit trail could not be read",
+										}),
+									),
+								),
+							}),
+					],
+				}),
+			}
+		case "audit-log-filtered":
+			return {
+				_tag: "AuditLog",
+				step: auditLog(nowMs, {
+					search: { provider: "vercel", category: "credential" },
+					answers: [
+						auditLogPage({
+							events: Arr.filter(
+								auditEventsOf(nowMs).events,
+								(event) => event.provider === "vercel" && event.category === "credential",
+							),
+							nextCursor: null,
+						}),
+					],
+				}),
+			}
+		case "detections":
+			return {
+				_tag: "Detections",
+				step: detections({ answers: [detectionsList(detectionsOf(nowMs))] }),
+			}
+		case "detections-empty":
+			return { _tag: "Detections", step: detections({ answers: [detectionsList(noDetections)] }) }
+		case "detections-member":
+			return { _tag: "Detections", step: detections({ isMember: true }) }
+		case "detections-error":
+			return {
+				_tag: "Detections",
+				step: detections({
+					answers: [
+						(model) =>
+							DT.CompletedFetchDetections({
+								key: model.list.key ?? "",
+								result: Result.fail(
+									toLoadFailure(
+										new AuditTrailPersistenceError({
+											message: "The audit trail could not be read",
+										}),
+									),
+								),
+							}),
+					],
+				}),
+			}
+		case "detection-new":
+			return { _tag: "DetectionForm", step: detectionForm(nowMs, {}) }
+		case "detection-new-template":
+			return { _tag: "DetectionForm", step: detectionForm(nowMs, { template: "sign_in" }) }
+		case "detection-edit": {
+			const list = detectionsOf(nowMs)
+			return {
+				_tag: "DetectionForm",
+				step: detectionForm(nowMs, { detectionId: list.detections[1]?.id }, [
+					(model) =>
+						DF.CompletedFetchExisting({
+							key: model.existing.key ?? "",
+							result: Result.succeed(list),
+						}),
+				]),
+			}
+		}
+		case "detection-error":
+			return {
+				_tag: "DetectionForm",
+				step: detectionForm(nowMs, { template: "refused" }, [
+					() =>
+						DF.GotDestinationMenuMessage({
+							message: Menu.Message.ClickedItem({
+								index: 1,
+								item: { kind: "Item", value: ON_CALL_ID },
+							}),
+						}),
+					() => DF.ClickedSave(),
+					() =>
+						DF.CompletedSave({
+							result: Result.fail(
+								toLoadFailure(
+									new AuditDetectionInvalidError({
+										message:
+											'Another alert rule is already named "Burst of refused requests".',
+									}),
+								),
+							),
+						}),
+				]),
+			}
 		case "runtimes":
 			return {
 				_tag: "Telemetry",

@@ -56,6 +56,12 @@ export interface WarehouseSqlClient {
 		statement: ClickHouseStatement,
 		options?: {
 			readonly responseLimits?: WarehouseResponseLimits
+			/**
+			 * Run in the server's read-only mode, with these settings sent beside the
+			 * statement (which then carries no `SETTINGS` of its own, because read-only
+			 * mode refuses one). Set only for a dialect with `readOnlyRawSql`.
+			 */
+			readonly readOnly?: { readonly settings: Readonly<Record<string, number>> }
 		},
 	) => Effect.Effect<
 		{ data: ReadonlyArray<Record<string, unknown>> },
@@ -77,6 +83,17 @@ export interface WarehouseSqlClient {
  *              in the managed write pipeline (e.g. `alert_checks`)
  */
 export type RoutePurpose = "read" | "raw" | "ingest"
+
+/**
+ * Whose rows a statement may see. `tenant` marks a read the executor has verified is pinned to
+ * one org, so a host may run it on credentials scoped to that org and, knowing the statement, to
+ * the datasources it reads. Absent for whatever needs the shared credential: writes, cross-org
+ * reads and capability probes.
+ */
+export interface RouteScope {
+	readonly kind: "tenant"
+	readonly sql: string
+}
 
 export type WarehouseTrustedRouteError = WarehouseSettingsRouteError
 export type WarehouseRawRouteError =
@@ -120,6 +137,7 @@ export interface WarehouseRouteResolver {
 		tenant: ExecutionTenant,
 		purpose: RoutePurpose,
 		label: string,
+		scope?: RouteScope,
 	): Effect.Effect<WarehouseRoute, WarehouseRawRouteError>
 }
 

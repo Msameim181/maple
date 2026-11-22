@@ -106,6 +106,13 @@ const USER_ACTIVITY_HOURLY_BACKFILL = [
 	"INSERT INTO user_activity_hourly (OrgId, ServiceNamespace, UserId, Hour, ServiceName, SpanCount, ErrorSpanCount, RequestCount, FailedRequestCount, TraceIds, SessionIds, RequestDurationQuantiles, TopRoutes, LogCount, WarnLogCount, ErrorLogCount, FirstSeen, LastSeen) SELECT OrgId, ResourceAttributes['service.namespace'] AS ServiceNamespace, if(LogAttributes['user.id'] != '', LogAttributes['user.id'], LogAttributes['enduser.id']) AS UserId, toStartOfHour(TimestampTime) AS Hour, ServiceName, toUInt64(0) AS SpanCount, toUInt64(0) AS ErrorSpanCount, toUInt64(0) AS RequestCount, toUInt64(0) AS FailedRequestCount, uniqIfState(TraceId, toUInt8(0)) AS TraceIds, uniqIfState(LogAttributes['session.id'], LogAttributes['session.id'] != '') AS SessionIds, quantilesTDigestIfState(0.5, 0.95)(toUInt64(0), toUInt8(0)) AS RequestDurationQuantiles, approx_top_kState(10)('') AS TopRoutes, count() AS LogCount, countIf(SeverityNumber >= 13 AND SeverityNumber < 17) AS WarnLogCount, countIf(SeverityNumber >= 17) AS ErrorLogCount, min(TimestampTime) AS FirstSeen, max(TimestampTime) AS LastSeen FROM logs WHERE if(LogAttributes['user.id'] != '', LogAttributes['user.id'], LogAttributes['enduser.id']) != '' GROUP BY OrgId, ServiceNamespace, UserId, Hour, ServiceName",
 ] as const
 
+/** Rebuilds the AWS series rollup from every retained aws.* point; the truncate makes a resumed step converge. */
+const AWS_METRICS_HOURLY_BACKFILL = [
+	"TRUNCATE TABLE IF EXISTS aws_metrics_hourly",
+	"INSERT INTO aws_metrics_hourly (OrgId, MetricType, MetricName, Hour, ServiceName, Attributes, CloudRegion, CloudAccountId, Total, Samples, Peak, LastSeen) SELECT OrgId, 'sum' AS MetricType, MetricName, toStartOfHour(toDateTime(TimeUnix)) AS Hour, ServiceName, Attributes, ResourceAttributes['cloud.region'] AS CloudRegion, ResourceAttributes['cloud.account.id'] AS CloudAccountId, sum(Value) AS Total, count() AS Samples, max(Value) AS Peak, max(toDateTime(TimeUnix)) AS LastSeen FROM metrics_sum WHERE startsWith(MetricName, 'aws.') GROUP BY OrgId, MetricType, MetricName, Hour, ServiceName, Attributes, CloudRegion, CloudAccountId",
+	"INSERT INTO aws_metrics_hourly (OrgId, MetricType, MetricName, Hour, ServiceName, Attributes, CloudRegion, CloudAccountId, Total, Samples, Peak, LastSeen) SELECT OrgId, 'gauge' AS MetricType, MetricName, toStartOfHour(toDateTime(TimeUnix)) AS Hour, ServiceName, Attributes, ResourceAttributes['cloud.region'] AS CloudRegion, ResourceAttributes['cloud.account.id'] AS CloudAccountId, sum(Value) AS Total, count() AS Samples, max(Value) AS Peak, max(toDateTime(TimeUnix)) AS LastSeen FROM metrics_gauge WHERE startsWith(MetricName, 'aws.') GROUP BY OrgId, MetricType, MetricName, Hour, ServiceName, Attributes, CloudRegion, CloudAccountId",
+] as const
+
 /** The six HTTP measures v39 adds to both service-operations rollups. */
 const SERVICE_OPERATIONS_HTTP_COLUMNS = [
 	["HttpClassifiedSpanCount", "SimpleAggregateFunction(sum, UInt64)"],
@@ -1921,6 +1928,188 @@ const STEP_ROWS: ReadonlyArray<StepRow> = [
 				guarantee:
 					"Existing rows are untouched; only spans ingested after the migration can carry the new scanner names.",
 			},
+		],
+	},
+	{
+		// Purely additive: a new empty table, created by the bootstrap. Cost rows come from the
+		// hosted cost sync, so a local store has nothing to backfill.
+		slug: "cost-daily",
+		description: "Create cost_daily for cloud cost pulled from provider billing data",
+		clonedBefore: "additive DDL runs",
+		plan: [["install-cost-daily", "Install the empty cost_daily table via the v55 bootstrap"]],
+		dispositions: [
+			{
+				name: "cost_daily",
+				classification: "authoritative",
+				disposition: "preserve-exact",
+				guarantee: "Created empty; no existing table is read or rewritten.",
+			},
+		],
+	},
+	{
+		// Purely additive: a new empty table, created by the bootstrap. Audit events come from the
+		// hosted provider adapters, so a local store has nothing to backfill.
+		slug: "audit-trail-events",
+		description: "Create audit_trail_events for audit events from connected platforms",
+		clonedBefore: "additive DDL runs",
+		plan: [
+			[
+				"install-audit-trail-events",
+				"Install the empty audit_trail_events table via the v56 bootstrap",
+			],
+		],
+		dispositions: [
+			{
+				name: "audit_trail_events",
+				classification: "authoritative",
+				disposition: "preserve-exact",
+				guarantee: "Created empty; no existing table is read or rewritten.",
+			},
+		],
+	},
+	{
+		// The latest user.name and user.email as argMaxIf states; both views are recreated to write
+		// them. Existing hours hold empty states and are not backfilled, so their users stay unnamed.
+		slug: "user-activity-identity",
+		description: "Add the latest user name and email to user_activity_hourly and recreate its views",
+		clonedBefore: "any DDL runs",
+		beforeBootstrap: [
+			addColumns("user_activity_hourly", [
+				["UserName", "AggregateFunction(argMaxIf, String, UInt32, UInt8)"],
+				["UserEmail", "AggregateFunction(argMaxIf, String, UInt32, UInt8)"],
+				["UserNameAt", "SimpleAggregateFunction(max, UInt32) DEFAULT 0"],
+				["UserEmailAt", "SimpleAggregateFunction(max, UInt32) DEFAULT 0"],
+			]),
+			dropViews("user_activity_hourly_traces_mv", "user_activity_hourly_logs_mv"),
+		],
+		plan: [
+			[
+				"add-user-activity-identity",
+				"Add the latest user name and email to user_activity_hourly and recreate its two views so new hours carry them",
+			],
+		],
+		dispositions: [
+			TRACES_UNDER_REPLACED_VIEWS,
+			{
+				name: "user_activity_hourly",
+				classification: "derived",
+				disposition: "preserve-exact",
+				guarantee:
+					"The identity columns are added as empty aggregate states; existing rows keep every value and read an empty name and email, carried at 0.",
+			},
+		],
+	},
+	{
+		slug: "aws-metrics-hourly",
+		description: "Create aws_metrics_hourly and its sum and gauge views for the AWS infra pages",
+		clonedBefore: "any DDL runs",
+		beforeBootstrap: [],
+		afterBootstrap: [backfill(...AWS_METRICS_HOURLY_BACKFILL)],
+		plan: [
+			[
+				"create-aws-metrics-hourly",
+				"Create aws_metrics_hourly and its two views via the v58 bootstrap and backfill it from retained aws.* sum and gauge points",
+			],
+		],
+		dispositions: [
+			{
+				name: "aws_metrics_hourly",
+				classification: "derived",
+				disposition: "rebuild-within-retention-horizon",
+				guarantee:
+					"Rebuilt from every aws.* point metrics_sum and metrics_gauge retain, then filled forward by its views.",
+				preservationInterval: "source retention horizon",
+				sourceRetentionDays: 90,
+				targetRetentionDays: 90,
+			},
+		],
+	},
+	{
+		// Purely additive: a new empty table, created by the bootstrap. Profiles only exist once a
+		// producer exports them, so there is nothing to backfill.
+		slug: "profiles",
+		description: "Create profiles, continuous profiling samples",
+		clonedBefore: "additive DDL runs",
+		plan: [["install-profiles", "Install the empty profiles table via the v59 bootstrap"]],
+		dispositions: [
+			{
+				name: "profiles",
+				classification: "authoritative",
+				disposition: "preserve-exact",
+				guarantee: "Created empty; no existing table is read or rewritten.",
+			},
+		],
+	},
+	{
+		// Profile stack rows and bytes on service_usage, written by a new view the bootstrap creates; the six
+		// signal views are dropped first so the bootstrap recreates them writing 0 there. Nothing is backfilled.
+		slug: "service-usage-profiles",
+		description: "Add profile counts and bytes to service_usage and create its view from profiles",
+		clonedBefore: "any DDL runs",
+		beforeBootstrap: [
+			addColumns("service_usage", [
+				["ProfileRowCount", "UInt64 DEFAULT 0"],
+				["ProfileSizeBytes", "UInt64 DEFAULT 0"],
+			]),
+			dropViews(
+				"service_usage_logs_mv",
+				"service_usage_traces_mv",
+				"service_usage_metrics_sum_mv",
+				"service_usage_metrics_gauge_mv",
+				"service_usage_metrics_histogram_mv",
+				"service_usage_metrics_exp_histogram_mv",
+			),
+		],
+		plan: [
+			[
+				"add-service-usage-profiles",
+				"Add ProfileRowCount and ProfileSizeBytes to service_usage, recreate its six signal views and create service_usage_profiles_mv via the v60 bootstrap",
+			],
+		],
+		dispositions: [
+			{
+				name: "service_usage",
+				classification: "derived",
+				disposition: "preserve-exact",
+				guarantee:
+					"The profile columns are added with a 0 default; existing rows keep every value and read no profile usage.",
+			},
+			{
+				name: "profiles",
+				classification: "authoritative",
+				disposition: "preserve-exact",
+				guarantee:
+					"The new view's source is neither read nor rewritten; only rows ingested after it count.",
+			},
+		],
+	},
+	{
+		// Fingerprint v5: the error and lineage views are recreated. No column change;
+		// stored rows keep their hashes and nothing is backfilled.
+		slug: "error-fingerprint-v5",
+		description:
+			"Recreate the error_events views for fingerprint v5 (minified names, URL path values, span-keyed bare errors)",
+		clonedBefore: "the views are replaced",
+		beforeBootstrap: [
+			dropViews("error_events_mv", "error_events_by_time_mv", "error_fingerprint_lineage_mv"),
+		],
+		plan: [
+			[
+				"rebuild-error-events-views",
+				"Drop and recreate the error-events and lineage views so new occurrences hash with fingerprint v5",
+			],
+		],
+		dispositions: [
+			TRACES_UNDER_REPLACED_VIEWS,
+			{
+				name: "error_events",
+				classification: "derived",
+				disposition: "preserve-exact",
+				guarantee:
+					"Existing rows keep their FingerprintHash untouched; new occurrences hash with v5, and the lineage table links each to its v4 hash.",
+				...ERROR_RETENTION,
+			},
+			{ ...ERROR_EVENTS_BY_TIME_FORWARD_ONLY, disposition: "preserve-exact" },
 		],
 	},
 	// local-schema:bump appends the next step above this line.

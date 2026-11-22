@@ -1,3 +1,4 @@
+import { isUptimeCertificateIncident } from "@maple/domain/uptime"
 import type {
 	AlertCheckDocument,
 	AlertIncidentDocument,
@@ -30,6 +31,7 @@ import type * as Chart from "@maple/views/charts/chart"
 import { isChartRuntimeReady } from "@maple/views/charts/chart-runtime"
 import { ResolveThemeColors, type ThemeColors } from "@maple/views/charts/theme-colors"
 import { AppRoute, hrefOf } from "../../../route"
+import { budgetsHref } from "../../cost/kit/budget-format"
 import { button, linkButton } from "@maple/views/ui/button"
 import { eyebrow } from "@maple/views/ui/eyebrow"
 import { icon } from "@maple/views/ui/icon"
@@ -60,7 +62,8 @@ import { anomalyEvidence, type AnomalyEvidenceInputs } from "./view-anomaly"
 import { ANOMALY_CHART_TOKENS } from "../../kit/anomaly-evidence"
 import { timestamp } from "@maple/views/ui/timestamp"
 import { typography } from "@maple/views/ui/typography"
-import { canManageAlerts } from "../../kit/session-grants"
+import { canReadAuditLog, canRespondToIncidents, denialReason, gatedControl } from "../../kit/session-grants"
+import { lockedControl } from "@maple/views/ui/locked-control"
 
 type H = HtmlBuilder<Message>
 
@@ -199,6 +202,7 @@ export const acknowledgeAction = <M>(
 	options: Readonly<{
 		incident: AlertIncidentDocument
 		isLoading: boolean
+		isDisabled?: boolean
 		onAcknowledge: (acknowledged: boolean) => M
 	}>,
 ): ReadonlyArray<Html> => {
@@ -211,6 +215,7 @@ export const acknowledgeAction = <M>(
 				variant: acknowledged ? "outline" : "default",
 				size: "sm",
 				isLoading: options.isLoading,
+				isDisabled: options.isDisabled,
 				attributes: [h.OnClick(options.onAcknowledge(!acknowledged))],
 			},
 			acknowledged ? ["Unacknowledge"] : [icon(h, "CheckIcon"), "Acknowledge"],
@@ -218,9 +223,15 @@ export const acknowledgeAction = <M>(
 	]
 }
 
-const investigateAction = (h: H, model: Model, investigation: V2Investigation | null): Html =>
-	investigation !== null
-		? linkButton(
+/** A link to the incident's investigation, or the button that starts one for who may run one. */
+const investigateAction = (
+	h: H,
+	model: Model,
+	investigation: V2Investigation | null,
+): ReadonlyArray<Html> => {
+	if (investigation !== null)
+		return [
+			linkButton(
 				h,
 				{
 					variant: "outline",
@@ -228,20 +239,27 @@ const investigateAction = (h: H, model: Model, investigation: V2Investigation | 
 					href: hrefOf(AppRoute.Investigation({ id: String(investigation.id), search: {} })),
 				},
 				[icon(h, "ChatBubbleSparkleIcon"), "Open investigation"],
-			)
-		: button(
+			),
+		]
+	return [
+		gatedControl(h, model, "investigations:run", (isLocked) =>
+			button(
 				h,
 				{
 					variant: "outline",
 					size: "sm",
 					isDisabled:
+						isLocked ||
 						model.isStartingInvestigation ||
 						AsyncData.isLoading(model.investigation.data) ||
 						AsyncData.isIdle(model.investigation.data),
 					attributes: [h.OnClick(Message.ClickedInvestigate())],
 				},
 				[icon(h, "ChatBubbleSparkleIcon"), "Investigate"],
-			)
+			),
+		),
+	]
+}
 
 /** What `incidentBody` renders: the page reads it off its Model, the lab off a fixture. */
 export type IncidentBodyInputs<M> = Readonly<{
@@ -264,6 +282,11 @@ export type IncidentBodyInputs<M> = Readonly<{
 	escalation?: EscalationData
 	/** An SLO or uptime incident's SLO or monitor page; its tab stands in until it is known. */
 	sourceHref?: string | null
+	/**
+	 * Whether the viewer may open the audit log; null until the session answers. An audit
+	 * incident links it only for someone who may: anyone else is sent home.
+	 */
+	canReadAuditLog?: boolean | null
 	chartId: string
 	chart: Chart.Model
 	toChartMessage: (message: Chart.Message) => M
@@ -272,23 +295,33 @@ export type IncidentBodyInputs<M> = Readonly<{
 	anomaly?: AnomalyEvidenceInputs<M> | null
 }>
 
-/** A managed incident's note on what opened it, and a link to its SLO or monitor (its tab until known). */
+/** Where an audit detection's events are listed; only org admins can open it. */
+const auditLogHref = () => hrefOf(AppRoute.SecurityAuditLog({ search: {} }))
+
+/**
+ * A managed incident's note on what opened it, and a link to its SLO or monitor (its tab until
+ * known). With neither a link nor a fallback it is the note alone.
+ */
 const sourceNote = <M>(
 	h: HtmlBuilder<M>,
 	options: Readonly<{
 		text: string
 		href: string | null
 		label: string
-		fallback: Readonly<{ href: string; label: string }>
+		fallback?: Readonly<{ href: string; label: string }>
 	}>,
-): Html =>
-	vstack(h, { gap: "3", align: "start" }, [
+): Html => {
+	const href = options.href ?? options.fallback?.href
+	return vstack(h, { gap: "3", align: "start" }, [
 		typography(h, { size: "sm", tone: "muted", as: "p" }, [options.text]),
-		linkButton(h, { size: "sm", variant: "outline", href: options.href ?? options.fallback.href }, [
-			options.href === null ? options.fallback.label : options.label,
-			icon(h, "ArrowRightIcon"),
-		]),
+		href === undefined
+			? h.empty
+			: linkButton(h, { size: "sm", variant: "outline", href }, [
+					options.href === null ? (options.fallback?.label ?? options.label) : options.label,
+					icon(h, "ArrowRightIcon"),
+				]),
 	])
+}
 
 /** Signal chart, timeline and rail. */
 export const incidentBody = <M>(h: HtmlBuilder<M>, inputs: IncidentBodyInputs<M>): Html => {
@@ -317,7 +350,9 @@ export const incidentBody = <M>(h: HtmlBuilder<M>, inputs: IncidentBodyInputs<M>
 											])
 										: incident.signalType === "uptime"
 											? sourceNote(h, {
-													text: "This incident follows an uptime monitor: it opened when the monitor's checks went down and resolves when one passes again. The monitor's page lists each check with its failing trace.",
+													text: isUptimeCertificateIncident(incident)
+														? "This incident follows an uptime monitor's TLS certificate: it opened when the certificate came within 14 days of expiry and resolves once a check sees a renewed one. The monitor stays up meanwhile."
+														: "This incident follows an uptime monitor: it opened when the monitor's checks went down and resolves when one passes again. The monitor's page lists each check with its failing trace.",
 													href: inputs.sourceHref ?? null,
 													label: "Open monitor",
 													fallback: {
@@ -332,31 +367,50 @@ export const incidentBody = <M>(h: HtmlBuilder<M>, inputs: IncidentBodyInputs<M>
 														label: "Open SLO",
 														fallback: { href: slosTabHref(), label: "Open SLOs" },
 													})
-												: rule === null
-													? typography(h, { size: "sm", tone: "muted", as: "p" }, [
-															"The rule behind this incident was deleted, so its signal cannot be replayed.",
-														])
-													: ruleChart(h, {
-															chartId: inputs.chartId,
-															chart: inputs.chart,
-															toChartMessage: inputs.toChartMessage,
-															colors: inputs.colors,
-															timeZone: inputs.timeZone,
-															preview: inputs.preview,
-															checks: inputs.checks,
-															incidents: [incident],
-															threshold: incident.threshold,
-															thresholdUpper: incident.thresholdUpper,
-															comparator: incident.comparator,
-															signalType: incident.signalType,
-															window: {
-																min: inputs.range.start,
-																max: inputs.range.end,
-															},
-															source: "preview",
-															isLoading: inputs.isPreviewLoading,
-															error: inputs.previewError,
-														}),
+												: incident.signalType === "audit"
+													? sourceNote(h, {
+															text: `This incident follows an audit log detection: it opened when the matching events that arrived within the detection's window reached its count, and resolves when they fall back below it. ${inputs.canReadAuditLog === false ? "The audit log lists the events; only org admins can open it." : "The audit log lists the events."}`,
+															href:
+																inputs.canReadAuditLog === true
+																	? auditLogHref()
+																	: null,
+															label: "Open audit log",
+														})
+													: incident.signalType === "cost_budget"
+														? sourceNote(h, {
+																text: "This incident follows a cost budget: it opened when the spend, or its forecast for the period, reached a percent of the budget's amount, and resolves once it is back under: a new period starts, the forecast eases, or the budget is raised. The budgets page shows where each one stands.",
+																href: budgetsHref(),
+																label: "Open budgets",
+															})
+														: rule === null
+															? typography(
+																	h,
+																	{ size: "sm", tone: "muted", as: "p" },
+																	[
+																		"The rule behind this incident was deleted, so its signal cannot be replayed.",
+																	],
+																)
+															: ruleChart(h, {
+																	chartId: inputs.chartId,
+																	chart: inputs.chart,
+																	toChartMessage: inputs.toChartMessage,
+																	colors: inputs.colors,
+																	timeZone: inputs.timeZone,
+																	preview: inputs.preview,
+																	checks: inputs.checks,
+																	incidents: [incident],
+																	threshold: incident.threshold,
+																	thresholdUpper: incident.thresholdUpper,
+																	comparator: incident.comparator,
+																	signalType: incident.signalType,
+																	window: {
+																		min: inputs.range.start,
+																		max: inputs.range.end,
+																	},
+																	source: "preview",
+																	isLoading: inputs.isPreviewLoading,
+																	error: inputs.previewError,
+																}),
 								],
 							),
 					incidentTimeline(h, {
@@ -409,6 +463,8 @@ const body = (h: H, model: Model, view: IncidentView, timeZone: string, now: num
 		incident,
 		rule,
 		sourceHref: Option.getOrNull(incident.signalType === "uptime" ? monitorLink : sloLink),
+		// No grants yet is no answer yet: an admin must not read that the log is not theirs.
+		canReadAuditLog: model.grants.length === 0 ? null : canReadAuditLog(model),
 		escalation: model.escalation.data,
 		ruleIncidents: view.ruleIncidents,
 		states: ruleStatesOf(model, incident.ruleId),
@@ -500,15 +556,30 @@ export const view = Submodel.defineView<Model, Message, PageViewInputs>((model, 
 						silenceBadges(h, model, view, timeZone),
 					),
 					actions: hstack(h, { gap: "2", wrap: true }, [
-						...acknowledgeAction(h, {
-							incident: view.incident,
-							isLoading: model.isUpdatingAcknowledgement,
-							onAcknowledge: (acknowledged) => Message.ClickedAcknowledge({ acknowledged }),
-						}),
-						...(canManageAlerts(model) && isOpenIncident(model)
-							? [silenceButton(h, Message.ClickedSilence(), model.rules === null)]
+						...Arr.map(
+							acknowledgeAction(h, {
+								incident: view.incident,
+								isLoading: model.isUpdatingAcknowledgement,
+								isDisabled: !canRespondToIncidents(model),
+								onAcknowledge: (acknowledged) => Message.ClickedAcknowledge({ acknowledged }),
+							}),
+							(control) =>
+								canRespondToIncidents(model)
+									? control
+									: lockedControl(h, denialReason("incidents:respond"), control),
+						),
+						...(isOpenIncident(model)
+							? [
+									gatedControl(h, model, "alerts:manage", (isLocked) =>
+										silenceButton(
+											h,
+											Message.ClickedSilence(),
+											isLocked || model.rules === null,
+										),
+									),
+								]
 							: []),
-						investigateAction(
+						...investigateAction(
 							h,
 							model,
 							AsyncData.getOrElse(model.investigation.data, () => null),

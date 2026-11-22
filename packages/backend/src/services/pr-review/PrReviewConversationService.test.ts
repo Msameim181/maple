@@ -8,6 +8,7 @@
 import { afterEach, assert, describe, it } from "@effect/vitest"
 import {
 	GitCommitSha,
+	PrReviewId,
 	type PullRequestCiApprovedJob,
 	type PullRequestCommentJob,
 	type PullRequestHead,
@@ -15,6 +16,9 @@ import {
 import { fakeChatSessionsLayer } from "@maple/backend/testing/chat-sessions-fake"
 import { envPorts } from "@maple/backend/platform/env-ports"
 import { Effect, Layer, Option, Schema } from "effect"
+import * as PG from "@maple-dev/effect-orm/postgres"
+import { PrReviewFindings } from "@maple/db/tables"
+import { Database } from "@maple/backend/platform/DatabaseLive"
 import { cleanupTestDbs, createTestDb, type TestDb } from "@maple/backend/testing/test-pglite"
 import {
 	asOrgId,
@@ -43,6 +47,8 @@ const orgId = asOrgId("org_reply")
 
 interface Recorded {
 	readonly begun: Array<string>
+	/** Where each begun turn said it posts. */
+	readonly repositories: Array<string | undefined>
 	readonly posted: Array<{ body: string; threadRootId?: string }>
 	readonly commits: Array<{
 		branch: string
@@ -53,7 +59,14 @@ interface Recorded {
 	readonly headLookups: Array<string>
 }
 
-const record = (): Recorded => ({ begun: [], posted: [], commits: [], reactions: [], headLookups: [] })
+const record = (): Recorded => ({
+	begun: [],
+	repositories: [],
+	posted: [],
+	commits: [],
+	reactions: [],
+	headLookups: [],
+})
 
 const head = (overrides: Partial<PullRequestHead> = {}): PullRequestHead => ({
 	number: 612,
@@ -77,6 +90,10 @@ const layerFor = (
 	options: {
 		readonly permission?: string
 		readonly pr?: PullRequestHead
+		/** Read on every head lookup, so a test can move the branch mid-reply. */
+		readonly livePr?: { current: PullRequestHead }
+		/** Present and true: posting an answer fails. */
+		readonly postFails?: { value: boolean }
 		readonly files?: Readonly<Record<string, string>>
 	} = {},
 ) => {
@@ -117,15 +134,21 @@ const layerFor = (
 		resolveReviewThread: unused,
 		hideEarlierComments: unused,
 		fetchChangesSince: unused,
-		fetchPullRequestHead: () => Effect.succeed(options.pr ?? head()),
+		fetchPullRequestHead: () => Effect.sync(() => options.livePr?.current ?? options.pr ?? head()),
 		postPullRequestReply: (_installation, _repo, input) =>
-			Effect.sync(() => {
-				recorded.posted.push({
-					body: input.body,
-					...(input.threadRootId === undefined ? undefined : { threadRootId: input.threadRootId }),
-				})
-				return { url: `https://github.com/octo/repo/pull/612#reply-${recorded.posted.length}` }
-			}),
+			options.postFails?.value === true
+				? Effect.die("GitHub is down")
+				: Effect.sync(() => {
+						recorded.posted.push({
+							body: input.body,
+							...(input.threadRootId === undefined
+								? undefined
+								: { threadRootId: input.threadRootId }),
+						})
+						return {
+							url: `https://github.com/octo/repo/pull/612#reply-${recorded.posted.length}`,
+						}
+					}),
 		reactToComment: (_installation, _repo, input) =>
 			Effect.sync(() => {
 				recorded.reactions.push(`${input.commentId}:${input.content}`)
@@ -141,6 +164,7 @@ const layerFor = (
 				return { sha: "cccccccccccccccccccccccccccccccccccccccc", htmlUrl: null }
 			}),
 		publishPullRequestReview: unused,
+		withdrawPullRequestApprovals: unused,
 		writePullRequestSummaryComment: unused,
 		writePullRequestCheck: unused,
 		searchCode: unused,
@@ -166,8 +190,11 @@ const layerFor = (
 	const workerEnv = Layer.merge(
 		envPorts({}),
 		fakeChatSessionsLayer(() => ({
-			beginTurn: async (input: { text: string }) => {
+			beginTurn: async (input) => {
 				recorded.begun.push(input.text)
+				recorded.repositories.push(
+					input.origin.kind === "autonomous" ? input.origin.repository : undefined,
+				)
 				return { cursor: 0, messageId: "m", turnMessageId: "t" }
 			},
 			abort: async () => undefined,
@@ -343,6 +370,27 @@ describe("PrReviewConversationService CI approvals", () => {
 })
 
 describe("PrReviewConversationService", () => {
+	it.effect.each([
+		["a private", true, "private"],
+		["a public", false, "public"],
+	] as const)(
+		"starts a reply on %s repository with its visibility on the turn",
+		([, isPrivate, expected]) => {
+			const testDb = createTestDb(trackedDbs)
+			const recorded = record()
+			return Effect.gen(function* () {
+				yield* seedRepo(isPrivate)
+				const conversations = yield* PrReviewConversationService
+				const outcome = yield* conversations.onPullRequestComment(
+					orgId,
+					comment({ surface: "review_thread", threadRootId: "800", commentId: "901" }),
+				)
+				assert.equal(outcome.outcome, "started")
+				assert.deepEqual(recorded.repositories, [expected])
+			}).pipe(Effect.provide(layerFor(testDb, recorded)))
+		},
+	)
+
 	it.effect("answers a member's question on the thread it came from", () => {
 		const testDb = createTestDb(trackedDbs)
 		const recorded = record()
@@ -394,6 +442,251 @@ describe("PrReviewConversationService", () => {
 				"duplicate",
 			)
 		}).pipe(Effect.provide(layerFor(testDb, recorded)))
+	})
+
+	it.effect("settles the open findings an answer names, and says so", () => {
+		const testDb = createTestDb(trackedDbs)
+		const recorded = record()
+		return Effect.gen(function* () {
+			yield* seed
+			const repo = yield* VcsRepository
+			const repositoryId = Option.getOrThrow(yield* repo.resolveRepository(orgId, "github", "7")).id
+			const database = yield* Database
+			const finding = (handle: string, status: "open" | "resolved") => ({
+				id: `finding-${handle}`,
+				orgId,
+				repositoryId,
+				number: 612,
+				reviewId: Schema.decodeSync(PrReviewId)("00000000-0000-0000-0000-000000000000"),
+				handle,
+				path: "src/a.ts",
+				line: 1,
+				category: "correctness" as const,
+				severity: "warn" as const,
+				title: `finding ${handle}`,
+				status,
+				createdAt: 0,
+				updatedAt: 0,
+			})
+			yield* database.execute((db) =>
+				db.run(
+					PG.insertInto(PrReviewFindings).values([
+						finding("F1", "open"),
+						finding("F2", "open"),
+						finding("F3", "resolved"),
+					]),
+				),
+			)
+			const conversations = yield* PrReviewConversationService
+			const outcome = yield* conversations.onPullRequestComment(orgId, comment())
+			yield* conversations.submitReply(orgId, outcome.replyId!, "You are right about F1.", {
+				dismissed: ["F1"],
+				// F3 is already settled and F9 does not exist: neither is touched or mentioned.
+				resolved: ["F2", "F3", "F9"],
+			})
+			assert.deepEqual(recorded.posted, [
+				{ body: "You are right about F1.\n\n_Dismissed F1. Marked F2 resolved._" },
+			])
+			const rows = yield* database.execute((db) =>
+				db.run(
+					PG.from(PrReviewFindings)
+						.select("handle", "status", "resolvedSha")
+						.where(($) => [$.repositoryId.eq(repositoryId)])
+						.orderBy(["handle", "asc"]),
+				),
+			)
+			assert.deepEqual(rows, [
+				{ handle: "F1", status: "dismissed", resolvedSha: null },
+				{ handle: "F2", status: "resolved", resolvedSha: null },
+				{ handle: "F3", status: "resolved", resolvedSha: null },
+			])
+		}).pipe(Effect.provide(layerFor(testDb, recorded)))
+	})
+
+	it.effect("leaves findings open when the answer could not be posted", () => {
+		const testDb = createTestDb(trackedDbs)
+		const recorded = record()
+		const postFails = { value: false }
+		return Effect.gen(function* () {
+			yield* seed
+			const repo = yield* VcsRepository
+			const repositoryId = Option.getOrThrow(yield* repo.resolveRepository(orgId, "github", "7")).id
+			const database = yield* Database
+			const finding = (handle: string, status: "open" | "resolved") => ({
+				id: `finding-${handle}`,
+				orgId,
+				repositoryId,
+				number: 612,
+				reviewId: Schema.decodeSync(PrReviewId)("00000000-0000-0000-0000-000000000000"),
+				handle,
+				path: "src/a.ts",
+				line: 1,
+				category: "correctness" as const,
+				severity: "warn" as const,
+				title: `finding ${handle}`,
+				status,
+				createdAt: 0,
+				updatedAt: 0,
+			})
+			yield* database.execute((db) =>
+				db.run(
+					PG.insertInto(PrReviewFindings).values([
+						finding("F1", "open"),
+						finding("F2", "open"),
+						finding("F3", "resolved"),
+					]),
+				),
+			)
+			const conversations = yield* PrReviewConversationService
+			const outcome = yield* conversations.onPullRequestComment(orgId, comment())
+			postFails.value = true
+			yield* conversations.submitReply(orgId, outcome.replyId!, "You are right about F1.", {
+				dismissed: ["F1"],
+				// F3 is already settled and F9 does not exist: neither is touched or mentioned.
+				resolved: ["F2", "F3", "F9"],
+			})
+			const rows = yield* database.execute((db) =>
+				db.run(
+					PG.from(PrReviewFindings)
+						.select("handle", "status", "resolvedSha")
+						.where(($) => [$.repositoryId.eq(repositoryId)])
+						.orderBy(["handle", "asc"]),
+				),
+			)
+			assert.deepEqual(rows, [
+				{ handle: "F1", status: "open", resolvedSha: null },
+				{ handle: "F2", status: "open", resolvedSha: null },
+				{ handle: "F3", status: "resolved", resolvedSha: null },
+			])
+		}).pipe(Effect.provide(layerFor(testDb, recorded, { postFails })))
+	})
+
+	it.effect("leaves a claimed fix open when the staged fix was not pushed", () => {
+		const testDb = createTestDb(trackedDbs)
+		const recorded = record()
+		return Effect.gen(function* () {
+			yield* seed
+			const repo = yield* VcsRepository
+			const repositoryId = Option.getOrThrow(yield* repo.resolveRepository(orgId, "github", "7")).id
+			const database = yield* Database
+			const finding = (handle: string, status: "open" | "resolved") => ({
+				id: `finding-${handle}`,
+				orgId,
+				repositoryId,
+				number: 612,
+				reviewId: Schema.decodeSync(PrReviewId)("00000000-0000-0000-0000-000000000000"),
+				handle,
+				path: "src/a.ts",
+				line: 1,
+				category: "correctness" as const,
+				severity: "warn" as const,
+				title: `finding ${handle}`,
+				status,
+				createdAt: 0,
+				updatedAt: 0,
+			})
+			yield* database.execute((db) =>
+				db.run(
+					PG.insertInto(PrReviewFindings).values([
+						finding("F1", "open"),
+						finding("F2", "open"),
+						finding("F3", "resolved"),
+					]),
+				),
+			)
+			const conversations = yield* PrReviewConversationService
+			const outcome = yield* conversations.onPullRequestComment(
+				orgId,
+				comment({ body: "@maple fix it" }),
+			)
+			// The edit does not apply to the file at the head, so nothing is pushed.
+			yield* conversations.stageEdit(orgId, outcome.replyId!, {
+				path: "src/a.ts",
+				oldText: "not in the file",
+				newText: "y",
+			})
+			yield* conversations.submitReply(orgId, outcome.replyId!, "Guarded it.", {
+				dismissed: [],
+				resolved: ["F1"],
+			})
+			assert.lengthOf(recorded.commits, 0)
+			assert.include(recorded.posted[0]?.body ?? "", "Left F1 open: the fix was not pushed.")
+			const rows = yield* database.execute((db) =>
+				db.run(
+					PG.from(PrReviewFindings)
+						.select("handle", "status", "resolvedSha")
+						.where(($) => [$.repositoryId.eq(repositoryId)])
+						.orderBy(["handle", "asc"]),
+				),
+			)
+			assert.deepEqual(rows, [
+				{ handle: "F1", status: "open", resolvedSha: null },
+				{ handle: "F2", status: "open", resolvedSha: null },
+				{ handle: "F3", status: "resolved", resolvedSha: null },
+			])
+		}).pipe(Effect.provide(layerFor(testDb, recorded, { files: { "src/a.ts": "const a = 1\n" } })))
+	})
+
+	it.effect("leaves a claimed fix open when the branch moved since the answer read it", () => {
+		const testDb = createTestDb(trackedDbs)
+		const recorded = record()
+		const live = { current: head() }
+		return Effect.gen(function* () {
+			yield* seed
+			const repo = yield* VcsRepository
+			const repositoryId = Option.getOrThrow(yield* repo.resolveRepository(orgId, "github", "7")).id
+			const database = yield* Database
+			const finding = (handle: string, status: "open" | "resolved") => ({
+				id: `finding-${handle}`,
+				orgId,
+				repositoryId,
+				number: 612,
+				reviewId: Schema.decodeSync(PrReviewId)("00000000-0000-0000-0000-000000000000"),
+				handle,
+				path: "src/a.ts",
+				line: 1,
+				category: "correctness" as const,
+				severity: "warn" as const,
+				title: `finding ${handle}`,
+				status,
+				createdAt: 0,
+				updatedAt: 0,
+			})
+			yield* database.execute((db) =>
+				db.run(
+					PG.insertInto(PrReviewFindings).values([
+						finding("F1", "open"),
+						finding("F2", "open"),
+						finding("F3", "resolved"),
+					]),
+				),
+			)
+			const conversations = yield* PrReviewConversationService
+			const outcome = yield* conversations.onPullRequestComment(orgId, comment())
+			live.current = head({ headSha: sha("3333333333333333333333333333333333333333") })
+			yield* conversations.submitReply(orgId, outcome.replyId!, "Both handled.", {
+				dismissed: ["F1"],
+				resolved: ["F2"],
+			})
+			assert.deepEqual(recorded.posted, [
+				{
+					body: "Both handled.\n\n_Dismissed F1. Left F2 open: the branch moved since I read it._",
+				},
+			])
+			const rows = yield* database.execute((db) =>
+				db.run(
+					PG.from(PrReviewFindings)
+						.select("handle", "status")
+						.where(($) => [$.repositoryId.eq(repositoryId)])
+						.orderBy(["handle", "asc"]),
+				),
+			)
+			assert.deepEqual(rows, [
+				{ handle: "F1", status: "dismissed" },
+				{ handle: "F2", status: "open" },
+				{ handle: "F3", status: "resolved" },
+			])
+		}).pipe(Effect.provide(layerFor(testDb, recorded, { livePr: live })))
 	})
 
 	it.effect("ignores people outside a public repository and comments on disabled repositories", () => {

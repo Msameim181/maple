@@ -32,7 +32,8 @@ import { panel } from "@maple/views/ui/panel"
 import { skeleton } from "@maple/views/ui/skeleton"
 import { statFigure } from "@maple/views/ui/stat-figure"
 import { seriesLegend } from "../../kit/series-legend"
-import { canManage, Message, type Model } from "./model"
+import { Message, type Model } from "./model"
+import { gatedControl } from "../../kit/session-grants"
 import { typography } from "@maple/views/ui/typography"
 import { hstack, vstack } from "@maple/views/ui/stack"
 import { stripClass } from "@maple/views/ui/rule"
@@ -65,7 +66,7 @@ const figure = (
 	}>,
 ): Html =>
 	vstack(h, { gap: "2", shrink: true, className: "p-4" }, [
-		// The uppercase overline every KPI tile uses (Overview's usage cards, the Stat widget).
+		// The label every KPI tile uses (Overview's usage cards, the Stat widget).
 		eyebrow(h, {}, [options.label]),
 		statFigure(h, { size: "lg", value: options.value, valueClassName: options.valueClassName }),
 		h.span([h.Class("font-prose text-2xs text-muted-foreground")], options.note),
@@ -389,18 +390,16 @@ export const cyclePanel = (h: H, model: Model, inputs: CyclePanelInputs): Html =
 												inputs.uncappedCount === 1
 													? "1 feature has no cap"
 													: `${inputs.uncappedCount} features have no cap`,
-												...(canManage(model)
-													? [
-															textLink(
-																h,
-																{
-																	onClick: Message.ClickedSetCaps(),
-																	isDisabled: model.isSavingCap,
-																},
-																["Set caps"],
-															),
-														]
-													: []),
+												gatedControl(h, model, "billing:manage", (isLocked) =>
+													textLink(
+														h,
+														{
+															onClick: Message.ClickedSetCaps(),
+															isDisabled: isLocked || model.isSavingCap,
+														},
+														["Set caps"],
+													),
+												),
 											],
 										),
 									],

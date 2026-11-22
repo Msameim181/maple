@@ -9,13 +9,16 @@ import {
 	tableHeaderStickyStyles,
 	tableHeaderStyles,
 	tableRowLinkLiftStyles,
+	tableGroupCellStyles,
 	tableRowLinkStyles,
+	tableRowNameLinkStyles,
 	tableRowStyles,
 	tableSortButtonStyles,
 	tableSortIconStyles,
 	tableSortIdleIconStyles,
 	tableStyles,
 	truncatedCellStyles,
+	wrappingCellStyles,
 } from "./table.styles"
 import { rowSelectedClass } from "./list-row.styles"
 import type { Attribute, Html, HtmlBuilder } from "foldkit/html"
@@ -101,6 +104,28 @@ export const tableRow = <M>(
 		children,
 	)
 
+/** A row that heads the rows under it (a day in a list grouped by day): one header cell across every column. */
+export const tableGroupRow = <M>(
+	h: HtmlBuilder<M>,
+	options: Readonly<{ colSpan: number; key: string; className?: string }>,
+	children: Children,
+): Html =>
+	tableRow(
+		h,
+		[
+			h.th(
+				[
+					h.Attribute("class", cn(tableCellStyles, tableGroupCellStyles, options.className)),
+					h.DataAttribute("slot", "table-group"),
+					h.Attribute("colspan", String(options.colSpan)),
+				],
+				children,
+			),
+		],
+		"hover:bg-transparent active:bg-transparent",
+		[h.Key(options.key)],
+	)
+
 /** A `tableRow` whose whole row opens something: the pointer and the sunken hover, strong while selected. */
 export const clickableRowClass = (isSelected = false): string =>
 	cn("cursor-pointer hover:bg-surface-sunken active:bg-surface-sunken", isSelected && "bg-surface-strong")
@@ -151,6 +176,14 @@ export const truncatedTableCell = <M>(
 	attributes: ReadonlyArray<Attribute<M>> = [],
 ): Html => tableCell(h, children, cn(truncatedCellStyles, className), attributes)
 
+/** A cell whose long value wraps inside its column: a hostname, a key, a record. */
+export const wrappingTableCell = <M>(
+	h: HtmlBuilder<M>,
+	children: Children,
+	className?: string,
+	attributes: ReadonlyArray<Attribute<M>> = [],
+): Html => tableCell(h, children, cn(wrappingCellStyles, className), attributes)
+
 /** A figure column's cell: right-aligned, tabular figures so the digits line up down the column. */
 export const numericTableCell = <M>(
 	h: HtmlBuilder<M>,
@@ -191,6 +224,29 @@ export const rowLink = <M>(
 			...(options.attributes ?? []),
 		],
 		children,
+	)
+
+/**
+ * A row's name as its `rowLink`: one truncating medium line, muted for a row that is switched off.
+ * The full name is its tooltip, so a cut-off name can still be told from its neighbours.
+ */
+export const rowNameLink = <M>(
+	h: HtmlBuilder<M>,
+	options: {
+		readonly href: string
+		readonly name: string
+		readonly isMuted?: boolean
+		readonly attributes?: ReadonlyArray<Attribute<M>>
+	},
+): Html =>
+	rowLink(
+		h,
+		{
+			href: options.href,
+			className: cn(tableRowNameLinkStyles, options.isMuted === true && "text-muted-foreground"),
+			attributes: [h.Title(options.name), ...(options.attributes ?? [])],
+		},
+		[options.name],
 	)
 
 export type SortDirection = "asc" | "desc"

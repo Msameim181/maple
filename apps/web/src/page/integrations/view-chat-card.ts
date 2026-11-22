@@ -1,10 +1,7 @@
-import type { ChatConnectorId } from "@maple/primitives"
 import { AsyncData } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
-import { heading } from "@maple/views/ui/heading"
 import { button } from "@maple/views/ui/button"
 import { errorState } from "@maple/views/ui/error-state"
-import { itemContent, mediaCard } from "@maple/views/ui/item"
 import { statusDot } from "@maple/views/ui/status-dot"
 import {
 	integrationEmpty,
@@ -12,17 +9,18 @@ import {
 	integrationEmptyFooter,
 	integrationEmptyHint,
 	integrationEmptyMedia,
-	integrationIconPlate,
 } from "../kit/integration-empty"
 import { relativeTime } from "../kit/relative-time"
-import { chatEntry, chatManifestOf } from "./catalog"
+import { chatConnectorOf, chatEntry, chatManifestOf, integrationOfSearch } from "./catalog"
+import { ChatMessage, connectorStatusOf } from "./chat"
 import { Message } from "./message"
 import type { Model } from "./model"
-import { chatConnectorStatus } from "./update-chat"
 import { chatCardLoading, identityRow, monoGlyph } from "./view-chat"
+import { chatFeaturePanel } from "./view-chat-features"
 import { disconnectConfirm } from "./view-disconnect"
 import { entryBrand } from "./view-entry"
-import { typography, typographyClass } from "@maple/views/ui/typography"
+import { connectedIntegrationCard } from "./view-integration-card"
+import { typographyClass } from "@maple/views/ui/typography"
 import { hstack, vstack } from "@maple/views/ui/stack"
 import { Array as Arr, Option } from "effect"
 
@@ -33,10 +31,16 @@ type H = HtmlBuilder<Message>
 
 const IS_ADMIN = true
 
-export const chatCard = (h: H, model: Model, connector: ChatConnectorId, timeZone: string): Html => {
-	const manifest = chatManifestOf(connector)
+/** A chat message, as the hub carries it. */
+export const toHub = (message: ChatMessage): Message => Message.GotChatMessage({ message })
+
+/** The card of the chat connector the page shows. */
+export const chatCard = (h: H, model: Model, timeZone: string): Html => {
+	const integration = integrationOfSearch(model.search.integration)
+	const connector = integration === null ? null : chatConnectorOf(integration)
+	const manifest = connector === null ? undefined : chatManifestOf(connector)
 	if (manifest === undefined) return h.empty
-	const status = chatConnectorStatus(model)
+	const status = connectorStatusOf(model.statuses.chat, connector)
 	const data = model.statuses.chat.data
 	if (status === null && (AsyncData.isIdle(data) || AsyncData.isLoading(data))) return chatCardLoading(h)
 	if (status === null && AsyncData.isFailure(data))
@@ -62,7 +66,7 @@ export const chatCard = (h: H, model: Model, connector: ChatConnectorId, timeZon
 					{
 						isDisabled: connectDisabled,
 						isLoading: busy === "install",
-						attributes: [h.OnClick(Message.ClickedChatInstall())],
+						attributes: [h.OnClick(toHub(ChatMessage.ClickedInstall()))],
 					},
 					[monoGlyph(h, manifest), `Add to ${manifest.name}`],
 				),
@@ -80,69 +84,54 @@ export const chatCard = (h: H, model: Model, connector: ChatConnectorId, timeZon
 	)
 	const confirmName = Option.map(confirmWorkspace, (workspace) => workspace.name)
 	return vstack(h, { gap: "4" }, [
-		...Arr.map(workspaces, (workspace) =>
-			mediaCard(h, integrationIconPlate(h, brand), [
-				itemContent(
+		...Arr.flatMap(workspaces, (workspace) => [
+			connectedIntegrationCard(h, model, {
+				integration: null,
+				brand,
+				title: workspace.name,
+				titleClassName: "min-w-0 [overflow-wrap:anywhere]",
+				badge: hstack(
 					h,
+					{ gap: "1.5", as: "span", className: typographyClass({ size: "xs", tone: "muted" }) },
+					[statusDot(h, { tone: "ok", size: "lg" }), "Connected"],
+				),
+				titleWraps: false,
+				summary: [
+					status?.supports_identity === true
+						? `Linked to your organization. Maple answers only people who have linked their ${manifest.name} account, as their own Maple user.`
+						: `Linked to your organization, for everyone in this workspace. No ${manifest.name} account is tied to an individual Maple user.`,
+				],
+				body: [
+					relativeTime(h, {
+						value: workspace.created_at,
+						nowMs: model.nowMs,
+						timeZone,
+						prefix: "Connected",
+						className: typographyClass({ size: "2xs", tone: "muted" }),
+					}),
+				],
+				actions: h.div(
+					[],
 					[
-						hstack(h, { gap: "2" }, [
-							heading(
-								h,
-								{
-									level: 3,
-									variant: "section",
-									className: "min-w-0 [overflow-wrap:anywhere]",
-								},
-								[workspace.name],
-							),
-							hstack(
-								h,
-								{
-									gap: "1.5",
-									as: "span",
-									className: typographyClass({ size: "xs", tone: "muted" }),
-								},
-								[statusDot(h, { tone: "ok", size: "lg" }), "Connected"],
-							),
-						]),
-						typography(h, { size: "xs", tone: "muted", as: "p" }, [
-							status?.supports_identity === true
-								? `Linked to your organization. Maple answers only people who have linked their ${manifest.name} account, as their own Maple user.`
-								: `Linked to your organization, for everyone in this workspace. No ${manifest.name} account is tied to an individual Maple user.`,
-						]),
-						relativeTime(h, {
-							value: workspace.created_at,
-							nowMs: model.nowMs,
-							timeZone,
-							prefix: "Connected",
-							className: typographyClass({ size: "2xs", tone: "muted" }),
-						}),
-						h.div(
-							[],
-							[
-								button(
-									h,
-									{
-										size: "sm",
-										variant: "outline",
-										isDisabled: !IS_ADMIN || busy !== null,
-										attributes: [
-											h.OnClick(
-												Message.ClickedChatDisconnect({
-													workspaceId: workspace.id,
-												}),
-											),
-										],
-									},
-									["Disconnect"],
-								),
-							],
+						button(
+							h,
+							{
+								size: "sm",
+								variant: "outline",
+								isDisabled: !IS_ADMIN || busy !== null,
+								attributes: [
+									h.OnClick(
+										toHub(ChatMessage.ClickedDisconnect({ workspaceId: workspace.id })),
+									),
+								],
+							},
+							["Disconnect"],
 						),
 					],
-					"gap-2",
 				),
-			]),
-		),
+			}),
+			chatFeaturePanel(h, model, workspace),
+		]),
 		...(status?.supports_identity === true
 			? [identityRow(h, model, manifest.name, status.identity)]
 			: []),
@@ -156,7 +145,7 @@ export const chatCard = (h: H, model: Model, connector: ChatConnectorId, timeZon
 						variant: "outline",
 						isDisabled: connectDisabled,
 						isLoading: busy === "install",
-						attributes: [h.OnClick(Message.ClickedChatInstall())],
+						attributes: [h.OnClick(toHub(ChatMessage.ClickedInstall()))],
 					},
 					["Add another workspace"],
 				),

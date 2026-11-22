@@ -5,7 +5,8 @@ import {
 	type IntegrationInventoryInputs,
 	withSourceHealth,
 } from "./integration-inventory"
-import { Array as Arr, Option, String as Str } from "effect"
+import { AwsMetricStream } from "@maple/domain/aws"
+import { Array as Arr, Option, Schema, String as Str } from "effect"
 
 const NOW = Date.UTC(2026, 9, 15, 12, 0, 0)
 const MINUTE = 60_000
@@ -17,8 +18,16 @@ const empty: IntegrationInventoryInputs = {
 	cloudflareStates: [],
 	cloudflareLogpush: [],
 	cloudflareHyperdrives: [],
+	gcpConnectors: [],
+	gcpResourceCounts: [],
+	awsConnections: [],
+	supabaseConnection: null,
+	supabaseProjects: [],
+	fleetConnection: null,
 	railwayConnection: null,
 	railwayEnvironments: [],
+	vercelConnection: null,
+	vercelProjectCount: 0,
 	planetscaleConnection: null,
 	planetscaleDatabases: [],
 	planetscalePollStates: [],
@@ -187,6 +196,116 @@ describe("buildIntegrationInventory", () => {
 		)
 	})
 
+	const fleetConnection = (lastSuccessAt: number | null, findingsError: string | null = null) => ({
+		organizationName: "Acme",
+		baseUrl: "https://fleet.example.com",
+		authFailedAt: null,
+		lastSuccessAt,
+		lastErrorAt: null,
+		lastError: null,
+		createdAt: NOW - MINUTE,
+		findings: {
+			lastSuccessAt: findingsError === null ? lastSuccessAt : NOW - 2 * MINUTE,
+			lastErrorAt: findingsError === null ? null : NOW - MINUTE,
+			lastError: findingsError,
+		},
+	})
+
+	it("reads a Fleet server as pending until its first read, then healthy", () => {
+		const fleet = (lastSuccessAt: number | null) =>
+			providerOf({ fleetConnection: fleetConnection(lastSuccessAt) }, "fleet")
+		expect([fleet(null)?.status, fleet(null)?.problem]).toEqual([
+			"pending",
+			"Connected; waiting for the first read of Fleet.",
+		])
+		expect([fleet(NOW - MINUTE)?.status, fleet(NOW - MINUTE)?.account]).toEqual(["healthy", "Acme"])
+	})
+
+	it("shows a failing device sync even while the activity feed reads fine", () => {
+		const fleet = providerOf(
+			{ fleetConnection: fleetConnection(NOW - MINUTE, "Fleet answered 403") },
+			"fleet",
+		)
+		expect(fleet?.status).toBe("failing")
+		expect(fleet?.problem).toContain("Fleet answered 403")
+	})
+
+	describe("vercel", () => {
+		const connection = {
+			teamName: "Acme",
+			authFailedAt: null,
+			logsEnabled: true,
+			tracesEnabled: true,
+			aiGatewayEnabled: true,
+			speedInsightsEnabled: false,
+			webAnalyticsEnabled: false,
+			auditLogEnabled: false,
+			logDrainState: { status: "enabled", lastError: null },
+			traceDrainState: { status: "enabled", lastError: null },
+			aiGatewayDrainState: { status: "enabled", lastError: null },
+			speedInsightsDrainState: null,
+			webAnalyticsDrainState: null,
+			auditLogDrainState: null,
+			lastSuccessAt: NOW - MINUTE,
+			lastErrorAt: null,
+			lastError: null,
+			createdAt: NOW - 24 * 60 * MINUTE,
+		}
+
+		it("is healthy with every drain enabled, and counts the team's projects", () => {
+			const vercel = providerOf({ vercelConnection: connection, vercelProjectCount: 3 }, "vercel")
+			expect(vercel?.status).toBe("healthy")
+			expect(vercel?.account).toBe("Acme (3 projects)")
+			expect(Arr.map(vercel?.resources ?? [], (r) => r.name)).toEqual(["AI Gateway", "logs", "traces"])
+		})
+
+		it("fails on a drain Vercel reports missing, and leaves out a drain that is turned off", () => {
+			const vercel = providerOf(
+				{
+					vercelConnection: {
+						...connection,
+						tracesEnabled: false,
+						aiGatewayEnabled: false,
+						logDrainState: { status: "missing", lastError: "Drains need a Pro plan" },
+					},
+				},
+				"vercel",
+			)
+			expect(vercel?.status).toBe("failing")
+			expect(vercel?.resources).toHaveLength(1)
+			expect(vercel?.problem).toBe("1 of 1 failing, e.g. drain logs: Drains need a Pro plan")
+		})
+
+		it("fails on an opt-in drain Vercel refused for the team's plan", () => {
+			const vercel = providerOf(
+				{
+					vercelConnection: {
+						...connection,
+						auditLogEnabled: true,
+						auditLogDrainState: {
+							status: "errored",
+							lastError: "Audit Log drains need Enterprise",
+						},
+					},
+				},
+				"vercel",
+			)
+			expect(vercel?.status).toBe("failing")
+			expect(vercel?.problem).toBe(
+				"1 of 4 failing, e.g. drain audit log: Audit Log drains need Enterprise",
+			)
+		})
+
+		it("reports a rejected token as disconnected", () => {
+			const vercel = providerOf(
+				{ vercelConnection: { ...connection, authFailedAt: NOW - MINUTE } },
+				"vercel",
+			)
+			expect(vercel?.status).toBe("disconnected")
+			expect(vercel?.problem).toContain("Vercel rejected the access token")
+		})
+	})
+
 	it("lets a revoked grant outrank healthy resources", () => {
 		const cloudflare = providerOf(
 			{
@@ -217,6 +336,8 @@ describe("buildIntegrationInventory", () => {
 					planetscaleConnection: {
 						psOrganization: "acme",
 						detectedPermissions,
+						metricsEnabled: true,
+						eventsEnabled: true,
 						lastInventoryAt: NOW - MINUTE,
 						lastInventoryError: null,
 						createdAt: NOW - 24 * 60 * MINUTE,
@@ -243,6 +364,8 @@ describe("buildIntegrationInventory", () => {
 			planetscaleConnection: {
 				psOrganization: "acme",
 				detectedPermissions: null,
+				metricsEnabled: true,
+				eventsEnabled: true,
 				lastInventoryAt: NOW - MINUTE,
 				lastInventoryError: null,
 				createdAt: NOW,
@@ -257,6 +380,58 @@ describe("buildIntegrationInventory", () => {
 		expect(Arr.map(planetscale?.resources ?? [], (r) => r.name)).toEqual(["planetscale"])
 		expect(prometheus?.status).toBe("failing")
 		expect(Arr.map(prometheus?.resources ?? [], (r) => r.name)).toEqual(["node-exporter"])
+	})
+
+	it("reads a switched-off PlanetScale feature as paused, not stale", () => {
+		const connection = {
+			psOrganization: "acme",
+			detectedPermissions: null,
+			metricsEnabled: true,
+			eventsEnabled: true,
+			lastInventoryAt: NOW - MINUTE,
+			lastInventoryError: null,
+			createdAt: NOW - 24 * 60 * MINUTE,
+		}
+		const longAgo = NOW - 24 * 60 * MINUTE
+		const inputsWith = (switches: { metricsEnabled: boolean; eventsEnabled: boolean }) => ({
+			planetscaleConnection: { ...connection, ...switches },
+			planetscaleDatabases: [
+				{ databaseId: "db_1", name: "shop", kind: "mysql", region: null, state: "ready" },
+			],
+			// Deploy-request polling stopped a day ago; the managed target last scraped then too.
+			planetscalePollStates: [
+				{
+					databaseId: "db_1",
+					dataset: "deploy_requests",
+					lastSuccessAt: longAgo,
+					lastErrorAt: null,
+					lastError: null,
+				},
+			],
+			scrapeTargets: [
+				{
+					name: "planetscale",
+					url: "https://api.planetscale.com/metrics",
+					serviceName: null,
+					managedBy: "planetscale:conn_1",
+					scrapeIntervalSeconds: 60,
+					lastScrapeAt: longAgo,
+					lastScrapeError: null,
+					enabled: true,
+				},
+			],
+		})
+		const on = providerOf(inputsWith({ metricsEnabled: true, eventsEnabled: true }), "planetscale")
+		expect(on?.status).toBe("stale")
+
+		const off = providerOf(inputsWith({ metricsEnabled: false, eventsEnabled: false }), "planetscale")
+		// Paused is a choice, not a fault: nothing reads stale or failing.
+		expect(off?.status).toBe("paused")
+		const resources = off?.resources ?? []
+		expect(Arr.map(resources, (r) => [r.name, r.status, r.note])).toEqual([
+			["planetscale", "paused", "Switched off"],
+			["shop", "healthy", "mysql, ready"],
+		])
 	})
 
 	it("never shows a scrape URL's userinfo or query, where tokens live", () => {
@@ -288,6 +463,7 @@ describe("buildIntegrationInventory", () => {
 						accountLogin: "acme",
 						status: "active",
 						ciTracesEnabled: false,
+						auditLogEnabled: true,
 						createdAt: NOW,
 					},
 				],
@@ -312,6 +488,398 @@ describe("buildIntegrationInventory", () => {
 			lastError: "Not Found",
 			note: "tracks main, PR review on",
 		})
+		expect(Arr.filter(github?.resources ?? [], (r) => r.kind === "audit log")).toHaveLength(1)
+	})
+
+	it("lists no audit log feed for an installation with the audit log off", () => {
+		const github = providerOf(
+			{
+				vcsInstallations: [
+					{
+						provider: "github",
+						accountLogin: "acme",
+						status: "active",
+						ciTracesEnabled: true,
+						auditLogEnabled: false,
+						createdAt: NOW,
+					},
+				],
+			},
+			"github",
+		)
+		// The source stays connected, so the audit log Sources panel reads it as off, not missing.
+		expect(github?.status).toBe("healthy")
+		expect(Arr.filter(github?.resources ?? [], (r) => r.kind === "audit log")).toEqual([])
+		expect(Arr.some(github?.feeds ?? [], (feed) => Str.includes("audit log")(feed))).toBe(false)
+	})
+})
+
+describe("google cloud", () => {
+	const connector = {
+		id: "gcp_1",
+		scopeType: "project",
+		scopeId: "acme-prod",
+		logsEnabled: true,
+		metricsEnabled: true,
+		lastReceivedAt: NOW - 5 * MINUTE,
+		lastError: null,
+		appliedLogsEnabled: true,
+		appliedMetricsEnabled: true,
+		setupReportedAt: NOW - 60 * MINUTE,
+		lastMetricsReceivedAt: NOW - 5 * MINUTE,
+		lastMetricsError: null,
+		resourcesSyncedAt: NOW - 30 * MINUTE,
+		lastResourcesError: null,
+		createdAt: NOW - 24 * 60 * MINUTE,
+	}
+
+	it("lists logs, metrics and inventory per scope, counting projects apart from resources", () => {
+		const gcp = providerOf(
+			{
+				gcpConnectors: [connector],
+				gcpResourceCounts: [
+					{
+						connectorId: "gcp_1",
+						assetType: "cloudresourcemanager.googleapis.com/Project",
+						count: 1,
+					},
+					{ connectorId: "gcp_1", assetType: "run.googleapis.com/Service", count: 4 },
+				],
+			},
+			"gcp",
+		)
+		expect(gcp?.status).toBe("healthy")
+		expect(gcp?.account).toBe("project acme-prod")
+		expect(Arr.map(gcp?.resources ?? [], (r) => r.kind).sort()).toEqual(["inventory", "logs", "metrics"])
+		expect(
+			Arr.findFirst(gcp?.resources ?? [], (r) => r.kind === "inventory").pipe(Option.getOrUndefined)
+				?.note,
+		).toBe("1 project, 4 resources")
+	})
+
+	it("fails on a metrics poll error and names it in the problem", () => {
+		const gcp = providerOf(
+			{
+				gcpConnectors: [
+					{
+						...connector,
+						// A failed read leaves the last good read's stamp behind.
+						lastMetricsReceivedAt: NOW - 20 * MINUTE,
+						lastMetricsError: "PERMISSION_DENIED: monitoring.timeSeries.list",
+					},
+				],
+			},
+			"gcp",
+		)
+		expect(gcp?.status).toBe("failing")
+		expect(gcp?.problem).toContain("PERMISSION_DENIED")
+	})
+
+	it("reads a truncated resource sync as healthy, and a failed one as failing", () => {
+		const statusOf = (resourcesSyncedAt: number) =>
+			Arr.findFirst(
+				providerOf(
+					{
+						gcpConnectors: [
+							{
+								...connector,
+								resourcesSyncedAt,
+								lastResourcesError: "The resource listing ran out of time and is incomplete.",
+							},
+						],
+					},
+					"gcp",
+				)?.resources ?? [],
+				(r) => r.kind === "inventory",
+			).pipe(Option.getOrUndefined)?.status
+		expect(statusOf(NOW - 10 * MINUTE)).toBe("healthy")
+		expect(statusOf(NOW - 90 * MINUTE)).toBe("failing")
+	})
+
+	it("stays healthy on a partial metrics read that still delivered", () => {
+		const gcp = providerOf(
+			{
+				gcpConnectors: [
+					{
+						...connector,
+						lastMetricsReceivedAt: NOW - 2 * MINUTE,
+						lastMetricsError: "3 of 30 metric queries were not read in full",
+					},
+				],
+			},
+			"gcp",
+		)
+		expect(gcp?.status).toBe("healthy")
+		expect(
+			Arr.findFirst(gcp?.resources ?? [], (r) => r.kind === "metrics").pipe(Option.getOrUndefined)
+				?.note,
+		).toBe("3 of 30 metric queries were not read in full")
+	})
+
+	it("is pending before the setup script has run, and leaves out what is switched off", () => {
+		const gcp = providerOf(
+			{
+				gcpConnectors: [
+					{
+						...connector,
+						metricsEnabled: false,
+						lastReceivedAt: null,
+						setupReportedAt: null,
+						appliedLogsEnabled: null,
+					},
+				],
+			},
+			"gcp",
+		)
+		expect(gcp?.status).toBe("pending")
+		expect(Arr.map(gcp?.resources ?? [], (r) => r.kind)).toEqual(["logs"])
+	})
+})
+
+describe("aws", () => {
+	const connection = {
+		accountId: "123456789012",
+		modules: ["observability"],
+		grantedModules: ["observability"],
+		templateVersion: 2,
+		verifiedAt: NOW - 24 * 60 * MINUTE,
+		lastCheckedAt: NOW - 30 * MINUTE,
+		lastCheckError: null,
+		metricStream: null,
+		metricStreamChangedAt: null,
+		streamLastReceivedAt: null,
+		streamLastError: null,
+		createdAt: NOW - 48 * 60 * MINUTE,
+	} satisfies IntegrationInventoryInputs["awsConnections"][number]
+	const stream = Schema.decodeSync(AwsMetricStream)({
+		regions: ["us-east-1"],
+		namespaces: ["AWS/Lambda"],
+	})
+
+	it("is healthy while the stream delivers", () => {
+		const aws = providerOf(
+			{
+				awsConnections: [
+					{ ...connection, metricStream: stream, streamLastReceivedAt: NOW - 2 * MINUTE },
+				],
+			},
+			"aws",
+		)
+		expect(aws?.status).toBe("healthy")
+		expect(aws?.account).toBe("123456789012")
+	})
+
+	it("fails on a stream that never delivered long after the setup", () => {
+		const aws = providerOf(
+			{
+				awsConnections: [
+					{ ...connection, metricStream: stream, metricStreamChangedAt: NOW - 120 * MINUTE },
+				],
+			},
+			"aws",
+		)
+		expect(aws?.status).toBe("failing")
+		expect(aws?.problem).toContain("No metrics have arrived")
+	})
+
+	it("reads an account with no metric stream as paused, and one not yet deployed as pending", () => {
+		expect(providerOf({ awsConnections: [connection] }, "aws")?.status).toBe("paused")
+		const undeployed = providerOf(
+			{ awsConnections: [{ ...connection, verifiedAt: null, grantedModules: null }] },
+			"aws",
+		)
+		expect(undeployed?.status).toBe("pending")
+	})
+
+	it("fails when the role can no longer be assumed", () => {
+		const aws = providerOf(
+			{ awsConnections: [{ ...connection, lastCheckError: "Maple can no longer assume the role" }] },
+			"aws",
+		)
+		expect(aws?.status).toBe("failing")
+		expect(aws?.problem).toContain("can no longer assume the role")
+	})
+
+	it("shows the audit log failing while the role cannot be assumed", () => {
+		const security = {
+			...connection,
+			modules: ["audit"],
+			grantedModules: ["audit"],
+			lastCheckError: "Maple can no longer assume the role",
+		}
+		const auditLog = Arr.findFirst(
+			providerOf({ awsConnections: [security], awsCloudTrailProblems: [] }, "aws")?.resources ?? [],
+			(resource) => resource.kind === "audit log",
+		)
+		expect(Option.getOrUndefined(auditLog)).toMatchObject({
+			status: "failing",
+			lastError: "Maple can no longer assume the role",
+		})
+	})
+
+	it("shows an audit-module account's audit log failing while CloudTrail cannot be read", () => {
+		const security = { ...connection, modules: ["audit"], grantedModules: ["audit"] }
+		const auditLogOf = (
+			problems: ReadonlyArray<{ accountId: string; state: string; lastError: string | null }>,
+		) =>
+			Option.getOrUndefined(
+				Arr.findFirst(
+					providerOf({ awsConnections: [security], awsCloudTrailProblems: problems }, "aws")
+						?.resources ?? [],
+					(resource) => resource.kind === "audit log",
+				),
+			)
+		expect(auditLogOf([])?.status).toBe("healthy")
+		// Asked for but not granted yet: no feed, so the Sources panel reads off.
+		const ungranted = providerOf(
+			{ awsConnections: [{ ...security, grantedModules: [] }] },
+			"aws",
+		)?.resources
+		expect(Arr.some(ungranted ?? [], (resource) => resource.kind === "audit log")).toBe(false)
+		const failing = auditLogOf([
+			{
+				accountId: security.accountId,
+				state: "denied",
+				lastError: "CloudTrail.LookupEvents: AccessDenied",
+			},
+		])
+		expect(failing?.status).toBe("failing")
+		expect(failing?.lastError).toContain("AccessDenied")
+	})
+})
+
+describe("supabase", () => {
+	const supabaseGrant = {
+		provider: "supabase",
+		externalAccountName: null,
+		externalUserEmail: null,
+		revokedAt: null,
+		createdAt: NOW - 24 * 60 * MINUTE,
+	}
+	const connection = {
+		organizationName: "Acme",
+		lastDiscoveryAt: NOW - 10 * MINUTE,
+		lastDiscoveryError: null,
+		createdAt: NOW - 24 * 60 * MINUTE,
+	}
+	const project = {
+		name: "shop",
+		region: "eu-central-1",
+		status: "ACTIVE_HEALTHY",
+		logDrainEnabled: false,
+		logDrainError: null,
+		logsEnabled: false,
+		logsLastPolledAt: null,
+		logsError: null,
+	}
+
+	it("is healthy with a healthy project and its metrics scrape", () => {
+		const supabase = providerOf(
+			{
+				oauthConnections: [supabaseGrant],
+				supabaseConnection: connection,
+				supabaseProjects: [project],
+				scrapeTargets: [
+					{
+						name: "Supabase shop",
+						url: "https://abcdefghijklmnopqrst.supabase.co/customer/v1/privileged/metrics",
+						serviceName: null,
+						managedBy: "supabase:conn_1",
+						scrapeIntervalSeconds: 60,
+						lastScrapeAt: NOW - MINUTE,
+						lastScrapeError: null,
+					},
+				],
+			},
+			"supabase",
+		)
+		expect(supabase?.status).toBe("healthy")
+		expect(supabase?.account).toBe("Acme")
+		expect(Arr.map(supabase?.resources ?? [], (r) => r.kind).sort()).toEqual([
+			"metrics scrape",
+			"project",
+		])
+	})
+
+	it("keeps Supabase's managed scrape targets out of Prometheus", () => {
+		const inventory = build({
+			oauthConnections: [supabaseGrant],
+			supabaseConnection: connection,
+			scrapeTargets: [
+				{
+					name: "Supabase shop",
+					url: "https://abcdefghijklmnopqrst.supabase.co/metrics",
+					serviceName: null,
+					managedBy: "supabase:conn_1",
+					scrapeIntervalSeconds: 60,
+					lastScrapeAt: NOW - MINUTE,
+					lastScrapeError: null,
+				},
+			],
+		})
+		expect(findProvider(inventory, "prometheus")).toBeUndefined()
+	})
+
+	it("fails on a log drain error and reads a paused project as paused", () => {
+		const supabase = providerOf(
+			{
+				oauthConnections: [supabaseGrant],
+				supabaseConnection: connection,
+				supabaseProjects: [
+					{ ...project, logDrainEnabled: true, logDrainError: "drain rejected: 403" },
+					{ ...project, name: "old", status: "INACTIVE" },
+				],
+			},
+			"supabase",
+		)
+		expect(supabase?.status).toBe("failing")
+		expect(supabase?.problem).toContain("drain rejected: 403")
+		expect(Arr.map(supabase?.resources ?? [], (r) => `${r.name}:${r.status}`)).toEqual([
+			"shop:failing",
+			"old:paused",
+		])
+	})
+
+	it("reads a running project whose log polling stopped as stale, but not a paused one", () => {
+		const stopped = { ...project, logsEnabled: true, logsLastPolledAt: NOW - 3 * 60 * MINUTE }
+		const supabase = providerOf(
+			{
+				oauthConnections: [supabaseGrant],
+				supabaseConnection: connection,
+				supabaseProjects: [
+					stopped,
+					{ ...stopped, name: "old", status: "INACTIVE" },
+					{ ...project, name: "live", logsEnabled: true, logsLastPolledAt: NOW - MINUTE },
+				],
+			},
+			"supabase",
+		)
+		expect(Arr.map(supabase?.resources ?? [], (r) => `${r.name}:${r.status}`)).toEqual([
+			"shop:stale",
+			"old:paused",
+			"live:healthy",
+		])
+	})
+
+	it("reports a revoked grant as disconnected, and a discovery error as failing", () => {
+		expect(
+			providerOf(
+				{
+					oauthConnections: [{ ...supabaseGrant, revokedAt: NOW - MINUTE }],
+					supabaseConnection: connection,
+				},
+				"supabase",
+			)?.status,
+		).toBe("disconnected")
+		const failing = providerOf(
+			{
+				oauthConnections: [supabaseGrant],
+				supabaseConnection: { ...connection, lastDiscoveryError: "Supabase answered 500" },
+			},
+			"supabase",
+		)
+		expect(failing?.status).toBe("failing")
+		expect(failing?.problem).toBe("Project discovery failing: Supabase answered 500")
 	})
 })
 

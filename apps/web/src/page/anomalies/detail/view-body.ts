@@ -8,6 +8,7 @@ import { AsyncData } from "foldkit"
 import type { Html, HtmlBuilder } from "foldkit/html"
 import { AppRoute, hrefOf } from "../../../route"
 import { button, linkButton } from "@maple/views/ui/button"
+import { gatedBy } from "../../kit/gated-controls"
 import { badge } from "@maple/views/ui/display"
 import { card, cardPanel } from "@maple/views/ui/card"
 import { detailTitle } from "../../kit/detail-header"
@@ -15,7 +16,7 @@ import { icon } from "@maple/views/ui/icon"
 import { iconButton } from "@maple/views/ui/icon-button"
 import { inlineCode } from "@maple/views/ui/inline-code"
 import { skeleton } from "@maple/views/ui/skeleton"
-import { serviceDot } from "@maple/views/ui/values"
+import { serviceLabel } from "@maple/views/ui/service-label"
 import { WORKFLOW_LABEL } from "../../kit/issue-workflow"
 import { actorAvatar } from "../../kit/issue-actor"
 import { ANOMALY_CHART_TOKENS, anomalySignalChart } from "../../kit/anomaly-evidence"
@@ -70,6 +71,7 @@ const cardActions = (
 	h: H,
 	issueId: NonNullable<AnomalyIncidentDocument["errorIssueId"]>,
 	isBusy: boolean,
+	canRespond: boolean,
 ): Html =>
 	hstack(h, { gap: "1.5", className: "shrink-0" }, [
 		linkButton(
@@ -81,23 +83,27 @@ const cardActions = (
 			},
 			["Open issue", icon(h, "ArrowRightIcon")],
 		),
-		iconButton(
-			h,
-			{
-				label: "Link a different issue",
-				isDisabled: isBusy,
-				attributes: [h.OnClick(Message.ClickedLinkIssue())],
-			},
-			[icon(h, "LinkIcon")],
+		gatedBy(h, canRespond, "incidents:respond", (isLocked) =>
+			iconButton(
+				h,
+				{
+					label: "Link a different issue",
+					isDisabled: isLocked || isBusy,
+					attributes: [h.OnClick(Message.ClickedLinkIssue())],
+				},
+				[icon(h, "LinkIcon")],
+			),
 		),
-		iconButton(
-			h,
-			{
-				label: "Unlink issue",
-				isDisabled: isBusy,
-				attributes: [h.OnClick(Message.ClickedUnlink())],
-			},
-			[icon(h, "XmarkIcon")],
+		gatedBy(h, canRespond, "incidents:respond", (isLocked) =>
+			iconButton(
+				h,
+				{
+					label: "Unlink issue",
+					isDisabled: isLocked || isBusy,
+					attributes: [h.OnClick(Message.ClickedUnlink())],
+				},
+				[icon(h, "XmarkIcon")],
+			),
 		),
 	])
 
@@ -106,6 +112,8 @@ export const linkedIssueCard = (
 	model: Model,
 	incident: AnomalyIncidentDocument,
 	isBusy: boolean,
+	/** The viewer may link, relink and unlink an issue (`incidents:respond`). */
+	canRespond: boolean,
 ): Html => {
 	const issueId = incident.errorIssueId
 	if (issueId === null)
@@ -119,11 +127,16 @@ export const linkedIssueCard = (
 							typography(h, { size: "sm", tone: "foreground", as: "p" }, [
 								"Not linked to an issue",
 							]),
-							typography(h, { size: "xs", tone: "muted", as: "p" }, [
-								incident.signalType === "error_spike"
-									? "This frequency increase is fingerprint-scoped, so an issue with this fingerprint may already exist for the service."
-									: "Escalate this anomaly by linking it to an existing error issue.",
-							]),
+							// The second line is an instruction, so it is left off for who cannot link.
+							...(incident.signalType === "error_spike" || canRespond
+								? [
+										typography(h, { size: "xs", tone: "muted", as: "p" }, [
+											incident.signalType === "error_spike"
+												? "This frequency increase is fingerprint-scoped, so an issue with this fingerprint may already exist for the service."
+												: "Escalate this anomaly by linking it to an existing error issue.",
+										]),
+									]
+								: []),
 							...(incident.fingerprintHash === null
 								? []
 								: [
@@ -138,15 +151,17 @@ export const linkedIssueCard = (
 									]),
 						],
 					),
-					button(
-						h,
-						{
-							size: "sm",
-							variant: "outline",
-							isDisabled: isBusy,
-							attributes: [h.OnClick(Message.ClickedLinkIssue())],
-						},
-						[icon(h, "LinkIcon"), "Link issue"],
+					gatedBy(h, canRespond, "incidents:respond", (isLocked) =>
+						button(
+							h,
+							{
+								size: "sm",
+								variant: "outline",
+								isDisabled: isLocked || isBusy,
+								attributes: [h.OnClick(Message.ClickedLinkIssue())],
+							},
+							[icon(h, "LinkIcon"), "Link issue"],
+						),
 					),
 				]),
 			],
@@ -167,7 +182,7 @@ export const linkedIssueCard = (
 				h.code([h.Class(typographyClass({ size: "xs", mono: true }))], [shortIssueId(id)]),
 				". Couldn't load its details.",
 			]),
-			cardActions(h, id, isBusy),
+			cardActions(h, id, isBusy, canRespond),
 		])
 	}
 	function loadedIssue(wire: Parameters<typeof errorIssueFromV2>[0]): Html {
@@ -195,8 +210,11 @@ export const linkedIssueCard = (
 							[shortIssueId(issue.id)],
 						),
 						badge(h, { variant: "meta", pill: true, size: "sm", className: META_CHIP_CLASS }, [
-							serviceDot(h, { serviceName: issue.serviceName, size: "sm" }),
-							h.span([h.Class("max-w-[140px] truncate")], [issue.serviceName]),
+							serviceLabel(h, {
+								serviceName: issue.serviceName,
+								dot: "sm",
+								className: "max-w-[140px]",
+							}),
 						]),
 					]),
 					typography(
@@ -234,7 +252,7 @@ export const linkedIssueCard = (
 					]),
 				],
 			),
-			cardActions(h, issue.id, isBusy),
+			cardActions(h, issue.id, isBusy, canRespond),
 		])
 	}
 	return card(h, [cardPanel(h, [content], "space-y-3 p-4 text-sm")])

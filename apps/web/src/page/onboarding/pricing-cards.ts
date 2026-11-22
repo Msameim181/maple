@@ -34,11 +34,14 @@ export const Message = defineMessageUnion({
 	ClickedPlan: { planId: Schema.String },
 	SucceededAttach: { paymentUrl: Schema.NullOr(Schema.String) },
 	FailedAttach: { message: Schema.String },
-	ClickedEnterpriseContact: {},
-	CompletedOpenEnterpriseContact: {},
 	CompletedOpenCheckout: {},
 	CompletedTrackCheckoutStarted: {},
 	GotCheckoutReturnMessage: { message: CheckoutReturn.Message },
+	/**
+	 * The customer read shows a plan: a wait on the Stripe return is over. `isReturnUnwaited`: back
+	 * from Stripe with the plan already synced, so no wait ran; the return is recorded all the same.
+	 */
+	SawPlan: { isReturnUnwaited: Schema.Boolean },
 })
 export type Message = typeof Message.Type
 
@@ -49,7 +52,7 @@ export const OutMessage = defineMessageUnion({
 	FailedChangePlan: { message: Schema.String },
 	/** Waiting on the Stripe to Autumn sync: read the customer again. */
 	RequestedCustomerRefresh: {},
-	/** The wait gave up: drop `checkout=complete` from the URL (replace). */
+	/** The wait ended (the plan showed up, or it gave up): drop `checkout=complete` from the URL (replace). */
 	RequestedClearCheckoutMarker: {},
 })
 export type OutMessage = typeof OutMessage.Type
@@ -100,15 +103,8 @@ export const TrackCheckoutStarted = Command.define("TrackCheckoutStarted", {
 		),
 })
 
-const ENTERPRISE_CONTACT_URL = "https://cal.com/david-granzin/30min?overlayCalendar=true"
-
-export const OpenEnterpriseContact = Command.define("OpenEnterpriseContact", {
-	messages: [Message.CompletedOpenEnterpriseContact],
-	execute: Effect.sync(() => {
-		window.open(ENTERPRISE_CONTACT_URL, "_blank", "noopener,noreferrer")
-		return Message.CompletedOpenEnterpriseContact()
-	}),
-})
+/** The founder's booking page, the Enterprise card's link. */
+export const ENTERPRISE_CONTACT_URL = "https://cal.com/david-granzin/30min?overlayCalendar=true"
 
 /**
  * A return from Stripe while the customer is still planless waits on the sync. Once the plan
@@ -179,10 +175,20 @@ export const update = (model: Model, message: Message): UpdateReturn =>
 			model: { ...model, loadingPlanId: null },
 			outMessage: OutMessage.FailedChangePlan({ message: failure }),
 		}),
-		ClickedEnterpriseContact: () => ({ model, commands: [OpenEnterpriseContact()] }),
-		CompletedOpenEnterpriseContact: () => ({ model }),
 		CompletedOpenCheckout: () => ({ model }),
 		CompletedTrackCheckoutStarted: () => ({ model }),
+		SawPlan: ({ isReturnUnwaited }) => {
+			const wait = isReturnUnwaited
+				? CheckoutReturn.arrivedConfirmed()
+				: CheckoutReturn.confirmed(model.checkoutReturn)
+			return wait === null
+				? { model }
+				: {
+						model: { ...model, checkoutReturn: wait.model },
+						commands: Command.mapMessages(wait.commands, checkoutReturnMessage),
+						outMessage: OutMessage.RequestedClearCheckoutMarker(),
+					}
+		},
 		GotCheckoutReturnMessage: ({ message: child }) => {
 			const wait = CheckoutReturn.update(model.checkoutReturn, child)
 			return {

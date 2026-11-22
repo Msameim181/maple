@@ -1,5 +1,6 @@
 import { Array as Arr, Effect, Schema, String as Str } from "effect"
 import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/http"
+import { readBoundedText } from "@maple/backend/http/bounded-body"
 import { Env } from "@maple/backend/platform/Env"
 import {
 	MCP_OAUTH_SCOPE,
@@ -33,14 +34,6 @@ const oauthJson = (body: unknown, status = 200) =>
 const oauthError = (error: string, description: string, status = 400) =>
 	oauthJson({ error, error_description: description }, status)
 
-const appendOAuthError = (error: McpOAuthProtocolError) => {
-	const url = new URL(error.redirectUri!)
-	url.searchParams.set("error", error.error)
-	url.searchParams.set("error_description", error.message)
-	if (error.state) url.searchParams.set("state", error.state)
-	return url.toString()
-}
-
 const metadata = (issuer: string) => ({
 	issuer,
 	authorization_endpoint: `${issuer}/oauth/authorize`,
@@ -62,34 +55,42 @@ const protectedResourceMetadata = (origin: string) => ({
 	resource_documentation: "https://maple.dev/docs/reference/mcp",
 })
 
-const toWebRequest = Effect.fn("McpOAuthRouter.toWebRequest")(function* () {
+/** A registration or token request is a few hundred bytes, and these routes read it before any credential. */
+const OAUTH_MAX_BODY_BYTES = 64 * 1024
+
+const readBody = Effect.fn("McpOAuthRouter.readBody")(function* () {
 	const request = yield* HttpServerRequest.HttpServerRequest
-	return yield* HttpServerRequest.toWeb(request).pipe(
+	return yield* readBoundedText(request, OAUTH_MAX_BODY_BYTES).pipe(
 		Effect.mapError(
-			() => new McpOAuthProtocolError({ error: "invalid_request", message: "Unable to read request" }),
+			(error) =>
+				new McpOAuthProtocolError({
+					error: "invalid_request",
+					message:
+						error._tag === "@maple/backend/http/RequestBodyTooLargeError"
+							? "Request body is too large"
+							: "Unable to read request body",
+				}),
 		),
 	)
 })
 
+const decodeJsonText = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))
+
 const readJson = Effect.fn("McpOAuthRouter.readJson")(function* () {
-	const request = yield* toWebRequest()
-	return yield* Effect.tryPromise({
-		try: () => request.json(),
-		catch: () =>
-			new McpOAuthProtocolError({
-				error: "invalid_request",
-				message: "Request body must be valid JSON",
-			}),
-	})
+	const text = yield* readBody()
+	return yield* decodeJsonText(text).pipe(
+		Effect.mapError(
+			() =>
+				new McpOAuthProtocolError({
+					error: "invalid_request",
+					message: "Request body must be valid JSON",
+				}),
+		),
+	)
 })
 
 const readForm = Effect.fn("McpOAuthRouter.readForm")(function* () {
-	const request = yield* toWebRequest()
-	const text = yield* Effect.tryPromise({
-		try: () => request.text(),
-		catch: () =>
-			new McpOAuthProtocolError({ error: "invalid_request", message: "Unable to read form body" }),
-	})
+	const text = yield* readBody()
 	return new URLSearchParams(text)
 })
 
@@ -101,13 +102,6 @@ const requireFormValue = (form: URLSearchParams, name: string) => {
 }
 
 const protocolResponse = (error: McpOAuthProtocolError) =>
-	Effect.succeed(
-		error.redirectUri
-			? HttpServerResponse.redirect(appendOAuthError(error), { status: 302 })
-			: oauthError(error.error, error.message),
-	)
-
-const tokenProtocolResponse = (error: McpOAuthProtocolError) =>
 	Effect.succeed(oauthError(error.error, error.message))
 
 const rateLimitResponse = (error: McpOAuthRateLimitError) =>
@@ -182,7 +176,7 @@ export const OAuthDiscoveryRouter = HttpRouter.use((router) =>
 				return oauthJson(result, 201)
 			}).pipe(
 				Effect.catchTags({
-					"@maple/backend/errors/McpOAuthProtocolError": tokenProtocolResponse,
+					"@maple/backend/errors/McpOAuthProtocolError": protocolResponse,
 					"@maple/backend/errors/McpOAuthRateLimitError": rateLimitResponse,
 					"@maple/http/errors/McpOAuthPersistenceError": (error) =>
 						Effect.succeed(oauthError("temporarily_unavailable", error.message, 503)),
@@ -266,7 +260,7 @@ export const OAuthDiscoveryRouter = HttpRouter.use((router) =>
 				})
 			}).pipe(
 				Effect.catchTags({
-					"@maple/backend/errors/McpOAuthProtocolError": tokenProtocolResponse,
+					"@maple/backend/errors/McpOAuthProtocolError": protocolResponse,
 					"@maple/backend/errors/McpOAuthRateLimitError": rateLimitResponse,
 					"@maple/http/errors/McpOAuthPersistenceError": (error) =>
 						Effect.succeed(oauthError("temporarily_unavailable", error.message, 503)),
@@ -282,7 +276,7 @@ export const OAuthDiscoveryRouter = HttpRouter.use((router) =>
 				return HttpServerResponse.empty({ status: 200, headers: noStoreHeaders })
 			}).pipe(
 				Effect.catchTags({
-					"@maple/backend/errors/McpOAuthProtocolError": tokenProtocolResponse,
+					"@maple/backend/errors/McpOAuthProtocolError": protocolResponse,
 					"@maple/http/errors/McpOAuthPersistenceError": () =>
 						Effect.succeed(HttpServerResponse.empty({ status: 200, headers: noStoreHeaders })),
 				}),

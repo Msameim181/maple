@@ -8,6 +8,7 @@ import {
 	TenantSchema,
 	UnauthorizedError,
 } from "./current-tenant"
+import { AnalystAccess } from "./analyst-access"
 
 export class CliDeviceStartRequest extends Schema.Class<CliDeviceStartRequest>("CliDeviceStartRequest")({
 	deviceName: Schema.String,
@@ -212,6 +213,16 @@ export class SelfHostedSessionPersistenceError extends Schema.TaggedError<SelfHo
 	{ httpApiStatus: 503 },
 ) {}
 
+/** Too many root-password attempts from one client; `retryAfterSeconds` is also sent as Retry-After. */
+export class SelfHostedLoginRateLimitError extends Schema.TaggedError<SelfHostedLoginRateLimitError>()(
+	"@maple/http/errors/SelfHostedLoginRateLimitError",
+	{
+		message: Schema.String,
+		retryAfterSeconds: Schema.Number,
+	},
+	{ httpApiStatus: 429 },
+) {}
+
 export class PreviewSignInStatusResponse extends Schema.Class<PreviewSignInStatusResponse>(
 	"PreviewSignInStatusResponse",
 )({
@@ -250,7 +261,11 @@ export class AuthPublicApiGroup extends HttpApiGroup.make("authPublic")
 		HttpApiEndpoint.post("login", "/login", {
 			payload: SelfHostedLoginRequest,
 			success: SelfHostedLoginResponse,
-			error: [SelfHostedAuthDisabledError, SelfHostedInvalidPasswordError],
+			error: [
+				SelfHostedAuthDisabledError,
+				SelfHostedInvalidPasswordError,
+				SelfHostedLoginRateLimitError,
+			],
 		}),
 	)
 	.add(
@@ -307,7 +322,7 @@ export class AuthApiGroup extends HttpApiGroup.make("auth")
 		HttpApiEndpoint.post("sessionRefresh", "/session/refresh", {
 			success: SelfHostedLoginResponse,
 			error: [SelfHostedAuthDisabledError, UnauthorizedError],
-		}),
+		}).annotate(AnalystAccess, "personal"),
 	)
 	// Self-hosted OIDC sessions: revoke all of the caller's sessions here and at the IdP.
 	// (`logout` of one session is in `authPublic`: it must accept an idle tab's expired token.)
@@ -315,7 +330,7 @@ export class AuthApiGroup extends HttpApiGroup.make("auth")
 		HttpApiEndpoint.post("logoutAll", "/logout-all", {
 			success: SelfHostedSessionOkResponse,
 			error: [SelfHostedAuthDisabledError, UnauthorizedError, SelfHostedSessionPersistenceError],
-		}),
+		}).annotate(AnalystAccess, "personal"),
 	)
 	.add(
 		HttpApiEndpoint.get("listSessions", "/sessions", {
@@ -327,7 +342,7 @@ export class AuthApiGroup extends HttpApiGroup.make("auth")
 		HttpApiEndpoint.delete("cliSessionRevoke", "/cli/session", {
 			success: CliDeviceActionResponse,
 			error: [CliDeviceConflictError, CliDevicePersistenceError],
-		}),
+		}).annotate(AnalystAccess, "personal"),
 	)
 	.prefix("/api/auth")
 	.middleware(Authorization) {}
@@ -355,7 +370,7 @@ export class AuthSessionApiGroup extends HttpApiGroup.make("authSession")
 				CliDevicePersistenceError,
 				OrganizationAccessDeniedError,
 			],
-		}),
+		}).annotate(AnalystAccess, "personal"),
 	)
 	.add(
 		HttpApiEndpoint.post("cliDeviceDeny", "/cli/device/:userCode/deny", {
@@ -367,7 +382,7 @@ export class AuthSessionApiGroup extends HttpApiGroup.make("authSession")
 				CliDeviceConflictError,
 				CliDevicePersistenceError,
 			],
-		}),
+		}).annotate(AnalystAccess, "personal"),
 	)
 	.add(
 		HttpApiEndpoint.get("mcpOAuthAuthorizationInspect", "/mcp/oauth/authorization/:requestId", {
@@ -391,7 +406,7 @@ export class AuthSessionApiGroup extends HttpApiGroup.make("authSession")
 				McpOAuthPersistenceError,
 				OrganizationAccessDeniedError,
 			],
-		}),
+		}).annotate(AnalystAccess, "personal"),
 	)
 	.add(
 		HttpApiEndpoint.post("mcpOAuthAuthorizationDeny", "/mcp/oauth/authorization/:requestId/deny", {
@@ -403,7 +418,7 @@ export class AuthSessionApiGroup extends HttpApiGroup.make("authSession")
 				McpOAuthAuthorizationConflictError,
 				McpOAuthPersistenceError,
 			],
-		}),
+		}).annotate(AnalystAccess, "personal"),
 	)
 	.prefix("/api/auth")
 	.middleware(SessionAuthorization) {}

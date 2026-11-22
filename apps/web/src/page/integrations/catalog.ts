@@ -12,10 +12,10 @@ export type EntryIcon =
 	| Readonly<{ _tag: "Named"; name: IconName }>
 	| Readonly<{ _tag: "Manifest"; icon: ChatConnectorManifest["icon"] }>
 
-export type IntegrationCategory = "infrastructure" | "code" | "analytics" | "notifications"
+export type IntegrationCategory = "infrastructure" | "code" | "analytics" | "notifications" | "security"
 
 /** What a connection does for Maple: the hub's row chips and filters. */
-export const CAPABILITIES = ["telemetry", "query", "alerts", "analytics"] as const
+export const CAPABILITIES = ["telemetry", "query", "alerts", "analytics", "security"] as const
 export type Capability = (typeof CAPABILITIES)[number]
 
 export const HubFilter = Schema.Literals(["all", ...CAPABILITIES, "attention"])
@@ -27,10 +27,17 @@ export const CAPABILITY_LABEL = {
 	query: { chip: "Query", filter: "Query" },
 	alerts: { chip: "Alerts", filter: "Alerts & chat" },
 	analytics: { chip: "Analytics", filter: "Analytics" },
+	security: { chip: "Security", filter: "Security" },
 } as const satisfies Record<Capability, { readonly chip: string; readonly filter: string }>
 
 export const capabilityOf = (category: IntegrationCategory): Capability =>
-	category === "notifications" ? "alerts" : category === "analytics" ? "analytics" : "telemetry"
+	category === "notifications"
+		? "alerts"
+		: category === "analytics"
+			? "analytics"
+			: category === "security"
+				? "security"
+				: "telemetry"
 
 export interface CatalogEntry {
 	readonly id: IntegrationId
@@ -52,6 +59,7 @@ export const INTEGRATION_CATEGORIES: ReadonlyArray<{
 	{ id: "code", label: "Code & deploys" },
 	{ id: "notifications", label: "Chat & alerts" },
 	{ id: "analytics", label: "Web analytics" },
+	{ id: "security", label: "Security & audit" },
 ]
 
 const named = (name: IconName): EntryIcon => ({ _tag: "Named", name })
@@ -117,6 +125,11 @@ const PROVIDER_COPY = {
 		description:
 			"Authorize your Supabase organization to collect CPU, memory, disk and Postgres metrics for every project.",
 	},
+	vercel: {
+		category: "infrastructure",
+		isNew: true,
+		description: "Paste a Vercel token to drain request logs, traces and AI Gateway usage from a team.",
+	},
 	warpstream: {
 		category: "infrastructure",
 		description: "Monitor WarpStream clusters via agent metrics or the hosted Prometheus endpoint.",
@@ -134,6 +147,12 @@ const PROVIDER_COPY = {
 		category: "analytics",
 		isNew: true,
 		description: "Import the search queries, pages and positions that bring people to your sites.",
+	},
+	fleet: {
+		category: "security",
+		isNew: true,
+		description:
+			"Connect a Fleet server with a read-only API token: its admin activity goes to the audit log, its failing policies and vulnerable software to Security, Devices.",
 	},
 } as const satisfies { readonly [K in ProviderId]: ProviderCopy }
 
@@ -158,10 +177,12 @@ const PROVIDER_ORDER: ReadonlyArray<ProviderId> = [
 	"aws",
 	"railway",
 	"supabase",
+	"vercel",
 	"warpstream",
 	"linear",
 	"github",
 	"google-search-console",
+	"fleet",
 ]
 
 /** A provider's entry; every provider has one. */

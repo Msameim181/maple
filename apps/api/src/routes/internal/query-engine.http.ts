@@ -1,12 +1,18 @@
 // BOUNDARY: This module owns unparsed external values and narrows them before domain use.
 import { HttpApiBuilder } from "effect/http-api"
+import { securityTenant } from "./security-tenant"
 import { mergeSupabaseSeries } from "./supabase-infra-series"
 import { apiTrafficResponse, mergeSupabaseCallers, mergeSupabaseProjects } from "./supabase-insights-merge"
 import {
 	CurrentTenant,
 	MapleInternalApi,
 	RawSqlExecuteResponse,
+	PromqlDiscoverResponse,
+	PromqlExecuteResponse,
+	QueryEngineValidationError,
 	SpanHierarchyResponse,
+	ProfileSampleTypesResponse,
+	ProfileStacksResponse,
 	SpanDetailResponse,
 	TraceSpanEventsResponse,
 	ErrorsByTypeResponse,
@@ -20,6 +26,17 @@ import {
 	ServiceApdexResponse,
 	PlanetScaleInfraTimeseriesResponse,
 	RailwayInfraRowsResponse,
+	VercelAiGatewayResponse,
+	VercelInfraDependenciesResponse,
+	VercelInfraFunctionsResponse,
+	VercelInfraFunctionTimeseriesResponse,
+	VercelInfraProjectDetailResponse,
+	VercelInfraProjectsResponse,
+	VercelInfraRequestTimeseriesResponse,
+	VercelInfraLatencyTimeseriesResponse,
+	VercelInfraBreakdownResponse,
+	VercelSpeedInsightsResponse,
+	VercelWebAnalyticsResponse,
 	SupabaseInfraRowsResponse,
 	SupabaseApiPath,
 	SupabaseApiTopPathsResponse,
@@ -52,9 +69,9 @@ import {
 	ServiceDbQuerySummaryResponse,
 	ServiceDetailOverviewResponse,
 	ReleasesListResponse,
+	ServiceDeploysResponse,
 	UptimeChecksResponse,
 	UptimePhaseTimingsResponse,
-	ReleaseDetailResponse,
 	type ReleaseRow,
 	ServiceDependenciesBundleResponse,
 	ServiceMapBundleResponse,
@@ -119,8 +136,11 @@ import {
 	SearchConsoleTimeseriesResponse,
 	SearchConsoleTopPagesResponse,
 	SearchConsoleTopQueriesResponse,
+	CostBreakdownResponse,
+	CostSourcesResponse,
+	CostTimeseriesResponse,
+	CostTotalsResponse,
 	CommitSha,
-	FingerprintHash,
 	SpanName,
 	StatusCode,
 	type TenantContext,
@@ -132,6 +152,7 @@ import { isAiContentFormat } from "@maple/domain/ai-traffic"
 import { DateTime, Duration, Effect, Option, Order, Schema, Array as Arr } from "effect"
 import { QueryEngineService } from "@maple/backend/services/warehouse/QueryEngineService"
 import {
+	isMissingAwsMetricsHourly,
 	isMissingProductEvents,
 	isMissingServiceEndpointDetails,
 	isMissingServiceMapDbEdgesMinutely,
@@ -139,11 +160,13 @@ import {
 import type { QueryEngineDirectError } from "@maple/query-engine/runtime"
 import { makeRunAuditedRawSql } from "@maple/backend/services/warehouse/audited-raw-sql"
 import { WarehouseQueryService } from "@maple/backend/services/warehouse/WarehouseQueryService"
+import { PromqlQueryService } from "@maple/backend/services/promql/PromqlQueryService"
 import {
 	alignServiceApiBucketSeconds,
 	CH,
 	formatWarehouseDateTime,
 	parseSpanEvents,
+	parseWarehouseDateTime,
 } from "@maple/query-engine"
 import { QueryEngineExecuteBatchResponse } from "@maple/domain/query-engine"
 
@@ -168,6 +191,9 @@ import {
 	withServiceApiFallback,
 } from "@maple/backend/queries/dashboard-reads"
 import { makeSearchConsoleReads } from "@maple/backend/queries/search-console-reads"
+import { makeCostReads } from "@maple/backend/queries/cost-reads"
+import { makeProfileReads } from "@maple/backend/queries/profile-reads"
+import { Database } from "@maple/backend/platform/DatabaseLive"
 import { runQueryEngineBatch } from "@/routes/query-engine-batch"
 import { RuntimeAdvisoryCatalog } from "@maple/backend/services/security/RuntimeAdvisoryCatalog"
 import { RuntimeReleaseCatalog } from "@maple/backend/services/security/RuntimeReleaseCatalog"
@@ -189,6 +215,11 @@ import { makeServeRows, serveData } from "./serve-rows"
 const withProductEventsFallback = makeRollupFallback(
 	isMissingProductEvents,
 	"product_events is absent on this cluster; reading raw session_events. Apply ClickHouse schema to restore the fast path.",
+)
+
+const withAwsMetricsHourlyFallback = makeRollupFallback(
+	isMissingAwsMetricsHourly,
+	"aws_metrics_hourly is absent on this cluster; reading raw AWS metric points. Apply ClickHouse schema to restore the fast path.",
 )
 
 const withDbEdgesMinutelyFallback = makeRollupFallback(
@@ -243,7 +274,6 @@ const toServiceApiBucket = (row: CH.ServiceApiTimeseriesOutput) => ({
 })
 
 const decodeSpanName = Schema.decodeUnknownSync(SpanName)
-const decodeFingerprintHash = Schema.decodeUnknownSync(FingerprintHash)
 const decodeCommitSha = Schema.decodeUnknownSync(CommitSha)
 
 // Warehouse stores span status in Title Case (Ok/Error/Unset). Coerce any
@@ -266,18 +296,20 @@ const toServicePlatformRow = (row: CH.ServicePlatformsOutput) => {
 	// Host infrastructure takes precedence over SDK self-report. Google Cloud's
 	// detector sets `faas.name` on Cloud Run and Cloud Functions, so it is checked
 	// before the Lambda rule.
-	const platform: "kubernetes" | "cloudflare" | "gcp" | "lambda" | "web" | "unknown" =
+	const platform: "kubernetes" | "cloudflare" | "gcp" | "vercel" | "lambda" | "web" | "unknown" =
 		cloudPlatform === "cloudflare.workers" || cloudProvider === "cloudflare"
 			? "cloudflare"
 			: cloudProvider === "gcp"
 				? "gcp"
-				: faasName !== "" || cloudPlatform === "aws_lambda"
-					? "lambda"
-					: isKubernetes
-						? "kubernetes"
-						: mapleSdkType === "client"
-							? "web"
-							: "unknown"
+				: cloudProvider === "vercel"
+					? "vercel"
+					: faasName !== "" || cloudPlatform === "aws_lambda"
+						? "lambda"
+						: isKubernetes
+							? "kubernetes"
+							: mapleSdkType === "client"
+								? "web"
+								: "unknown"
 	return {
 		serviceName: decodeServiceName(row.serviceName),
 		platform,
@@ -309,11 +341,17 @@ const toReleaseRow = (row: CH.ReleasesListOutput): ReleaseRow => {
 	}
 }
 
-const toReleaseTimelinePoint = (row: CH.ReleasesTimelineOutput) => ({
-	bucket: DateTime.formatIso(row.bucket),
+const toDeployVerificationRow = (row: CH.ReleaseVerificationOutput) => ({
 	serviceName: decodeServiceName(row.serviceName),
+	environment: row.environment,
 	commitSha: decodeCommitSha(row.commitSha),
-	count: row.count,
+	firstSeen: DateTime.formatIso(row.firstSeen),
+	afterSpans: row.afterSpans,
+	afterErrors: row.afterErrors,
+	afterP95Ms: row.afterP95Ms,
+	beforeSpans: row.beforeSpans,
+	beforeErrors: row.beforeErrors,
+	beforeP95Ms: row.beforeP95Ms,
 })
 
 const toServiceWorkloadRow = (row: CH.ServiceWorkloadsOutput) => ({
@@ -340,12 +378,16 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 	Effect.gen(function* () {
 		const queryEngine = yield* QueryEngineService
 		const warehouse = yield* WarehouseQueryService
+		const promql = yield* PromqlQueryService
 		const runtimeReleases = yield* RuntimeReleaseCatalog
 		const runtimeAdvisories = yield* RuntimeAdvisoryCatalog
 		const reads = makeDashboardReads({ warehouse, queryEngine })
 		const { runQuery, runQueryFirst } = reads
 		const serve = makeServeRows(runQuery, runQueryFirst)
 		const searchConsole = makeSearchConsoleReads({ warehouse, queryEngine })
+		const database = yield* Database
+		const cost = makeCostReads({ warehouse, queryEngine, database })
+		const profiles = makeProfileReads({ warehouse, queryEngine })
 
 		const dbEdgesWithinBudget = <A, P, E extends QueryEngineDirectError, R>(
 			rollup: (tenant: TenantContext, payload: P) => Effect.Effect<ReadonlyArray<A>, E, R>,
@@ -715,7 +757,15 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 						})
 					}),
 				)
-				.handle("awsInfraMetrics", serve.rows(Queries.awsInfraMetrics, AwsInfraMetricsResponse))
+				.handle(
+					"awsInfraMetrics",
+					serve.fallbackRows(
+						withAwsMetricsHourlyFallback,
+						Queries.awsInfraMetrics,
+						Queries.awsInfraMetricsRaw,
+						AwsInfraMetricsResponse,
+					),
+				)
 				.handle(
 					"awsInfraSparklines",
 					serve.rows(Queries.awsInfraSparklines, AwsInfraSparklinesResponse),
@@ -723,6 +773,258 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 				.handle(
 					"awsInfraTimeseries",
 					serve.rows(Queries.awsInfraTimeseries, AwsInfraTimeseriesResponse),
+				)
+				.handle("vercelInfraProjects", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* warehouse.warmRoute(tenant)
+						const [requestRows, latencyRows, functionRows] = yield* Effect.all(
+							[
+								runQuery(Queries.vercelInfraProjectRequests, tenant, payload),
+								runQuery(Queries.vercelInfraProjectLatency, tenant, payload),
+								runQuery(Queries.vercelInfraProjectFunctions, tenant, payload),
+							],
+							{ concurrency: 3 },
+						)
+						const latencyByProject = new Map(Arr.map(latencyRows, (row) => [row.projectId, row]))
+						const functionsByProject = new Map(
+							Arr.map(functionRows, (row) => [row.projectId, row]),
+						)
+						const functionUsage = (projectId: string) => ({
+							invocations: functionsByProject.get(projectId)?.invocations ?? 0,
+							coldStarts: functionsByProject.get(projectId)?.coldStarts ?? 0,
+						})
+						const withLogs = new Set(Arr.map(requestRows, (row) => row.projectId))
+						const withLatency = new Set(Arr.map(latencyRows, (row) => row.projectId))
+						// Projects that only send traces: the logs drain is off, or not delivering.
+						const tracesOnly = (row: {
+							projectId: string
+							serviceName: string
+							lastSeen: DateTime.Utc
+						}) => ({
+							projectId: row.projectId,
+							projectName: "",
+							// The project's own service, which ingest gives its invocations; the edge's otherwise.
+							serviceName:
+								functionsByProject.get(row.projectId)?.serviceName || row.serviceName,
+							requests: 0,
+							requests4xx: 0,
+							requests5xx: 0,
+							cacheHits: 0,
+							cacheLookups: 0,
+							errorLogs: 0,
+							lastSeen: DateTime.formatIso(row.lastSeen),
+							...functionUsage(row.projectId),
+						})
+						return new VercelInfraProjectsResponse({
+							projects: [
+								...Arr.map(requestRows, (row) => {
+									const latency = latencyByProject.get(row.projectId)
+									return {
+										...row,
+										lastSeen: DateTime.formatIso(row.lastSeen),
+										p50DurationMs: latency?.p50DurationMs ?? null,
+										p95DurationMs: latency?.p95DurationMs ?? null,
+										...functionUsage(row.projectId),
+									}
+								}),
+								...Arr.map(
+									Arr.filter(latencyRows, (row) => !withLogs.has(row.projectId)),
+									(row) => ({
+										...tracesOnly(row),
+										p50DurationMs: row.p50DurationMs,
+										p95DurationMs: row.p95DurationMs,
+									}),
+								),
+								...Arr.map(
+									Arr.filter(
+										functionRows,
+										(row) =>
+											!withLogs.has(row.projectId) && !withLatency.has(row.projectId),
+									),
+									(row) => ({
+										...tracesOnly(row),
+										p50DurationMs: null,
+										p95DurationMs: null,
+									}),
+								),
+							],
+						})
+					}),
+				)
+				.handle("vercelInfraRequestTimeseries", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const buckets = yield* runQuery(Queries.vercelInfraRequestTimeseries, tenant, payload)
+						return new VercelInfraRequestTimeseriesResponse({ buckets })
+					}),
+				)
+				.handle("vercelInfraLatencyTimeseries", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* warehouse.warmRoute(tenant)
+						const [edge, functions] = yield* Effect.all(
+							[
+								runQuery(Queries.vercelInfraEdgeLatencyTimeseries, tenant, payload),
+								runQuery(Queries.vercelInfraFunctionTimeseries, tenant, payload),
+							],
+							{ concurrency: 2 },
+						)
+						const edgeByBucket = new Map(Arr.map(edge, (row) => [row.bucket, row] as const))
+						const functionsByBucket = new Map(
+							Arr.map(functions, (row) => [row.bucket, row] as const),
+						)
+						const buckets = Arr.sort(
+							[...new Set([...edgeByBucket.keys(), ...functionsByBucket.keys()])],
+							Order.String,
+						)
+						return new VercelInfraLatencyTimeseriesResponse({
+							buckets: Arr.map(buckets, (bucket) => {
+								const e = edgeByBucket.get(bucket)
+								const f = functionsByBucket.get(bucket)
+								const invocations = f?.invocations ?? 0
+								return {
+									bucket,
+									edgeP50Ms: e?.p50DurationMs ?? null,
+									edgeP95Ms: e?.p95DurationMs ?? null,
+									invocations,
+									coldStarts: f?.coldStarts ?? 0,
+									invokeP50Ms: invocations > 0 ? (f?.invokeP50Ms ?? null) : null,
+									invokeP95Ms: invocations > 0 ? (f?.invokeP95Ms ?? null) : null,
+								}
+							}),
+						})
+					}),
+				)
+				.handle("vercelInfraBreakdown", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const rows = yield* runQuery(Queries.vercelInfraBreakdown, tenant, payload)
+						return new VercelInfraBreakdownResponse({ rows })
+					}),
+				)
+				.handle("vercelInfraProjectDetail", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* warehouse.warmRoute(tenant)
+						const [paths, errorLogs] = yield* Effect.all(
+							[
+								runQuery(Queries.vercelInfraTopPaths, tenant, payload),
+								runQuery(Queries.vercelInfraErrorLogs, tenant, payload),
+							],
+							{ concurrency: 2 },
+						)
+						const patterns = Integrations.clusterVercelErrorLogs(
+							Arr.map(errorLogs, (row) => ({
+								...row,
+								timestamp: DateTime.formatIso(row.timestamp),
+							})),
+						)
+						return new VercelInfraProjectDetailResponse({
+							paths,
+							errors: Arr.map(patterns, (pattern) => ({
+								...pattern,
+								search: Integrations.errorPatternSearch(pattern.pattern),
+							})),
+							errorLogsSampled: errorLogs.length,
+							errorLogsCapped: errorLogs.length >= Integrations.VERCEL_ERROR_LOG_SAMPLE,
+						})
+					}),
+				)
+				.handle("vercelAiGateway", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* warehouse.warmRoute(tenant)
+						const [summaryRows, models, projects, timeseries] = yield* Effect.all(
+							[
+								runQuery(Queries.vercelAiGatewaySummary, tenant, payload),
+								runQuery(Queries.vercelAiGatewayByModel, tenant, payload),
+								payload.projectId === undefined
+									? runQuery(Queries.vercelAiGatewayByProject, tenant, payload)
+									: Effect.succeed([]),
+								runQuery(Queries.vercelAiGatewayTimeseries, tenant, payload),
+							],
+							{ concurrency: 4 },
+						)
+						// An aggregate without GROUP BY always returns its one row.
+						const summary = summaryRows[0] ?? {
+							requests: 0,
+							costUsd: 0,
+							inputTokens: 0,
+							outputTokens: 0,
+							errors: 0,
+							p50DurationMs: null,
+							p95DurationMs: null,
+						}
+						return new VercelAiGatewayResponse({ summary, models, projects, timeseries })
+					}),
+				)
+				.handle("vercelInfraFunctions", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const functions = yield* runQuery(Queries.vercelInfraFunctionRoutes, tenant, payload)
+						return new VercelInfraFunctionsResponse({ functions })
+					}),
+				)
+				.handle("vercelInfraFunctionTimeseries", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const buckets = yield* runQuery(Queries.vercelInfraRouteTimeseries, tenant, payload)
+						return new VercelInfraFunctionTimeseriesResponse({ buckets })
+					}),
+				)
+				.handle("vercelInfraDependencies", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const dependencies = yield* runQuery(Queries.vercelInfraDependencies, tenant, payload)
+						return new VercelInfraDependenciesResponse({ dependencies })
+					}),
+				)
+				.handle("vercelSpeedInsights", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* warehouse.warmRoute(tenant)
+						// Route and device breakdowns only for one project: across projects they mix sites.
+						const scoped = payload.projectId !== undefined
+						const [metrics, routes, devices] = yield* Effect.all(
+							[
+								runQuery(Queries.vercelSpeedInsightsMetrics, tenant, payload),
+								scoped
+									? runQuery(Queries.vercelSpeedInsightsRoutes, tenant, payload)
+									: Effect.succeed([]),
+								scoped
+									? runQuery(Queries.vercelSpeedInsightsDevices, tenant, payload)
+									: Effect.succeed([]),
+							],
+							{ concurrency: 3 },
+						)
+						return new VercelSpeedInsightsResponse({ metrics, routes, devices })
+					}),
+				)
+				.handle("vercelWebAnalytics", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						yield* warehouse.warmRoute(tenant)
+						const [summaryRows, pages, referrers, countries, events] = yield* Effect.all(
+							[
+								runQuery(Queries.vercelWebAnalyticsSummary, tenant, payload),
+								runQuery(Queries.vercelWebAnalyticsPages, tenant, payload),
+								runQuery(Queries.vercelWebAnalyticsReferrers, tenant, payload),
+								runQuery(Queries.vercelWebAnalyticsCountries, tenant, payload),
+								runQuery(Queries.vercelWebAnalyticsEvents, tenant, payload),
+							],
+							{ concurrency: 5 },
+						)
+						// An aggregate without GROUP BY always returns its one row.
+						const summary = summaryRows[0] ?? { pageViews: 0, uniqueDevices: 0, customEvents: 0 }
+						return new VercelWebAnalyticsResponse({
+							summary,
+							pages,
+							referrers,
+							countries,
+							events,
+						})
+					}),
 				)
 				.handle("gcpInfraPresence", ({ payload }) =>
 					Effect.gen(function* () {
@@ -1098,22 +1400,36 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 						})
 					}),
 				)
+				.handle("serviceDeploys", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						// A commit alone would read every service's minutes: bound it to the ones it reached.
+						const commitSha = payload.commitSha
+						const reached =
+							payload.serviceName !== undefined || commitSha === undefined
+								? undefined
+								: yield* runQuery(Queries.commitServices, tenant, { ...payload, commitSha })
+						const serviceNames =
+							reached === undefined ? undefined : Arr.map(reached, (row) => row.serviceName)
+						const rows =
+							serviceNames !== undefined && serviceNames.length === 0
+								? []
+								: yield* runQuery(Queries.serviceDeploys, tenant, {
+										...payload,
+										serviceNames,
+									})
+						return new ServiceDeploysResponse({
+							deploys: Arr.map(rows, toDeployVerificationRow),
+							verifyWindowSeconds: CH.DEPLOY_VERIFY_WINDOW_SECONDS,
+						})
+					}),
+				)
 				.handle("releasesList", ({ payload }) =>
 					Effect.gen(function* () {
 						const tenant = yield* CurrentTenant.Context
-						// One Worker invocation for the page: the per-commit rows and the
-						// swimlane timeline share a config resolution and run concurrently.
-						yield* warehouse.warmRoute(tenant)
-						const [rows, timelineRows] = yield* Effect.all(
-							[
-								runQuery(Queries.releasesList, tenant, payload),
-								runQuery(Queries.releasesTimeline, tenant, payload),
-							],
-							{ concurrency: 2 },
-						)
+						const rows = yield* runQuery(Queries.releasesList, tenant, payload)
 						return new ReleasesListResponse({
 							releases: Arr.map(rows, toReleaseRow),
-							timeline: Arr.map(timelineRows, toReleaseTimelinePoint),
 							truncated: rows.length >= CH.RELEASES_LIST_CAP,
 						})
 					}),
@@ -1141,6 +1457,7 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 								durationMs: row.durationMs,
 								ok: row.status !== "Error",
 								statusCode: row.httpStatus > 0 ? row.httpStatus : null,
+								error: row.status === "Error" && row.error !== "" ? row.error : null,
 								phases:
 									row.timed === 1
 										? {
@@ -1151,34 +1468,6 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 												transferMs: row.transferMs,
 											}
 										: null,
-							})),
-						})
-					}),
-				)
-				.handle("releaseDetail", ({ payload }) =>
-					Effect.gen(function* () {
-						const tenant = yield* CurrentTenant.Context
-						yield* warehouse.warmRoute(tenant)
-						const [versionRows, timelineRows, timeseries, baselineTimeseries, fingerprintRows] =
-							yield* Effect.all(
-								[
-									runQuery(Queries.releaseVersions, tenant, payload),
-									runQuery(Queries.releaseTimeline, tenant, payload),
-									queryEngine.execute(tenant, payload.timeseries),
-									queryEngine.execute(tenant, payload.baselineTimeseries),
-									runQuery(Queries.releaseErrorFingerprints, tenant, payload),
-								],
-								{ concurrency: 5 },
-							)
-						return new ReleaseDetailResponse({
-							versions: Arr.map(versionRows, toReleaseRow),
-							timeline: Arr.map(timelineRows, toReleaseTimelinePoint),
-							timeseries,
-							baselineTimeseries,
-							errorFingerprints: Arr.map(fingerprintRows, (row) => ({
-								fingerprintHash: decodeFingerprintHash(row.fingerprintHash),
-								count: row.count,
-								firstSeen: DateTime.formatIso(row.firstSeen),
 							})),
 						})
 					}),
@@ -1361,6 +1650,14 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 						return new ServiceRuntimesResponse({
 							data: toServiceRuntimeRows(rows, payload.services),
 						})
+					}),
+				)
+				.handle("profileSampleTypes", serveData(profiles.sampleTypes, ProfileSampleTypesResponse))
+				.handle("profileStacks", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const read = yield* profiles.stacks(tenant, payload)
+						return new ProfileStacksResponse(read)
 					}),
 				)
 				.handle("serviceUsage", serve.rows(Queries.serviceUsage, ServiceUsageResponse))
@@ -2236,10 +2533,38 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 					"searchConsoleLandingPages",
 					serveData(searchConsole.landingPages, SearchConsoleLandingPagesResponse),
 				)
+				.handle("costTotals", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const data = yield* cost.totals(tenant, payload)
+						return new CostTotalsResponse(data)
+					}),
+				)
+				.handle("costTimeseries", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const data = yield* cost.timeseries(tenant, payload)
+						return new CostTimeseriesResponse(data)
+					}),
+				)
+				.handle("costBreakdown", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const data = yield* cost.breakdown(tenant, payload)
+						return new CostBreakdownResponse(data)
+					}),
+				)
+				.handle("costSources", () =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const data = yield* cost.sources(tenant)
+						return new CostSourcesResponse(data)
+					}),
+				)
 				// No raw fallback, like the crawler tab: a cluster without migration 0050 answers 502.
 				.handle("securityExposure", ({ payload }) =>
 					Effect.gen(function* () {
-						const tenant = yield* CurrentTenant.Context
+						const tenant = yield* securityTenant
 						yield* warehouse.warmRoute(tenant)
 						const [signatures, exposed, sources, timeline] = yield* Effect.all(
 							[
@@ -2256,6 +2581,7 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 									signature: row.signature,
 									service: row.service,
 									requests: row.requests,
+									inPath: row.inPath,
 									answered: row.answered,
 									sources: row.sources,
 									lastSeen: DateTime.formatIso(row.lastSeen),
@@ -2291,7 +2617,7 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 				)
 				.handle("securityRuntimes", ({ payload }) =>
 					Effect.gen(function* () {
-						const tenant = yield* CurrentTenant.Context
+						const tenant = yield* securityTenant
 						yield* warehouse.warmRoute(tenant)
 						const rows = yield* runQuery(Queries.runtimeVersions, tenant, payload)
 						const products = Arr.flatMap(rows, (row): ReadonlyArray<RuntimeProduct> => {
@@ -2393,6 +2719,98 @@ export const HttpQueryEngineLive = HttpApiBuilder.group(MapleInternalApi, "query
 				.handle(
 					"productEventTraceSamples",
 					serve.rows(Queries.productEventTraceSamples, ProductEventTraceSamplesResponse),
+				)
+				.handle("executePromql", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const result = yield* mapExecError(
+							promql.widget(tenant, {
+								query: payload.query,
+								startTime: payload.startTime,
+								endTime: payload.endTime,
+								...(payload.legendFormat === undefined
+									? undefined
+									: { legendFormat: payload.legendFormat }),
+								...(payload.minStepSeconds === undefined
+									? undefined
+									: { minStepSeconds: payload.minStepSeconds }),
+								...(payload.maxDataPoints === undefined
+									? undefined
+									: { maxDataPoints: payload.maxDataPoints }),
+								...(payload.displayType === undefined
+									? undefined
+									: { displayType: payload.displayType }),
+							}),
+							"promql query failed",
+						).pipe(
+							// A query that does not parse or cannot run is the author's to fix: a 400 with the reason.
+							Effect.catchTags({
+								"@maple/backend/promql/PromqlBadQueryError": (error) =>
+									Effect.fail(
+										new QueryEngineValidationError({
+											message: `Invalid PromQL: ${error.message}`,
+											details:
+												error.position === undefined
+													? []
+													: [`position ${error.position}`],
+										}),
+									),
+								"@maple/backend/promql/PromqlExecutionError": (error) =>
+									Effect.fail(
+										new QueryEngineValidationError({
+											message: error.message,
+											details: [],
+										}),
+									),
+							}),
+						)
+						return new PromqlExecuteResponse({
+							data: result.rows,
+							meta: {
+								resultType: result.resultType,
+								seriesCount: result.seriesCount,
+								stepSeconds: result.stepSeconds,
+								...(result.warnings.length === 0 ? undefined : { warnings: result.warnings }),
+							},
+						})
+					}),
+				)
+				// The PromQL editor's autocomplete: label names, or one label's values (`__name__`: metrics).
+				.handle("discoverPromql", ({ payload }) =>
+					Effect.gen(function* () {
+						const tenant = yield* CurrentTenant.Context
+						const query = {
+							startMs: parseWarehouseDateTime(payload.startTime),
+							endMs: parseWarehouseDateTime(payload.endTime),
+							matches: payload.match === undefined ? [] : [payload.match],
+							limit: payload.limit ?? 500,
+						}
+						const data = yield* mapExecError(
+							(payload.label === undefined
+								? promql.labelNames(tenant, query)
+								: promql.labelValues(tenant, { ...query, name: payload.label })
+							).pipe(Effect.map((answer) => answer.data)),
+							"promql discovery failed",
+						).pipe(
+							Effect.catchTags({
+								"@maple/backend/promql/PromqlBadQueryError": (error) =>
+									Effect.fail(
+										new QueryEngineValidationError({
+											message: `Invalid PromQL: ${error.message}`,
+											details: [],
+										}),
+									),
+								"@maple/backend/promql/PromqlExecutionError": (error) =>
+									Effect.fail(
+										new QueryEngineValidationError({
+											message: error.message,
+											details: [],
+										}),
+									),
+							}),
+						)
+						return new PromqlDiscoverResponse({ data })
+					}),
 				)
 				.handle("executeRawSql", ({ payload }) =>
 					Effect.gen(function* () {

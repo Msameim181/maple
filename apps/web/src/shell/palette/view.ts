@@ -16,6 +16,7 @@ import { kbd } from "@maple/views/ui/display"
 import { icon } from "@maple/views/ui/icon"
 import { manifestGlyph } from "@maple/views/ui/manifest-glyph"
 import { serviceDot } from "@maple/views/ui/values"
+import type { NavAudience } from "../nav"
 import { type Glyph, groupEntries, type PaletteEntry } from "./entries"
 import { Message, type Model } from "./model"
 import { type Context, shownEntries } from "./update"
@@ -24,15 +25,19 @@ import { hstack, hstackClass } from "@maple/views/ui/stack"
 import { Array as Arr } from "effect"
 
 /**
- * Layout-free wrapper: group labels take the sidebar's uppercase tracked style, and a short scroll
+ * Layout-free wrapper: group labels take the sidebar's group label style, and a short scroll
  * fade keeps the last visible row from reading as disabled.
  */
 const PALETTE_LIST_CLASS =
-	"contents [&_[data-slot=command-group-label]]:text-2xs [&_[data-slot=command-group-label]]:font-semibold [&_[data-slot=command-group-label]]:uppercase [&_[data-slot=command-group-label]]:tracking-overline [&_[data-slot=scroll-area-viewport]]:[--fade-size:0.5rem]"
+	"contents [&_[data-slot=command-group-label]]:text-xs [&_[data-slot=command-group-label]]:font-medium [&_[data-slot=scroll-area-viewport]]:[--fade-size:0.5rem]"
 
 // The command palette's popup: the input, the grouped entries (or "No results"), the footer hints.
 
-export type ViewInputs = Readonly<{ context: Context; visibleFlagged: ReadonlyArray<string> }>
+export type ViewInputs = Readonly<{
+	context: Context
+	visibleFlagged: ReadonlyArray<string>
+	audience: NavAudience
+}>
 
 const GLYPH_CLASS = "shrink-0 text-muted-foreground"
 
@@ -81,10 +86,10 @@ export const paletteView = <M>(
 	const toList = (message: Combobox.Message) =>
 		toMessage(
 			message._tag === "PressedInputKey" && message.key === "Enter"
-				? Message.PressedEnter({ visibleFlagged: inputs.visibleFlagged })
+				? Message.PressedEnter({ visibleFlagged: inputs.visibleFlagged, audience: inputs.audience })
 				: Message.GotListMessage({ message }),
 		)
-	const shown = shownEntries(model, inputs.context, inputs.visibleFlagged)
+	const shown = shownEntries(model, inputs.context, inputs.visibleFlagged, inputs.audience)
 	const groups = groupsOf(h, shown.entries)
 	return h.submodel({
 		slotId: "command-palette",

@@ -11,8 +11,10 @@ import {
 	resolveDeploymentEnvironment,
 	resolveRegionAppUrls,
 } from "@maple/infra/cloudflare"
+import { DEFAULT_MAPLE_REGION } from "@maple/domain/organization-regions"
 import { siteBuildMemo } from "@maple/infra/worker-build"
 import { commitSha, plainFrom, selfObservabilityEnv } from "@maple/infra/env"
+import { resolveWorkerEnv } from "@maple/infra/secret-guard"
 import * as Cloudflare from "@alchemy.run/cloudflare"
 import { Effect, Schema } from "effect"
 import { API_PROXY_PREFIX } from "./api-proxy.ts"
@@ -44,7 +46,7 @@ const props = Effect.gen(function* () {
 			// Share previews go over the service binding, which still needs an absolute URL.
 			...(urls.api === "" ? undefined : { MAPLE_API_BASE_URL: urls.api }),
 			API: api,
-			...(yield* selfObservabilityEnv(stage, region)),
+			...(yield* resolveWorkerEnv("web", selfObservabilityEnv(stage, region))),
 			// Client build inputs: a change here rebuilds with no source change.
 			// Same-origin through the proxy where the stage has an app domain.
 			VITE_API_BASE_URL:
@@ -53,17 +55,20 @@ const props = Effect.gen(function* () {
 					: urls.api,
 			VITE_API_PUBLIC_URL: urls.api,
 			VITE_INGEST_URL: urls.ingest,
-			// The app's own telemetry. A preview's gateway knows none of Maple's internal keys.
+			// The app's own telemetry. A preview's gateway knows none of Maple's internal keys, and the
+			// EU gateway does not know the US internal org's: both report to the US, as the EU API does.
 			VITE_MAPLE_SELF_INGEST_URL:
 				stage.kind === "pr"
 					? yield* plainFrom(["VITE_INGEST_URL"], prdOrigin("ingest"))
-					: urls.ingest,
+					: stage.kind === "prd" && region !== DEFAULT_MAPLE_REGION
+						? prdOrigin("ingest")
+						: urls.ingest,
 			VITE_ELECTRIC_SYNC_URL: urls.electricSync,
 			// A `preview:web` stage has no Electric, so its shape proxy can only 503 (as electric-sync's env).
 			...(stage.kind === "pr" && !profile.deploys.electric
 				? { VITE_ELECTRIC_SYNC_DISABLED: "1" }
 				: undefined),
-			// The status Worker's origin for public page links; empty hides them (prd has no domain yet).
+			// The status Worker's origin for public page links; empty hides them (a stage without a status domain).
 			VITE_STATUS_PAGE_BASE_URL: urls.status,
 			// Orgs living in another region are redirected to that region's app.
 			VITE_MAPLE_REGION: region,

@@ -1,5 +1,13 @@
 import type { QueryBuilderQueryDraftPayload } from "@maple/domain/http"
-import { MAX_METRICS_GROUP_BY_KEYS, type MetricsMetric, type QuerySpec } from "@maple/domain/query-engine"
+import {
+	MAX_METRICS_GROUP_BY_KEYS,
+	METRICS_PERCENTILES,
+	type MetricsMetric,
+	type QuerySpec,
+	TRACES_NUMERIC_AGGREGATION_FNS,
+	TRACES_NUMERIC_ATTRIBUTE_KEY_MAX_LENGTH,
+	type TracesNumericAggregationFn,
+} from "@maple/domain/query-engine"
 import {
 	normalizeKey,
 	parseBoolean,
@@ -90,6 +98,11 @@ export interface BuildSpecResult {
 	error: string | null
 }
 
+const METRICS_AGGREGATIONS_PERCENTILES = Arr.map(Rec.keys(METRICS_PERCENTILES), (value) => ({
+	label: value,
+	value,
+}))
+
 export const AGGREGATIONS_BY_SOURCE: Record<
 	QueryBuilderDataSource,
 	Arr.NonEmptyArray<{ label: string; value: string }>
@@ -112,6 +125,7 @@ export const AGGREGATIONS_BY_SOURCE: Record<
 		{ label: "latest", value: "latest" },
 		{ label: "rate", value: "rate" },
 		{ label: "increase", value: "increase" },
+		...METRICS_AGGREGATIONS_PERCENTILES,
 	],
 	// `persons` is the row-local key (UserId, else VisitorId) — no identity
 	// stitching, which is the funnel's job.
@@ -128,15 +142,13 @@ export const AGGREGATIONS_BY_SOURCE: Record<
  * The aggregations legal on traces when `valueField` names a numeric span
  * attribute — a different vocabulary from `AGGREGATIONS_BY_SOURCE.traces`,
  * because the aggregation applies to an arbitrary number rather than to
- * duration. This is the ONLY place bare `p50`/`p95`/`p99` are valid; the
- * duration percentiles are spelled `p95_duration`.
+ * duration. On traces this is the only place bare `p50`/`p95`/`p99` are valid;
+ * the duration percentiles are spelled `p95_duration`.
  *
- * Exported because the MCP schema doc renders it: the instructions resource
- * previously advertised bare `p50`/`p95`/`p99` as *metrics* aggregations, which
- * `buildTimeseriesQuerySpec` hard-errors on. Documenting from the same array the
- * builder enforces is what keeps that from recurring.
+ * Exported because the MCP schema doc renders it: documenting from the same
+ * array the builder enforces keeps the two from drifting.
  */
-export const TRACES_NUMERIC_AGGREGATIONS = ["avg", "sum", "min", "max", "p50", "p95", "p99"] as const
+export const TRACES_NUMERIC_AGGREGATIONS = TRACES_NUMERIC_AGGREGATION_FNS
 
 /**
  * Enforcement sets, derived from the option lists above rather than retyped.
@@ -179,11 +191,12 @@ const METRICS_AGGREGATIONS_GAUGE_LIKE = [
 	{ label: "count", value: "count" },
 ]
 
-// Histograms merge buckets across series; there is no single last sample to read.
-const METRICS_AGGREGATIONS_HISTOGRAM = Arr.filter(
-	METRICS_AGGREGATIONS_GAUGE_LIKE,
-	({ value }) => value !== "latest",
-)
+// Histograms merge buckets across series, so there is no single last sample to read, and
+// percentiles are estimated from the merged buckets. `avg` stays first: it is the default.
+const METRICS_AGGREGATIONS_HISTOGRAM = [
+	...Arr.filter(METRICS_AGGREGATIONS_GAUGE_LIKE, ({ value }) => value !== "latest"),
+	...METRICS_AGGREGATIONS_PERCENTILES,
+]
 
 export function getMetricsAggregations(
 	metricType: QueryBuilderMetricType,
@@ -1495,6 +1508,13 @@ export function buildTimeseriesQuerySpec(query: QueryBuilderQueryDraftPayload): 
 				error: "valueField must reference a span attribute, e.g. attr.result.rowCount",
 			}
 		}
+		if (numericAttributeKey.length > TRACES_NUMERIC_ATTRIBUTE_KEY_MAX_LENGTH) {
+			return {
+				query: null,
+				warnings,
+				error: `valueField attribute key is ${numericAttributeKey.length} characters; the limit is ${TRACES_NUMERIC_ATTRIBUTE_KEY_MAX_LENGTH}`,
+			}
+		}
 
 		const emptyTraces: TracesFilterAccumulator = { attributeFilters: [], resourceAttributeFilters: [] }
 		const filters = Arr.reduce(
@@ -1530,7 +1550,7 @@ export function buildTimeseriesQuerySpec(query: QueryBuilderQueryDraftPayload): 
 					...specFilters,
 					numericAggregation: {
 						key: numericAttributeKey,
-						fn: query.aggregation as "avg" | "sum" | "min" | "max" | "p50" | "p95" | "p99",
+						fn: query.aggregation as TracesNumericAggregationFn,
 					},
 				}
 			: specFilters

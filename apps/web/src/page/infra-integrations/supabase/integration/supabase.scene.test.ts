@@ -12,11 +12,13 @@ import type { Model } from "../../../integrations/model"
 import type { SupabaseProjectRow } from "../model"
 import { init, update } from "../../../integrations/update"
 import { view as pageView } from "../../../integrations/view"
+import { SupabaseMessage } from "./supabase"
 
 const orgId = Schema.decodeSync(OrgId)("org_acme")
 const context: PageContext = { orgId, pinnedNamespace: null, timeZone: "UTC" }
 const pageUpdate = (model: Model, message: Message) => update(model, message, context)
 const view = withViewInputs(pageView, { context })()
+const supabase = (message: SupabaseMessage) => Message.GotSupabaseMessage({ message })
 const names = (commands: ReadonlyArray<{ readonly name: string }> | undefined) =>
 	Arr.map(commands ?? [], ({ name }) => name)
 
@@ -108,10 +110,12 @@ const withMetrics = (rows: ReadonlyArray<SupabaseProjectRow>): Model => {
 	const clocked = pageUpdate(withStatus(status()), Message.CompletedReadClock({ nowMs: NOW })).model
 	return pageUpdate(
 		clocked,
-		Message.CompletedLoadSupabaseMetrics({
-			key: clocked.supabaseCard.metrics.key ?? "",
-			result: Result.succeed(rows),
-		}),
+		supabase(
+			SupabaseMessage.CompletedLoadMetrics({
+				key: clocked.supabaseCard.metrics.key ?? "",
+				result: Result.succeed(rows),
+			}),
+		),
 	).model
 }
 
@@ -203,10 +207,12 @@ describe("supabase card", () => {
 		const clocked = pageUpdate(withStatus(status()), Message.CompletedReadClock({ nowMs: NOW })).model
 		const failed = pageUpdate(
 			clocked,
-			Message.CompletedLoadSupabaseMetrics({
-				key: clocked.supabaseCard.metrics.key ?? "",
-				result: Result.fail(toLoadFailure("boom")),
-			}),
+			supabase(
+				SupabaseMessage.CompletedLoadMetrics({
+					key: clocked.supabaseCard.metrics.key ?? "",
+					result: Result.fail(toLoadFailure("boom")),
+				}),
+			),
 		).model
 		scene(
 			{ update: pageUpdate, view },
@@ -241,7 +247,7 @@ describe("supabase card", () => {
 		)
 		const sent = pageUpdate(
 			withStatus(status()),
-			Message.ToggledSupabaseMetrics({ ref: REF, enabled: false }),
+			supabase(SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: false })),
 		)
 		expect(names(sent.commands)).toEqual(["SetSupabaseProjectMetrics"])
 		scene(
@@ -264,17 +270,27 @@ describe("supabase card", () => {
 	test("a logs switch shares the project's pending write and toasts on failure", () => {
 		const sent = pageUpdate(
 			withStatus(status()),
-			Message.ToggledSupabaseLogs({ ref: REF, enabled: false }),
+			supabase(SupabaseMessage.ToggledSwitch({ kind: "logs", ref: REF, enabled: false })),
 		)
 		expect(names(sent.commands)).toEqual(["SetSupabaseProjectLogs"])
 		expect(
 			names(
-				pageUpdate(sent.model, Message.ToggledSupabaseMetrics({ ref: REF, enabled: false })).commands,
+				pageUpdate(
+					sent.model,
+					supabase(SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: false })),
+				).commands,
 			),
 		).toEqual([])
 		const failed = pageUpdate(
 			sent.model,
-			Message.CompletedSupabaseLogs({ ref: REF, enabled: false, failure: toLoadFailure("boom") }),
+			supabase(
+				SupabaseMessage.CompletedSwitch({
+					kind: "logs",
+					ref: REF,
+					enabled: false,
+					failure: toLoadFailure("boom"),
+				}),
+			),
 		)
 		scene(
 			{ update: pageUpdate, view },
@@ -389,7 +405,7 @@ describe("supabase card", () => {
 	test("a drain switch writes once, shows polling off while it saves, and toasts a plan refusal", () => {
 		const sent = pageUpdate(
 			withStatus(status()),
-			Message.ToggledSupabaseLogDrain({ ref: REF, enabled: true }),
+			supabase(SupabaseMessage.ToggledSwitch({ kind: "drain", ref: REF, enabled: true })),
 		)
 		expect(names(sent.commands)).toEqual(["SetSupabaseProjectLogDrain"])
 		scene(
@@ -402,11 +418,14 @@ describe("supabase card", () => {
 		)
 		const failed = pageUpdate(
 			sent.model,
-			Message.CompletedSupabaseLogDrain({
-				ref: REF,
-				enabled: true,
-				failure: toLoadFailure("Log drains need a Supabase Pro plan or higher."),
-			}),
+			supabase(
+				SupabaseMessage.CompletedSwitch({
+					kind: "drain",
+					ref: REF,
+					enabled: true,
+					failure: toLoadFailure("Log drains need a Supabase Pro plan or higher."),
+				}),
+			),
 		)
 		expect(failed.outMessage).toEqual(
 			PageOutMessage.RequestedToast({
@@ -439,16 +458,24 @@ describe("supabase card", () => {
 
 	test("a metrics switch writes once per project until its answer, then re-reads the status", () => {
 		const model = withStatus(status())
-		const sent = pageUpdate(model, Message.ToggledSupabaseMetrics({ ref: REF, enabled: false }))
+		const sent = pageUpdate(
+			model,
+			supabase(SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: false })),
+		)
 		expect(names(sent.commands)).toEqual(["SetSupabaseProjectMetrics"])
 		expect(
 			names(
-				pageUpdate(sent.model, Message.ToggledSupabaseMetrics({ ref: REF, enabled: false })).commands,
+				pageUpdate(
+					sent.model,
+					supabase(SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: false })),
+				).commands,
 			),
 		).toEqual([])
 		const done = pageUpdate(
 			sent.model,
-			Message.CompletedSupabaseMetrics({ ref: REF, enabled: false, failure: null }),
+			supabase(
+				SupabaseMessage.CompletedSwitch({ kind: "metrics", ref: REF, enabled: false, failure: null }),
+			),
 		)
 		expect(names(done.commands)).toContain("LoadIntegrationsSupabaseStatus")
 		expect(names(done.commands)).toContain("ReadSupabaseClock")
@@ -456,21 +483,28 @@ describe("supabase card", () => {
 
 	test("a settled switch re-reads the metrics rows, so the new rows replace the entry-time verdict", () => {
 		const before = withMetrics([])
-		const sent = pageUpdate(before, Message.ToggledSupabaseMetrics({ ref: REF, enabled: true }))
+		const sent = pageUpdate(
+			before,
+			supabase(SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: true })),
+		)
 		const done = pageUpdate(
 			sent.model,
-			Message.CompletedSupabaseMetrics({ ref: REF, enabled: true, failure: null }),
+			supabase(
+				SupabaseMessage.CompletedSwitch({ kind: "metrics", ref: REF, enabled: true, failure: null }),
+			),
 		)
 		expect(names(done.commands)).toContain("ReadSupabaseClock")
 		// Same clock, same window: the re-read still goes out, superseding the pre-write rows.
-		const clocked = pageUpdate(done.model, Message.CompletedReadSupabaseClock({ nowMs: NOW }))
+		const clocked = pageUpdate(done.model, supabase(SupabaseMessage.CompletedReadClock({ nowMs: NOW })))
 		expect(names(clocked.commands)).toContain("LoadIntegrationsSupabaseMetrics")
 		const reread = pageUpdate(
 			clocked.model,
-			Message.CompletedLoadSupabaseMetrics({
-				key: clocked.model.supabaseCard.metrics.key ?? "",
-				result: Result.succeed([metricsRow(REF)]),
-			}),
+			supabase(
+				SupabaseMessage.CompletedLoadMetrics({
+					key: clocked.model.supabaseCard.metrics.key ?? "",
+					result: Result.succeed([metricsRow(REF)]),
+				}),
+			),
 		).model
 		scene(
 			{ update: pageUpdate, view },
@@ -479,20 +513,30 @@ describe("supabase card", () => {
 			expectView(text("Healthy")).toExist(),
 		)
 		const logs = pageUpdate(
-			pageUpdate(before, Message.ToggledSupabaseLogs({ ref: REF, enabled: false })).model,
-			Message.CompletedSupabaseLogs({ ref: REF, enabled: false, failure: null }),
+			pageUpdate(
+				before,
+				supabase(SupabaseMessage.ToggledSwitch({ kind: "logs", ref: REF, enabled: false })),
+			).model,
+			supabase(
+				SupabaseMessage.CompletedSwitch({ kind: "logs", ref: REF, enabled: false, failure: null }),
+			),
 		)
 		expect(names(logs.commands)).toContain("ReadSupabaseClock")
 	})
 
 	test("a switch toggled long after mount re-reads the hour ending now, not at mount", () => {
 		const later = NOW + 80 * 60_000
-		const sent = pageUpdate(withMetrics([]), Message.ToggledSupabaseMetrics({ ref: REF, enabled: true }))
+		const sent = pageUpdate(
+			withMetrics([]),
+			supabase(SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: true })),
+		)
 		const done = pageUpdate(
 			sent.model,
-			Message.CompletedSupabaseMetrics({ ref: REF, enabled: true, failure: null }),
+			supabase(
+				SupabaseMessage.CompletedSwitch({ kind: "metrics", ref: REF, enabled: true, failure: null }),
+			),
 		)
-		const clocked = pageUpdate(done.model, Message.CompletedReadSupabaseClock({ nowMs: later }))
+		const clocked = pageUpdate(done.model, supabase(SupabaseMessage.CompletedReadClock({ nowMs: later })))
 		const load = Option.getOrUndefined(
 			Arr.findFirst(clocked.commands ?? [], ({ name }) => name === "LoadIntegrationsSupabaseMetrics"),
 		)
@@ -502,10 +546,12 @@ describe("supabase card", () => {
 		})
 		const reread = pageUpdate(
 			clocked.model,
-			Message.CompletedLoadSupabaseMetrics({
-				key: clocked.model.supabaseCard.metrics.key ?? "",
-				result: Result.succeed([metricsRow(REF, { lastSeen: "2026-10-01 13:19:30" })]),
-			}),
+			supabase(
+				SupabaseMessage.CompletedLoadMetrics({
+					key: clocked.model.supabaseCard.metrics.key ?? "",
+					result: Result.succeed([metricsRow(REF, { lastSeen: "2026-10-01 13:19:30" })]),
+				}),
+			),
 		).model
 		scene(
 			{ update: pageUpdate, view },
@@ -516,7 +562,7 @@ describe("supabase card", () => {
 	})
 
 	test("the card's clock tick advances the window, so the rows re-read on the new hour", () => {
-		const ticked = pageUpdate(withMetrics([metricsRow(REF)]), Message.TickedSupabaseClock())
+		const ticked = pageUpdate(withMetrics([metricsRow(REF)]), supabase(SupabaseMessage.TickedClock()))
 		expect(names(ticked.commands)).toEqual(["ReadIntegrationsClock"])
 		const clocked = pageUpdate(ticked.model, Message.CompletedReadClock({ nowMs: NOW + 60_000 }))
 		expect(names(clocked.commands)).toContain("LoadIntegrationsSupabaseMetrics")
@@ -530,16 +576,16 @@ describe("supabase card", () => {
 		)
 		expect(names(connected.commands)).toContain("SyncSupabase")
 		expect(connected.model.supabaseCard.isSyncing).toBe(true)
-		const synced = pageUpdate(connected.model, Message.CompletedSupabaseSync({ failure: null }))
+		const synced = pageUpdate(connected.model, supabase(SupabaseMessage.CompletedSync({ failure: null })))
 		expect(synced.model.supabaseCard.isSyncing).toBe(false)
 		expect(names(synced.commands)).toEqual(["LoadIntegrationsSupabaseStatus"])
 	})
 
 	test("a failed sync toasts and still re-reads the status", () => {
-		const syncing = pageUpdate(withStatus(status()), Message.ClickedSupabaseSync())
+		const syncing = pageUpdate(withStatus(status()), supabase(SupabaseMessage.ClickedSync()))
 		const failed = pageUpdate(
 			syncing.model,
-			Message.CompletedSupabaseSync({ failure: toLoadFailure("boom") }),
+			supabase(SupabaseMessage.CompletedSync({ failure: toLoadFailure("boom") })),
 		)
 		expect(failed.model.supabaseCard.isSyncing).toBe(false)
 		expect(names(failed.commands)).toEqual(["LoadIntegrationsSupabaseStatus"])
@@ -556,7 +602,7 @@ describe("supabase card", () => {
 		const metricsSwitch = role("switch", { name: "Collect metrics for storefront" })
 		const sent = pageUpdate(
 			withStatus(status()),
-			Message.ToggledSupabaseMetrics({ ref: REF, enabled: false }),
+			supabase(SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: false })),
 		)
 		scene(
 			{ update: pageUpdate, view },
@@ -570,7 +616,9 @@ describe("supabase card", () => {
 		)
 		const done = pageUpdate(
 			sent.model,
-			Message.CompletedSupabaseMetrics({ ref: REF, enabled: false, failure: null }),
+			supabase(
+				SupabaseMessage.CompletedSwitch({ kind: "metrics", ref: REF, enabled: false, failure: null }),
+			),
 		)
 		// The write landed but the status still holds the old value: the switch must not bounce back.
 		scene(
@@ -597,10 +645,15 @@ describe("supabase card", () => {
 	test("a status read superseded by the write does not retire the flip", () => {
 		const model = withStatus(status())
 		const staleKey = model.statuses.supabase.key ?? ""
-		const sent = pageUpdate(model, Message.ToggledSupabaseMetrics({ ref: REF, enabled: false }))
+		const sent = pageUpdate(
+			model,
+			supabase(SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: false })),
+		)
 		const done = pageUpdate(
 			sent.model,
-			Message.CompletedSupabaseMetrics({ ref: REF, enabled: false, failure: null }),
+			supabase(
+				SupabaseMessage.CompletedSwitch({ kind: "metrics", ref: REF, enabled: false, failure: null }),
+			),
 		)
 		const stale = pageUpdate(
 			done.model,
@@ -619,11 +672,18 @@ describe("supabase card", () => {
 	test("a failed metrics write frees the switch and toasts", () => {
 		const sent = pageUpdate(
 			withStatus(status()),
-			Message.ToggledSupabaseMetrics({ ref: REF, enabled: true }),
+			supabase(SupabaseMessage.ToggledSwitch({ kind: "metrics", ref: REF, enabled: true })),
 		)
 		const failed = pageUpdate(
 			sent.model,
-			Message.CompletedSupabaseMetrics({ ref: REF, enabled: true, failure: toLoadFailure("boom") }),
+			supabase(
+				SupabaseMessage.CompletedSwitch({
+					kind: "metrics",
+					ref: REF,
+					enabled: true,
+					failure: toLoadFailure("boom"),
+				}),
+			),
 		)
 		scene(
 			{ update: pageUpdate, view },
@@ -641,5 +701,134 @@ describe("supabase card", () => {
 				description: toLoadFailure("boom").message,
 			}),
 		)
+	})
+
+	describe("features across projects", () => {
+		const API_REF = Schema.decodeSync(SupabaseProjectRef)("apiprojectabcdefghij")
+		const project = (ref: string, name: string, overrides: Record<string, unknown> = {}) => ({
+			ref,
+			name,
+			region: "eu-central-1",
+			status: "ACTIVE_HEALTHY",
+			metricsEnabled: false,
+			logDrainEnabled: false,
+			logDrainError: null,
+			logDrainSourceId: null,
+			logDrains: [],
+			logDrainsCheckedAt: null,
+			logsEnabled: false,
+			logsLastPolledAt: null,
+			logsError: null,
+			lastSeenAt: 1_760_000_000_000,
+			...overrides,
+		})
+		const argsOf = (
+			commands: ReadonlyArray<{ readonly name: string; readonly args?: unknown }> | undefined,
+		) => Arr.map(commands ?? [], ({ name, args }) => [name, args])
+
+		test("a feature counts its projects, and switching it on writes each running project without it", () => {
+			const model = withStatus(
+				status({
+					projects: [
+						project(REF, "storefront", { metricsEnabled: true }),
+						project(API_REF, "api"),
+						project(PAUSED_REF, "sandbox", { status: "INACTIVE" }),
+					],
+				}),
+			)
+			scene(
+				{ update: pageUpdate, view },
+				given(model),
+				expectView(role("switch", { name: "Metrics and Postgres health" })).toHaveAttr(
+					"aria-checked",
+					"false",
+				),
+				expectView(text("1 of 3 projects")).toExist(),
+			)
+			const sent = pageUpdate(model, supabase(SupabaseMessage.ToggledFeature({ kind: "metrics" })))
+			expect(argsOf(sent.commands)).toEqual([
+				["SetSupabaseProjectMetrics", { ref: API_REF, enabled: true }],
+			])
+			scene(
+				{ update: pageUpdate, view },
+				given(sent.model),
+				expectView(role("switch", { name: "Metrics and Postgres health" })).toBeDisabled(),
+				expectView(text("Saving")).toExist(),
+			)
+		})
+
+		test("a feature on everywhere it can be switches off on every project, one write each", () => {
+			const model = withStatus(
+				status({
+					projects: [
+						project(REF, "storefront", { metricsEnabled: true }),
+						project(API_REF, "api", { metricsEnabled: true }),
+					],
+				}),
+			)
+			scene(
+				{ update: pageUpdate, view },
+				given(model),
+				expectView(role("switch", { name: "Metrics and Postgres health" })).toHaveAttr(
+					"aria-checked",
+					"true",
+				),
+			)
+			const sent = pageUpdate(model, supabase(SupabaseMessage.ToggledFeature({ kind: "metrics" })))
+			expect(argsOf(sent.commands)).toEqual([
+				["SetSupabaseProjectMetrics", { ref: REF, enabled: false }],
+				["SetSupabaseProjectMetrics", { ref: API_REF, enabled: false }],
+			])
+		})
+
+		test("polling skips a project whose logs come through a drain, and a drain skips a hand-made Maple drain", () => {
+			const model = withStatus(
+				status({
+					projects: [
+						project(REF, "storefront", { logDrainEnabled: true }),
+						project(API_REF, "api", {
+							logDrains: [
+								{
+									id: "drain-manual",
+									name: "maple-by-hand",
+									backendType: "otlp",
+									destination: null,
+									toMaple: true,
+									managedByMaple: false,
+								},
+							],
+						}),
+						project(PAUSED_REF, "worker", { status: "ACTIVE_HEALTHY" }),
+					],
+				}),
+			)
+			expect(
+				argsOf(
+					pageUpdate(model, supabase(SupabaseMessage.ToggledFeature({ kind: "logs" }))).commands,
+				),
+			).toEqual([["SetSupabaseProjectLogs", { ref: PAUSED_REF, enabled: true }]])
+			expect(
+				argsOf(
+					pageUpdate(model, supabase(SupabaseMessage.ToggledFeature({ kind: "drain" }))).commands,
+				),
+			).toEqual([["SetSupabaseProjectLogDrain", { ref: PAUSED_REF, enabled: true }]])
+		})
+
+		test("a feature no project can take is disabled and says why", () => {
+			const model = withStatus(
+				status({
+					projects: [
+						project(REF, "storefront", { logDrainEnabled: true }),
+						project(API_REF, "api", { logDrainEnabled: true }),
+					],
+				}),
+			)
+			scene(
+				{ update: pageUpdate, view },
+				given(model),
+				expectView(role("switch", { name: "Logs, polled" })).toBeDisabled(),
+				expectView(text("Logs already come through a drain")).toExist(),
+			)
+		})
 	})
 })

@@ -25,9 +25,17 @@ describe("Policy.can", () => {
 		}
 	})
 
-	it("reads members, unknown Clerk roles and no roles as member", () => {
-		for (const roles of [["org:member"], ["org:billing"], []]) {
+	it("gives members and a tenant with no roles the member permissions, and no more", () => {
+		for (const roles of [["org:member"], []]) {
+			expect(Policy.can(roles, "ingest_keys:view_public")).toBe(true)
 			expect(Policy.can(roles, "alerts:manage")).toBe(false)
+		}
+	})
+
+	it("holds nothing a member has for an analyst or a Clerk role it does not know", () => {
+		for (const roles of [["org:analyst"], ["org:billing"]]) {
+			expect(Policy.can(roles, "ingest_keys:view_public")).toBe(false)
+			expect(Policy.grantsOf(roles)).toEqual([])
 		}
 	})
 
@@ -56,6 +64,21 @@ describe("Policy.check", () => {
 			)
 			assert.instanceOf(error, Forbidden)
 			expect(error.message).toBe("Only org admins and engineers can manage integrations.")
+		}),
+	)
+
+	it.effect("tells an analyst which roles hold a member permission", () =>
+		Effect.gen(function* () {
+			const error = yield* Effect.flip(
+				Policy.check(
+					["org:analyst"],
+					"ingest_keys:view_public",
+					(denial) => new Forbidden({ message: denial.message }),
+				),
+			)
+			expect(error.message).toBe(
+				"Only org admins, engineers and members can view the public ingest key.",
+			)
 		}),
 	)
 
@@ -90,9 +113,59 @@ describe("Policy.grantsOf", () => {
 describe("roleOf", () => {
 	it("maps the Clerk keys the Members page assigns", () => {
 		expect(Arr.map(Policy.assignableRoles, (entry) => Policy.roleOf(entry.clerkKey))).toEqual([
+			"analyst",
 			"member",
 			"engineer",
 			"admin",
 		])
+	})
+
+	it("lists the assignable roles lowest first, so each outranks the one before it", () => {
+		const roles = Arr.map(Policy.assignableRoles, (entry) => entry.role)
+		expect(
+			Arr.every(Arr.zip(roles, Arr.drop(roles, 1)), ([lower, higher]) =>
+				Policy.outranks(higher, lower),
+			),
+		).toBe(true)
+	})
+})
+
+describe("highestRole", () => {
+	it("keeps an analyst an analyst instead of lifting them to member", () => {
+		expect(Policy.highestRole(["org:analyst"])).toBe("analyst")
+		expect(Policy.highestRole(["org:analyst", "org:billing"])).toBe("analyst")
+	})
+
+	it("takes the highest when an analyst role sits beside a higher one", () => {
+		expect(Policy.highestRole(["org:analyst", "org:engineer"])).toBe("engineer")
+	})
+
+	it("retires a member-pinned credential when its owner becomes an analyst", () => {
+		const pinned = Policy.highestRole(["org:member"])
+		expect(Policy.outranks(pinned, Policy.highestRole(["org:analyst"]))).toBe(true)
+	})
+})
+
+describe("Policy.canGrantScopes", () => {
+	const holds = (roles: ReadonlyArray<string>) => (permission: Policy.Permission) =>
+		Policy.can(roles, permission)
+
+	it("lets an engineer grant the families their role can use, and only those", () => {
+		const engineer = holds(["org:engineer"])
+		expect(Policy.canGrantScopes(engineer, ["alerts:write", "traces:read", "ingest_keys:read"])).toBe(
+			true,
+		)
+		expect(Policy.canGrantScopes(engineer, ["api_keys:read"])).toBe(true)
+		expect(Policy.canGrantScopes(engineer, ["api_keys:write"])).toBe(false)
+		expect(Policy.canGrantScopes(engineer, ["ingest_keys:write", "data_sources:write"])).toBe(true)
+		expect(Policy.canGrantScopes(engineer, ["audit_log:read"])).toBe(false)
+		expect(Policy.canGrantScopes(holds(["org:member"]), ["traces:read", "ingest_keys:read"])).toBe(false)
+	})
+
+	it("never treats full access, an unknown family or no scopes as restricted", () => {
+		const admin = holds(["org:admin"])
+		for (const scopes of [null, undefined, [], ["*"], ["nope:read"], ["traces"]]) {
+			expect(Policy.canGrantScopes(admin, scopes)).toBe(false)
+		}
 	})
 })

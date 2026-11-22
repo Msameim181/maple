@@ -7,6 +7,7 @@ import { LoadFailure } from "@maple/views/data/load-failure"
 import { TimeWindow } from "../../../data/time-range"
 import * as Select from "@maple/views/ui/select"
 import { SignalPresences } from "@maple/views/data/signal-presence"
+import * as SavedViews from "../../kit/saved-views"
 import * as TimeRangePicker from "../../kit/time-range-picker"
 import { Catalog, SparklineSeries, SummaryRow } from "./model"
 
@@ -31,6 +32,9 @@ export const Message = defineMessageUnion({
 	ClickedLoadMorePages: {},
 	ClickedLoadMoreTable: {},
 	ClickedMetricCard: { metricName: Schema.String, metricType: Schema.String },
+	/** A list key over the table: J / K / arrows, Enter, Escape. */
+	PressedListKey: { key: Schema.String },
+	CompletedScrollFocusedRow: {},
 	ClickedClearFilters: {},
 	CompletedLoadSignalPresence: { result: Schema.Result(SignalPresences, LoadFailure) },
 	...ChartEnvMessages,
@@ -39,6 +43,7 @@ export const Message = defineMessageUnion({
 	ClickedResetTimeRange: {},
 	GotTypeSelectMessage: { message: Select.Message },
 	GotTimePickerMessage: { message: TimeRangePicker.Message },
+	GotSavedViewsMessage: { message: SavedViews.Message },
 	GotSparklineMessage: { message: Chart.Message },
 })
 export type Message = typeof Message.Type
