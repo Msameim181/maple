@@ -16,4 +16,5 @@ DATABASE_URL="$MAPLE_PG_URL" bun -e 'await Bun.sql`UPDATE org_clickhouse_schema_
 
 bun deploy/docker/runner/mail-bridge.ts &
 
-exec node_modules/.bin/alchemy dev --stage dev_selfhost
+# Under Bun, like upstream's `bun dev`: Node cannot import the status Worker's .ttf fonts.
+exec bun --bun node_modules/.bin/alchemy dev --stage dev_selfhost
