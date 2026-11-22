@@ -744,7 +744,7 @@ const storageTable = (h: H, storage: OrgStorageResponse): Html =>
 							h.span([h.Class("font-mono")], [table.table]),
 							hstack(h, { gap: "4", className: "tabular-nums text-muted-foreground" }, [
 								h.span([], [`${formatNumber(table.rows)} rows`]),
-								h.span([], [`${table.partitions} partitions`]),
+								h.span([], [`${table.partitions} ${table.partitions === 1 ? "partition" : "partitions"}`]),
 								h.span([h.Class("text-foreground")], [formatStorageBytes(table.bytes)]),
 							]),
 						],
@@ -813,7 +813,7 @@ const retentionPanel = (h: H, model: Model, retention: OrgRetentionResponse, inp
 									nowMs: inputs.nowMs,
 									timeZone: inputs.timeZone,
 								}),
-								`, dropped ${retention.lastSweepDropped ?? 0} daily partitions.`,
+								`, dropped ${retention.lastSweepDropped ?? 0} daily ${retention.lastSweepDropped === 1 ? "partition" : "partitions"}.`,
 							],
 				),
 				button(
