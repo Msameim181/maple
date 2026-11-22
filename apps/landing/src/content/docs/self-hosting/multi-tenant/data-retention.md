@@ -40,7 +40,7 @@ Set these in `deploy/docker/.env`:
 | `MAPLE_RETENTION_MAX_DAYS` | unset | Ceiling on any organization's limit. A larger value saved by an admin is lowered to this. |
 | `MAPLE_RETENTION_SWEEP_MINUTES` | `60` | Minutes between sweeps. |
 
-The sweep endpoint, `POST /api/internal/retention/sweep`, takes the `SD_INTERNAL_TOKEN` bearer and is not reachable through the public proxy. Add `?dryRun=1` to log what would be dropped without dropping it.
+The sweep endpoint, `POST /api/internal/retention/sweep`, takes the `SD_INTERNAL_TOKEN` bearer and is not reachable through the public proxy.
 
 ## Not included yet
 

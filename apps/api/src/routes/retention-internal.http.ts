@@ -6,7 +6,7 @@ import { RetentionService } from "@maple/backend/services/org/RetentionService"
 
 /**
  * `POST /api/internal/retention/sweep` behind the `SD_INTERNAL_TOKEN` bearer: the scraper calls it
- * on a timer. `?dryRun=1` reports what would be dropped without dropping it.
+ * on a timer.
  */
 export const RetentionInternalRouter = HttpRouter.use((router) =>
 	Effect.gen(function* () {
@@ -19,9 +19,8 @@ export const RetentionInternalRouter = HttpRouter.use((router) =>
 				if (!internalToken) return HttpServerResponse.text("Not configured", { status: 401 })
 				if (!isValidInternalBearer(req.headers.authorization, internalToken))
 					return HttpServerResponse.text("Unauthorized", { status: 401 })
-				const dryRun = new URL(req.url, "http://localhost").searchParams.get("dryRun") === "1"
-				const orgs = yield* retention.sweep({ dryRun })
-				return yield* HttpServerResponse.json({ dryRun, orgs })
+				const orgs = yield* retention.sweep()
+				return yield* HttpServerResponse.json({ orgs })
 			}).pipe(
 				Effect.catch((error) =>
 					Effect.logError("Retention sweep failed").pipe(
