@@ -7,7 +7,7 @@ export const OrgRetentionSettings = PG.table("org_retention_settings", {
 		orgId: PG.column(PG.brand(PG.text, OrgId), { name: "org_id" }),
 		// Keep this many days of raw telemetry; null keeps the shipped TTLs.
 		maxAgeDays: PG.column(PG.nullable(PG.int4), { name: "max_age_days" }),
-		// Stored for the size cap (slice 2); not enforced yet.
+		// Approximate size cap of the org database; the sweep drops oldest daily partitions above it.
 		maxBytes: PG.column(PG.nullable(PG.int8), { name: "max_bytes" }),
 		lastSweepAt: PG.column(PG.nullable(PG.timestamptzMillis), { name: "last_sweep_at" }),
 		lastSweepDropped: PG.column(PG.nullable(PG.int4), { name: "last_sweep_dropped" }),

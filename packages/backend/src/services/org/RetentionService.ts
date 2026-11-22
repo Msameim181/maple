@@ -23,11 +23,65 @@ import { Env } from "@maple/backend/platform/Env"
 import { ClickHouseAdmin, orgDatabaseName } from "@maple/backend/services/directory/OrgProvisioner"
 
 const toIso = Schema.decodeSync(IsoDateTimeString)
-const DAY_MS = 86_400_000
+/** Per-sweep ceiling on free-disk drops: dropped parts free space only after ClickHouse removes them, minutes later. */
+const MAX_DISK_DROPS = 20
+/** The disk guard drops until free space is this many percentage points above the threshold. */
+const DISK_MARGIN_PERCENT = 2
+/** Org databases (`org_<slug>`): the only databases a drop may name. */
+const ORG_DATABASE = /^org_[a-z0-9_]+$/u
 /** Daily partitions (`toDate(...)`) have partition_id like `20261101` (`partition` reads `2026-11-01`, which `DROP PARTITION ID` rejects); anything else is never dropped. */
 const DAILY_PARTITION = /^\d{8}$/u
 /** The table allowlist: raw tables only, never input. */
 const SWEEP_TABLES = Object.keys(RETENTION_TABLE_TTL_DAYS) as ReadonlyArray<keyof typeof RETENTION_TABLE_TTL_DAYS>
+
+export type DropReason = "age" | "size" | "disk"
+
+interface Part {
+	readonly db: string
+	readonly table: string
+	readonly partition: string
+	readonly bytes: number
+}
+
+const parseParts = (rows: ReadonlyArray<Record<string, unknown>>): ReadonlyArray<Part> =>
+	rows
+		.map((r) => ({ db: String(r.database), table: String(r.table), partition: String(r.partition), bytes: Number(r.bytes) }))
+		.filter((p) => ORG_DATABASE.test(p.db))
+
+const isDailyRaw = (p: Part) =>
+	DAILY_PARTITION.test(p.partition) && (SWEEP_TABLES as ReadonlyArray<string>).includes(p.table)
+
+/** Calendar arithmetic on a YYYYMMDD id, so it holds in any server timezone. */
+const minusDays = (id: string, days: number) =>
+	new Date(Date.UTC(Number(id.slice(0, 4)), Number(id.slice(4, 6)) - 1, Number(id.slice(6, 8)) - days))
+		.toISOString()
+		.slice(0, 10)
+		.replaceAll("-", "")
+
+/**
+ * Size and disk candidates, oldest partition first (largest table breaks ties). Never today's
+ * partition, and never the newest daily partition of a table.
+ */
+const droppable = (parts: ReadonlyArray<Part>, today: string): ReadonlyArray<Part> => {
+	const newest = new Map<string, string>()
+	const tableBytes = new Map<string, number>()
+	const daily = parts.filter(isDailyRaw)
+	for (const p of daily) {
+		const key = `${p.db}.${p.table}`
+		if (p.partition > (newest.get(key) ?? "")) newest.set(key, p.partition)
+		tableBytes.set(key, (tableBytes.get(key) ?? 0) + p.bytes)
+	}
+	return daily
+		.filter((p) => p.partition < today && p.partition !== newest.get(`${p.db}.${p.table}`))
+		.sort(
+			(a, b) =>
+				a.partition.localeCompare(b.partition) ||
+				(tableBytes.get(`${b.db}.${b.table}`) ?? 0) - (tableBytes.get(`${a.db}.${a.table}`) ?? 0),
+		)
+}
+
+/** The org id of an `org_<slug>` database; slugs never contain `_`, so the mapping is one to one. */
+const orgIdOfDatabase = (db: string) => db.slice(4).replaceAll("_", "-")
 
 const persistence = (error: unknown) =>
 	new OrgClickHouseSettingsPersistenceError({
@@ -35,6 +89,8 @@ const persistence = (error: unknown) =>
 	})
 
 export interface DroppedPartition {
+	readonly database: string
+	readonly reason: DropReason
 	readonly table: string
 	readonly partition: string
 	readonly bytes: number
@@ -65,7 +121,10 @@ export interface RetentionServiceApi {
 		orgId: OrgId,
 		roles: ReadonlyArray<RoleName>,
 	) => Effect.Effect<OrgStorageResponse, OrgClickHouseSettingsForbiddenError | OrgClickHouseSettingsPersistenceError>
-	/** Drops expired daily partitions for every org with a max age. `dryRun` only reports them. */
+	/**
+	 * Drops daily partitions: past each org's max age, then oldest-first while an org is over its size
+	 * cap, and, below the free-disk threshold, oldest-first across all orgs. `dryRun` only reports them.
+	 */
 	readonly sweep: (options?: {
 		readonly dryRun?: boolean
 	}) => Effect.Effect<ReadonlyArray<OrgSweepReport>, OrgClickHouseSettingsPersistenceError>
@@ -80,6 +139,8 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 			const dbExecute = makeDbExecute(database, "RetentionService", persistence)
 			const admin = yield* ClickHouseAdmin
 			const instanceMax = Option.getOrNull(env.MAPLE_RETENTION_MAX_DAYS)
+			const instanceMaxBytes = Option.getOrNull(env.MAPLE_RETENTION_MAX_BYTES)
+			const minFreePercent = Option.getOrNull(env.MAPLE_CLICKHOUSE_MIN_FREE_PERCENT)
 
 			const requireAdmin = (roles: ReadonlyArray<RoleName>) =>
 				Policy.check(
@@ -109,6 +170,7 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 					maxAgeDays: Option.isSome(row) ? row.value.maxAgeDays : null,
 					maxBytes: Option.isSome(row) && row.value.maxBytes !== null ? Number(row.value.maxBytes) : null,
 					instanceMaxDays: instanceMax,
+					instanceMaxBytes,
 					lastSweepAt:
 						Option.isSome(row) && row.value.lastSweepAt !== null
 							? toIso(new Date(row.value.lastSweepAt).toISOString())
@@ -133,6 +195,10 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 					request.maxAgeDays !== null && instanceMax !== null
 						? Math.min(request.maxAgeDays, instanceMax)
 						: request.maxAgeDays
+				const maxBytes =
+					request.maxBytes !== null && instanceMaxBytes !== null
+						? Math.min(request.maxBytes, instanceMaxBytes)
+						: request.maxBytes
 				const now = yield* Clock.currentTimeMillis
 				yield* dbExecute((db) =>
 					db.run(
@@ -140,7 +206,7 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 							.values({
 								orgId,
 								maxAgeDays,
-								maxBytes: null,
+								maxBytes,
 								lastSweepAt: null,
 								lastSweepDropped: null,
 								updatedBy: userId,
@@ -148,7 +214,7 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 							})
 							.onConflictDoUpdate({
 								target: ["orgId"],
-								set: { maxAgeDays, updatedBy: userId, updatedAt: now },
+								set: { maxAgeDays, maxBytes, updatedBy: userId, updatedAt: now },
 							}),
 					),
 				)
@@ -193,47 +259,152 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 				)
 			})
 
-			const sweepOrg = (orgId: OrgId, maxAgeDays: number, nowMs: number, dryRun: boolean) =>
+			const dropPart = (p: Part, reason: DropReason, dryRun: boolean) =>
+				Effect.gen(function* () {
+					yield* Effect.logInfo("Retention: dropping partition").pipe(
+						Effect.annotateLogs({
+							orgId: orgIdOfDatabase(p.db),
+							table: p.table,
+							partition: p.partition,
+							bytes: p.bytes,
+							reason,
+							dryRun,
+						}),
+					)
+					if (!dryRun)
+						yield* admin.exec(`ALTER TABLE \`${p.db}\`.\`${p.table}\` DROP PARTITION ID '${p.partition}'`)
+					return { database: p.db, reason, table: p.table, partition: p.partition, bytes: p.bytes }
+				})
+
+			/** Drops `droppable` parts, oldest first, until `done(bytesFreed)` or `limit` drops. Pushes into `out` so a failure keeps the earlier drops. */
+			const dropOldest = (
+				parts: ReadonlyArray<Part>,
+				today: string,
+				reason: DropReason,
+				dryRun: boolean,
+				done: (freed: number) => boolean,
+				limit: number,
+				out: Array<DroppedPartition>,
+			) =>
+				Effect.gen(function* () {
+					let freed = 0
+					let count = 0
+					for (const p of droppable(parts, today)) {
+						if (done(freed) || count >= limit) break
+						out.push(yield* dropPart(p, reason, dryRun))
+						freed += p.bytes
+						count += 1
+					}
+				})
+
+			// today() follows the ClickHouse server's timezone, which is what toDate() partitions by.
+			const serverToday = admin
+				.query("SELECT toYYYYMMDD(today()) AS today")
+				.pipe(
+					Effect.mapError(persistence),
+					Effect.flatMap((rows) => {
+						const today = String(rows[0]?.today)
+						return DAILY_PARTITION.test(today)
+							? Effect.succeed(today)
+							: Effect.fail(persistence(new Error("ClickHouse returned no date")))
+					}),
+				)
+
+			const sweepOrg = (orgId: OrgId, maxAgeDays: number | null, maxBytes: number | null, today: string, dryRun: boolean) =>
 				Effect.gen(function* () {
 					const name = yield* dbNameFor(orgId)
+					let parts = parseParts(
+						yield* admin.query(
+							`SELECT database, table, partition_id AS partition, sum(bytes_on_disk) AS bytes FROM system.parts WHERE database = '${name}' AND active GROUP BY database, table, partition_id`,
+						),
+					)
 					const dropped: Array<DroppedPartition> = []
-					for (const table of SWEEP_TABLES) {
-						// A larger N than the shipped TTL has no effect: the TTL already removes that data.
-						const days = Math.min(maxAgeDays, RETENTION_TABLE_TTL_DAYS[table])
-						const cutoff = new Date(nowMs - days * DAY_MS).toISOString().slice(0, 10).replaceAll("-", "")
-						const parts = yield* admin.query(
-							`SELECT partition_id AS partition, sum(bytes_on_disk) AS bytes FROM system.parts WHERE database = '${name}' AND table = '${table}' AND active GROUP BY partition_id`,
-						)
-						for (const part of parts) {
-							const partition = String(part.partition)
-							if (!DAILY_PARTITION.test(partition) || partition >= cutoff) continue
-							const bytes = Number(part.bytes)
-							yield* Effect.logInfo("Retention: dropping partition").pipe(
-								Effect.annotateLogs({ orgId, table, partition, bytes, dryRun }),
-							)
-							if (!dryRun)
-								yield* admin.exec(`ALTER TABLE \`${name}\`.\`${table}\` DROP PARTITION ID '${partition}'`)
-							dropped.push({ table, partition, bytes })
-						}
+					if (maxAgeDays !== null) {
+						const expired = parts
+							.filter((p) => {
+								if (!isDailyRaw(p)) return false
+								// A larger N than the shipped TTL has no effect: the TTL already removes that data.
+								const days = Math.min(maxAgeDays, RETENTION_TABLE_TTL_DAYS[p.table as keyof typeof RETENTION_TABLE_TTL_DAYS])
+								return p.partition < minusDays(today, days)
+							})
+							.sort((a, b) => a.partition.localeCompare(b.partition))
+						for (const p of expired) dropped.push(yield* dropPart(p, "age", dryRun))
+						parts = parts.filter((p) => !expired.includes(p))
+					}
+					if (maxBytes !== null) {
+						const total = parts.reduce((sum, p) => sum + p.bytes, 0)
+						yield* dropOldest(parts, today, "size", dryRun, (freed) => total - freed <= maxBytes, Infinity, dropped)
 					}
 					return dropped
 				})
+
+			/** Below the free-disk threshold, drops the oldest partitions of every org database, ignoring org settings. */
+			const diskPass = (today: string, dryRun: boolean) =>
+				Effect.gen(function* () {
+					const out: Array<DroppedPartition> = []
+					if (minFreePercent === null) return out
+					const disk = (yield* admin.query(
+						"SELECT sum(free_space) AS free, sum(total_space) AS total FROM system.disks WHERE name = 'default'",
+					))[0]
+					const free = Number(disk?.free)
+					const total = Number(disk?.total)
+					if (!(total > 0) || !(free >= 0) || (free / total) * 100 >= minFreePercent) return out
+					yield* Effect.logWarning("Retention: free disk below threshold").pipe(
+						Effect.annotateLogs({ freePercent: (free / total) * 100, minFreePercent }),
+					)
+					const target = ((minFreePercent + DISK_MARGIN_PERCENT) / 100) * total
+					const parts = parseParts(
+						yield* admin.query(
+							"SELECT database, table, partition_id AS partition, sum(bytes_on_disk) AS bytes FROM system.parts WHERE startsWith(database, 'org_') AND active GROUP BY database, table, partition_id",
+						),
+					)
+					yield* dropOldest(parts, today, "disk", dryRun, (freed) => free + freed >= target, MAX_DISK_DROPS, out)
+					return out
+				}).pipe(
+					Effect.catch((e: { readonly message: string }) =>
+						Effect.logWarning("Retention disk guard failed").pipe(
+							Effect.annotateLogs({ error: e.message }),
+							Effect.as([] as Array<DroppedPartition>),
+						),
+					),
+				)
 
 			const sweep = Effect.fn("RetentionService.sweep")(function* (options?: { readonly dryRun?: boolean }) {
 				const dryRun = options?.dryRun === true
 				const nowMs = yield* Clock.currentTimeMillis
 				const rows = yield* dbExecute((db) => db.run(PG.from(OrgRetentionSettings).select()))
+				const limits = rows.map((row) => ({
+					row,
+					days:
+						row.maxAgeDays === null || instanceMax === null
+							? row.maxAgeDays
+							: Math.min(row.maxAgeDays, instanceMax),
+					// An org with no cap of its own gets the instance ceiling.
+					bytes:
+						row.maxBytes === null
+							? instanceMaxBytes
+							: instanceMaxBytes === null
+								? Number(row.maxBytes)
+								: Math.min(Number(row.maxBytes), instanceMaxBytes),
+				}))
+				if (minFreePercent === null && limits.every((l) => l.days === null && l.bytes === null)) return []
+				const today = yield* serverToday
+				// Disk first: it is the emergency, and the org passes then read what is left.
+				const diskDrops = yield* diskPass(today, dryRun)
 				const reports: Array<OrgSweepReport> = []
-				for (const row of rows) {
-					if (row.maxAgeDays === null) continue
-					const days = instanceMax === null ? row.maxAgeDays : Math.min(row.maxAgeDays, instanceMax)
+				const handled = new Set<string>()
+				for (const { row, days, bytes } of limits) {
+					const name = orgDatabaseName(row.orgId)
+					const disk = diskDrops.filter((d) => d.database === name)
+					if (days === null && bytes === null) continue
+					handled.add(name)
 					// One org failing (database gone, ClickHouse down) must not stop the others.
-					const result = yield* sweepOrg(row.orgId, days, nowMs, dryRun).pipe(
-						Effect.map((dropped) => ({ dropped, error: null as string | null })),
+					const result = yield* sweepOrg(row.orgId, days, bytes, today, dryRun).pipe(
+						Effect.map((dropped) => ({ dropped: [...disk, ...dropped], error: null as string | null })),
 						Effect.catch((e: { readonly message: string }) =>
 							Effect.logWarning("Retention sweep failed for org").pipe(
 								Effect.annotateLogs({ orgId: row.orgId, error: e.message }),
-								Effect.as({ dropped: [] as ReadonlyArray<DroppedPartition>, error: e.message as string | null }),
+								Effect.as({ dropped: disk as ReadonlyArray<DroppedPartition>, error: e.message as string | null }),
 							),
 						),
 					)
@@ -247,6 +418,10 @@ export class RetentionService extends Context.Service<RetentionService, Retentio
 							),
 						)
 				}
+				// Disk drops in databases of orgs with no limit of their own.
+				for (const name of new Set(diskDrops.map((d) => d.database)))
+					if (!handled.has(name))
+						reports.push({ orgId: orgIdOfDatabase(name), dropped: diskDrops.filter((d) => d.database === name), error: null })
 				return reports
 			})
 

@@ -238,6 +238,10 @@ export interface EnvConfig {
 	readonly MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: Option.Option<Redacted.Redacted>
 	/** Instance ceiling (days) on any org's retention; unset means no ceiling beyond the shipped TTLs. */
 	readonly MAPLE_RETENTION_MAX_DAYS: Option.Option<number>
+	/** Instance ceiling (bytes) on any org's size cap; unset means none. */
+	readonly MAPLE_RETENTION_MAX_BYTES: Option.Option<number>
+	/** Free-disk guard: below this free percent of the ClickHouse disk, the sweep drops the oldest partitions. Unset = off. */
+	readonly MAPLE_CLICKHOUSE_MIN_FREE_PERCENT: Option.Option<number>
 }
 
 const portConfig = Config.Number("PORT").pipe(Config.withDefault(3472))
@@ -431,6 +435,22 @@ const envConfig = Config.all({
 			Option.flatMap((raw) => {
 				const days = Math.floor(Number(raw))
 				return raw.trim() !== "" && days >= 1 ? Option.some(days) : Option.none()
+			}),
+		),
+	),
+	MAPLE_RETENTION_MAX_BYTES: Config.option(Config.String("MAPLE_RETENTION_MAX_BYTES")).pipe(
+		Config.map(
+			Option.flatMap((raw) => {
+				const bytes = Math.floor(Number(raw))
+				return raw.trim() !== "" && Number.isSafeInteger(bytes) && bytes >= 1 ? Option.some(bytes) : Option.none()
+			}),
+		),
+	),
+	MAPLE_CLICKHOUSE_MIN_FREE_PERCENT: Config.option(Config.String("MAPLE_CLICKHOUSE_MIN_FREE_PERCENT")).pipe(
+		Config.map(
+			Option.flatMap((raw) => {
+				const percent = Number(raw)
+				return raw.trim() !== "" && percent > 0 && percent < 100 ? Option.some(percent) : Option.none()
 			}),
 		),
 	),

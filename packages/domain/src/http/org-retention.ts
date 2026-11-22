@@ -21,10 +21,12 @@ export const RETENTION_MAX_DAYS = 3650
 export class OrgRetentionResponse extends Schema.Class<OrgRetentionResponse>("OrgRetentionResponse")({
 	/** Days of raw telemetry kept, or null for the shipped TTLs. */
 	maxAgeDays: Schema.NullOr(Schema.Number),
-	/** Stored but not enforced yet. */
+	/** Approximate size cap (bytes) for the org database, or null. */
 	maxBytes: Schema.NullOr(Schema.Number),
 	/** Instance ceiling from `MAPLE_RETENTION_MAX_DAYS`, or null. */
 	instanceMaxDays: Schema.NullOr(Schema.Number),
+	/** Instance ceiling from `MAPLE_RETENTION_MAX_BYTES`, or null. */
+	instanceMaxBytes: Schema.NullOr(Schema.Number),
 	lastSweepAt: Schema.NullOr(IsoDateTimeString),
 	lastSweepDropped: Schema.NullOr(Schema.Number),
 }) {}
@@ -33,6 +35,7 @@ export class OrgRetentionUpsertRequest extends Schema.Class<OrgRetentionUpsertRe
 	"OrgRetentionUpsertRequest",
 )({
 	maxAgeDays: Schema.NullOr(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: RETENTION_MAX_DAYS }))),
+	maxBytes: Schema.NullOr(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER }))),
 }) {}
 
 export class OrgStorageTable extends Schema.Class<OrgStorageTable>("OrgStorageTable")({
