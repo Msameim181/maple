@@ -29,6 +29,8 @@ Per-org, not global. Each org has its own ClickHouse database (`org_<slug>`), so
 - Cutoff from ClickHouse `today()` (server tz). Web: Max storage field, presets, usage bar.
 - Not done: per-statement `SETTINGS max_partition_size_to_drop=0` (could not be verified: no ClickHouse image/container available; a partition over the server limit fails its drop, which is logged and recorded as the org's sweep error); per-reason counts in the sweep note (needs a column).
 
+- Emergency CLI `deploy/docker/scripts/retention-emergency.sh` (status, free, truncate-system-logs, drop-org-data; `--dry-run` CLI only). Tested only against a stubbed `docker` (no ClickHouse available), so its SQL and the per-statement limit retry are unverified against a real server. A backend test pins its table list to the sweep allowlist.
+
 ## Later
 N above shipped TTL via `MODIFY TTL`, system.*_log TTLs, replay blob lifecycle, Postgres tables retention.
 

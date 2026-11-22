@@ -59,6 +59,34 @@ Set these in `deploy/docker/.env`:
 
 The sweep endpoint, `POST /api/internal/retention/sweep`, takes the `SD_INTERNAL_TOKEN` bearer and is not reachable through the public proxy.
 
+## Disk full emergency
+
+The sweep's free-disk guard (`MAPLE_CLICKHOUSE_MIN_FREE_PERCENT`) is the automatic version of this. When the disk is already full, or ClickHouse is down, use `deploy/docker/scripts/retention-emergency.sh` on the host. It talks only to the `clickhouse` container, so it works with the Maple API, worker, scraper and Postgres stopped. Run it from `deploy/docker`:
+
+```bash
+# 1. See where the space is: disks, host df, bytes per organization database and table,
+#    and the biggest tables overall, including system.query_log, trace_log, metric_log, text_log.
+scripts/retention-emergency.sh status
+
+# 2. Cheapest first: truncate ClickHouse's own diagnostics logs (safe, they hold no telemetry).
+scripts/retention-emergency.sh truncate-system-logs
+
+# 3. Free space down to a target (default 15% free). Truncates the system logs first, then removes
+#    the oldest daily partitions across all organizations until the target is reached.
+scripts/retention-emergency.sh free --target-free-percent 15
+
+# 4. Or remove by age: everything older than N days, all organizations or one.
+scripts/retention-emergency.sh free --keep-days 14
+scripts/retention-emergency.sh free --org acme --keep-days 7
+
+# 5. Last resort: erase every raw table of one organization (you type its slug to confirm).
+scripts/retention-emergency.sh drop-org-data --org acme
+```
+
+Every destructive command prints exactly what it will remove with sizes and asks for confirmation; `--yes` skips the question for scripts. `--dry-run` prints the plan and the statements and changes nothing. Today's partition is never removed by `free`, and only the raw tables listed above are touched. ClickHouse hands the space back a few minutes after a removal, so `free` tracks an estimate and `status` shows the real figure later. If a statement is refused because it exceeds ClickHouse's `max_partition_size_to_drop` (or `max_table_size_to_drop`), the script retries that one statement with the limit lifted for it.
+
+If ClickHouse will not answer because the disk is completely full, the script prints the fallback: stop the writers (`docker compose stop ingest maple scraper`), free a little host space, start ClickHouse (`docker compose up -d clickhouse`), run `truncate-system-logs`, then `free`, then `docker compose up -d`.
+
 ## Not included yet
 
 Ceilings and caps for organizations that never saved retention settings, limits above the built-in TTLs, ClickHouse system log retention, and retention for session replay blobs and Postgres tables.
