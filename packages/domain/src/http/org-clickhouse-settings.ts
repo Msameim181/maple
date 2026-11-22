@@ -10,6 +10,7 @@ import {
 	OrgClickHouseSettingsUpstreamUnavailableError,
 	OrgClickHouseSettingsValidationError,
 } from "./org-clickhouse-settings-errors"
+import { OrgRetentionResponse, OrgRetentionUpsertRequest, OrgStorageResponse } from "./org-retention"
 
 export * from "./org-clickhouse-settings-errors"
 
@@ -287,6 +288,29 @@ export class OrgClickHouseSettingsApiGroup extends HttpApiGroup.make("orgClickHo
 	.add(
 		HttpApiEndpoint.delete("delete", "/", {
 			success: OrgClickHouseSettingsDeleteResponse,
+			error: [OrgClickHouseSettingsForbiddenError, OrgClickHouseSettingsPersistenceError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.get("getRetention", "/retention", {
+			success: OrgRetentionResponse,
+			error: [OrgClickHouseSettingsForbiddenError, OrgClickHouseSettingsPersistenceError],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.put("setRetention", "/retention", {
+			payload: OrgRetentionUpsertRequest,
+			success: OrgRetentionResponse,
+			error: [
+				OrgClickHouseSettingsForbiddenError,
+				OrgClickHouseSettingsValidationError,
+				OrgClickHouseSettingsPersistenceError,
+			],
+		}),
+	)
+	.add(
+		HttpApiEndpoint.get("getStorage", "/storage", {
+			success: OrgStorageResponse,
 			error: [OrgClickHouseSettingsForbiddenError, OrgClickHouseSettingsPersistenceError],
 		}),
 	)

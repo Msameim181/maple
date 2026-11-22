@@ -156,6 +156,7 @@ import { QueryEngineService } from "@maple/backend/services/warehouse/QueryEngin
 import { PromqlQueryService } from "@maple/backend/services/promql/PromqlQueryService"
 import { TelemetryReadService } from "@maple/backend/services/warehouse/TelemetryReadService"
 import { OrgClickHouseSettingsService } from "@maple/backend/services/org/OrgClickHouseSettingsService"
+import { RetentionService } from "@maple/backend/services/org/RetentionService"
 import { VcsSourceService } from "@maple/backend/services/integrations/vcs/VcsSourceService"
 import { CiAnalyticsService } from "@maple/backend/services/pr-review/CiAnalyticsService"
 import { CodeReviewTeamService } from "@maple/backend/services/pr-review/CodeReviewTeamService"
@@ -216,6 +217,7 @@ export const HttpServicesLive = Layer.mergeAll(
 	SourcesService.layer,
 	SourceUsageService.layer,
 	OrgClickHouseSettingsService.layer,
+	RetentionService.layer,
 	OrganizationService.layer,
 	OrganizationDeletionService.layer,
 	MobileDevicesService.layer,

@@ -58,6 +58,7 @@ import { AwsEventsRouter } from "@/routes/webhooks/aws-events.http"
 import { HttpQueryEngineLive } from "@/routes/internal/query-engine.http"
 import { HttpSessionReplaysInternalLive } from "@/routes/internal/session-replays.http"
 import { ScraperInternalRouter } from "@/routes/scraper-internal.http"
+import { RetentionInternalRouter } from "@/routes/retention-internal.http"
 import { UptimeHeartbeatRouter, UptimeInternalRouter } from "@/routes/uptime-internal.http"
 import { ChatCallbackRouter } from "@/routes/chat-integration.http"
 import { VcsWebhookRouter } from "@/routes/webhooks/vcs.http"
@@ -292,6 +293,7 @@ const RawRoutes = rawRoutes<Layer.Success<ApiPortsLayer>>()(
 		AwsEventsRouter,
 		ScraperInternalRouter,
 		UptimeInternalRouter,
+		RetentionInternalRouter,
 		UptimeHeartbeatRouter,
 		VcsWebhookRouter,
 		ClerkWebhookRouter,

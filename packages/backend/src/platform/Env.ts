@@ -236,6 +236,8 @@ export interface EnvConfig {
 	readonly MAPLE_SMTP_BRIDGE_URL: Option.Option<string>
 	readonly MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: Option.Option<string>
 	readonly MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: Option.Option<Redacted.Redacted>
+	/** Instance ceiling (days) on any org's retention; unset means no ceiling beyond the shipped TTLs. */
+	readonly MAPLE_RETENTION_MAX_DAYS: Option.Option<number>
 }
 
 const portConfig = Config.Number("PORT").pipe(Config.withDefault(3472))
@@ -423,6 +425,7 @@ const envConfig = Config.all({
 	MAPLE_SMTP_BRIDGE_URL: optionalString("MAPLE_SMTP_BRIDGE_URL"),
 	MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: optionalString("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER"),
 	MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: optionalRedacted("MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD"),
+	MAPLE_RETENTION_MAX_DAYS: Config.option(Config.Number("MAPLE_RETENTION_MAX_DAYS")),
 })
 
 const makeEnv = Effect.gen(function* () {
