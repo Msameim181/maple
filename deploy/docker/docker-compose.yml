@@ -132,6 +132,8 @@ services:
       MAPLE_SELFHOST_CLICKHOUSE_ADMIN_USER: admin
       # Optional instance ceiling on any org's retention (days); unset = shipped TTLs only.
       MAPLE_RETENTION_MAX_DAYS: ${MAPLE_RETENTION_MAX_DAYS:-}
+      MAPLE_RETENTION_MAX_BYTES: ${MAPLE_RETENTION_MAX_BYTES:-}
+      MAPLE_CLICKHOUSE_MIN_FREE_PERCENT: ${MAPLE_CLICKHOUSE_MIN_FREE_PERCENT:-}
       MAPLE_SELFHOST_CLICKHOUSE_ADMIN_PASSWORD: ${CLICKHOUSE_ADMIN_PASSWORD}
       MAPLE_OIDC_AUTHORIZE_URL: https://${AUTH_HOST}/realms/maple/protocol/openid-connect/auth
       MAPLE_OIDC_TOKEN_URL: http://keycloak:8080/realms/maple/protocol/openid-connect/token

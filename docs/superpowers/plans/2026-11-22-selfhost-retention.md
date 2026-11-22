@@ -23,8 +23,14 @@ Per-org, not global. Each org has its own ClickHouse database (`org_<slug>`), so
 - Dry-run flag on sweep, used by tests.
 - Raise `max_partition_size_to_drop` only per statement via SETTINGS if needed; do not change server config.
 
-## Slice 2 (later)
-Per-org byte cap enforcement, instance free-disk guard (`MAPLE_CLICKHOUSE_MIN_FREE_PERCENT`), N above shipped TTL via `MODIFY TTL`, system.*_log TTLs, replay blob lifecycle, Postgres tables retention.
+## Slice 2 (built)
+- Size cap per org (`maxBytes`), enforced in the sweep: oldest daily partition across raw tables first (largest table on ties), never today's or a table's newest; age and size both apply; `reason` logged (age|size|disk).
+- `MAPLE_RETENTION_MAX_BYTES` ceiling (clamps saves, and holds orgs with no cap); `MAPLE_CLICKHOUSE_MIN_FREE_PERCENT` free-disk guard over all org databases (max 20 drops per sweep, 2-point margin, estimated from dropped bytes because freed space lags).
+- Cutoff from ClickHouse `today()` (server tz). Web: Max storage field, presets, usage bar.
+- Not done: per-statement `SETTINGS max_partition_size_to_drop=0` (could not be verified: no ClickHouse image/container available; a partition over the server limit fails its drop, which is logged and recorded as the org's sweep error); per-reason counts in the sweep note (needs a column).
+
+## Later
+N above shipped TTL via `MODIFY TTL`, system.*_log TTLs, replay blob lifecycle, Postgres tables retention.
 
 ## Tests
 Service tests with a fake ClickHouseAdmin (partition selection, validation, clamp, dry-run); API auth test (non-admin 403); web update test for the panel state.
