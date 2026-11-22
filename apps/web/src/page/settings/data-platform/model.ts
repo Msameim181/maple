@@ -43,6 +43,8 @@ export const Model = Schema.Struct({
 	storage: AsyncData.Schema(OrgStorageResponse, LoadFailure).schema,
 	/** The days field as typed, `null` while it shows the saved value. */
 	retentionDraft: Schema.NullOr(Schema.String),
+	/** The max-storage field (GB) as typed, `null` while it shows the saved value. */
+	maxGbDraft: Schema.NullOr(Schema.String),
 	isSavingRetention: Schema.Boolean,
 	/** The connection edits, `null` while the form shows the saved values. */
 	draft: Schema.NullOr(ConnectionDraft),
@@ -70,6 +72,7 @@ export const Message = defineMessageUnion({
 	CompletedFetchRetention: done(OrgRetentionResponse),
 	CompletedFetchStorage: done(OrgStorageResponse),
 	ChangedRetentionDays: { value: Schema.String },
+	ChangedMaxGb: { value: Schema.String },
 	ClickedSaveRetention: {},
 	CompletedSaveRetention: done(OrgRetentionResponse),
 	ChangedConnection: { field: ConnectionField, value: Schema.String },

@@ -76,11 +76,13 @@ const FetchStorage = Command.define("FetchOrgStorage", {
 })
 
 const SaveRetention = Command.define("SaveOrgRetention", {
-	args: { maxAgeDays: Schema.NullOr(Schema.Number) },
+	args: { maxAgeDays: Schema.NullOr(Schema.Number), maxBytes: Schema.NullOr(Schema.Number) },
 	messages: [Message.CompletedSaveRetention],
-	execute: ({ maxAgeDays }) =>
+	execute: ({ maxAgeDays, maxBytes }) =>
 		Effect.flatMap(MapleInternalApiClient, (client) =>
-			client.orgClickHouseSettings.setRetention({ payload: new OrgRetentionUpsertRequest({ maxAgeDays }) }),
+			client.orgClickHouseSettings.setRetention({
+				payload: new OrgRetentionUpsertRequest({ maxAgeDays, maxBytes }),
+			}),
 		).pipe(settleTo((result) => Message.CompletedSaveRetention({ result }))),
 })
 
@@ -125,6 +127,7 @@ export const init = (): Return => ({
 		retention: AsyncData.Loading(),
 		storage: AsyncData.Loading(),
 		retentionDraft: null,
+		maxGbDraft: null,
 		isSavingRetention: false,
 		draft: null,
 		committedOver: null,
@@ -175,6 +178,23 @@ export const retentionDaysOf = (model: Model): number | null | "invalid" => {
 	if (text === "") return null
 	const days = Number(text)
 	return Number.isInteger(days) && days >= 1 && days <= 3650 ? days : "invalid"
+}
+
+/** Decimal bytes per GB, matching how the panel formats sizes. */
+export const BYTES_PER_GB = 1_000_000_000
+
+/** The max-storage field as the API takes it: blank means no cap (`null`); anything not a positive size is invalid. */
+export const maxBytesOf = (model: Model): number | null | "invalid" => {
+	const text = Str.trim(
+		model.maxGbDraft ??
+			AsyncData.getOrElse(
+				AsyncData.map(model.retention, (r) => (r.maxBytes === null ? "" : String(r.maxBytes / BYTES_PER_GB))),
+				() => "",
+			),
+	)
+	if (text === "") return null
+	const bytes = Math.round(Number(text) * BYTES_PER_GB)
+	return Number.isSafeInteger(bytes) && bytes >= 1 ? bytes : "invalid"
 }
 
 /** Retention is admin-only; a forbidden read hides the whole panel. */
@@ -306,13 +326,15 @@ export const update = (model: Model, message: Message): Return =>
 			model: { ...model, storage: AsyncData.settle(model.storage, result) },
 		}),
 		ChangedRetentionDays: ({ value }) => ({ model: { ...model, retentionDraft: value } }),
+		ChangedMaxGb: ({ value }) => ({ model: { ...model, maxGbDraft: value } }),
 		ClickedSaveRetention: () => {
 			if (model.isSavingRetention) return { model }
 			const days = retentionDaysOf(model)
-			if (days === "invalid") return { model }
+			const maxBytes = maxBytesOf(model)
+			if (days === "invalid" || maxBytes === "invalid") return { model }
 			return {
 				model: { ...model, isSavingRetention: true },
-				commands: [SaveRetention({ maxAgeDays: days })],
+				commands: [SaveRetention({ maxAgeDays: days, maxBytes })],
 			}
 		},
 		CompletedSaveRetention: ({ result }) =>
@@ -322,6 +344,7 @@ export const update = (model: Model, message: Message): Return =>
 						...model,
 						isSavingRetention: false,
 						retentionDraft: null,
+						maxGbDraft: null,
 						retention: AsyncData.settle(model.retention, Result.succeed(saved)),
 					},
 					outMessage: toast("success", "Retention saved"),

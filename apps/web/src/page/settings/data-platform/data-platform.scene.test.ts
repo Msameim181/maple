@@ -106,6 +106,7 @@ describe("data platform tab", () => {
 			maxAgeDays,
 			maxBytes: null,
 			instanceMaxDays: null,
+			instanceMaxBytes: null,
 			lastSweepAt: null,
 			lastSweepDropped: null,
 		})
@@ -116,12 +117,26 @@ describe("data platform tab", () => {
 		const typed = update(read, Message.ChangedRetentionDays({ value: "14" })).model
 		expect(update(typed, Message.ClickedSaveRetention()).commands?.[0]).toMatchObject({
 			name: "SaveOrgRetention",
-			args: { maxAgeDays: 14 },
+			args: { maxAgeDays: 14, maxBytes: null },
 		})
 		const blank = update(read, Message.ChangedRetentionDays({ value: " " })).model
 		expect(update(blank, Message.ClickedSaveRetention()).commands?.[0]).toMatchObject({
 			args: { maxAgeDays: null },
 		})
+	})
+
+	test("Save sends the typed max storage in bytes, blank clears it, and a bad value does not save", () => {
+		const read = update(init().model, Message.CompletedFetchRetention({ result: Result.succeed(retention(null)) })).model
+		const typed = update(read, Message.ChangedMaxGb({ value: "5" })).model
+		expect(update(typed, Message.ClickedSaveRetention()).commands?.[0]).toMatchObject({
+			args: { maxAgeDays: null, maxBytes: 5_000_000_000 },
+		})
+		const half = update(read, Message.ChangedMaxGb({ value: "0.5" })).model
+		expect(update(half, Message.ClickedSaveRetention()).commands?.[0]).toMatchObject({
+			args: { maxBytes: 500_000_000 },
+		})
+		const bad = update(read, Message.ChangedMaxGb({ value: "-1" })).model
+		expect(update(bad, Message.ClickedSaveRetention()).commands).toBeUndefined()
 	})
 
 	test("an invalid days value does not save, and a saved value replaces the draft", () => {
